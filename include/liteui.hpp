@@ -146,8 +146,8 @@ inline Natural measureNatural(const View &node, float availW, float availH,
   float h = resolveAxis(node.style.height, availH, hDefinite, 0);
   if ((!needW && !needH) || node.children.empty()) return {w, h};
 
-  float innerW = (wDefinite && !needW) ? max(0.0f, w - pad.left - pad.right) : availW;
-  float innerH = (hDefinite && !needH) ? max(0.0f, h - pad.top - pad.bottom) : availH;
+  float innerW = (wDefinite && !needW) ? std::max(0.0f, w - pad.left - pad.right) : availW;
+  float innerH = (hDefinite && !needH) ? std::max(0.0f, h - pad.top - pad.bottom) : availH;
 
   float mainTotal = 0, crossMax = 0;
   for (size_t i = 0; i < node.children.size(); ++i) {
@@ -159,7 +159,7 @@ inline Natural measureNatural(const View &node, float availW, float availH,
     float childCross = horizontal ? cn.h + mv : cn.w + mm;
     mainTotal += childMain;
     if (i + 1 < node.children.size()) mainTotal += node.style.gap;
-    crossMax = max(crossMax, childCross);
+    crossMax = std::max(crossMax, childCross);
   }
   if (needW) w = (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
   if (needH) h = (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
@@ -173,8 +173,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   bool horizontal = node.style.direction == FlexDirection::Row;
   const EdgeInsets &pad = node.style.padding;
   float contentX = x + pad.left, contentY = y + pad.top;
-  float contentW = max(0.0f, w - pad.left - pad.right);
-  float contentH = max(0.0f, h - pad.top - pad.bottom);
+  float contentW = std::max(0.0f, w - pad.left - pad.right);
+  float contentH = std::max(0.0f, h - pad.top - pad.bottom);
   float mainAvail = horizontal ? contentW : contentH;
   float crossAvail = horizontal ? contentH : contentW;
 
@@ -205,7 +205,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
       extra = leftover * (node.children[i].style.flexGrow / growSum);
     else if (leftover < 0 && shrinkSum > 0)
       extra = leftover * (node.children[i].style.flexShrink / shrinkSum);
-    finalMain[i] = max(0.0f, basis[i] + extra);
+    finalMain[i] = std::max(0.0f, basis[i] + extra);
   }
 
   float totalUsed = 0;
@@ -213,7 +213,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
     if (i + 1 < n) totalUsed += node.style.gap;
   }
-  float freeSpace = max(0.0f, mainAvail - totalUsed);
+  float freeSpace = std::max(0.0f, mainAvail - totalUsed);
   float startOffset = 0, between = node.style.gap;
   switch (node.style.justifyContent) {
   case Justify::Start: break;
@@ -233,7 +233,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
                                     : c.style.width.kind != Size::Kind::Fit;
     float finalCross = cross[i];
     if (node.style.alignItems == Align::Stretch && !explicitCross)
-      finalCross = max(0.0f, crossAvail - mCrossS[i] - mCrossE[i]);
+      finalCross = std::max(0.0f, crossAvail - mCrossS[i] - mCrossE[i]);
 
     float crossOffset;
     switch (node.style.alignItems) {
