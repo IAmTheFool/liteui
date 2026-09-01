@@ -2,7 +2,7 @@
 #include <iostream>
 
 int main() {
-  GuiWindow window(800, 600, "A Bare Window");
+  LiteUI window(800, 600, "A Bare Window");
 
 
 
