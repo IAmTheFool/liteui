@@ -13,6 +13,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -25,6 +26,21 @@
 #include <unistd.h>
 #include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
 #endif
+
+// Plain RGB color, one byte per channel.
+struct Color {
+  uint8_t r = 0, g = 0, b = 0;
+};
+
+// A static, axis-aligned filled rectangle the caller wants drawn on the
+// window. Position is in window-local pixel coordinates, (0,0) at top-left.
+struct Box {
+  int width = 0;
+  int height = 0;
+  int pos_x = 0;
+  int pos_y = 0;
+  Color color;
+};
 
 class LiteUI {
 
@@ -45,6 +61,9 @@ public:
   // event loop.
   void run(); // blocks, runs the event loop
 
+  // Adds a static box to be drawn on the window and triggers a repaint.
+  void addBox(const Box &box);
+
   // Everything below is internal implementation detail.
 private:
   // Requested window width in pixels, stored so pixel-drawing helpers can
@@ -52,6 +71,9 @@ private:
   int width_;
   // Requested window height in pixels, same purpose as width_.
   int height_;
+
+  // Boxes queued for drawing, in the order addBox() was called (paint order).
+  std::vector<Box> boxes_;
 
 // Windows-only member/method block.
 #if defined(_WIN32)
@@ -103,6 +125,15 @@ private:
 
     // Dispatch on the specific message type.
     switch (msg) {
+    // Repaint request: redraw all boxes using GDI.
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC hdc = BeginPaint(hwnd, &ps);
+      if (self)
+        self->paintBoxes(hdc);
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
     // When the window is being destroyed...
     case WM_DESTROY:
       // ...tell Windows to post a WM_QUIT message, which ends the GetMessage
@@ -114,6 +145,16 @@ private:
     // Any message not explicitly handled above falls through to Windows'
     // default behavior.
     return DefWindowProcW(hwnd, msg, wp, lp);
+  }
+
+  // Draws every queued box into the given device context via GDI.
+  void paintBoxes(HDC hdc) {
+    for (const auto &b : boxes_) {
+      RECT r{b.pos_x, b.pos_y, b.pos_x + b.width, b.pos_y + b.height};
+      HBRUSH brush = CreateSolidBrush(RGB(b.color.r, b.color.g, b.color.b));
+      FillRect(hdc, &r, brush);
+      DeleteObject(brush);
+    }
   }
 
 #else // Linux / Wayland
@@ -543,6 +584,11 @@ private:
       return;
     // Clear the whole buffer to white as the plain content-area background.
     std::memset(bufferData_, 0xFF, bufferSize_); // content area
+    // Paint queued boxes on top of the plain background, before the titlebar
+    // so it stays on top.
+    for (const auto &b : boxes_)
+      fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
+               b.color.b);
     // Paint the titlebar and its buttons on top of that background.
     drawTitlebar();
     // Tell the compositor this buffer is what the surface should display, at
@@ -731,6 +777,20 @@ inline LiteUI::~LiteUI() {
   if (display_)
     wl_display_disconnect(display_);
 // Ends the Windows/Linux teardown branch.
+#endif
+}
+
+inline void LiteUI::addBox(const Box &box) {
+  boxes_.push_back(box);
+#if defined(_WIN32)
+  // Ask Windows to repaint; the actual drawing happens in WM_PAINT.
+  if (hwnd_)
+    InvalidateRect(hwnd_, nullptr, FALSE);
+#else
+  // Repaint immediately if the buffer already exists; if it doesn't yet,
+  // attachBuffer()'s own redraw() will pick up boxes_ once configured.
+  if (bufferData_)
+    redraw();
 #endif
 }
 
