@@ -25,7 +25,9 @@ elseif(UNIX AND NOT APPLE)
     find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner REQUIRED)
     pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
     set(XDG_SHELL_XML "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml")
+    set(XDG_DECORATION_XML "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml")
 
+    # --- xdg-shell ---
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
         COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
@@ -38,15 +40,33 @@ elseif(UNIX AND NOT APPLE)
                 ${XDG_SHELL_XML} ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h
         DEPENDS ${XDG_SHELL_XML}
     )
+
+    # --- xdg-decoration ---
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c
+        COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code
+                ${XDG_DECORATION_XML} ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c
+        DEPENDS ${XDG_DECORATION_XML}
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-client-protocol.h
+        COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header
+                ${XDG_DECORATION_XML} ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-client-protocol.h
+        DEPENDS ${XDG_DECORATION_XML}
+    )
+
     add_custom_target(xdg_shell_protocol
         DEPENDS
             ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
             ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h
+            ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c
+            ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-client-protocol.h
     )
 
     add_executable(main
         src/main.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
+        ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c
     )
     target_include_directories(main PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(main PRIVATE
