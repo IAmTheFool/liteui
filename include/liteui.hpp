@@ -16,8 +16,9 @@
 #include <vector>
 
 #if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
-
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
@@ -60,7 +61,14 @@ struct Size {
 };
 
 enum class FlexDirection { Row, Column };
-enum class Justify { Start, End, Center, SpaceBetween, SpaceAround, SpaceEvenly };
+enum class Justify {
+  Start,
+  End,
+  Center,
+  SpaceBetween,
+  SpaceAround,
+  SpaceEvenly
+};
 // Note: flex-wrap and align-content are intentionally not implemented yet —
 // this engine only supports a single flex line. Revisit once wrap is needed.
 enum class Align { Start, End, Center, Stretch };
@@ -123,14 +131,21 @@ public:
 // ancestor's size is itself Fit (indefinite).
 namespace liteui_layout {
 
-struct Natural { float w, h; };
+struct Natural {
+  float w, h;
+};
 
-inline float resolveAxis(const Size &s, float available, bool definite, float fitValue) {
+inline float resolveAxis(const Size &s, float available, bool definite,
+                         float fitValue) {
   switch (s.kind) {
-  case Size::Kind::Fixed: return s.value;
-  case Size::Kind::Percentage: return definite ? available * s.value / 100.0f : fitValue;
-  case Size::Kind::Full: return definite ? available : fitValue;
-  case Size::Kind::Fit: return fitValue;
+  case Size::Kind::Fixed:
+    return s.value;
+  case Size::Kind::Percentage:
+    return definite ? available * s.value / 100.0f : fitValue;
+  case Size::Kind::Full:
+    return definite ? available : fitValue;
+  case Size::Kind::Fit:
+    return fitValue;
   }
   return fitValue;
 }
@@ -144,31 +159,39 @@ inline Natural measureNatural(const View &node, float availW, float availH,
 
   float w = resolveAxis(node.style.width, availW, wDefinite, 0);
   float h = resolveAxis(node.style.height, availH, hDefinite, 0);
-  if ((!needW && !needH) || node.children.empty()) return {w, h};
+  if ((!needW && !needH) || node.children.empty())
+    return {w, h};
 
-  float innerW = (wDefinite && !needW) ? std::max(0.0f, w - pad.left - pad.right) : availW;
-  float innerH = (hDefinite && !needH) ? std::max(0.0f, h - pad.top - pad.bottom) : availH;
+  float innerW =
+      (wDefinite && !needW) ? std::max(0.0f, w - pad.left - pad.right) : availW;
+  float innerH =
+      (hDefinite && !needH) ? std::max(0.0f, h - pad.top - pad.bottom) : availH;
 
   float mainTotal = 0, crossMax = 0;
   for (size_t i = 0; i < node.children.size(); ++i) {
     const View &c = node.children[i];
-    Natural cn = measureNatural(c, innerW, innerH, wDefinite || !needW, hDefinite || !needH);
+    Natural cn = measureNatural(c, innerW, innerH, wDefinite || !needW,
+                                hDefinite || !needH);
     float mm = c.style.margin.left + c.style.margin.right;
     float mv = c.style.margin.top + c.style.margin.bottom;
     float childMain = horizontal ? cn.w + mm : cn.h + mv;
     float childCross = horizontal ? cn.h + mv : cn.w + mm;
     mainTotal += childMain;
-    if (i + 1 < node.children.size()) mainTotal += node.style.gap;
+    if (i + 1 < node.children.size())
+      mainTotal += node.style.gap;
     crossMax = std::max(crossMax, childCross);
   }
-  if (needW) w = (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
-  if (needH) h = (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
+  if (needW)
+    w = (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
+  if (needH)
+    h = (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
   return {w, h};
 }
 
 inline void placeNode(View &node, float x, float y, float w, float h) {
   node.computed = {x, y, w, h};
-  if (node.children.empty()) return;
+  if (node.children.empty())
+    return;
 
   bool horizontal = node.style.direction == FlexDirection::Row;
   const EdgeInsets &pad = node.style.padding;
@@ -179,7 +202,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   float crossAvail = horizontal ? contentH : contentW;
 
   size_t n = node.children.size();
-  std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n), mCrossE(n);
+  std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
+      mCrossE(n);
   float usedMain = 0, growSum = 0, shrinkSum = 0;
 
   for (size_t i = 0; i < n; ++i) {
@@ -194,7 +218,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     usedMain += basis[i] + mMainS[i] + mMainE[i];
     growSum += c.style.flexGrow;
     shrinkSum += c.style.flexShrink;
-    if (i + 1 < n) usedMain += node.style.gap;
+    if (i + 1 < n)
+      usedMain += node.style.gap;
   }
 
   float leftover = mainAvail - usedMain;
@@ -211,17 +236,36 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   float totalUsed = 0;
   for (size_t i = 0; i < n; ++i) {
     totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
-    if (i + 1 < n) totalUsed += node.style.gap;
+    if (i + 1 < n)
+      totalUsed += node.style.gap;
   }
   float freeSpace = std::max(0.0f, mainAvail - totalUsed);
   float startOffset = 0, between = node.style.gap;
   switch (node.style.justifyContent) {
-  case Justify::Start: break;
-  case Justify::End: startOffset = freeSpace; break;
-  case Justify::Center: startOffset = freeSpace / 2; break;
-  case Justify::SpaceBetween: if (n > 1) between += freeSpace / (n - 1); break;
-  case Justify::SpaceAround: { float each = n ? freeSpace / n : 0; startOffset = each / 2; between += each; break; }
-  case Justify::SpaceEvenly: { float each = freeSpace / (n + 1); startOffset = each; between += each; break; }
+  case Justify::Start:
+    break;
+  case Justify::End:
+    startOffset = freeSpace;
+    break;
+  case Justify::Center:
+    startOffset = freeSpace / 2;
+    break;
+  case Justify::SpaceBetween:
+    if (n > 1)
+      between += freeSpace / (n - 1);
+    break;
+  case Justify::SpaceAround: {
+    float each = n ? freeSpace / n : 0;
+    startOffset = each / 2;
+    between += each;
+    break;
+  }
+  case Justify::SpaceEvenly: {
+    float each = freeSpace / (n + 1);
+    startOffset = each;
+    between += each;
+    break;
+  }
   }
 
   float cursor = (horizontal ? contentX : contentY) + startOffset;
@@ -237,9 +281,15 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
 
     float crossOffset;
     switch (node.style.alignItems) {
-    case Align::End: crossOffset = crossAvail - finalCross - mCrossE[i]; break;
-    case Align::Center: crossOffset = (crossAvail - finalCross) / 2; break;
-    default: crossOffset = mCrossS[i]; break; // Start & Stretch
+    case Align::End:
+      crossOffset = crossAvail - finalCross - mCrossE[i];
+      break;
+    case Align::Center:
+      crossOffset = (crossAvail - finalCross) / 2;
+      break;
+    default:
+      crossOffset = mCrossS[i];
+      break; // Start & Stretch
     }
 
     float cx = horizontal ? cursor : contentX + crossOffset;
@@ -258,7 +308,6 @@ inline void layoutRoot(View &root, float windowW, float windowH) {
 }
 
 } // namespace liteui_layout
-
 
 class LiteUI {
 
@@ -302,7 +351,8 @@ private:
   // Re-runs the layout algorithm over root_ against the current window size.
   void relayout() {
     if (hasRoot_)
-      liteui_layout::layoutRoot(root_, static_cast<float>(width_), static_cast<float>(height_));
+      liteui_layout::layoutRoot(root_, static_cast<float>(width_),
+                                static_cast<float>(height_));
   }
 
 // Windows-only member/method block.
@@ -361,7 +411,7 @@ private:
       HDC hdc = BeginPaint(hwnd, &ps);
       if (self)
         self->paintBoxes(hdc);
-        self->paintRoot(hdc);
+      self->paintRoot(hdc);
       EndPaint(hwnd, &ps);
       return 0;
     }
@@ -388,7 +438,6 @@ private:
     }
   }
 
-
   // Draws the layout tree (if any) using native GDI RoundRect, which handles
   // border-radius directly — no manual pixel math needed on this platform.
   void paintRoot(HDC hdc) {
@@ -400,11 +449,13 @@ private:
     const Style &s = v.style;
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
-    HBRUSH bg = CreateSolidBrush(RGB(s.backgroundColor.r, s.backgroundColor.g, s.backgroundColor.b));
-    HPEN pen = s.borderWidth > 0
-        ? CreatePen(PS_SOLID, static_cast<int>(s.borderWidth),
-                    RGB(s.borderColor.r, s.borderColor.g, s.borderColor.b))
-        : static_cast<HPEN>(GetStockObject(NULL_PEN));
+    HBRUSH bg = CreateSolidBrush(
+        RGB(s.backgroundColor.r, s.backgroundColor.g, s.backgroundColor.b));
+    HPEN pen =
+        s.borderWidth > 0
+            ? CreatePen(PS_SOLID, static_cast<int>(s.borderWidth),
+                        RGB(s.borderColor.r, s.borderColor.g, s.borderColor.b))
+            : static_cast<HPEN>(GetStockObject(NULL_PEN));
     HGDIOBJ oldBrush = SelectObject(hdc, bg);
     HGDIOBJ oldPen = SelectObject(hdc, pen);
     int d = static_cast<int>(s.borderRadius) * 2;
@@ -412,7 +463,8 @@ private:
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
     DeleteObject(bg);
-    if (s.borderWidth > 0) DeleteObject(pen);
+    if (s.borderWidth > 0)
+      DeleteObject(pen);
     for (const auto &child : v.children)
       paintView(hdc, child);
   }
@@ -730,28 +782,38 @@ private:
         setPixel(x, y, r, g, b);
   }
 
-
   // Fills an axis-aligned rectangle with rounded corners, clamping the
   // radius so it can't exceed half the shorter side. Per-pixel distance
   // check against each corner's circle center — fine at this scale, not
   // meant for huge boxes.
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
                        uint8_t g, uint8_t b) {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0)
+      return;
     radius = std::max(0, std::min({radius, w / 2, h / 2}));
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
         int cx = -1, cy = -1;
-        if (x < radius && y < radius) { cx = radius; cy = radius; }
-        else if (x >= w - radius && y < radius) { cx = w - radius - 1; cy = radius; }
-        else if (x < radius && y >= h - radius) { cx = radius; cy = h - radius - 1; }
-        else if (x >= w - radius && y >= h - radius) { cx = w - radius - 1; cy = h - radius - 1; }
+        if (x < radius && y < radius) {
+          cx = radius;
+          cy = radius;
+        } else if (x >= w - radius && y < radius) {
+          cx = w - radius - 1;
+          cy = radius;
+        } else if (x < radius && y >= h - radius) {
+          cx = radius;
+          cy = h - radius - 1;
+        } else if (x >= w - radius && y >= h - radius) {
+          cx = w - radius - 1;
+          cy = h - radius - 1;
+        }
         bool inside = true;
         if (cx >= 0) {
           int dx = x - cx, dy = y - cy;
           inside = (dx * dx + dy * dy) <= radius * radius;
         }
-        if (inside) setPixel(x0 + x, y0 + y, r, g, b);
+        if (inside)
+          setPixel(x0 + x, y0 + y, r, g, b);
       }
     }
   }
@@ -766,13 +828,16 @@ private:
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
     int radius = static_cast<int>(s.borderRadius);
     if (s.borderWidth > 0) {
-      fillRoundedRect(x, y, w, h, radius, s.borderColor.r, s.borderColor.g, s.borderColor.b);
+      fillRoundedRect(x, y, w, h, radius, s.borderColor.r, s.borderColor.g,
+                      s.borderColor.b);
       int bw = static_cast<int>(s.borderWidth);
-      fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw), std::max(0, h - 2 * bw),
-                      std::max(0, radius - bw), s.backgroundColor.r, s.backgroundColor.g,
+      fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw),
+                      std::max(0, h - 2 * bw), std::max(0, radius - bw),
+                      s.backgroundColor.r, s.backgroundColor.g,
                       s.backgroundColor.b);
     } else {
-      fillRoundedRect(x, y, w, h, radius, s.backgroundColor.r, s.backgroundColor.g, s.backgroundColor.b);
+      fillRoundedRect(x, y, w, h, radius, s.backgroundColor.r,
+                      s.backgroundColor.g, s.backgroundColor.b);
     }
     for (const auto &child : v.children)
       renderView(child);
@@ -1102,7 +1167,6 @@ inline void LiteUI::setRoot(View view) {
     redraw();
 #endif
 }
-
 
 inline void LiteUI::addBox(const Box &box) {
   boxes_.push_back(box);
