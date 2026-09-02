@@ -74,7 +74,6 @@ enum class Justify {
 
 enum class Align { Start, End, Center, Stretch };
 
-
 // Whether children that overflow the main axis wrap onto additional lines.
 enum class FlexWrap { NoWrap, Wrap };
 
@@ -97,6 +96,8 @@ struct EdgeInsets {
   float top = 0, right = 0, bottom = 0, left = 0;
   static EdgeInsets all(float v) { return {v, v, v, v}; }
 };
+
+enum class Position { Static, Absolute };
 
 struct Style {
   Size width = Size::fit();
@@ -128,6 +129,21 @@ struct Style {
   float borderWidth = 0;
   Color borderColor{0, 0, 0};
   float borderRadius = 0;
+
+  // Absolute children are pulled out of flex distribution entirely and
+  // placed against the parent's content box using left/top/right/bottom.
+  // NaN means "unset" for each edge. If width/height is Fit and both
+  // opposing edges are set, size is derived from them (contentW - left -
+  // right); otherwise size resolves normally (Fixed/Percentage/Fit/Full)
+  // against the containing block, same as an in-flow child would.
+  Position position = Position::Static;
+  float left = std::numeric_limits<float>::quiet_NaN();
+  float top = std::numeric_limits<float>::quiet_NaN();
+  float right = std::numeric_limits<float>::quiet_NaN();
+  float bottom = std::numeric_limits<float>::quiet_NaN();
+  // Stacking order among all Absolute nodes tree-wide (not just siblings).
+  // Ties break by document order — see collectAbsolutes().
+  int zIndex = 0;
 };
 
 // A node in the retained layout tree. Set `style` and `children`; the engine
@@ -211,18 +227,22 @@ inline Natural measureNatural(const View &node, float availW, float availH,
       (hDefinite && !needH) ? std::max(0.0f, h - pad.top - pad.bottom) : availH;
 
   float mainTotal = 0, crossMax = 0;
+  bool firstFlow = true;
   for (size_t i = 0; i < node.children.size(); ++i) {
     const View &c = node.children[i];
+    if (c.style.position == Position::Absolute)
+      continue; // out of flow: doesn't affect the parent's Fit size at all
     Natural cn = measureNatural(c, innerW, innerH, wDefinite || !needW,
                                 hDefinite || !needH);
     float mm = c.style.margin.left + c.style.margin.right;
     float mv = c.style.margin.top + c.style.margin.bottom;
     float childMain = horizontal ? cn.w + mm : cn.h + mv;
     float childCross = horizontal ? cn.h + mv : cn.w + mm;
-    mainTotal += childMain;
-    if (i + 1 < node.children.size())
+    if (!firstFlow)
       mainTotal += node.style.gap;
+    mainTotal += childMain;
     crossMax = std::max(crossMax, childCross);
+    firstFlow = false;
   }
   if (needW)
     w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
@@ -249,21 +269,27 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
 
   size_t n = node.children.size();
   bool wrap = node.style.flexWrap == FlexWrap::Wrap;
+  std::vector<size_t> flowIdx;
+  flowIdx.reserve(node.children.size());
+  for (size_t i = 0; i < node.children.size(); ++i)
+    if (node.children[i].style.position != Position::Absolute)
+      flowIdx.push_back(i);
+  n = flowIdx.size();
   std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
       mCrossE(n), minMain(n), maxMain(n), marginMain(n);
 
-  for (size_t i = 0; i < n; ++i) {
-    const View &c = node.children[i];
+  for (size_t k = 0; k < n; ++k) {
+    const View &c = node.children[flowIdx[k]];
     Natural cn = measureNatural(c, contentW, contentH, true, true);
-    basis[i] = horizontal ? cn.w : cn.h;
-    cross[i] = horizontal ? cn.h : cn.w;
-    mMainS[i] = horizontal ? c.style.margin.left : c.style.margin.top;
-    mMainE[i] = horizontal ? c.style.margin.right : c.style.margin.bottom;
-    mCrossS[i] = horizontal ? c.style.margin.top : c.style.margin.left;
-    mCrossE[i] = horizontal ? c.style.margin.bottom : c.style.margin.right;
-    minMain[i] = horizontal ? c.style.minWidth : c.style.minHeight;
-    maxMain[i] = horizontal ? c.style.maxWidth : c.style.maxHeight;
-    marginMain[i] = mMainS[i] + mMainE[i];
+    basis[k] = horizontal ? cn.w : cn.h;
+    cross[k] = horizontal ? cn.h : cn.w;
+    mMainS[k] = horizontal ? c.style.margin.left : c.style.margin.top;
+    mMainE[k] = horizontal ? c.style.margin.right : c.style.margin.bottom;
+    mCrossS[k] = horizontal ? c.style.margin.top : c.style.margin.left;
+    mCrossE[k] = horizontal ? c.style.margin.bottom : c.style.margin.right;
+    minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
+    maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
+    marginMain[k] = mMainS[k] + mMainE[k];
   }
 
   // ---- Line breaking ----
@@ -323,8 +349,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
         size_t i = lb + k;
         used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
         if (!frozen[k]) {
-          gsum += node.children[i].style.flexGrow;
-          ssum += node.children[i].style.flexShrink;
+          gsum += node.children[flowIdx[i]].style.flexGrow;
+          ssum += node.children[flowIdx[i]].style.flexShrink;
         }
       }
       float leftover = mainAvail - used;
@@ -341,7 +367,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
         if (frozen[k])
           continue;
         size_t i = lb + k;
-        const Style &cs = node.children[i].style;
+        const Style &cs = node.children[flowIdx[i]].style;
         float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
                                    : leftover * (cs.flexShrink / ssum);
         float candidate = std::max(0.0f, basis[i] + extra);
@@ -472,12 +498,11 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     float cursor = (horizontal ? contentX : contentY) + startOffset;
     for (size_t k = 0; k < ln; ++k) {
       size_t i = lb + k;
-      View &ch = node.children[i];
+      View &ch = node.children[flowIdx[i]];
       cursor += mMainS[i];
 
-      bool explicitCross = horizontal
-                                ? ch.style.height.kind != Size::Kind::Fit
-                                : ch.style.width.kind != Size::Kind::Fit;
+      bool explicitCross = horizontal ? ch.style.height.kind != Size::Kind::Fit
+                                      : ch.style.width.kind != Size::Kind::Fit;
       float finalCross = cross[i];
       if (node.style.alignItems == Align::Stretch && !explicitCross)
         finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
@@ -507,6 +532,41 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
       placeNode(ch, cx, cy, cw, chh);
       cursor += finalMain[i] + mMainE[i] + between;
     }
+  }
+
+  // ---- Position::Absolute children ----
+  // Placed against this node's content box, entirely independent of the
+  // flex distribution above. Sizing reuses measureNatural: Fixed/
+  // Percentage/Full resolve normally against contentW/contentH (always
+  // definite here, since this node's own box is already finalized);
+  // Fit falls back to natural content size unless both opposing edges
+  // are set, in which case size is derived from them (CSS's "left+right
+  // implies width" rule).
+  for (auto &ch : node.children) {
+    if (ch.style.position != Position::Absolute)
+      continue;
+    const Style &cs = ch.style;
+    bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
+    bool hasT = !std::isnan(cs.top), hasB = !std::isnan(cs.bottom);
+
+    Natural probe = measureNatural(ch, contentW, contentH, true, true);
+    float aw = (cs.width.kind == Size::Kind::Fit && hasL && hasR)
+                   ? contentW - cs.left - cs.right
+                   : probe.w;
+    float ah = (cs.height.kind == Size::Kind::Fit && hasT && hasB)
+                   ? contentH - cs.top - cs.bottom
+                   : probe.h;
+    aw = clampSize(aw, cs.minWidth, cs.maxWidth);
+    ah = clampSize(ah, cs.minHeight, cs.maxHeight);
+
+    float ax = hasL   ? contentX + cs.left + cs.margin.left
+               : hasR ? contentX + contentW - cs.right - cs.margin.right - aw
+                      : contentX + cs.margin.left;
+    float ay = hasT   ? contentY + cs.top + cs.margin.top
+               : hasB ? contentY + contentH - cs.bottom - cs.margin.bottom - ah
+                      : contentY + cs.margin.top;
+
+    placeNode(ch, ax, ay, aw, ah);
   }
 }
 
@@ -561,6 +621,36 @@ private:
     if (hasRoot_)
       liteui_layout::layoutRoot(root_, static_cast<float>(width_),
                                 static_cast<float>(height_));
+  }
+
+  // Global z-index stacking, shared by both backends.
+  struct AbsoluteEntry {
+    const View *view;
+    int order; // document/discovery order, for stable z-index ties
+  };
+
+  // Walks the whole tree (not just direct children) collecting every
+  // Position::Absolute node, tagged with its pre-order discovery index.
+  // Recurses into every node regardless of its own position, so nested
+  // absolutes (an absolute inside another absolute's subtree) still get
+  // their own top-level slot in the global list.
+  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
+    for (const auto &child : v.children) {
+      if (child.style.position == Position::Absolute)
+        out.push_back({&child, static_cast<int>(out.size())});
+      collectAbsolutes(child, out);
+    }
+  }
+
+  // Sorts absolute entries by zIndex ascending, document order breaking
+  // ties — shared by paintRoot() (Windows) and redraw() (Linux).
+  static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
+    std::stable_sort(absolutes.begin(), absolutes.end(),
+                     [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
+                       if (a.view->style.zIndex != b.view->style.zIndex)
+                         return a.view->style.zIndex < b.view->style.zIndex;
+                       return a.order < b.order;
+                     });
   }
 
 // Windows-only member/method block.
@@ -662,8 +752,14 @@ private:
   // Draws the layout tree (if any) using native GDI RoundRect, which handles
   // border-radius directly — no manual pixel math needed on this platform.
   void paintRoot(HDC hdc) {
-    if (hasRoot_)
+    if (hasRoot_) {
       paintView(hdc, root_);
+      std::vector<AbsoluteEntry> absolutes;
+      collectAbsolutes(root_, absolutes);
+      sortAbsolutes(absolutes);
+      for (const auto &e : absolutes)
+        paintView(hdc, *e.view);
+    }
   }
 
   void paintView(HDC hdc, const View &v) {
@@ -687,7 +783,8 @@ private:
     if (s.borderWidth > 0)
       DeleteObject(pen);
     for (const auto &child : v.children)
-      paintView(hdc, child);
+      if (child.style.position != Position::Absolute)
+        paintView(hdc, child);
   }
 
 #else // Linux / Wayland
@@ -1197,6 +1294,11 @@ private:
   // then recurses into children. Border is drawn as an outer rounded rect in
   // borderColor with an inner rounded rect in backgroundColor inset by
   // borderWidth — simple and correct for a uniform border on all sides.
+  // Paints v's own background/border, then recurses into in-flow
+  // children only. Any Position::Absolute descendant, at any depth, is
+  // skipped here — it's collected separately and painted in a single
+  // global-stacking pass afterward, so it can interleave correctly with
+  // absolute nodes from entirely different subtrees.
   void renderView(const View &v) {
     const Style &s = v.style;
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
@@ -1215,7 +1317,8 @@ private:
                       s.backgroundColor.g, s.backgroundColor.b);
     }
     for (const auto &child : v.children)
-      renderView(child);
+      if (child.style.position != Position::Absolute)
+        renderView(child);
   }
 
   // Simple stepped line, good enough for axis-aligned/diagonal 18px icons.
@@ -1338,8 +1441,19 @@ private:
     for (const auto &b : boxes_)
       fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
                b.color.b);
-    if (hasRoot_)
+    if (hasRoot_) {
       renderView(root_);
+      std::vector<AbsoluteEntry> absolutes;
+      collectAbsolutes(root_, absolutes);
+      std::stable_sort(absolutes.begin(), absolutes.end(),
+                       [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
+                         if (a.view->style.zIndex != b.view->style.zIndex)
+                           return a.view->style.zIndex < b.view->style.zIndex;
+                         return a.order < b.order;
+                       });
+      for (const auto &e : absolutes)
+        renderView(*e.view);
+    }
     // Paint the titlebar and its buttons on top of that background.
     drawTitlebar();
     // Tell the compositor this buffer is what the surface should display, at
