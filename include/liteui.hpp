@@ -415,6 +415,19 @@ private:
       EndPaint(hwnd, &ps);
       return 0;
     }
+    // Window was resized (including maximize/restore/snap): update our
+    // stored dimensions and re-run layout against the new size. GDI needs
+    // no buffer reallocation (it paints straight into the window's DC), so
+    // this is just relayout + repaint.
+    case WM_SIZE: {
+      if (self) {
+        self->width_ = LOWORD(lp);
+        self->height_ = HIWORD(lp);
+        self->relayout();
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      return 0;
+    }
     // When the window is being destroyed...
     case WM_DESTROY:
       // ...tell Windows to post a WM_QUIT message, which ends the GetMessage
@@ -543,7 +556,9 @@ private:
   bool configured_ =
       false; // Set true once the compositor has sent its first
              // configure event, meaning we're allowed to attach a buffer.
-
+  int pendingWidth_ = 0;  // Size most recently suggested by
+  int pendingHeight_ = 0; // toplevelConfigure; 0 means "no suggestion yet"
+                          // (the compositor may send 0x0 to mean "you decide").
   bool running_ = true; // Controls the event loop in run(); set false to
                         // request a clean exit.
 
@@ -565,19 +580,31 @@ private:
     xdg_surface_ack_configure(xs, serial);
     // Remember that we're now allowed to attach a buffer.
     self->configured_ = true;
-    // On the very first configure, no buffer exists yet, so create and attach
-    // one now.
-    if (!self->buffer_)
+    // If the compositor suggested a size different from what we have, resize
+    // (reallocate the buffer + relayout) to match. Otherwise, on the very
+    // first configure, no buffer exists yet, so create and attach one now.
+    if (self->pendingWidth_ > 0 && self->pendingHeight_ > 0 &&
+        (self->pendingWidth_ != self->width_ ||
+         self->pendingHeight_ != self->height_)) {
+      self->resize(self->pendingWidth_, self->pendingHeight_);
+    } else if (!self->buffer_)
       self->attachBuffer();
   }
   // Listener struct binding surfaceConfigure to xdg_surface's single event.
   static constexpr xdg_surface_listener surfListener = {surfaceConfigure};
 
   // Called when the compositor suggests a new size/state for the toplevel.
-  static void toplevelConfigure(void *, xdg_toplevel *, int32_t, int32_t,
-                                wl_array *) {
-    // Compositor's suggested size — ignored until Chapter 3, where we
-    // actually have a swap chain to resize.
+  static void toplevelConfigure(void *data, xdg_toplevel *, int32_t width,
+                                int32_t height, wl_array *) {
+    // 0x0 means "you decide the size" — keep whatever we currently have.
+    // The actual resize happens later, in surfaceConfigure, once this
+    // configure is ack'd (that's the point at which the protocol allows us
+    // to attach a differently-sized buffer).
+    auto *self = static_cast<LiteUI *>(data);
+    if (width > 0 && height > 0) {
+      self->pendingWidth_ = width;
+      self->pendingHeight_ = height;
+    }
   }
   // Called when the compositor/user requests the window be closed (e.g. via a
   // taskbar close action).
@@ -704,6 +731,32 @@ private:
   // events.
   static constexpr wl_registry_listener registryListener = {registryGlobal,
                                                             registryRemove};
+
+
+  // Handles a compositor-driven resize: tears down the old shm buffer,
+  // updates width_/height_, re-runs layout against the new size, and
+  // allocates+attaches a fresh buffer at the new dimensions. Buffers can't
+  // be resized in place — wl_shm buffers are fixed-size — so this is a full
+  // destroy/recreate rather than a realloc.
+  void resize(int newWidth, int newHeight) {
+    if (buffer_) {
+      wl_buffer_destroy(buffer_);
+      buffer_ = nullptr;
+    }
+    if (bufferData_) {
+      munmap(bufferData_, bufferSize_);
+      bufferData_ = nullptr;
+    }
+    if (bufferFd_ >= 0) {
+      close(bufferFd_);
+      bufferFd_ = -1;
+    }
+    width_ = newWidth;
+    height_ = newHeight;
+    relayout();
+    attachBuffer(); // allocates the new buffer and calls redraw() itself
+  }
+
   // Allocates the shared-memory pixel buffer and attaches it to the surface for
   // the first time.
   void attachBuffer() {
