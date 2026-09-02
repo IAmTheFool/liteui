@@ -1,46 +1,40 @@
+// src/main.cpp
 #include "liteui.hpp"
+#include <iostream>
 
 int main() {
-  LiteUI window(300, 220, "Absolute Positioning Demo");
+    LiteUI ui(800, 600, "onClick demo");
 
-  View root;
-  root.style.width = Size::full();
-  root.style.height = Size::full();
-  root.style.padding = EdgeInsets::all(20);
-  root.style.backgroundColor = {0xF8, 0xF9, 0xFA};
+    View root;
+    root.style.width = Size::full();
+    root.style.height = Size::full();
+    root.style.direction = FlexDirection::Column;
+    root.style.justifyContent = Justify::Center;
+    root.style.alignItems = Align::Center;
+    root.style.gap = 16;
+    root.style.backgroundColor = Color{240, 240, 240};
 
-  // A normal in-flow "card" — absolute positioning is always relative to
-  // this box's content area, not the window.
-  View card;
-  card.style.width = Size::pixel(200);
-  card.style.height = Size::pixel(120);
-  card.style.backgroundColor = {255, 255, 255};
-  card.style.borderWidth = 1;
-  card.style.borderColor = {0, 0, 0};
-  card.style.borderRadius = 8;
-  card.style.padding = EdgeInsets::all(12);
+    View button;
+    button.style.width = Size::pixel(200);
+    button.style.height = Size::pixel(60);
+    button.style.backgroundColor = Color{70, 130, 200};
+    button.style.borderRadius = 8;
+    button.onClick = [] {
+        std::cout << "Button clicked!" << std::endl;
+    };
 
-  // Some ordinary flex content inside the card.
-  View label;
-  label.style.width = Size::full();
-  label.style.height = Size::pixel(20);
-  label.style.backgroundColor = {0xE9, 0xEC, 0xEF};
-  card.addChild(label);
+    View button2;
+    button2.style.width = Size::pixel(200);
+    button2.style.height = Size::pixel(60);
+    button2.style.backgroundColor = Color{200, 90, 90};
+    button2.style.borderRadius = 8;
+    button2.onClick = [] {
+        std::cout << "Second button clicked!" << std::endl;
+    };
 
-  // The badge: pulled out of flex flow, pinned to the card's top-right
-  // corner regardless of what else is in the card.
-  View badge;
-  badge.style.position = Position::Absolute;
-  badge.style.top = -8;     // negative offsets work too, like CSS
-  badge.style.right = -2;
-  badge.style.width = Size::pixel(24);
-  badge.style.height = Size::pixel(24);
-  badge.style.backgroundColor = {0xDC, 0x35, 0x45};
-  badge.style.borderRadius = 12; // full circle at 24x24
-  badge.style.zIndex = 1;        // paint above the card's own border/content
-  card.addChild(badge);
+    root.addChild(button);
+    root.addChild(button2);
 
-  root.addChild(card);
-  window.setRoot(root);
-  window.run();
+    ui.setRoot(std::move(root));
+    ui.run();
 }

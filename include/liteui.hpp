@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -153,6 +154,11 @@ class View {
 public:
   Style style;
   std::vector<View> children;
+
+  // Fired on a left-click whose point lands on this view (see LiteUI::hitTest).
+  // Bubbles: if a deeper view under the point has no handler, the nearest
+  // containing ancestor's onClick fires instead.
+  std::function<void()> onClick;
 
   struct Computed {
     float x = 0, y = 0, w = 0, h = 0; // border-box, absolute window coords
@@ -653,6 +659,74 @@ private:
                      });
   }
 
+  // Returns whether (px, py) lies within v's already-computed border-box.
+  static bool containsPoint(const View &v, float px, float py) {
+    return px >= v.computed.x && px < v.computed.x + v.computed.w &&
+           py >= v.computed.y && py < v.computed.y + v.computed.h;
+  }
+
+  // Recursively finds the topmost in-flow view under (x, y) with a
+  // non-null onClick. Children are checked last-to-first (later siblings
+  // paint on top), and Position::Absolute children are skipped here —
+  // they're handled globally by hitTest(), same split as
+  // collectAbsolutes()/renderView(). If the deepest matching view (or any
+  // of its flow descendants) has no handler, the search falls through to
+  // checking `v` itself, so a click bubbles up to the nearest ancestor
+  // that does have one.
+  static View *hitTestFlow(View &v, float x, float y) {
+    if (!containsPoint(v, x, y))
+      return nullptr;
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+      if (it->style.position == Position::Absolute)
+        continue;
+      if (View *hit = hitTestFlow(*it, x, y))
+        return hit;
+    }
+    return v.onClick ? &v : nullptr;
+  }
+
+  // Top-level hit test against the whole tree: absolutes take priority
+  // over the flow tree, highest zIndex/latest doc-order first, mirroring
+  // paint order (collectAbsolutes + sortAbsolutes are the same lists used
+  // to paint on Windows/Linux).
+  View *hitTest(float x, float y) {
+    if (!hasRoot_)
+      return nullptr;
+    std::vector<AbsoluteEntry> absolutes;
+    collectAbsolutes(root_, absolutes);
+    sortAbsolutes(absolutes);
+    for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
+      if (View *hit = hitTestFlow(const_cast<View &>(*it->view), x, y))
+        return hit;
+    return hitTestFlow(root_, x, y);
+  }
+
+  // Invokes v's onClick if it has one; no-op for nullptr or an unset handler.
+  static void dispatchClick(View *v) {
+    if (v && v->onClick)
+      v->onClick();
+  }
+
+  // Tracks which view (if any) most recently received a left-button press,
+  // so a click only fires if the matching release lands back on the same
+  // view — ordinary UI click semantics: press, drag off, release elsewhere
+  // cancels; press and release both on the button fires it.
+  View *pressedView_ = nullptr;
+
+  // Records the view under (x, y) as the pending click's press target.
+  void beginPress(float x, float y) { pressedView_ = hitTest(x, y); }
+
+  // Completes a pending press: fires pressedView_'s onClick only if the
+  // release also landed on that same view, then clears the pending state
+  // unconditionally (a press that never resolves shouldn't linger and
+  // affect some later, unrelated release).
+  void endPress(float x, float y) {
+    View *released = hitTest(x, y);
+    if (released && released == pressedView_)
+      dispatchClick(released);
+    pressedView_ = nullptr;
+  }
+
 // Windows-only member/method block.
 #if defined(_WIN32)
   // Native window handle; null until CreateWindowExW succeeds.
@@ -713,6 +787,43 @@ private:
       EndPaint(hwnd, &ps);
       return 0;
     }
+
+    // Left mouse button pressed: record the hit-test target as the
+    // pending click's press target (fired later on WM_LBUTTONUP, only if
+    // the release lands on the same view). Capture the mouse so we still
+    // get the matching WM_LBUTTONUP even if the cursor leaves the window
+    // before the button is released.
+    case WM_LBUTTONDOWN: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        self->beginPress(x, y);
+        SetCapture(hwnd);
+      }
+      return 0;
+    }
+
+    // Left mouse button released: resolve the pending press against
+    // whatever's under the cursor now, firing onClick only if it matches
+    // the original press target.
+    case WM_LBUTTONUP: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        self->endPress(x, y);
+      }
+      ReleaseCapture();
+      return 0;
+    }
+
+    // Capture was taken away from us mid-press (e.g. alt-tab, a system
+    // dialog popping up) — the click can't complete normally, so drop the
+    // pending press rather than let a later, unrelated release resolve it.
+    case WM_CAPTURECHANGED:
+      if (self)
+        self->pressedView_ = nullptr;
+      return 0;
+
     // Window was resized (including maximize/restore/snap): update our
     // stored dimensions and re-run layout against the new size. GDI needs
     // no buffer reallocation (it paints straight into the window's DC), so
@@ -1007,13 +1118,16 @@ private:
                             uint32_t button, uint32_t state) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
-    // Ignore anything that isn't a left-button press (we don't handle
-    // right-click or releases).
-    if (button != BTN_LEFT_CODE || state != WL_POINTER_BUTTON_STATE_PRESSED)
+    // Ignore anything that isn't the left button (we don't handle
+    // right-click, middle-click, etc.).
+    if (button != BTN_LEFT_CODE)
       return;
-    // Route the click to the custom titlebar hit-testing logic, passing the
-    // event serial (needed for interactive move).
-    self->handleTitlebarClick(serial);
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+      // Route the press to the custom titlebar hit-testing logic, passing
+      // the event serial (needed for interactive resize/move grabs).
+      self->handlePress(serial);
+    else if (state == WL_POINTER_BUTTON_STATE_RELEASED)
+      self->handleRelease();
   }
   // Listener struct binding all five pointer callbacks above to wl_pointer's
   // events, in the order the interface expects.
@@ -1466,8 +1580,12 @@ private:
     wl_surface_commit(surface_);
   }
 
-  // Hit-tests a left-click against the titlebar buttons and drag region.
-  void handleTitlebarClick(uint32_t serial) {
+  // Hit-tests a left-button press against the titlebar buttons, resize
+  // edges, and drag region. Resize/move grabs and the chrome buttons
+  // (close/maximize/minimize) still act immediately on press, same as
+  // before — only content-area widget clicks wait for a matching release
+  // (see beginPress/endPress).
+  void handlePress(uint32_t serial) {
     // Clicks within kResizeMargin of any outer edge start an interactive
     // resize instead — checked first since the resize strip along the top
     // overlaps the first few pixels of the titlebar itself.
@@ -1478,10 +1596,13 @@ private:
       return;
     }
 
-    // Clicks below the titlebar strip aren't ours to handle (no widget tree yet
-    // in this minimal header).
-    if (pointer_y_ >= kTitlebarHeight)
-      return; // no widget tree yet in this minimal header
+    // Presses below the titlebar strip start a pending widget click,
+    // resolved later in handleRelease() rather than firing immediately.
+    if (pointer_y_ >= kTitlebarHeight) {
+      beginPress(static_cast<float>(pointer_x_),
+                 static_cast<float>(pointer_y_));
+      return;
+    }
 
     // If the click landed on the close button...
     if (inside(closeRect(), pointer_x_, pointer_y_)) {
@@ -1515,6 +1636,16 @@ private:
     // if we have a seat to drive it.
     if (seat_)
       xdg_toplevel_move(toplevel_, seat_, serial);
+  }
+
+  // Resolves a pending widget click on button release. Chrome buttons and
+  // resize/move grabs don't need this — they already acted on press — so
+  // this only matters for content-area clicks below the titlebar.
+  void handleRelease() {
+    if (pointer_y_ >= kTitlebarHeight)
+      endPress(static_cast<float>(pointer_x_), static_cast<float>(pointer_y_));
+    else
+      pressedView_ = nullptr; // release moved back into the titlebar; cancel
   }
 
 // Ends the Windows/Linux member block.
