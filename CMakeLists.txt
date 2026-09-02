@@ -16,6 +16,7 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
+    pkg_check_modules(WAYLAND_CURSOR REQUIRED IMPORTED_TARGET wayland-cursor)
     pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
     pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
     pkg_check_modules(GLES REQUIRED IMPORTED_TARGET glesv2)
@@ -71,6 +72,7 @@ elseif(UNIX AND NOT APPLE)
     target_include_directories(main PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(main PRIVATE
         PkgConfig::WAYLAND
+        PkgConfig::WAYLAND_CURSOR
         PkgConfig::CAIRO
         PkgConfig::PANGOCAIRO
         PkgConfig::EGL

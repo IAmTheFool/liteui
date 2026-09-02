@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
+#include <wayland-cursor.h> // wl_cursor_theme_load / wl_cursor_theme_get_cursor, for showing resize/arrow cursors.
 #endif
 
 // Plain RGB color, one byte per channel.
@@ -507,6 +508,20 @@ private:
   wl_pointer *pointer_ =
       nullptr; // The pointer (mouse) device obtained from
                // the seat, once it announces pointer capability.
+  wl_cursor_theme *cursorTheme_ =
+      nullptr; // Loaded cursor theme (arrow, resize handles, etc.), used to
+               // look up the pixel images for wl_pointer_set_cursor.
+  wl_surface *cursorSurface_ =
+      nullptr; // Dedicated surface that holds whichever cursor image is
+               // currently active; the compositor renders this at the
+               // pointer position once we call wl_pointer_set_cursor.
+  uint32_t pointerEnterSerial_ =
+      0; // Serial from the most recent pointer-enter event; wl_pointer_set_cursor
+         // requires one and it's not resent on motion, so we cache it.
+  std::string currentCursorName_; // Name of the cursor image currently shown,
+                                  // so we don't reissue set_cursor every
+                                  // single motion event for no reason.
+
 
   zxdg_decoration_manager_v1 *decoration_manager_ =
       nullptr; // Global for negotiating who draws window decorations (server vs
@@ -639,7 +654,7 @@ private:
   static constexpr wl_seat_listener seatListener = {seatCapabilities, seatName};
 
   // Called when the pointer enters this surface.
-  static void pointerEnter(void *data, wl_pointer *, uint32_t, wl_surface *,
+  static void pointerEnter(void *data, wl_pointer *, uint32_t serial, wl_surface *,
                            wl_fixed_t sx, wl_fixed_t sy) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
@@ -647,9 +662,23 @@ private:
     self->pointer_x_ = wl_fixed_to_double(sx);
     // Same for the y coordinate.
     self->pointer_y_ = wl_fixed_to_double(sy);
+
+    // wl_pointer_set_cursor requires the serial of an enter event, and it
+    // isn't resent on plain motion, so remember it for later calls.
+    self->pointerEnterSerial_ = serial;
+    // Force the next setCursor() call to actually apply, since re-entering
+    // (e.g. after a resize/move) may land us back on the same cursor name
+    // the compositor's default already reset to something else.
+    self->currentCursorName_.clear();
+    self->setCursor(
+        cursorNameForEdge(self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
   }
-  // Called when the pointer leaves this surface; nothing to track here.
-  static void pointerLeave(void *, wl_pointer *, uint32_t, wl_surface *) {}
+  // Called when the pointer leaves this surface. Reset the cached cursor
+  // name so re-entering always re-applies one, rather than skipping the
+  // very next setCursor() as a no-op change.
+  static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *) {
+    static_cast<LiteUI *>(data)->currentCursorName_.clear();
+  }
   // Called on every pointer movement while over this surface.
   static void pointerMotion(void *data, wl_pointer *, uint32_t, wl_fixed_t sx,
                             wl_fixed_t sy) {
@@ -659,6 +688,12 @@ private:
     self->pointer_x_ = wl_fixed_to_double(sx);
     // Update the stored y position.
     self->pointer_y_ = wl_fixed_to_double(sy);
+
+    // Re-derive which edge (if any) the pointer is over and update the
+    // cursor image to match, so the user sees a resize cursor before they
+    // even click.
+    self->setCursor(
+        cursorNameForEdge(self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
   }
   // Called on scroll/axis events; not used by this minimal window.
   static void pointerAxis(void *, wl_pointer *, uint32_t, uint32_t,
@@ -731,6 +766,87 @@ private:
   // events.
   static constexpr wl_registry_listener registryListener = {registryGlobal,
                                                             registryRemove};
+
+  // How close (in pixels) the pointer must be to the window's outer edge
+  // before we treat it as a resize grab instead of ordinary titlebar
+  // content. Kept well inside the button icons (which start ~7px into a
+  // 32px titlebar) so it never steals clicks from minimize/maximize/close.
+  static constexpr int kResizeMargin = 6;
+
+  // Maps a pointer position to which edge (if any) an interactive resize
+  // should grab, mirroring how most CSD toolkits treat a thin strip along
+  // each window edge as a resize handle rather than ordinary content.
+  uint32_t resizeEdgeAt(double px, double py) const {
+    bool left = px < kResizeMargin;
+    bool right = px >= width_ - kResizeMargin;
+    bool top = py < kResizeMargin;
+    bool bottom = py >= height_ - kResizeMargin;
+    if (top && left)
+      return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
+    if (top && right)
+      return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
+    if (bottom && left)
+      return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
+    if (bottom && right)
+      return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
+    if (left)
+      return XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+    if (right)
+      return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+    if (top)
+      return XDG_TOPLEVEL_RESIZE_EDGE_TOP;
+    if (bottom)
+      return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+    return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
+  }
+
+  // Standard XCursor names for each edge/corner; "left_ptr" is the ordinary
+  // arrow shown everywhere else.
+  static const char *cursorNameForEdge(uint32_t edge) {
+    switch (edge) {
+    case XDG_TOPLEVEL_RESIZE_EDGE_TOP:
+      return "top_side";
+    case XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM:
+      return "bottom_side";
+    case XDG_TOPLEVEL_RESIZE_EDGE_LEFT:
+      return "left_side";
+    case XDG_TOPLEVEL_RESIZE_EDGE_RIGHT:
+      return "right_side";
+    case XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT:
+      return "top_left_corner";
+    case XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT:
+      return "top_right_corner";
+    case XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT:
+      return "bottom_left_corner";
+    case XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT:
+      return "bottom_right_corner";
+    default:
+      return "left_ptr";
+    }
+  }
+
+  // Swaps the pointer's visible cursor to the named XCursor image, skipping
+  // the work entirely if it's already showing (motion events fire far more
+  // often than the cursor actually needs to change).
+  void setCursor(const char *name) {
+    if (!cursorTheme_ || !pointer_ || currentCursorName_ == name)
+      return;
+    wl_cursor *cursor = wl_cursor_theme_get_cursor(cursorTheme_, name);
+    if (!cursor)
+      cursor = wl_cursor_theme_get_cursor(cursorTheme_, "default");
+    if (!cursor || cursor->image_count == 0)
+      return;
+    wl_cursor_image *image = cursor->images[0];
+    wl_buffer *cbuf = wl_cursor_image_get_buffer(image);
+    if (!cbuf)
+      return;
+    currentCursorName_ = name;
+    wl_surface_attach(cursorSurface_, cbuf, 0, 0);
+    wl_surface_damage_buffer(cursorSurface_, 0, 0, image->width, image->height);
+    wl_surface_commit(cursorSurface_);
+    wl_pointer_set_cursor(pointer_, pointerEnterSerial_, cursorSurface_,
+                          image->hotspot_x, image->hotspot_y);
+  }
 
 
   // Handles a compositor-driven resize: tears down the old shm buffer,
@@ -1032,6 +1148,16 @@ private:
 
   // Hit-tests a left-click against the titlebar buttons and drag region.
   void handleTitlebarClick(uint32_t serial) {
+    // Clicks within kResizeMargin of any outer edge start an interactive
+    // resize instead — checked first since the resize strip along the top
+    // overlaps the first few pixels of the titlebar itself.
+    uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
+    if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+      if (seat_)
+        xdg_toplevel_resize(toplevel_, seat_, serial, edge);
+      return;
+    }
+
     // Clicks below the titlebar strip aren't ours to handle (no widget tree yet
     // in this minimal header).
     if (pointer_y_ >= kTitlebarHeight)
@@ -1144,6 +1270,15 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
   if (!compositor_ || !wm_base_ || !shm_)
     throw std::runtime_error("Missing required Wayland globals");
 
+  // Load a cursor theme so resize/arrow cursors can be shown over CSD
+  // window edges — nothing does this automatically the way server-side
+  // decorations would. nullptr picks the user's configured/default theme;
+  // 24 is a conventional base cursor size in pixels. Non-fatal if it fails:
+  // we just silently keep whatever cursor the compositor already set.
+  cursorTheme_ = wl_cursor_theme_load(nullptr, 24, shm_);
+  if (cursorTheme_)
+    cursorSurface_ = wl_compositor_create_surface(compositor_);
+
   // Create the raw drawable surface from the compositor.
   surface_ = wl_compositor_create_surface(compositor_);
   // Wrap that surface as an xdg_surface so it can become a desktop window.
@@ -1184,6 +1319,11 @@ inline LiteUI::~LiteUI() {
   // Close the backing file descriptor if one was created.
   if (bufferFd_ >= 0)
     close(bufferFd_);
+  // Destroy the cursor surface and theme if they were created.
+  if (cursorSurface_)
+    wl_surface_destroy(cursorSurface_);
+  if (cursorTheme_)
+    wl_cursor_theme_destroy(cursorTheme_);
   // Destroy the decoration-mode object if one was requested.
   if (toplevel_decoration_)
     zxdg_toplevel_decoration_v1_destroy(toplevel_decoration_);
