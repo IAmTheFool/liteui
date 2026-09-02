@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -83,6 +84,15 @@ struct Style {
   Size width = Size::fit();
   Size height = Size::fit();
 
+  // Clamp bounds applied (in pixels) after width/height above are resolved.
+  // Defaults impose no constraint. maxWidth < minWidth (or the height
+  // equivalent) is treated as maxWidth == minWidth rather than producing a
+  // negative range.
+  float minWidth = 0;
+  float maxWidth = std::numeric_limits<float>::infinity();
+  float minHeight = 0;
+  float maxHeight = std::numeric_limits<float>::infinity();
+
   EdgeInsets margin;
   EdgeInsets padding;
 
@@ -151,6 +161,12 @@ inline float resolveAxis(const Size &s, float available, bool definite,
   return fitValue;
 }
 
+// Clamps a resolved axis size into [minV, maxV], guarding against a
+// misconfigured maxV < minV by falling back to minV.
+inline float clampSize(float v, float minV, float maxV) {
+  return std::clamp(v, minV, std::max(minV, maxV));
+}
+
 inline Natural measureNatural(const View &node, float availW, float availH,
                               bool wDefinite, bool hDefinite) {
   bool horizontal = node.style.direction == FlexDirection::Row;
@@ -158,8 +174,10 @@ inline Natural measureNatural(const View &node, float availW, float availH,
   bool needW = node.style.width.kind == Size::Kind::Fit;
   bool needH = node.style.height.kind == Size::Kind::Fit;
 
-  float w = resolveAxis(node.style.width, availW, wDefinite, 0);
-  float h = resolveAxis(node.style.height, availH, hDefinite, 0);
+  float w = clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
+                      node.style.minWidth, node.style.maxWidth);
+  float h = clampSize(resolveAxis(node.style.height, availH, hDefinite, 0),
+                      node.style.minHeight, node.style.maxHeight);
   if ((!needW && !needH) || node.children.empty())
     return {w, h};
 
@@ -183,9 +201,12 @@ inline Natural measureNatural(const View &node, float availW, float availH,
     crossMax = std::max(crossMax, childCross);
   }
   if (needW)
-    w = (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
+    w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
+                  node.style.minWidth, node.style.maxWidth);
+
   if (needH)
-    h = (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
+    h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
+                  node.style.minHeight, node.style.maxHeight);
   return {w, h};
 }
 
@@ -205,7 +226,6 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   size_t n = node.children.size();
   std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
       mCrossE(n);
-  float usedMain = 0, growSum = 0, shrinkSum = 0;
 
   for (size_t i = 0; i < n; ++i) {
     const View &c = node.children[i];
@@ -216,22 +236,65 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     mMainE[i] = horizontal ? c.style.margin.right : c.style.margin.bottom;
     mCrossS[i] = horizontal ? c.style.margin.top : c.style.margin.left;
     mCrossE[i] = horizontal ? c.style.margin.bottom : c.style.margin.right;
-    usedMain += basis[i] + mMainS[i] + mMainE[i];
-    growSum += c.style.flexGrow;
-    shrinkSum += c.style.flexShrink;
-    if (i + 1 < n)
-      usedMain += node.style.gap;
   }
 
-  float leftover = mainAvail - usedMain;
-  std::vector<float> finalMain(n);
+  // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
+  // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
+  // algorithm. A single pass (basis + share of leftover, then clamp) would
+  // silently drop whatever a clamped child couldn't absorb; instead, any
+  // item whose share would violate its own bound gets frozen at that bound
+  // and removed from the pool, and the remaining free space is
+  // recalculated and redistributed among the still-flexible siblings.
+  // Repeats until nothing new freezes (at most one extra item freezes per
+  // pass, so n+1 passes always suffices).
+  std::vector<float> minMain(n), maxMain(n), marginMain(n);
   for (size_t i = 0; i < n; ++i) {
-    float extra = 0;
-    if (leftover > 0 && growSum > 0)
-      extra = leftover * (node.children[i].style.flexGrow / growSum);
-    else if (leftover < 0 && shrinkSum > 0)
-      extra = leftover * (node.children[i].style.flexShrink / shrinkSum);
-    finalMain[i] = std::max(0.0f, basis[i] + extra);
+    const Style &cs = node.children[i].style;
+    minMain[i] = horizontal ? cs.minWidth : cs.minHeight;
+    maxMain[i] = horizontal ? cs.maxWidth : cs.maxHeight;
+    marginMain[i] = mMainS[i] + mMainE[i];
+  }
+  float gapTotal = n > 1 ? node.style.gap * (n - 1) : 0.0f;
+
+  std::vector<float> finalMain(n);
+  std::vector<bool> frozen(n, false);
+  for (size_t pass = 0; pass <= n; ++pass) {
+    float used = gapTotal, gsum = 0, ssum = 0;
+    for (size_t i = 0; i < n; ++i) {
+      used += (frozen[i] ? finalMain[i] : basis[i]) + marginMain[i];
+      if (!frozen[i]) {
+        gsum += node.children[i].style.flexGrow;
+        ssum += node.children[i].style.flexShrink;
+      }
+    }
+    float leftover = mainAvail - used;
+    if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
+        (leftover < 0 && ssum <= 0)) {
+      // Nothing left to distribute (or nothing left that can absorb it):
+      // whatever's still unfrozen settles at its own clamped basis.
+      for (size_t i = 0; i < n; ++i)
+        if (!frozen[i])
+          finalMain[i] = clampSize(basis[i], minMain[i], maxMain[i]);
+      break;
+    }
+
+    bool frozeAny = false;
+    for (size_t i = 0; i < n; ++i) {
+      if (frozen[i])
+        continue;
+      const Style &cs = node.children[i].style;
+      float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
+                                 : leftover * (cs.flexShrink / ssum);
+      float candidate = std::max(0.0f, basis[i] + extra);
+      float clamped = clampSize(candidate, minMain[i], maxMain[i]);
+      finalMain[i] = clamped;
+      if (clamped != candidate) {
+        frozen[i] = true;
+        frozeAny = true;
+      }
+    }
+    if (!frozeAny)
+      break; // this pass's candidates all satisfied their bounds — done
   }
 
   float totalUsed = 0;
@@ -279,6 +342,10 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     float finalCross = cross[i];
     if (node.style.alignItems == Align::Stretch && !explicitCross)
       finalCross = std::max(0.0f, crossAvail - mCrossS[i] - mCrossE[i]);
+
+    float minCross = horizontal ? c.style.minHeight : c.style.minWidth;
+    float maxCross = horizontal ? c.style.maxHeight : c.style.maxWidth;
+    finalCross = clampSize(finalCross, minCross, maxCross);
 
     float crossOffset;
     switch (node.style.alignItems) {
@@ -516,12 +583,12 @@ private:
                // currently active; the compositor renders this at the
                // pointer position once we call wl_pointer_set_cursor.
   uint32_t pointerEnterSerial_ =
-      0; // Serial from the most recent pointer-enter event; wl_pointer_set_cursor
-         // requires one and it's not resent on motion, so we cache it.
+      0; // Serial from the most recent pointer-enter event;
+         // wl_pointer_set_cursor requires one and it's not resent on motion, so
+         // we cache it.
   std::string currentCursorName_; // Name of the cursor image currently shown,
                                   // so we don't reissue set_cursor every
                                   // single motion event for no reason.
-
 
   zxdg_decoration_manager_v1 *decoration_manager_ =
       nullptr; // Global for negotiating who draws window decorations (server vs
@@ -574,8 +641,8 @@ private:
   int pendingWidth_ = 0;  // Size most recently suggested by
   int pendingHeight_ = 0; // toplevelConfigure; 0 means "no suggestion yet"
                           // (the compositor may send 0x0 to mean "you decide").
-  bool running_ = true; // Controls the event loop in run(); set false to
-                        // request a clean exit.
+  bool running_ = true;   // Controls the event loop in run(); set false to
+                          // request a clean exit.
 
   // xdg_wm_base ping handler: the compositor periodically checks we're alive.
   static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial) {
@@ -654,8 +721,8 @@ private:
   static constexpr wl_seat_listener seatListener = {seatCapabilities, seatName};
 
   // Called when the pointer enters this surface.
-  static void pointerEnter(void *data, wl_pointer *, uint32_t serial, wl_surface *,
-                           wl_fixed_t sx, wl_fixed_t sy) {
+  static void pointerEnter(void *data, wl_pointer *, uint32_t serial,
+                           wl_surface *, wl_fixed_t sx, wl_fixed_t sy) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // Convert Wayland's fixed-point x coordinate to a double and store it.
@@ -670,8 +737,8 @@ private:
     // (e.g. after a resize/move) may land us back on the same cursor name
     // the compositor's default already reset to something else.
     self->currentCursorName_.clear();
-    self->setCursor(
-        cursorNameForEdge(self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
+    self->setCursor(cursorNameForEdge(
+        self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
   }
   // Called when the pointer leaves this surface. Reset the cached cursor
   // name so re-entering always re-applies one, rather than skipping the
@@ -692,8 +759,8 @@ private:
     // Re-derive which edge (if any) the pointer is over and update the
     // cursor image to match, so the user sees a resize cursor before they
     // even click.
-    self->setCursor(
-        cursorNameForEdge(self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
+    self->setCursor(cursorNameForEdge(
+        self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
   }
   // Called on scroll/axis events; not used by this minimal window.
   static void pointerAxis(void *, wl_pointer *, uint32_t, uint32_t,
@@ -847,7 +914,6 @@ private:
     wl_pointer_set_cursor(pointer_, pointerEnterSerial_, cursorSurface_,
                           image->hotspot_x, image->hotspot_y);
   }
-
 
   // Handles a compositor-driven resize: tears down the old shm buffer,
   // updates width_/height_, re-runs layout against the new size, and
