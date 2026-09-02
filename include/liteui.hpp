@@ -71,9 +71,27 @@ enum class Justify {
   SpaceAround,
   SpaceEvenly
 };
-// Note: flex-wrap and align-content are intentionally not implemented yet —
-// this engine only supports a single flex line. Revisit once wrap is needed.
+
 enum class Align { Start, End, Center, Stretch };
+
+
+// Whether children that overflow the main axis wrap onto additional lines.
+enum class FlexWrap { NoWrap, Wrap };
+
+// How multiple flex lines are distributed along the cross axis. Only
+// meaningful when FlexWrap::Wrap actually produces more than one line;
+// with a single line this reduces to Stretch filling crossAvail (matching
+// the old un-wrapped behavior) or the others packing that one line at the
+// start.
+enum class AlignContent {
+  Start,
+  End,
+  Center,
+  SpaceBetween,
+  SpaceAround,
+  SpaceEvenly,
+  Stretch
+};
 
 struct EdgeInsets {
   float top = 0, right = 0, bottom = 0, left = 0;
@@ -100,6 +118,8 @@ struct Style {
   Justify justifyContent = Justify::Start;
   Align alignItems = Align::Stretch;
   float gap = 0;
+  FlexWrap flexWrap = FlexWrap::NoWrap;
+  AlignContent alignContent = AlignContent::Stretch;
 
   float flexGrow = 0;
   float flexShrink = 1;
@@ -137,9 +157,13 @@ public:
 //     flexGrow/flexShrink, positions via justifyContent/alignItems, and
 //     recurses.
 //
-// Known limitations (fine for v1, revisit if needed): single flex line only
-// (no wrap), no min/max size constraints, percentages resolve to 0 when an
-// ancestor's size is itself Fit (indefinite).
+
+// Known limitations (fine for v1, revisit if needed): percentages resolve to
+// 0 when an ancestor's size is itself Fit (indefinite). flex-wrap only
+// affects placeNode's placement pass — measureNatural's Fit sizing still
+// assumes a single line, since a Fit main axis has no definite width to
+// wrap against in the first place; give the container a definite/Full main
+// size if you want Fit-height wrapping content to actually wrap.
 namespace liteui_layout {
 
 struct Natural {
@@ -224,8 +248,9 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   float crossAvail = horizontal ? contentH : contentW;
 
   size_t n = node.children.size();
+  bool wrap = node.style.flexWrap == FlexWrap::Wrap;
   std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
-      mCrossE(n);
+      mCrossE(n), minMain(n), maxMain(n), marginMain(n);
 
   for (size_t i = 0; i < n; ++i) {
     const View &c = node.children[i];
@@ -236,137 +261,252 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     mMainE[i] = horizontal ? c.style.margin.right : c.style.margin.bottom;
     mCrossS[i] = horizontal ? c.style.margin.top : c.style.margin.left;
     mCrossE[i] = horizontal ? c.style.margin.bottom : c.style.margin.right;
-  }
-
-  // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
-  // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
-  // algorithm. A single pass (basis + share of leftover, then clamp) would
-  // silently drop whatever a clamped child couldn't absorb; instead, any
-  // item whose share would violate its own bound gets frozen at that bound
-  // and removed from the pool, and the remaining free space is
-  // recalculated and redistributed among the still-flexible siblings.
-  // Repeats until nothing new freezes (at most one extra item freezes per
-  // pass, so n+1 passes always suffices).
-  std::vector<float> minMain(n), maxMain(n), marginMain(n);
-  for (size_t i = 0; i < n; ++i) {
-    const Style &cs = node.children[i].style;
-    minMain[i] = horizontal ? cs.minWidth : cs.minHeight;
-    maxMain[i] = horizontal ? cs.maxWidth : cs.maxHeight;
+    minMain[i] = horizontal ? c.style.minWidth : c.style.minHeight;
+    maxMain[i] = horizontal ? c.style.maxWidth : c.style.maxHeight;
     marginMain[i] = mMainS[i] + mMainE[i];
   }
-  float gapTotal = n > 1 ? node.style.gap * (n - 1) : 0.0f;
 
+  // ---- Line breaking ----
+  // With wrap disabled this is always one line spanning every child (the
+  // original single-line behavior, byte-for-byte). With wrap enabled,
+  // children are greedily packed onto a line until the next child's basis
+  // would overflow mainAvail, at which point a new line starts. A line
+  // always takes at least one child, even an oversized one, so a single
+  // giant child can't stall the packer.
+  struct Line {
+    size_t begin, end; // half-open [begin, end) into node.children
+  };
+  std::vector<Line> lines;
+  if (!wrap) {
+    lines.push_back({0, n});
+  } else {
+    size_t start = 0;
+    float used = 0;
+    for (size_t i = 0; i < n; ++i) {
+      float itemMain = basis[i] + marginMain[i];
+      float withGap = (i > start) ? node.style.gap : 0.0f;
+      if (i > start && used + withGap + itemMain > mainAvail) {
+        lines.push_back({start, i});
+        start = i;
+        used = itemMain;
+      } else {
+        used += withGap + itemMain;
+      }
+    }
+    lines.push_back({start, n});
+  }
+
+  // ---- Per-line main-axis flex resolution ----
+  // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
+  // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
+  // algorithm, scoped to one line's children at a time. A single pass
+  // (basis + share of leftover, then clamp) would silently drop whatever a
+  // clamped child couldn't absorb; instead, any item whose share would
+  // violate its own bound gets frozen at that bound and removed from the
+  // pool, and the remaining free space is recalculated and redistributed
+  // among the still-flexible siblings. Repeats until nothing new freezes
+  // (at most one extra item freezes per pass, so ln+1 passes always
+  // suffices). Also tracks each line's cross size (max child cross extent)
+  // for the cross-axis distribution pass below.
   std::vector<float> finalMain(n);
-  std::vector<bool> frozen(n, false);
-  for (size_t pass = 0; pass <= n; ++pass) {
-    float used = gapTotal, gsum = 0, ssum = 0;
-    for (size_t i = 0; i < n; ++i) {
-      used += (frozen[i] ? finalMain[i] : basis[i]) + marginMain[i];
-      if (!frozen[i]) {
-        gsum += node.children[i].style.flexGrow;
-        ssum += node.children[i].style.flexShrink;
+  std::vector<float> lineCross(lines.size());
+  for (size_t li = 0; li < lines.size(); ++li) {
+    size_t lb = lines[li].begin, le = lines[li].end;
+    size_t ln = le - lb;
+    std::vector<bool> frozen(ln, false);
+    std::vector<float> lineFinal(ln);
+    float gapTotal = ln > 1 ? node.style.gap * (ln - 1) : 0.0f;
+
+    for (size_t pass = 0; pass <= ln; ++pass) {
+      float used = gapTotal, gsum = 0, ssum = 0;
+      for (size_t k = 0; k < ln; ++k) {
+        size_t i = lb + k;
+        used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
+        if (!frozen[k]) {
+          gsum += node.children[i].style.flexGrow;
+          ssum += node.children[i].style.flexShrink;
+        }
       }
-    }
-    float leftover = mainAvail - used;
-    if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
-        (leftover < 0 && ssum <= 0)) {
-      // Nothing left to distribute (or nothing left that can absorb it):
-      // whatever's still unfrozen settles at its own clamped basis.
-      for (size_t i = 0; i < n; ++i)
-        if (!frozen[i])
-          finalMain[i] = clampSize(basis[i], minMain[i], maxMain[i]);
-      break;
-    }
-
-    bool frozeAny = false;
-    for (size_t i = 0; i < n; ++i) {
-      if (frozen[i])
-        continue;
-      const Style &cs = node.children[i].style;
-      float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
-                                 : leftover * (cs.flexShrink / ssum);
-      float candidate = std::max(0.0f, basis[i] + extra);
-      float clamped = clampSize(candidate, minMain[i], maxMain[i]);
-      finalMain[i] = clamped;
-      if (clamped != candidate) {
-        frozen[i] = true;
-        frozeAny = true;
+      float leftover = mainAvail - used;
+      if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
+          (leftover < 0 && ssum <= 0)) {
+        for (size_t k = 0; k < ln; ++k)
+          if (!frozen[k])
+            lineFinal[k] =
+                clampSize(basis[lb + k], minMain[lb + k], maxMain[lb + k]);
+        break;
       }
-    }
-    if (!frozeAny)
-      break; // this pass's candidates all satisfied their bounds — done
-  }
-
-  float totalUsed = 0;
-  for (size_t i = 0; i < n; ++i) {
-    totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
-    if (i + 1 < n)
-      totalUsed += node.style.gap;
-  }
-  float freeSpace = std::max(0.0f, mainAvail - totalUsed);
-  float startOffset = 0, between = node.style.gap;
-  switch (node.style.justifyContent) {
-  case Justify::Start:
-    break;
-  case Justify::End:
-    startOffset = freeSpace;
-    break;
-  case Justify::Center:
-    startOffset = freeSpace / 2;
-    break;
-  case Justify::SpaceBetween:
-    if (n > 1)
-      between += freeSpace / (n - 1);
-    break;
-  case Justify::SpaceAround: {
-    float each = n ? freeSpace / n : 0;
-    startOffset = each / 2;
-    between += each;
-    break;
-  }
-  case Justify::SpaceEvenly: {
-    float each = freeSpace / (n + 1);
-    startOffset = each;
-    between += each;
-    break;
-  }
-  }
-
-  float cursor = (horizontal ? contentX : contentY) + startOffset;
-  for (size_t i = 0; i < n; ++i) {
-    View &c = node.children[i];
-    cursor += mMainS[i];
-
-    bool explicitCross = horizontal ? c.style.height.kind != Size::Kind::Fit
-                                    : c.style.width.kind != Size::Kind::Fit;
-    float finalCross = cross[i];
-    if (node.style.alignItems == Align::Stretch && !explicitCross)
-      finalCross = std::max(0.0f, crossAvail - mCrossS[i] - mCrossE[i]);
-
-    float minCross = horizontal ? c.style.minHeight : c.style.minWidth;
-    float maxCross = horizontal ? c.style.maxHeight : c.style.maxWidth;
-    finalCross = clampSize(finalCross, minCross, maxCross);
-
-    float crossOffset;
-    switch (node.style.alignItems) {
-    case Align::End:
-      crossOffset = crossAvail - finalCross - mCrossE[i];
-      break;
-    case Align::Center:
-      crossOffset = (crossAvail - finalCross) / 2;
-      break;
-    default:
-      crossOffset = mCrossS[i];
-      break; // Start & Stretch
+      bool frozeAny = false;
+      for (size_t k = 0; k < ln; ++k) {
+        if (frozen[k])
+          continue;
+        size_t i = lb + k;
+        const Style &cs = node.children[i].style;
+        float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
+                                   : leftover * (cs.flexShrink / ssum);
+        float candidate = std::max(0.0f, basis[i] + extra);
+        float clamped = clampSize(candidate, minMain[i], maxMain[i]);
+        lineFinal[k] = clamped;
+        if (clamped != candidate) {
+          frozen[k] = true;
+          frozeAny = true;
+        }
+      }
+      if (!frozeAny)
+        break; // this pass's candidates all satisfied their bounds — done
     }
 
-    float cx = horizontal ? cursor : contentX + crossOffset;
-    float cy = horizontal ? contentY + crossOffset : cursor;
-    float cw = horizontal ? finalMain[i] : finalCross;
-    float ch = horizontal ? finalCross : finalMain[i];
+    float maxCross = 0;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      finalMain[i] = lineFinal[k];
+      maxCross = std::max(maxCross, cross[i] + mCrossS[i] + mCrossE[i]);
+    }
+    lineCross[li] = maxCross;
+  }
 
-    placeNode(c, cx, cy, cw, ch);
-    cursor += finalMain[i] + mMainE[i] + between;
+  // ---- Distribute lines along the cross axis (align-content) ----
+  // With exactly one line this collapses to the old behavior: Stretch
+  // grows that line to fill crossAvail (matching the previous unconditional
+  // stretch-to-container-cross-size), everything else just packs the one
+  // line at the start.
+  size_t numLines = lines.size();
+  float lineGapTotal = numLines > 1 ? node.style.gap * (numLines - 1) : 0.0f;
+  float linesTotal = lineGapTotal;
+  for (float lc : lineCross)
+    linesTotal += lc;
+  float crossFree = std::max(0.0f, crossAvail - linesTotal);
+
+  std::vector<float> lineOffset(numLines), lineSize(numLines);
+  float crossStart = 0, crossBetween = node.style.gap;
+  switch (node.style.alignContent) {
+  case AlignContent::Start:
+    lineSize = lineCross;
+    break;
+  case AlignContent::End:
+    crossStart = crossFree;
+    lineSize = lineCross;
+    break;
+  case AlignContent::Center:
+    crossStart = crossFree / 2;
+    lineSize = lineCross;
+    break;
+  case AlignContent::SpaceBetween:
+    if (numLines > 1)
+      crossBetween += crossFree / (numLines - 1);
+    lineSize = lineCross;
+    break;
+  case AlignContent::SpaceAround: {
+    float each = numLines ? crossFree / numLines : 0;
+    crossStart = each / 2;
+    crossBetween += each;
+    lineSize = lineCross;
+    break;
+  }
+  case AlignContent::SpaceEvenly: {
+    float each = crossFree / (numLines + 1);
+    crossStart = each;
+    crossBetween += each;
+    lineSize = lineCross;
+    break;
+  }
+  case AlignContent::Stretch: {
+    float extra = numLines ? crossFree / numLines : 0;
+    for (size_t li = 0; li < numLines; ++li)
+      lineSize[li] = lineCross[li] + extra;
+    break;
+  }
+  }
+  {
+    float pos = crossStart;
+    for (size_t li = 0; li < numLines; ++li) {
+      lineOffset[li] = pos;
+      pos += lineSize[li] + crossBetween;
+    }
+  }
+
+  // ---- Per-line: justify main axis, align children within the line's
+  // cross extent, then recurse ----
+  for (size_t li = 0; li < numLines; ++li) {
+    size_t lb = lines[li].begin, le = lines[li].end;
+    size_t ln = le - lb;
+    float lineCrossAvail = lineSize[li];
+    float lineCrossPos = (horizontal ? contentY : contentX) + lineOffset[li];
+
+    float totalUsed = 0;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
+      if (k + 1 < ln)
+        totalUsed += node.style.gap;
+    }
+    float freeSpace = std::max(0.0f, mainAvail - totalUsed);
+    float startOffset = 0, between = node.style.gap;
+    switch (node.style.justifyContent) {
+    case Justify::Start:
+      break;
+    case Justify::End:
+      startOffset = freeSpace;
+      break;
+    case Justify::Center:
+      startOffset = freeSpace / 2;
+      break;
+    case Justify::SpaceBetween:
+      if (ln > 1)
+        between += freeSpace / (ln - 1);
+      break;
+    case Justify::SpaceAround: {
+      float each = ln ? freeSpace / ln : 0;
+      startOffset = each / 2;
+      between += each;
+      break;
+    }
+    case Justify::SpaceEvenly: {
+      float each = freeSpace / (ln + 1);
+      startOffset = each;
+      between += each;
+      break;
+    }
+    }
+
+    float cursor = (horizontal ? contentX : contentY) + startOffset;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      View &ch = node.children[i];
+      cursor += mMainS[i];
+
+      bool explicitCross = horizontal
+                                ? ch.style.height.kind != Size::Kind::Fit
+                                : ch.style.width.kind != Size::Kind::Fit;
+      float finalCross = cross[i];
+      if (node.style.alignItems == Align::Stretch && !explicitCross)
+        finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
+
+      float minCross = horizontal ? ch.style.minHeight : ch.style.minWidth;
+      float maxCross = horizontal ? ch.style.maxHeight : ch.style.maxWidth;
+      finalCross = clampSize(finalCross, minCross, maxCross);
+
+      float crossOffset;
+      switch (node.style.alignItems) {
+      case Align::End:
+        crossOffset = lineCrossAvail - finalCross - mCrossE[i];
+        break;
+      case Align::Center:
+        crossOffset = (lineCrossAvail - finalCross) / 2;
+        break;
+      default:
+        crossOffset = mCrossS[i];
+        break; // Start & Stretch
+      }
+
+      float cx = horizontal ? cursor : lineCrossPos + crossOffset;
+      float cy = horizontal ? lineCrossPos + crossOffset : cursor;
+      float cw = horizontal ? finalMain[i] : finalCross;
+      float chh = horizontal ? finalCross : finalMain[i];
+
+      placeNode(ch, cx, cy, cw, chh);
+      cursor += finalMain[i] + mMainE[i] + between;
+    }
   }
 }
 
