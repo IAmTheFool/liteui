@@ -1,40 +1,65 @@
 // src/main.cpp
+//
+// Minimal example: a window with a fixed-size scrollable list.
+
+
 #include "liteui.hpp"
-#include <iostream>
+#include <cstdio>
 
 int main() {
-    LiteUI ui(800, 600, "onClick demo");
+  LiteUI ui(400, 300, "Scrolling demo");
 
-    View root;
-    root.style.width = Size::full();
-    root.style.height = Size::full();
-    root.style.direction = FlexDirection::Column;
-    root.style.justifyContent = Justify::Center;
-    root.style.alignItems = Align::Center;
-    root.style.gap = 16;
-    root.style.backgroundColor = Color{240, 240, 240};
+  // The whole window content, laid out top-to-bottom.
+  View root;
+  root.style.direction = FlexDirection::Column;
+  root.style.width = Size::full();
+  root.style.height = Size::full();
+  root.style.padding = EdgeInsets::all(16);
+  root.style.gap = 12;
+  root.style.backgroundColor = {0xF2, 0xF2, 0xF2};
 
-    View button;
-    button.style.width = Size::pixel(200);
-    button.style.height = Size::pixel(60);
-    button.style.backgroundColor = Color{70, 130, 200};
-    button.style.borderRadius = 8;
-    button.onClick = [] {
-        std::cout << "Button clicked!" << std::endl;
-    };
+  // A plain heading above the scrollable area.
+  View heading;
+  heading.style.width = Size::full();
+  heading.style.height = Size::pixel(24);
+  root.addChild(heading);
 
-    View button2;
-    button2.style.width = Size::pixel(200);
-    button2.style.height = Size::pixel(60);
-    button2.style.backgroundColor = Color{200, 90, 90};
-    button2.style.borderRadius = 8;
-    button2.onClick = [] {
-        std::cout << "Second button clicked!" << std::endl;
-    };
+  // The scrollable list itself: a fixed-height box holding more rows than
+  // fit at once. overflowY = Scroll clips it and always shows the
+  // vertical scrollbar; the rows below are simply added at their natural
+  // height and the container takes care of the rest.
+  View list;
+  list.style.direction = FlexDirection::Column;
+  list.style.width = Size::full();
+  list.style.height = Size::pixel(200); // fixed viewport — content will overflow it
+  list.style.gap = 8;
+  list.style.padding = EdgeInsets::all(8);
+  list.style.backgroundColor = {255, 255, 255};
+  list.style.borderWidth = 1;
+  list.style.borderColor = {0xCC, 0xCC, 0xCC};
+  list.style.borderRadius = 6;
+  list.style.overflowY = Overflow::Scroll;
 
-    root.addChild(button);
-    root.addChild(button2);
+  const Color rowColors[] = {
+      {0x4C, 0xAF, 0x50}, {0x21, 0x96, 0xF3}, {0xFF, 0x98, 0x00},
+      {0x9C, 0x27, 0xB0}, {0xF4, 0x43, 0x36},
+  };
 
-    ui.setRoot(std::move(root));
-    ui.run();
+  for (int i = 0; i < 20; ++i) {
+    View row;
+    row.style.width = Size::full();
+    row.style.height = Size::pixel(36); // natural height; list scrolls once these overflow it
+    row.style.backgroundColor = rowColors[i % 5];
+    row.style.borderRadius = 4;
+    // Each row just prints its own index when clicked — swap in whatever
+    // you'd actually do (open an item, toggle a selection, etc.).
+    row.onClick = [i]() { std::printf("Row %d clicked\n", i); };
+    list.addChild(std::move(row));
+  }
+
+  root.addChild(std::move(list));
+  ui.setRoot(std::move(root));
+
+  ui.run();
+  return 0;
 }

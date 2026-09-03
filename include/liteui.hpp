@@ -21,6 +21,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
@@ -45,6 +46,14 @@ struct Box {
   int pos_y = 0;
   Color color;
 };
+
+// Width (vertical bar) / height (horizontal bar) of a scrollbar's track, in
+// pixels. Shared between the layout engine (which reserves this much space
+// out of a scroll container's content box on whichever edges show a bar)
+// and both renderers (which draw the track/thumb at exactly this size) —
+// keeping it in one place means layout and painting can never disagree
+// about how much room a bar takes up.
+constexpr float kScrollbarThickness = 12.0f;
 
 // ---------------- Layout engine: Size / Style / View ----------------
 
@@ -100,6 +109,15 @@ struct EdgeInsets {
 
 enum class Position { Static, Absolute };
 
+// CSS-style overflow behavior for one axis of a container. Visible (the
+// default) is behavior: children are never clipped and never
+// scroll, regardless of how big they get. Hidden clips children to the
+// container's box but offers no scrollbar/interaction. Scroll always
+// clips *and* always shows that axis's scrollbar, even if content
+// currently fits. Auto clips and shows the scrollbar only when content
+// actually exceeds the viewport on that axis.
+enum class Overflow { Visible, Hidden, Scroll, Auto };
+
 struct Style {
   Size width = Size::fit();
   Size height = Size::fit();
@@ -145,6 +163,14 @@ struct Style {
   // Stacking order among all Absolute nodes tree-wide (not just siblings).
   // Ties break by document order — see collectAbsolutes().
   int zIndex = 0;
+
+  // When either axis is non-Visible, this view becomes a scroll container:
+  // its children are measured at their natural size (not squeezed to fit)
+  // and clipped+offset by the view's live scroll position. See
+  // View::Computed::scrollX/scrollY and the "Scrolling" section of the
+  // layout engine below for how the two axes are handled independently.
+  Overflow overflowX = Overflow::Visible;
+  Overflow overflowY = Overflow::Visible;
 };
 
 // A node in the retained layout tree. Set `style` and `children`; the engine
@@ -162,9 +188,31 @@ public:
 
   struct Computed {
     float x = 0, y = 0, w = 0, h = 0; // border-box, absolute window coords
+
+    // Only meaningful when style.overflowX/Y != Visible. contentW/contentH
+    // is how big this view's children naturally want to be (the scrollable
+    // extent); scrollX/scrollY is how far the content is currently
+    // scrolled, always clamped to [0, max(0, content - viewport)]. A
+    // non-scrollable view leaves these at 0 and they're simply unused.
+    float contentW = 0, contentH = 0;
+    float scrollX = 0, scrollY = 0;
   } computed;
 
   void addChild(View child) { children.push_back(std::move(child)); }
+
+  // Whether this view clips/scrolls on the given axis.
+  bool scrollsX() const { return style.overflowX != Overflow::Visible; }
+  bool scrollsY() const { return style.overflowY != Overflow::Visible; }
+
+  // Maximum scrollX/scrollY this view can currently have, given its last
+  // computed content size vs its viewport size. 0 when content fits (or
+  // the axis doesn't scroll).
+  float maxScrollX() const {
+    return std::max(0.0f, computed.contentW - computed.w);
+  }
+  float maxScrollY() const {
+    return std::max(0.0f, computed.contentH - computed.h);
+  }
 };
 
 // ---------------- Layout algorithm (flexbox subset) ----------------
@@ -213,33 +261,78 @@ inline float clampSize(float v, float minV, float maxV) {
   return std::clamp(v, minV, std::max(minV, maxV));
 }
 
-inline Natural measureNatural(const View &node, float availW, float availH,
+// Whether a given axis's scrollbar should actually be drawn/interactive:
+// Scroll always shows it, Auto shows it only once content overflows the
+// viewport (the "+ 0.5" is just slack against float rounding so a
+// perfectly-fitting container doesn't flicker a bar on and off), and
+// Hidden/Visible never do. Used by both placeNode (to decide whether to
+// reserve gutter space for it) and every renderer/hit-tester (to decide
+// whether to draw/click it) — kept as one function so those two places
+// can never disagree about whether a bar is showing.
+inline bool axisScrollbarVisible(Overflow ov, float content, float viewport) {
+  if (ov == Overflow::Scroll)
+    return true;
+  if (ov == Overflow::Auto)
+    return content > viewport + 0.5f;
+  return false; // Visible, Hidden
+}
+
+// Takes node by non-const reference (unlike the rest of this "measure"
+// pass, which is conceptually read-only) for exactly one reason: a scroll
+// container's natural content size — the scrollable extent — needs to be
+// recorded somewhere for later use by placeNode() (to offset/clip
+// children), by the scrollbar-thumb sizing code, and by input handling
+// (to know how far a drag/wheel event is allowed to move the scroll
+// offset). node.computed.contentW/contentH is that somewhere. Everything
+// else this function does is still the same bottom-up size query it always
+// was.
+inline Natural measureNatural(View &node, float availW, float availH,
                               bool wDefinite, bool hDefinite) {
   bool horizontal = node.style.direction == FlexDirection::Row;
   const EdgeInsets &pad = node.style.padding;
   bool needW = node.style.width.kind == Size::Kind::Fit;
   bool needH = node.style.height.kind == Size::Kind::Fit;
+  bool scrollX = node.scrollsX();
+  bool scrollY = node.scrollsY();
 
   float w = clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
                       node.style.minWidth, node.style.maxWidth);
   float h = clampSize(resolveAxis(node.style.height, availH, hDefinite, 0),
                       node.style.minHeight, node.style.maxHeight);
-  if ((!needW && !needH) || node.children.empty())
+  // A scroll container must still visit its children even when neither
+  // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
+  // point: we need to know how big the content *wants* to be so we know
+  // how far it can scroll, even though the container's own box size
+  // doesn't depend on that at all.
+  if ((!needW && !needH && !scrollX && !scrollY) || node.children.empty())
     return {w, h};
 
-  float innerW =
-      (wDefinite && !needW) ? std::max(0.0f, w - pad.left - pad.right) : availW;
-  float innerH =
-      (hDefinite && !needH) ? std::max(0.0f, h - pad.top - pad.bottom) : availH;
+  // Along an axis this node scrolls, children are measured against
+  // effectively unbounded space so they report their true desired size
+  // instead of being squeezed into the viewport — that natural total is
+  // exactly the "scrollable extent". Along a non-scrolling axis, sizing is
+  // unchanged from before (children measured against the resolved inner
+  // box, or against availW/availH while this node's own size is still
+  // being figured out).
+  constexpr float kUnbounded = std::numeric_limits<float>::max() / 4;
+  float innerW = scrollX ? kUnbounded
+                 : (wDefinite && !needW)
+                     ? std::max(0.0f, w - pad.left - pad.right)
+                     : availW;
+  float innerH = scrollY ? kUnbounded
+                 : (hDefinite && !needH)
+                     ? std::max(0.0f, h - pad.top - pad.bottom)
+                     : availH;
 
   float mainTotal = 0, crossMax = 0;
   bool firstFlow = true;
   for (size_t i = 0; i < node.children.size(); ++i) {
-    const View &c = node.children[i];
+    View &c = node.children[i];
     if (c.style.position == Position::Absolute)
       continue; // out of flow: doesn't affect the parent's Fit size at all
-    Natural cn = measureNatural(c, innerW, innerH, wDefinite || !needW,
-                                hDefinite || !needH);
+    Natural cn = measureNatural(c, innerW, innerH,
+                                scrollX ? false : (wDefinite || !needW),
+                                scrollY ? false : (hDefinite || !needH));
     float mm = c.style.margin.left + c.style.margin.right;
     float mv = c.style.margin.top + c.style.margin.bottom;
     float childMain = horizontal ? cn.w + mm : cn.h + mv;
@@ -257,21 +350,98 @@ inline Natural measureNatural(const View &node, float availW, float availH,
   if (needH)
     h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
                   node.style.minHeight, node.style.maxHeight);
+
+  // Content extent is deliberately NOT run through clampSize/min-max: a
+  // container's max-width doesn't shrink its *content*, only its own box
+  // (that's the entire reason overflow is a thing).
+  if (scrollX)
+    node.computed.contentW =
+        (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
+  if (scrollY)
+    node.computed.contentH =
+        (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
   return {w, h};
 }
 
 inline void placeNode(View &node, float x, float y, float w, float h) {
-  node.computed = {x, y, w, h};
-  if (node.children.empty())
+  // contentW/contentH here already existed as "content's natural size" on
+  // node.computed before this call, set by the measureNatural() pass that
+  // ran over this same node earlier (either from the parent's per-child
+  // loop, or from layoutRoot() for the root). We're about to overwrite
+  // x/y/w/h with the final viewport box; contentW/contentH and
+  // scrollX/scrollY are left untouched by this assignment.
+  node.computed.x = x;
+  node.computed.y = y;
+  node.computed.w = w;
+  node.computed.h = h;
+  if (node.children.empty()) {
+    // No children means nothing to scroll regardless of overflow setting;
+    // pin the offset at 0 so a container that briefly had children (and
+    // therefore a scroll offset) doesn't leave a stale one behind if it's
+    // ever emptied out.
+    node.computed.scrollX = node.computed.scrollY = 0;
     return;
+  }
 
   bool horizontal = node.style.direction == FlexDirection::Row;
   const EdgeInsets &pad = node.style.padding;
-  float contentX = x + pad.left, contentY = y + pad.top;
   float contentW = std::max(0.0f, w - pad.left - pad.right);
   float contentH = std::max(0.0f, h - pad.top - pad.bottom);
+
+  // ---- Scrolling: gutter reservation, offset clamping, content origin ----
+  // Whether each axis's scrollbar is actually showing determines whether it
+  // eats into the space available for children — same rule CSS uses (a
+  // visible scrollbar shrinks the content box on the OTHER axis; the
+  // scrolling axis itself is unbounded so its own bar doesn't need to
+  // "make room" against itself).
+  bool showVBar = node.scrollsY() &&
+                  axisScrollbarVisible(node.style.overflowY,
+                                       node.computed.contentH, h);
+  bool showHBar = node.scrollsX() &&
+                  axisScrollbarVisible(node.style.overflowX,
+                                       node.computed.contentW, w);
+  if (showVBar)
+    contentW = std::max(0.0f, contentW - kScrollbarThickness);
+  if (showHBar)
+    contentH = std::max(0.0f, contentH - kScrollbarThickness);
+
+  // Scroll offsets are user/input-driven state that can go stale the
+  // instant content size or viewport size changes (a window resize, or
+  // content shrinking), so every relayout re-clamps them into range rather
+  // than trusting whatever a previous frame left behind.
+  if (node.scrollsX())
+    node.computed.scrollX =
+        std::clamp(node.computed.scrollX, 0.0f, node.maxScrollX());
+  else
+    node.computed.scrollX = 0;
+  if (node.scrollsY())
+    node.computed.scrollY =
+        std::clamp(node.computed.scrollY, 0.0f, node.maxScrollY());
+  else
+    node.computed.scrollY = 0;
+
+  // The content origin simply shifts by the (clamped) scroll offset —
+  // children are positioned exactly as they would be at scroll (0,0), then
+  // this single subtraction slides the whole subtree. Clipping (handled by
+  // the renderers/hit-testers, not here) is what actually hides the part
+  // that scrolls out of view.
+  float contentX = x + pad.left - node.computed.scrollX;
+  float contentY = y + pad.top - node.computed.scrollY;
+
   float mainAvail = horizontal ? contentW : contentH;
   float crossAvail = horizontal ? contentH : contentW;
+  // A scrolling main axis must never let flexShrink squeeze children below
+  // their natural size just because the viewport is smaller than the
+  // content — that's the entire point of scrolling instead of shrinking.
+  // Widening mainAvail to at least the natural content total makes
+  // "leftover" in the flex-resolution pass below >= 0, which keeps every
+  // shrink factor's candidate at-or-above its unclamped basis.
+  if (horizontal && node.scrollsX())
+    mainAvail = std::max(
+        mainAvail, node.computed.contentW - pad.left - pad.right);
+  if (!horizontal && node.scrollsY())
+    mainAvail = std::max(
+        mainAvail, node.computed.contentH - pad.top - pad.bottom);
 
   size_t n = node.children.size();
   bool wrap = node.style.flexWrap == FlexWrap::Wrap;
@@ -285,7 +455,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
       mCrossE(n), minMain(n), maxMain(n), marginMain(n);
 
   for (size_t k = 0; k < n; ++k) {
-    const View &c = node.children[flowIdx[k]];
+    View &c = node.children[flowIdx[k]];
     Natural cn = measureNatural(c, contentW, contentH, true, true);
     basis[k] = horizontal ? cn.w : cn.h;
     cross[k] = horizontal ? cn.h : cn.w;
@@ -629,6 +799,323 @@ private:
                                 static_cast<float>(height_));
   }
 
+  // A rectangle used to accumulate the intersection of every scrollable
+  // ancestor's viewport as we walk down the tree, so painting and
+  // hit-testing can both tell "is this point/pixel actually visible, or
+  // has it scrolled behind a clipping ancestor". Defaults to "the whole
+  // plane" so the root of any walk starts unclipped.
+  struct ClipRect {
+    float x0 = -std::numeric_limits<float>::infinity();
+    float y0 = -std::numeric_limits<float>::infinity();
+    float x1 = std::numeric_limits<float>::infinity();
+    float y1 = std::numeric_limits<float>::infinity();
+    bool contains(float px, float py) const {
+      return px >= x0 && px < x1 && py >= y0 && py < y1;
+    }
+    // Narrows this clip to also be inside the given box — used every time
+    // we descend into a scroll container's children.
+    ClipRect intersect(float bx, float by, float bw, float bh) const {
+      return {std::max(x0, bx), std::max(y0, by), std::min(x1, bx + bw),
+              std::min(y1, by + bh)};
+    }
+  };
+
+  // Plain float rectangle for scrollbar geometry (track/thumb), kept
+  // separate from Wayland's integer-pixel `Rect` below since scrollbar math
+  // wants to stay in the same float space as View::Computed.
+  struct PixRect {
+    float x, y, w, h;
+  };
+
+  // Whether view v's vertical/horizontal scrollbar is currently showing —
+  // thin wrappers around axisScrollbarVisible() using v's own already-
+  // computed sizes, so callers don't have to repeat the h vs. contentH /
+  // w vs. contentW pairing correctly every time.
+  static bool wantVBar(const View &v) {
+    return v.scrollsY() && liteui_layout::axisScrollbarVisible(
+                               v.style.overflowY, v.computed.contentH,
+                               v.computed.h);
+  }
+  static bool wantHBar(const View &v) {
+    return v.scrollsX() && liteui_layout::axisScrollbarVisible(
+                               v.style.overflowX, v.computed.contentW,
+                               v.computed.w);
+  }
+
+  // Track rectangles run the full length of their edge, minus the corner
+  // square where both bars would otherwise overlap (only relevant when
+  // both axes scroll at once).
+  static PixRect vTrackRect(const View &v) {
+    float h = v.computed.h - (wantHBar(v) ? kScrollbarThickness : 0.0f);
+    return {v.computed.x + v.computed.w - kScrollbarThickness, v.computed.y,
+            kScrollbarThickness, std::max(0.0f, h)};
+  }
+  static PixRect hTrackRect(const View &v) {
+    float w = v.computed.w - (wantVBar(v) ? kScrollbarThickness : 0.0f);
+    return {v.computed.x, v.computed.y + v.computed.h - kScrollbarThickness,
+            std::max(0.0f, w), kScrollbarThickness};
+  }
+
+  // Minimum thumb length so a very long scrollable area doesn't shrink the
+  // thumb down to an unclickable sliver.
+  static constexpr float kMinThumb = 20.0f;
+
+  // Thumb length is proportional to viewport/content (how much of the
+  // content is visible at once); thumb position is proportional to how far
+  // through the scrollable range the current offset is.
+  static PixRect vThumbRect(const View &v) {
+    PixRect track = vTrackRect(v);
+    float thumbH =
+        v.computed.contentH > 0
+            ? std::clamp(track.h * (v.computed.h / v.computed.contentH),
+                        kMinThumb, track.h)
+            : track.h;
+    float maxScroll = v.maxScrollY();
+    float pos = maxScroll > 0 ? (v.computed.scrollY / maxScroll) *
+                                     (track.h - thumbH)
+                              : 0.0f;
+    return {track.x, track.y + pos, track.w, thumbH};
+  }
+  static PixRect hThumbRect(const View &v) {
+    PixRect track = hTrackRect(v);
+    float thumbW =
+        v.computed.contentW > 0
+            ? std::clamp(track.w * (v.computed.w / v.computed.contentW),
+                        kMinThumb, track.w)
+            : track.w;
+    float maxScroll = v.maxScrollX();
+    float pos = maxScroll > 0 ? (v.computed.scrollX / maxScroll) *
+                                     (track.w - thumbW)
+                              : 0.0f;
+    return {track.x + pos, track.y, thumbW, track.h};
+  }
+  static bool pixRectContains(const PixRect &r, float px, float py) {
+    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+  }
+
+  // ---- Press/drag/wheel resolution against scrollbars & scrollable content ----
+  // What a press (or a wheel event, which reuses this to find its target)
+  // landed on. VThumb/HThumb mean "start dragging that thumb"; VTrack/
+  // HTrack mean "clicked empty track — jump the thumb to click position;
+  // Content means "this is inside some scrollable view's content area
+  // (not its scrollbar)" — used both to start a possible pan-to-scroll
+  // drag and, for wheel events, as the view to scroll.
+  enum class ScrollHit { None, VThumb, HThumb, VTrack, HTrack, Content };
+  struct ScrollPress {
+    ScrollHit kind = ScrollHit::None;
+    View *view = nullptr;
+    float trackFrac = 0; // 0..1 position along the track, for VTrack/HTrack
+  };
+
+  // Walks down from v looking for the deepest relevant scroll interaction
+  // under (x, y). Each node's own scrollbars are checked before recursing
+  // into its children, which is always correct because layout already
+  // reserves the scrollbar's gutter out of the children's placement area —
+  // a child box can never overlap its parent's own scrollbar. Known
+  // limitation shared with hitTestFlow below: Position::Absolute
+  // descendants aren't threaded through this clip-aware walk at all (they
+  // bypass the normal recursion entirely, same as elsewhere in this file),
+  // so an absolute view inside a scrolled-out region can still be found —
+  // acceptable for v1, matching this file's existing absolute-positioning
+  // trade-offs.
+  static ScrollPress resolveScrollTarget(View &v, float x, float y,
+                                         ClipRect clip) {
+    if (!clip.contains(x, y) || !containsPoint(v, x, y))
+      return {};
+    if (wantVBar(v)) {
+      PixRect track = vTrackRect(v);
+      if (pixRectContains(track, x, y)) {
+        PixRect thumb = vThumbRect(v);
+        if (pixRectContains(thumb, x, y))
+          return {ScrollHit::VThumb, &v, 0};
+        float frac = track.h > 0 ? (y - track.y) / track.h : 0;
+        return {ScrollHit::VTrack, &v, frac};
+      }
+    }
+    if (wantHBar(v)) {
+      PixRect track = hTrackRect(v);
+      if (pixRectContains(track, x, y)) {
+        PixRect thumb = hThumbRect(v);
+        if (pixRectContains(thumb, x, y))
+          return {ScrollHit::HThumb, &v, 0};
+        float frac = track.w > 0 ? (x - track.x) / track.w : 0;
+        return {ScrollHit::HTrack, &v, frac};
+      }
+    }
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                             v.computed.w, v.computed.h)
+                             : clip;
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+      if (it->style.position == Position::Absolute)
+        continue;
+      ScrollPress r = resolveScrollTarget(*it, x, y, childClip);
+      if (r.kind != ScrollHit::None)
+        return r;
+    }
+    if (v.scrollsX() || v.scrollsY())
+      return {ScrollHit::Content, &v, 0};
+    return {};
+  }
+
+  // How a click-and-drag inside scrollable content is currently being
+  // interpreted. Mirrors pressedView_'s press/release pairing, but for
+  // scroll interactions instead of onClick.
+  enum class DragMode { None, VThumb, HThumb, ContentPan };
+  struct ScrollDrag {
+    DragMode mode = DragMode::None;
+    View *target = nullptr;
+    float startPointerX = 0, startPointerY = 0;
+    float startScrollX = 0, startScrollY = 0;
+    // ContentPan only: whether the pointer has moved past the click/drag
+    // threshold yet. Until it does, this might still turn out to be an
+    // ordinary click (see beginScrollPress/updateScrollDrag/endScrollPress).
+    bool moved = false;
+  } scrollDrag_;
+
+  // Pixels of pointer movement before a press-in-content is treated as a
+  // pan-to-scroll drag rather than a click.
+  static constexpr float kDragThreshold = 4.0f;
+
+  // Call on every left-button press, before the existing beginPress(). If
+  // this returns true, it fully owns the press (a scrollbar grab, or a
+  // track-click jump) and the caller must NOT also call beginPress() —
+  // there's nothing left to click. If it returns false, the caller should
+  // fall through to its normal beginPress(x, y) — resolveScrollTarget()
+  // found either nothing scrollable, or plain scrollable *content*, in
+  // which case a ContentPan drag is armed here but the ordinary click path
+  // still runs too, since a small movement should behave as a click, not a
+  // pan (see updateScrollDrag/endScrollPress).
+  bool beginScrollPress(float x, float y) {
+    if (!hasRoot_)
+      return false;
+    ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
+    switch (r.kind) {
+    case ScrollHit::VThumb:
+      scrollDrag_ = {DragMode::VThumb, r.view, x, y, r.view->computed.scrollX,
+                     r.view->computed.scrollY, true};
+      return true;
+    case ScrollHit::HThumb:
+      scrollDrag_ = {DragMode::HThumb, r.view, x, y, r.view->computed.scrollX,
+                     r.view->computed.scrollY, true};
+      return true;
+    case ScrollHit::VTrack: {
+      PixRect track = vTrackRect(*r.view), thumb = vThumbRect(*r.view);
+      float target = r.trackFrac * track.h - thumb.h / 2;
+      float maxScroll = r.view->maxScrollY();
+      float range = track.h - thumb.h;
+      r.view->computed.scrollY =
+          std::clamp(range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f,
+                    maxScroll);
+      relayout();
+      return true;
+    }
+    case ScrollHit::HTrack: {
+      PixRect track = hTrackRect(*r.view), thumb = hThumbRect(*r.view);
+      float target = r.trackFrac * track.w - thumb.w / 2;
+      float maxScroll = r.view->maxScrollX();
+      float range = track.w - thumb.w;
+      r.view->computed.scrollX =
+          std::clamp(range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f,
+                    maxScroll);
+      relayout();
+      return true;
+    }
+    case ScrollHit::Content:
+      scrollDrag_ = {DragMode::ContentPan, r.view, x, y,
+                     r.view->computed.scrollX, r.view->computed.scrollY,
+                     false};
+      return false; // ordinary click press still proceeds too
+    case ScrollHit::None:
+      return false;
+    }
+    return false;
+  }
+
+  // Call on every pointer-motion event while a button is held. Advances an
+  // in-progress scrollbar drag or content pan; a no-op if scrollDrag_ isn't
+  // active. Returns true if it changed anything (caller should repaint).
+  bool updateScrollDrag(float x, float y) {
+    if (scrollDrag_.mode == DragMode::None)
+      return false;
+    View &v = *scrollDrag_.target;
+    float dx = x - scrollDrag_.startPointerX;
+    float dy = y - scrollDrag_.startPointerY;
+    if (scrollDrag_.mode == DragMode::ContentPan) {
+      if (!scrollDrag_.moved && std::abs(dx) < kDragThreshold &&
+          std::abs(dy) < kDragThreshold)
+        return false; // still within click tolerance — not a pan yet
+      if (!scrollDrag_.moved) {
+        scrollDrag_.moved = true;
+        // It just became a drag, not a click — cancel any pending onClick
+        // so the eventual release doesn't also fire it.
+        pressedView_ = nullptr;
+      }
+      if (v.scrollsX())
+        v.computed.scrollX =
+            std::clamp(scrollDrag_.startScrollX - dx, 0.0f, v.maxScrollX());
+      if (v.scrollsY())
+        v.computed.scrollY =
+            std::clamp(scrollDrag_.startScrollY - dy, 0.0f, v.maxScrollY());
+    } else if (scrollDrag_.mode == DragMode::VThumb) {
+      PixRect track = vTrackRect(v), thumb = vThumbRect(v);
+      float range = track.h - thumb.h;
+      float delta = range > 0 ? (dy / range) * v.maxScrollY() : 0.0f;
+      v.computed.scrollY =
+          std::clamp(scrollDrag_.startScrollY + delta, 0.0f, v.maxScrollY());
+    } else if (scrollDrag_.mode == DragMode::HThumb) {
+      PixRect track = hTrackRect(v), thumb = hThumbRect(v);
+      float range = track.w - thumb.w;
+      float delta = range > 0 ? (dx / range) * v.maxScrollX() : 0.0f;
+      v.computed.scrollX =
+          std::clamp(scrollDrag_.startScrollX + delta, 0.0f, v.maxScrollX());
+    }
+    relayout();
+    return true;
+  }
+
+  // Call on every left-button release. Resolves a ContentPan that never
+  // crossed the drag threshold back into an ordinary click via the
+  // existing endPress(); anything that already became a real drag (a
+  // scrollbar grab, or a pan that moved) just ends quietly. Always clears
+  // scrollDrag_ so a stale target can't leak into some unrelated later
+  // press.
+  void endScrollPress(float x, float y) {
+    if (scrollDrag_.mode == DragMode::ContentPan && !scrollDrag_.moved)
+      endPress(x, y);
+    scrollDrag_ = {};
+  }
+
+  // Call on every wheel/scroll event; deltaX/deltaY are in pixels (already
+  // sign-adjusted so positive means "scroll right"/"scroll down" — each
+  // platform's wheel callback is responsible for that conversion). Finds
+  // the deepest scrollable view under the cursor via the same walk used
+  // for press resolution — scrollbar vs. content doesn't matter for wheel
+  // input, both count as "the pointer is over this scrollable view".
+  // Returns true if it changed anything (caller should repaint).
+  bool applyWheelScroll(float x, float y, float deltaX, float deltaY) {
+    if (!hasRoot_)
+      return false;
+    ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
+    if (r.kind == ScrollHit::None || !r.view)
+      return false;
+    View &v = *r.view;
+    bool changed = false;
+    if (v.scrollsY() && deltaY != 0.0f) {
+      float ns = std::clamp(v.computed.scrollY + deltaY, 0.0f, v.maxScrollY());
+      changed |= ns != v.computed.scrollY;
+      v.computed.scrollY = ns;
+    }
+    if (v.scrollsX() && deltaX != 0.0f) {
+      float ns = std::clamp(v.computed.scrollX + deltaX, 0.0f, v.maxScrollX());
+      changed |= ns != v.computed.scrollX;
+      v.computed.scrollX = ns;
+    }
+    if (changed)
+      relayout();
+    return changed;
+  }
+
   // Global z-index stacking, shared by both backends.
   struct AbsoluteEntry {
     const View *view;
@@ -673,13 +1160,23 @@ private:
   // of its flow descendants) has no handler, the search falls through to
   // checking `v` itself, so a click bubbles up to the nearest ancestor
   // that does have one.
-  static View *hitTestFlow(View &v, float x, float y) {
-    if (!containsPoint(v, x, y))
+  //
+  // `clip` is the accumulated intersection of every scrollable ancestor's
+  // viewport seen so far — a point outside it means whatever's physically
+  // there has scrolled out of view, so it can't be hit no matter what its
+  // own box says. Only scrollable nodes narrow the clip further as we
+  // descend, exactly mirroring how renderView() decides what to clip.
+  static View *hitTestFlow(View &v, float x, float y, ClipRect clip) {
+    if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return nullptr;
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                             v.computed.w, v.computed.h)
+                             : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute)
         continue;
-      if (View *hit = hitTestFlow(*it, x, y))
+      if (View *hit = hitTestFlow(*it, x, y, childClip))
         return hit;
     }
     return v.onClick ? &v : nullptr;
@@ -688,7 +1185,8 @@ private:
   // Top-level hit test against the whole tree: absolutes take priority
   // over the flow tree, highest zIndex/latest doc-order first, mirroring
   // paint order (collectAbsolutes + sortAbsolutes are the same lists used
-  // to paint on Windows/Linux).
+  // to paint on Windows/Linux). Absolutes are tested unclipped — see the
+  // "known limitation" note on resolveScrollTarget() above.
   View *hitTest(float x, float y) {
     if (!hasRoot_)
       return nullptr;
@@ -696,9 +1194,10 @@ private:
     collectAbsolutes(root_, absolutes);
     sortAbsolutes(absolutes);
     for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
-      if (View *hit = hitTestFlow(const_cast<View &>(*it->view), x, y))
+      if (View *hit =
+              hitTestFlow(const_cast<View &>(*it->view), x, y, ClipRect{}))
         return hit;
-    return hitTestFlow(root_, x, y);
+    return hitTestFlow(root_, x, y, ClipRect{});
   }
 
   // Invokes v's onClick if it has one; no-op for nullptr or an unset handler.
@@ -731,6 +1230,37 @@ private:
 #if defined(_WIN32)
   // Native window handle; null until CreateWindowExW succeeds.
   HWND hwnd_ = nullptr;
+
+  // Off-screen back buffer: everything is painted here first, then
+  // BitBlt'd to the screen in one shot during WM_PAINT. 
+  // Null until the first WM_PAINT (or WM_SIZE) needs it; recreated
+  // whenever the window's size no longer matches memW_/memH_.
+  HDC memDC_ = nullptr;
+  HBITMAP memBitmap_ = nullptr;
+  HBITMAP memBitmapOld_ = nullptr; // the 1x1 stock bitmap memDC_ started
+                                   // with, restored before deleting memDC_
+  int memW_ = 0, memH_ = 0; // dimensions memBitmap_ was last created at
+
+  // Makes sure memDC_/memBitmap_ exist and match the window's current
+  // size, (re)creating them if not. `screenDC` only needs to be
+  // compatible-DC-source-worthy (CreateCompatibleDC/CreateCompatibleBitmap
+  // just need *a* DC to match pixel format against), so the WM_PAINT DC is
+  // fine to pass in every time.
+  void ensureBackBuffer(HDC screenDC) {
+    if (memDC_ && memW_ == width_ && memH_ == height_)
+      return;
+    if (memDC_) {
+      SelectObject(memDC_, memBitmapOld_); // put the stock bitmap back...
+      DeleteObject(memBitmap_);            // ...so this one can be freed
+      DeleteDC(memDC_);
+    }
+    memDC_ = CreateCompatibleDC(screenDC);
+    memBitmap_ = CreateCompatibleBitmap(screenDC, std::max(1, width_),
+                                        std::max(1, height_));
+    memBitmapOld_ = static_cast<HBITMAP>(SelectObject(memDC_, memBitmap_));
+    memW_ = width_;
+    memH_ = height_;
+  }
 
   // Helper converting a UTF-8 std::string to the UTF-16 wide string Win32's *W
   // APIs require.
@@ -777,51 +1307,136 @@ private:
 
     // Dispatch on the specific message type.
     switch (msg) {
-    // Repaint request: redraw all boxes using GDI.
+    // Repaint request: paint everything into the off-screen back buffer,
+    // then blit it to the screen in a single BitBlt — see memDC_'s comment
+    // for why (this is the actual flicker fix).
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC hdc = BeginPaint(hwnd, &ps);
-      if (self)
-        self->paintBoxes(hdc);
-      self->paintRoot(hdc);
+      if (self) {
+        self->ensureBackBuffer(hdc);
+        // Plain white background first — WM_ERASEBKGND below tells
+        // Windows not to do this for us anymore, so we own it, matching
+        // what the Linux/Wayland renderer already does for its content
+        // area.
+        RECT full{0, 0, self->width_, self->height_};
+        HBRUSH whiteBrush =
+            reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        FillRect(self->memDC_, &full, whiteBrush);
+        self->paintBoxes(self->memDC_);
+        self->paintRoot(self->memDC_);
+        BitBlt(hdc, 0, 0, self->width_, self->height_, self->memDC_, 0, 0,
+              SRCCOPY);
+      }
       EndPaint(hwnd, &ps);
       return 0;
     }
 
-    // Left mouse button pressed: record the hit-test target as the
-    // pending click's press target (fired later on WM_LBUTTONUP, only if
-    // the release lands on the same view). Capture the mouse so we still
-    // get the matching WM_LBUTTONUP even if the cursor leaves the window
-    // before the button is released.
+    // Tells Windows we're handling the background ourselves (see
+    // WM_PAINT), so it should skip its own default erase-to-brush pass —
+    // that default erase is what caused a visible white/gray flash right
+    // before every repaint.
+    case WM_ERASEBKGND:
+      return 1;
+
+    // Left mouse button pressed: first give scrollbars/scrollable content a
+    // chance to claim the press (beginScrollPress) — a thumb grab or track
+    // click consumes it entirely; a press over plain scrollable content
+    // arms a possible pan but still falls through to the ordinary
+    // beginPress() below, since a small movement should still resolve as a
+    // click (see updateScrollDrag/endScrollPress). Capture the mouse so we
+    // still get the matching WM_MOUSEMOVE/WM_LBUTTONUP even if the cursor
+    // leaves the window before the button is released.
     case WM_LBUTTONDOWN: {
       if (self) {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
-        self->beginPress(x, y);
+        if (!self->beginScrollPress(x, y))
+          self->beginPress(x, y);
         SetCapture(hwnd);
+        if (self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
+    // Pointer moved with a button held: advances an in-progress scrollbar
+    // drag or content pan. No-op (returns false) if neither is active, so
+    // this costs nothing on ordinary hover.
+    case WM_MOUSEMOVE: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        if (self->updateScrollDrag(x, y) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
       return 0;
     }
 
     // Left mouse button released: resolve the pending press against
     // whatever's under the cursor now, firing onClick only if it matches
-    // the original press target.
+    // the original press target (endScrollPress handles the scroll-drag
+    // side of this and defers to endPress() when a pan never actually
+    // moved, i.e. it was really just a click).
     case WM_LBUTTONUP: {
       if (self) {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
-        self->endPress(x, y);
+        self->endScrollPress(x, y);
       }
       ReleaseCapture();
       return 0;
     }
 
+    // Vertical mouse-wheel rotation. WM_MOUSEWHEEL's cursor coordinates are
+    // in *screen* space (unlike every other mouse message here, which are
+    // client-space) — ScreenToClient converts before hit-testing. One
+    // notch (WHEEL_DELTA = 120) scrolls a fixed 40px step; larger/precision
+    // wheels report multiples/fractions of that.
+    case WM_MOUSEWHEEL: {
+      if (self) {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        float notches =
+            static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
+        // Wheel-up (positive notches) should scroll content up, i.e.
+        // decrease scrollY — hence the negation.
+        if (self->applyWheelScroll(static_cast<float>(pt.x),
+                                   static_cast<float>(pt.y), 0.0f,
+                                   -notches * 40.0f) &&
+            self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
+    // Horizontal mouse-wheel rotation (tilt-wheel or shift+wheel on most
+    // drivers). Same coordinate/notch handling as WM_MOUSEWHEEL, but
+    // positive notches scroll right, so no negation here.
+    case WM_MOUSEHWHEEL: {
+      if (self) {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        float notches =
+            static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
+        if (self->applyWheelScroll(static_cast<float>(pt.x),
+                                   static_cast<float>(pt.y), notches * 40.0f,
+                                   0.0f) &&
+            self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
     // Capture was taken away from us mid-press (e.g. alt-tab, a system
-    // dialog popping up) — the click can't complete normally, so drop the
-    // pending press rather than let a later, unrelated release resolve it.
+    // dialog popping up) — the click/drag can't complete normally, so drop
+    // both the pending click and any in-progress scroll drag rather than
+    // let a later, unrelated event resolve them.
     case WM_CAPTURECHANGED:
-      if (self)
+      if (self) {
         self->pressedView_ = nullptr;
+        self->scrollDrag_ = {};
+      }
       return 0;
 
     // Window was resized (including maximize/restore/snap): update our
@@ -864,19 +1479,88 @@ private:
   // border-radius directly — no manual pixel math needed on this platform.
   void paintRoot(HDC hdc) {
     if (hasRoot_) {
-      paintView(hdc, root_);
+      paintView(hdc, root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
       sortAbsolutes(absolutes);
       for (const auto &e : absolutes)
-        paintView(hdc, *e.view);
+        paintView(hdc, *e.view, ClipRect{});
     }
   }
 
-  void paintView(HDC hdc, const View &v) {
+  // Fills a GDI RECT with a solid color — small helper so scrollbar
+  // track/thumb painting below doesn't have to repeat the
+  // create-select-fill-restore-delete dance for every rectangle.
+  static void gdiFillRect(HDC hdc, int x, int y, int w, int h, Color c) {
+    RECT r{x, y, x + w, y + h};
+    HBRUSH brush = CreateSolidBrush(RGB(c.r, c.g, c.b));
+    FillRect(hdc, &r, brush);
+    DeleteObject(brush);
+  }
+
+  // Draws v's vertical/horizontal scrollbar (whichever are currently
+  // showing) using flat GDI fills — classic fixed track+thumb styling,
+  // unclipped by the content clip (a scrollbar always sits fully within
+  // its own view's box, which is itself already visible or this function
+  // wouldn't have been reached).
+  void paintScrollbars(HDC hdc, const View &v) {
+    if (wantVBar(v)) {
+      PixRect t = vTrackRect(v), th = vThumbRect(v);
+      gdiFillRect(hdc, static_cast<int>(t.x), static_cast<int>(t.y),
+                  static_cast<int>(t.w), static_cast<int>(t.h),
+                  {0xE0, 0xE0, 0xE0});
+      gdiFillRect(hdc, static_cast<int>(th.x), static_cast<int>(th.y),
+                  static_cast<int>(th.w), static_cast<int>(th.h),
+                  {0x90, 0x90, 0x90});
+    }
+    if (wantHBar(v)) {
+      PixRect t = hTrackRect(v), th = hThumbRect(v);
+      gdiFillRect(hdc, static_cast<int>(t.x), static_cast<int>(t.y),
+                  static_cast<int>(t.w), static_cast<int>(t.h),
+                  {0xE0, 0xE0, 0xE0});
+      gdiFillRect(hdc, static_cast<int>(th.x), static_cast<int>(th.y),
+                  static_cast<int>(th.w), static_cast<int>(th.h),
+                  {0x90, 0x90, 0x90});
+    }
+    // Corner filler where both bars would otherwise leave a gap/overlap.
+    if (wantVBar(v) && wantHBar(v))
+      gdiFillRect(hdc,
+                  static_cast<int>(v.computed.x + v.computed.w -
+                                    kScrollbarThickness),
+                  static_cast<int>(v.computed.y + v.computed.h -
+                                    kScrollbarThickness),
+                  static_cast<int>(kScrollbarThickness),
+                  static_cast<int>(kScrollbarThickness), {0xE0, 0xE0, 0xE0});
+  }
+
+  // `clip` is the accumulated visible region from scrollable ancestors —
+  // GDI's own clip region (SelectClipRgn) is intersected with it for the
+  // duration of painting v and its subtree, then restored, so content
+  // scrolled out of a container's viewport is actually cut off rather than
+  // just drawn in the wrong place.
+  void paintView(HDC hdc, const View &v, ClipRect clip) {
     const Style &s = v.style;
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
+
+    // Always explicitly (re)select the clip region for `clip` on entry —
+    // never assume the HDC is in any particular clip state, since a
+    // sibling or child's own recursive paintView call may have left it set
+    // to something narrower (or unset). Passing nullptr to SelectClipRgn
+    // is itself well-defined: it clears any existing clip region, so the
+    // unclipped case is just as deterministic as the clipped one.
+    bool clipped = clip.x0 != -std::numeric_limits<float>::infinity() ||
+                  clip.y0 != -std::numeric_limits<float>::infinity() ||
+                  clip.x1 != std::numeric_limits<float>::infinity() ||
+                  clip.y1 != std::numeric_limits<float>::infinity();
+    HRGN clipRgn = nullptr;
+    if (clipped)
+      clipRgn = CreateRectRgn(static_cast<int>(clip.x0),
+                              static_cast<int>(clip.y0),
+                              static_cast<int>(clip.x1),
+                              static_cast<int>(clip.y1));
+    SelectClipRgn(hdc, clipRgn);
+
     HBRUSH bg = CreateSolidBrush(
         RGB(s.backgroundColor.r, s.backgroundColor.g, s.backgroundColor.b));
     HPEN pen =
@@ -893,9 +1577,29 @@ private:
     DeleteObject(bg);
     if (s.borderWidth > 0)
       DeleteObject(pen);
+
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                             v.computed.w, v.computed.h)
+                             : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute)
-        paintView(hdc, child);
+        paintView(hdc, child, childClip);
+
+    // Scrollbars are drawn after children, back under v's own (ancestor,
+    // not child-narrowed) clip — the recursive child calls above left the
+    // HDC's clip region set to whatever they last needed, so it has to be
+    // re-selected here rather than assumed. Using `clip` rather than no
+    // clip at all keeps a scrollbar correctly hidden if v itself has
+    // scrolled out of some outer ancestor's viewport. Scrollbars sit in
+    // the gutter layout already reserved outside the children's placement
+    // area, so drawing them after children never overlaps content, and
+    // keeps them on top the way an overlay scrollbar should be.
+    SelectClipRgn(hdc, clipRgn);
+    if (v.scrollsX() || v.scrollsY())
+      paintScrollbars(hdc, v);
+    if (clipRgn)
+      DeleteObject(clipRgn);
   }
 
 #else // Linux / Wayland
@@ -1104,15 +1808,37 @@ private:
     // Update the stored y position.
     self->pointer_y_ = wl_fixed_to_double(sy);
 
+    // Advance any in-progress scrollbar drag / content pan (see
+    // beginScrollPress/handlePress). A no-op, and cheap, when nothing's
+    // being dragged.
+    if (self->updateScrollDrag(static_cast<float>(self->pointer_x_),
+                               static_cast<float>(self->pointer_y_)))
+      self->redraw();
+
     // Re-derive which edge (if any) the pointer is over and update the
     // cursor image to match, so the user sees a resize cursor before they
     // even click.
     self->setCursor(cursorNameForEdge(
         self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
   }
-  // Called on scroll/axis events; not used by this minimal window.
-  static void pointerAxis(void *, wl_pointer *, uint32_t, uint32_t,
-                          wl_fixed_t) {}
+  // Called on scroll/axis events — mouse wheel rotation or a touchpad's
+  // continuous scroll gesture. `value` is already a relative-movement
+  // amount in the same coordinate space as pointer motion (per the
+  // wl_pointer protocol), so it's usable directly as a pixel delta with no
+  // extra scaling, unlike Windows' notch-based WM_MOUSEWHEEL.
+  static void pointerAxis(void *data, wl_pointer *, uint32_t, uint32_t axis,
+                          wl_fixed_t value) {
+    auto *self = static_cast<LiteUI *>(data);
+    float delta = static_cast<float>(wl_fixed_to_double(value));
+    float dx = 0, dy = 0;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+      dy = delta;
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+      dx = delta;
+    if (self->applyWheelScroll(static_cast<float>(self->pointer_x_),
+                               static_cast<float>(self->pointer_y_), dx, dy))
+      self->redraw();
+  }
   // Called on every pointer button press/release.
   static void pointerButton(void *data, wl_pointer *, uint32_t serial, uint32_t,
                             uint32_t button, uint32_t state) {
@@ -1340,10 +2066,24 @@ private:
 
   // ---- pixel helpers (XBGR8888: memory byte order R,G,B,X per pixel) ----
   // Writes a single opaque pixel at (x, y), silently ignoring out-of-bounds
-  // coordinates.
+  // coordinates. Two overloads: the plain one (unchanged signature from
+  // before scrolling existed) draws unclipped, exactly like every
+  // pre-existing call site (titlebar, addBox boxes) expects; the clip-
+  // aware one is what renderView()'s new clip-aware recursion actually
+  // calls. (A default `= ClipRect{}` argument here would be simpler, but
+  // GCC rejects using a nested class's own default member initializers
+  // inside a default *argument* of a sibling member function — hence two
+  // overloads instead of one function with a default.)
   void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-    // Skip drawing anything outside the buffer's bounds.
+    setPixel(x, y, r, g, b, ClipRect{});
+  }
+  void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b,
+               const ClipRect &clip) {
+    // Skip drawing anything outside the buffer's bounds or outside clip.
     if (x < 0 || y < 0 || x >= width_ || y >= height_)
+      return;
+    if (static_cast<float>(x) < clip.x0 || static_cast<float>(x) >= clip.x1 ||
+        static_cast<float>(y) < clip.y0 || static_cast<float>(y) >= clip.y1)
       return;
     // Compute the byte address of this pixel: row offset plus column offset,
     // four bytes per pixel.
@@ -1358,22 +2098,31 @@ private:
     px[3] = 0xFF;
   }
   // Fills an axis-aligned rectangle with a solid color by calling setPixel for
-  // every point inside it.
-  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+  // every point inside it. Same unclipped/clipped overload split as setPixel.
+  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g,
+               uint8_t b) {
+    fillRect(x0, y0, w, h, r, g, b, ClipRect{});
+  }
+  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b,
+               const ClipRect &clip) {
     // Iterate every row of the rectangle.
     for (int y = y0; y < y0 + h; ++y)
       // Iterate every column of the current row.
       for (int x = x0; x < x0 + w; ++x)
         // Paint this pixel with the requested color.
-        setPixel(x, y, r, g, b);
+        setPixel(x, y, r, g, b, clip);
   }
 
   // Fills an axis-aligned rectangle with rounded corners, clamping the
   // radius so it can't exceed half the shorter side. Per-pixel distance
   // check against each corner's circle center — fine at this scale, not
-  // meant for huge boxes.
+  // meant for huge boxes. Same unclipped/clipped overload split as setPixel.
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
                        uint8_t g, uint8_t b) {
+    fillRoundedRect(x0, y0, w, h, radius, r, g, b, ClipRect{});
+  }
+  void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
+                       uint8_t g, uint8_t b, const ClipRect &clip) {
     if (w <= 0 || h <= 0)
       return;
     radius = std::max(0, std::min({radius, w / 2, h / 2}));
@@ -1399,9 +2148,43 @@ private:
           inside = (dx * dx + dy * dy) <= radius * radius;
         }
         if (inside)
-          setPixel(x0 + x, y0 + y, r, g, b);
+          setPixel(x0 + x, y0 + y, r, g, b, clip);
       }
     }
+  }
+
+  // Draws v's vertical/horizontal scrollbar (whichever are currently
+  // showing) as flat filled rectangles — classic fixed track+thumb
+  // styling, matching the Windows/GDI renderer's look. `clip` is v's own
+  // ancestor-level clip (not narrowed by v's own children), so a
+  // scrollbar correctly disappears if v itself has scrolled out of some
+  // outer ancestor's viewport, same reasoning as the GDI version.
+  void renderScrollbars(const View &v, const ClipRect &clip) {
+    if (wantVBar(v)) {
+      PixRect t = vTrackRect(v), th = vThumbRect(v);
+      fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
+              static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
+              clip);
+      fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
+              static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90,
+              0x90, clip);
+    }
+    if (wantHBar(v)) {
+      PixRect t = hTrackRect(v), th = hThumbRect(v);
+      fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
+              static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
+              clip);
+      fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
+              static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90,
+              0x90, clip);
+    }
+    if (wantVBar(v) && wantHBar(v))
+      fillRect(static_cast<int>(v.computed.x + v.computed.w -
+                                kScrollbarThickness),
+              static_cast<int>(v.computed.y + v.computed.h -
+                                kScrollbarThickness),
+              static_cast<int>(kScrollbarThickness),
+              static_cast<int>(kScrollbarThickness), 0xE0, 0xE0, 0xE0, clip);
   }
 
   // Draws one View (background + border) using its already-computed layout,
@@ -1413,26 +2196,42 @@ private:
   // skipped here — it's collected separately and painted in a single
   // global-stacking pass afterward, so it can interleave correctly with
   // absolute nodes from entirely different subtrees.
-  void renderView(const View &v) {
+  //
+  // `clip` is the accumulated intersection of every scrollable ancestor's
+  // viewport, exactly mirroring hitTestFlow()'s clip parameter — v's own
+  // background/border is drawn under `clip` (the ancestor-level one, not
+  // narrowed by v itself), while children are drawn under a further-
+  // narrowed clip if v itself scrolls, which is what actually makes
+  // scrolled-out content invisible instead of just mispositioned.
+  void renderView(const View &v, ClipRect clip) {
     const Style &s = v.style;
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
     int radius = static_cast<int>(s.borderRadius);
     if (s.borderWidth > 0) {
       fillRoundedRect(x, y, w, h, radius, s.borderColor.r, s.borderColor.g,
-                      s.borderColor.b);
+                      s.borderColor.b, clip);
       int bw = static_cast<int>(s.borderWidth);
       fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw),
                       std::max(0, h - 2 * bw), std::max(0, radius - bw),
                       s.backgroundColor.r, s.backgroundColor.g,
-                      s.backgroundColor.b);
+                      s.backgroundColor.b, clip);
     } else {
       fillRoundedRect(x, y, w, h, radius, s.backgroundColor.r,
-                      s.backgroundColor.g, s.backgroundColor.b);
+                      s.backgroundColor.g, s.backgroundColor.b, clip);
     }
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                             v.computed.w, v.computed.h)
+                             : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute)
-        renderView(child);
+        renderView(child, childClip);
+    // Scrollbars sit in the gutter layout already reserved outside the
+    // children's placement area, so drawing them after children never
+    // overlaps content, and keeps them visually on top.
+    if (v.scrollsX() || v.scrollsY())
+      renderScrollbars(v, clip);
   }
 
   // Simple stepped line, good enough for axis-aligned/diagonal 18px icons.
@@ -1556,7 +2355,7 @@ private:
       fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
                b.color.b);
     if (hasRoot_) {
-      renderView(root_);
+      renderView(root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
       std::stable_sort(absolutes.begin(), absolutes.end(),
@@ -1566,7 +2365,7 @@ private:
                          return a.order < b.order;
                        });
       for (const auto &e : absolutes)
-        renderView(*e.view);
+        renderView(*e.view, ClipRect{});
     }
     // Paint the titlebar and its buttons on top of that background.
     drawTitlebar();
@@ -1596,11 +2395,16 @@ private:
       return;
     }
 
-    // Presses below the titlebar strip start a pending widget click,
-    // resolved later in handleRelease() rather than firing immediately.
+    // Presses below the titlebar strip first give scrollbars/scrollable
+    // content a chance to claim the press (beginScrollPress) — a thumb
+    // grab or track click consumes it entirely; anything else falls
+    // through to the ordinary pending-click press, resolved later in
+    // handleRelease().
     if (pointer_y_ >= kTitlebarHeight) {
-      beginPress(static_cast<float>(pointer_x_),
-                 static_cast<float>(pointer_y_));
+      float x = static_cast<float>(pointer_x_), y = static_cast<float>(pointer_y_);
+      if (!beginScrollPress(x, y))
+        beginPress(x, y);
+      redraw();
       return;
     }
 
@@ -1638,14 +2442,17 @@ private:
       xdg_toplevel_move(toplevel_, seat_, serial);
   }
 
-  // Resolves a pending widget click on button release. Chrome buttons and
-  // resize/move grabs don't need this — they already acted on press — so
-  // this only matters for content-area clicks below the titlebar.
+  // Resolves a pending widget click (or in-progress scroll drag) on button
+  // release. Chrome buttons and resize/move grabs don't need this — they
+  // already acted on press — so this only matters for content-area
+  // interactions below the titlebar.
   void handleRelease() {
     if (pointer_y_ >= kTitlebarHeight)
-      endPress(static_cast<float>(pointer_x_), static_cast<float>(pointer_y_));
+      endScrollPress(static_cast<float>(pointer_x_),
+                     static_cast<float>(pointer_y_));
     else
       pressedView_ = nullptr; // release moved back into the titlebar; cancel
+    scrollDrag_ = {};
   }
 
 // Ends the Windows/Linux member block.
@@ -1756,6 +2563,12 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
 inline LiteUI::~LiteUI() {
 // Windows-specific teardown path.
 #if defined(_WIN32)
+  // Release the off-screen back buffer, if one was ever created.
+  if (memDC_) {
+    SelectObject(memDC_, memBitmapOld_);
+    DeleteObject(memBitmap_);
+    DeleteDC(memDC_);
+  }
   // Destroy the native window if it was successfully created.
   if (hwnd_)
     DestroyWindow(hwnd_);
