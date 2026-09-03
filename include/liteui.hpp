@@ -110,7 +110,7 @@ struct EdgeInsets {
 enum class Position { Static, Absolute };
 
 // CSS-style overflow behavior for one axis of a container. Visible (the
-// default) is behavior: children are never clipped and never
+// default) behavior: children are never clipped and never
 // scroll, regardless of how big they get. Hidden clips children to the
 // container's box but offers no scrollbar/interaction. Scroll always
 // clips *and* always shows that axis's scrollbar, even if content
@@ -1619,8 +1619,8 @@ private:
                // (movable/resizable/closable) window.
   wl_shm *shm_ =
       nullptr; // The shared-memory global used to allocate pixel buffers.
-  wl_buffer *buffer_ =
-      nullptr; // The currently attached pixel buffer shown on screen.
+  wl_buffer *buffers_[2] = {
+      nullptr, nullptr}; 
   wl_seat *seat_ = nullptr; // The seat global, representing one user's set of
                             // input devices (keyboard/mouse/etc.).
 
@@ -1675,17 +1675,52 @@ private:
       false; // Tracks whether the window currently believes
              // itself to be maximized (for toggling and icon state).
 
-  // keep mapped for the buffer's lifetime instead of mmap/unmap per attach,
-  // since we now need to repaint(maximize toggle,etc) after the initial attach.
-  // File descriptor for the anonymous shared-memory-backed buffer; -1 until
-  // created.
-  int bufferFd_ = -1;
+  // ---- Double buffering ----
+  // A single wl_shm buffer isn't safe to redraw into and re-attach
+  // repeatedly: the compositor may still be reading it (compositing it to
+  // the screen) when we start overwriting it for the next frame, which is
+  // exactly what produced the flicker/tearing during scrolling — a scroll
+  // drag fires many pointer-motion events per second, each triggering a
+  // redraw(), far faster than one buffer alone can be safely reused.
+  //
+  // The fix is the standard wl_shm pattern: two buffers sharing one mmap'd
+  // region (back-to-back), alternating which one we draw into each frame.
+  // wl_buffer's own `release` event tells us exactly when the compositor
+  // is done with a given buffer and it's safe to draw into again — until
+  // that fires, redraw() must not touch it.
+  int bufferFd_ = -1; // File descriptor for the anonymous shared-memory-
+                      // backed region covering BOTH buffers; -1 until
+                      // attachBuffer() runs.
+  uint8_t *bufferData_ =
+      nullptr; // Pointer to the whole mmap'd region (both buffers back to
+               // back); null until attachBuffer() runs.
+  int singleBufSize_ = 0; // Size in bytes of ONE buffer (stride * height).
+  int bufferSize_ = 0;   // Total mapped size: singleBufSize_ * 2.
+  bool bufBusy_[2] = {
+      false,
+      false}; // Whether the compositor still owns buffers_[i] (true from
+              // the moment we attach+commit it until its `release` event
+              // fires). redraw() refuses to draw into a busy buffer.
+  int drawBuf_ = 0; // Index of the buffer redraw() will draw into next;
+                    // flips after every successful draw.
+  uint8_t *activeBuf_ =
+      nullptr; // bufferData_ + drawBuf_*singleBufSize_ — set at the top of
+               // every redraw() call; this is what setPixel() actually
+               // writes into.
+  bool redrawPending_ =
+      false; // Set when redraw() was asked to draw but skipped because
+             // drawBuf_ was still busy; retried automatically the moment
+             // that buffer's release event arrives (see bufferRelease()).
 
-  uint8_t *bufferData_ = nullptr; // Pointer to the mmap'd pixel data backing
-                                  // bufferFd_; null until attachBuffer() runs.
-
-  int bufferSize_ =
-      0; // Total size in bytes of the mapped buffer (stride * height).
+  // Small per-buffer context handed to the wl_buffer release listener so
+  // it knows both which LiteUI instance it belongs to and which of the
+  // two buffer slots was released — a plain wl_buffer_listener's user data
+  // is a single opaque pointer, so this bundles both.
+  struct BufferSlot {
+    LiteUI *self;
+    int index;
+  };
+  BufferSlot bufferSlots_[2]{};
 
   bool configured_ =
       false; // Set true once the compositor has sent its first
@@ -1721,7 +1756,7 @@ private:
         (self->pendingWidth_ != self->width_ ||
          self->pendingHeight_ != self->height_)) {
       self->resize(self->pendingWidth_, self->pendingHeight_);
-    } else if (!self->buffer_)
+    } else if (!self->buffers_[0])
       self->attachBuffer();
   }
   // Listener struct binding surfaceConfigure to xdg_surface's single event.
@@ -1992,16 +2027,17 @@ private:
                           image->hotspot_x, image->hotspot_y);
   }
 
-  // Handles a compositor-driven resize: tears down the old shm buffer,
+  // Handles a compositor-driven resize: tears down the old shm buffers,
   // updates width_/height_, re-runs layout against the new size, and
-  // allocates+attaches a fresh buffer at the new dimensions. Buffers can't
+  // allocates+attaches fresh buffers at the new dimensions. Buffers can't
   // be resized in place — wl_shm buffers are fixed-size — so this is a full
   // destroy/recreate rather than a realloc.
   void resize(int newWidth, int newHeight) {
-    if (buffer_) {
-      wl_buffer_destroy(buffer_);
-      buffer_ = nullptr;
-    }
+    for (int i = 0; i < 2; ++i)
+      if (buffers_[i]) {
+        wl_buffer_destroy(buffers_[i]);
+        buffers_[i] = nullptr;
+      }
     if (bufferData_) {
       munmap(bufferData_, bufferSize_);
       bufferData_ = nullptr;
@@ -2010,27 +2046,44 @@ private:
       close(bufferFd_);
       bufferFd_ = -1;
     }
+    bufBusy_[0] = bufBusy_[1] = false;
+    redrawPending_ = false;
     width_ = newWidth;
     height_ = newHeight;
     relayout();
-    attachBuffer(); // allocates the new buffer and calls redraw() itself
+    attachBuffer(); // allocates the new buffers and calls redraw() itself
   }
 
-  // Allocates the shared-memory pixel buffer and attaches it to the surface for
-  // the first time.
+  // wl_buffer's release event: the compositor is done with this buffer
+  // (it's no longer on screen or queued to be), so it's safe for redraw()
+  // to draw into it again. If a redraw came in while this buffer was still
+  // busy, this is also what retries it — otherwise a redraw requested at
+  // exactly the wrong moment would just be silently dropped forever.
+  static void bufferRelease(void *data, wl_buffer *) {
+    auto *slot = static_cast<BufferSlot *>(data);
+    slot->self->bufBusy_[slot->index] = false;
+    if (slot->self->redrawPending_)
+      slot->self->redraw();
+  }
+  static constexpr wl_buffer_listener bufferListener = {bufferRelease};
+
+  // Allocates both shared-memory pixel buffers (back to back in one mmap'd
+  // region) and draws+attaches the first frame. See the "Double buffering"
+  // member-block comment above for why there are two.
   void attachBuffer() {
     // Each pixel is 4 bytes (XBGR8888), so a row's byte length is width * 4.
     const int stride = width_ * 4;
     // Total buffer size is one row's bytes times the number of rows.
-    bufferSize_ = stride * height_;
+    singleBufSize_ = stride * height_;
+    bufferSize_ = singleBufSize_ * 2;
 
     // Create an anonymous, memory-backed file descriptor to hold the pixel
-    // data.
+    // data for BOTH buffers.
     bufferFd_ = memfd_create("gui-window-buf", 0);
     // Bail out if the kernel couldn't give us one.
     if (bufferFd_ < 0)
       throw std::runtime_error("memfd_create failed");
-    // Resize that anonymous file to exactly the buffer size we need.
+    // Resize that anonymous file to exactly the combined size we need.
     if (ftruncate(bufferFd_, bufferSize_) < 0) {
       // Clean up the fd before propagating the error.
       close(bufferFd_);
@@ -2051,15 +2104,21 @@ private:
     }
 
     // Wrap the fd in a wl_shm_pool so the compositor can carve buffers out of
-    // it.
+    // it, then carve out two same-sized buffers at different offsets within
+    // that one pool/mmap region.
     wl_shm_pool *pool = wl_shm_create_pool(shm_, bufferFd_, bufferSize_);
-    // Create a single buffer covering the whole pool, describing
-    // width/height/stride/pixel format.
-    buffer_ = wl_shm_pool_create_buffer(pool, 0, width_, height_, stride,
-                                        WL_SHM_FORMAT_XBGR8888);
-    // The pool object itself isn't needed anymore once the buffer exists.
+    for (int i = 0; i < 2; ++i) {
+      buffers_[i] = wl_shm_pool_create_buffer(
+          pool, i * singleBufSize_, width_, height_, stride,
+          WL_SHM_FORMAT_XBGR8888);
+      bufferSlots_[i] = {this, i};
+      wl_buffer_add_listener(buffers_[i], &bufferListener, &bufferSlots_[i]);
+      bufBusy_[i] = false;
+    }
+    // The pool object itself isn't needed anymore once both buffers exist.
     wl_shm_pool_destroy(pool);
 
+    drawBuf_ = 0;
     // Paint the initial frame into the freshly mapped buffer and present it.
     redraw();
   }
@@ -2086,8 +2145,11 @@ private:
         static_cast<float>(y) < clip.y0 || static_cast<float>(y) >= clip.y1)
       return;
     // Compute the byte address of this pixel: row offset plus column offset,
-    // four bytes per pixel.
-    uint8_t *px = bufferData_ + (static_cast<size_t>(y) * width_ + x) * 4;
+    // four bytes per pixel. Writes go into activeBuf_ (the buffer redraw()
+    // is currently drawing into — see the "Double buffering" comment
+    // block), not the raw bufferData_ base, since bufferData_ spans both
+    // buffers back to back.
+    uint8_t *px = activeBuf_ + (static_cast<size_t>(y) * width_ + x) * 4;
     // First byte in memory is red (per the XBGR8888 comment above).
     px[0] = r;
     // Second byte is green.
@@ -2343,12 +2405,26 @@ private:
   }
 
   // Repaints the entire window content and commits it to the compositor.
+  // Draws into whichever of the two buffers (drawBuf_) isn't currently
+  // still owned by the compositor — see the "Double buffering" comment
+  // block for why that matters. If it's still busy, the draw is skipped
+  // entirely (never blocks) and redrawPending_ is set so bufferRelease()
+  // retries automatically the moment that buffer frees up — a call to
+  // redraw() should therefore be thought of as "request a repaint soon",
+  // not "repaint synchronously right now".
   void redraw() {
-    // Nothing to draw into yet if the buffer hasn't been mapped.
+    // Nothing to draw into yet if the buffers haven't been mapped.
     if (!bufferData_)
       return;
-    // Clear the whole buffer to white as the plain content-area background.
-    std::memset(bufferData_, 0xFF, bufferSize_); // content area
+    if (bufBusy_[drawBuf_]) {
+      redrawPending_ = true;
+      return;
+    }
+    redrawPending_ = false;
+    activeBuf_ = bufferData_ + static_cast<size_t>(drawBuf_) * singleBufSize_;
+
+    // Clear this buffer to white as the plain content-area background.
+    std::memset(activeBuf_, 0xFF, singleBufSize_); // content area
     // Paint queued boxes on top of the plain background, before the titlebar
     // so it stays on top.
     for (const auto &b : boxes_)
@@ -2371,12 +2447,17 @@ private:
     drawTitlebar();
     // Tell the compositor this buffer is what the surface should display, at
     // offset (0,0).
-    wl_surface_attach(surface_, buffer_, 0, 0);
+    wl_surface_attach(surface_, buffers_[drawBuf_], 0, 0);
     // Mark the whole buffer area as changed so the compositor knows to
     // re-composite it.
     wl_surface_damage_buffer(surface_, 0, 0, width_, height_);
+    // The compositor now owns this buffer until it sends `release` —
+    // redraw() won't draw into it again before then.
+    bufBusy_[drawBuf_] = true;
     // Submit the attach+damage as an atomic update to the compositor.
     wl_surface_commit(surface_);
+    // Next call draws into the other buffer.
+    drawBuf_ = 1 - drawBuf_;
   }
 
   // Hit-tests a left-button press against the titlebar buttons, resize
@@ -2574,9 +2655,10 @@ inline LiteUI::~LiteUI() {
     DestroyWindow(hwnd_);
 // Linux/Wayland-specific teardown path.
 #else
-  // Release the shared pixel buffer object if one was created.
-  if (buffer_)
-    wl_buffer_destroy(buffer_);
+  // Release both shared pixel buffer objects, if they were created.
+  for (int i = 0; i < 2; ++i)
+    if (buffers_[i])
+      wl_buffer_destroy(buffers_[i]);
   // Unmap the shared memory region if it was mapped.
   if (bufferData_)
     munmap(bufferData_, bufferSize_);
