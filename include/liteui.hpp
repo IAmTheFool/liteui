@@ -20,8 +20,10 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <d2d1.h>
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
+#pragma comment(lib, "d2d1")
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
@@ -394,12 +396,12 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   // visible scrollbar shrinks the content box on the OTHER axis; the
   // scrolling axis itself is unbounded so its own bar doesn't need to
   // "make room" against itself).
-  bool showVBar = node.scrollsY() &&
-                  axisScrollbarVisible(node.style.overflowY,
-                                       node.computed.contentH, h);
-  bool showHBar = node.scrollsX() &&
-                  axisScrollbarVisible(node.style.overflowX,
-                                       node.computed.contentW, w);
+  bool showVBar =
+      node.scrollsY() &&
+      axisScrollbarVisible(node.style.overflowY, node.computed.contentH, h);
+  bool showHBar =
+      node.scrollsX() &&
+      axisScrollbarVisible(node.style.overflowX, node.computed.contentW, w);
   if (showVBar)
     contentW = std::max(0.0f, contentW - kScrollbarThickness);
   if (showHBar)
@@ -437,11 +439,11 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   // "leftover" in the flex-resolution pass below >= 0, which keeps every
   // shrink factor's candidate at-or-above its unclamped basis.
   if (horizontal && node.scrollsX())
-    mainAvail = std::max(
-        mainAvail, node.computed.contentW - pad.left - pad.right);
+    mainAvail =
+        std::max(mainAvail, node.computed.contentW - pad.left - pad.right);
   if (!horizontal && node.scrollsY())
-    mainAvail = std::max(
-        mainAvail, node.computed.contentH - pad.top - pad.bottom);
+    mainAvail =
+        std::max(mainAvail, node.computed.contentH - pad.top - pad.bottom);
 
   size_t n = node.children.size();
   bool wrap = node.style.flexWrap == FlexWrap::Wrap;
@@ -832,14 +834,14 @@ private:
   // computed sizes, so callers don't have to repeat the h vs. contentH /
   // w vs. contentW pairing correctly every time.
   static bool wantVBar(const View &v) {
-    return v.scrollsY() && liteui_layout::axisScrollbarVisible(
-                               v.style.overflowY, v.computed.contentH,
-                               v.computed.h);
+    return v.scrollsY() &&
+           liteui_layout::axisScrollbarVisible(
+               v.style.overflowY, v.computed.contentH, v.computed.h);
   }
   static bool wantHBar(const View &v) {
-    return v.scrollsX() && liteui_layout::axisScrollbarVisible(
-                               v.style.overflowX, v.computed.contentW,
-                               v.computed.w);
+    return v.scrollsX() &&
+           liteui_layout::axisScrollbarVisible(
+               v.style.overflowX, v.computed.contentW, v.computed.w);
   }
 
   // Track rectangles run the full length of their edge, minus the corner
@@ -868,12 +870,12 @@ private:
     float thumbH =
         v.computed.contentH > 0
             ? std::clamp(track.h * (v.computed.h / v.computed.contentH),
-                        kMinThumb, track.h)
+                         kMinThumb, track.h)
             : track.h;
     float maxScroll = v.maxScrollY();
-    float pos = maxScroll > 0 ? (v.computed.scrollY / maxScroll) *
-                                     (track.h - thumbH)
-                              : 0.0f;
+    float pos = maxScroll > 0
+                    ? (v.computed.scrollY / maxScroll) * (track.h - thumbH)
+                    : 0.0f;
     return {track.x, track.y + pos, track.w, thumbH};
   }
   static PixRect hThumbRect(const View &v) {
@@ -881,20 +883,20 @@ private:
     float thumbW =
         v.computed.contentW > 0
             ? std::clamp(track.w * (v.computed.w / v.computed.contentW),
-                        kMinThumb, track.w)
+                         kMinThumb, track.w)
             : track.w;
     float maxScroll = v.maxScrollX();
-    float pos = maxScroll > 0 ? (v.computed.scrollX / maxScroll) *
-                                     (track.w - thumbW)
-                              : 0.0f;
+    float pos = maxScroll > 0
+                    ? (v.computed.scrollX / maxScroll) * (track.w - thumbW)
+                    : 0.0f;
     return {track.x + pos, track.y, thumbW, track.h};
   }
   static bool pixRectContains(const PixRect &r, float px, float py) {
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
   }
 
-  // ---- Press/drag/wheel resolution against scrollbars & scrollable content ----
-  // What a press (or a wheel event, which reuses this to find its target)
+  // ---- Press/drag/wheel resolution against scrollbars & scrollable content
+  // ---- What a press (or a wheel event, which reuses this to find its target)
   // landed on. VThumb/HThumb mean "start dragging that thumb"; VTrack/
   // HTrack mean "clicked empty track — jump the thumb to click position;
   // Content means "this is inside some scrollable view's content area
@@ -944,7 +946,7 @@ private:
     }
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
-                                             v.computed.w, v.computed.h)
+                                              v.computed.w, v.computed.h)
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute)
@@ -992,21 +994,22 @@ private:
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
     switch (r.kind) {
     case ScrollHit::VThumb:
-      scrollDrag_ = {DragMode::VThumb, r.view, x, y, r.view->computed.scrollX,
-                     r.view->computed.scrollY, true};
+      scrollDrag_ = {
+          DragMode::VThumb,         r.view, x, y, r.view->computed.scrollX,
+          r.view->computed.scrollY, true};
       return true;
     case ScrollHit::HThumb:
-      scrollDrag_ = {DragMode::HThumb, r.view, x, y, r.view->computed.scrollX,
-                     r.view->computed.scrollY, true};
+      scrollDrag_ = {
+          DragMode::HThumb,         r.view, x, y, r.view->computed.scrollX,
+          r.view->computed.scrollY, true};
       return true;
     case ScrollHit::VTrack: {
       PixRect track = vTrackRect(*r.view), thumb = vThumbRect(*r.view);
       float target = r.trackFrac * track.h - thumb.h / 2;
       float maxScroll = r.view->maxScrollY();
       float range = track.h - thumb.h;
-      r.view->computed.scrollY =
-          std::clamp(range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f,
-                    maxScroll);
+      r.view->computed.scrollY = std::clamp(
+          range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f, maxScroll);
       relayout();
       return true;
     }
@@ -1015,16 +1018,15 @@ private:
       float target = r.trackFrac * track.w - thumb.w / 2;
       float maxScroll = r.view->maxScrollX();
       float range = track.w - thumb.w;
-      r.view->computed.scrollX =
-          std::clamp(range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f,
-                    maxScroll);
+      r.view->computed.scrollX = std::clamp(
+          range > 0 ? (target / range) * maxScroll : 0.0f, 0.0f, maxScroll);
       relayout();
       return true;
     }
     case ScrollHit::Content:
-      scrollDrag_ = {DragMode::ContentPan, r.view, x, y,
-                     r.view->computed.scrollX, r.view->computed.scrollY,
-                     false};
+      scrollDrag_ = {
+          DragMode::ContentPan,     r.view, x, y, r.view->computed.scrollX,
+          r.view->computed.scrollY, false};
       return false; // ordinary click press still proceeds too
     case ScrollHit::None:
       return false;
@@ -1171,7 +1173,7 @@ private:
       return nullptr;
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
-                                             v.computed.w, v.computed.h)
+                                              v.computed.w, v.computed.h)
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute)
@@ -1231,35 +1233,50 @@ private:
   // Native window handle; null until CreateWindowExW succeeds.
   HWND hwnd_ = nullptr;
 
-  // Off-screen back buffer: everything is painted here first, then
-  // BitBlt'd to the screen in one shot during WM_PAINT. 
-  // Null until the first WM_PAINT (or WM_SIZE) needs it; recreated
-  // whenever the window's size no longer matches memW_/memH_.
-  HDC memDC_ = nullptr;
-  HBITMAP memBitmap_ = nullptr;
-  HBITMAP memBitmapOld_ = nullptr; // the 1x1 stock bitmap memDC_ started
-                                   // with, restored before deleting memDC_
-  int memW_ = 0, memH_ = 0; // dimensions memBitmap_ was last created at
+  // Device-independent: created once in the constructor, lives for the
+  // process (well, the LiteUI instance's) lifetime.
+  ID2D1Factory *d2dFactory_ = nullptr;
 
-  // Makes sure memDC_/memBitmap_ exist and match the window's current
-  // size, (re)creating them if not. `screenDC` only needs to be
-  // compatible-DC-source-worthy (CreateCompatibleDC/CreateCompatibleBitmap
-  // just need *a* DC to match pixel format against), so the WM_PAINT DC is
-  // fine to pass in every time.
-  void ensureBackBuffer(HDC screenDC) {
-    if (memDC_ && memW_ == width_ && memH_ == height_)
+  // Device-dependent: bound to hwnd_'s current size. Torn down and
+  // recreated if EndDraw() ever reports D2DERR_RECREATE_TARGET (e.g. after
+  // a display driver reset) — everything that draws goes through this
+  // pointer, never a raw HDC.
+  ID2D1HwndRenderTarget *renderTarget_ = nullptr;
+
+  // Lazily (re)creates renderTarget_ against hwnd_'s current client size.
+  // A no-op once a valid target already exists; WM_SIZE calls Resize()
+  // directly instead of tearing this down, so this only actually runs
+  // once per (factory, hwnd) pair unless EndDraw() invalidates the target.
+  void ensureRenderTarget() {
+    if (renderTarget_)
       return;
-    if (memDC_) {
-      SelectObject(memDC_, memBitmapOld_); // put the stock bitmap back...
-      DeleteObject(memBitmap_);            // ...so this one can be freed
-      DeleteDC(memDC_);
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    D2D1_SIZE_U size =
+        D2D1::SizeU(static_cast<UINT32>(std::max<LONG>(1, rc.right - rc.left)),
+                    static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
+    HRESULT hr = d2dFactory_->CreateHwndRenderTarget(
+        D2D1::RenderTargetProperties(),
+        D2D1::HwndRenderTargetProperties(hwnd_, size), &renderTarget_);
+    if (FAILED(hr))
+      throw std::runtime_error("CreateHwndRenderTarget failed");
+  }
+
+  // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
+  static D2D1::ColorF toD2DColor(Color c) {
+    return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+  }
+
+  // Draws a filled rectangle in one shot: create brush, fill, release.
+  // Mirrors the old gdiFillRect's create-use-delete pattern 1:1.
+  static void d2dFillRect(ID2D1RenderTarget *rt, float x, float y, float w,
+                          float h, Color c) {
+    ID2D1SolidColorBrush *brush = nullptr;
+    rt->CreateSolidColorBrush(toD2DColor(c), &brush);
+    if (brush) {
+      rt->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brush);
+      brush->Release();
     }
-    memDC_ = CreateCompatibleDC(screenDC);
-    memBitmap_ = CreateCompatibleBitmap(screenDC, std::max(1, width_),
-                                        std::max(1, height_));
-    memBitmapOld_ = static_cast<HBITMAP>(SelectObject(memDC_, memBitmap_));
-    memW_ = width_;
-    memH_ = height_;
   }
 
   // Helper converting a UTF-8 std::string to the UTF-16 wide string Win32's *W
@@ -1312,21 +1329,25 @@ private:
     // for why (this is the actual flicker fix).
     case WM_PAINT: {
       PAINTSTRUCT ps;
-      HDC hdc = BeginPaint(hwnd, &ps);
+      BeginPaint(hwnd, &ps);
       if (self) {
-        self->ensureBackBuffer(hdc);
+        self->ensureRenderTarget();
+        self->renderTarget_->BeginDraw();
         // Plain white background first — WM_ERASEBKGND below tells
         // Windows not to do this for us anymore, so we own it, matching
         // what the Linux/Wayland renderer already does for its content
         // area.
-        RECT full{0, 0, self->width_, self->height_};
-        HBRUSH whiteBrush =
-            reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
-        FillRect(self->memDC_, &full, whiteBrush);
-        self->paintBoxes(self->memDC_);
-        self->paintRoot(self->memDC_);
-        BitBlt(hdc, 0, 0, self->width_, self->height_, self->memDC_, 0, 0,
-              SRCCOPY);
+        self->renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
+        self->paintBoxes(self->renderTarget_);
+        self->paintRoot(self->renderTarget_);
+        HRESULT hr = self->renderTarget_->EndDraw();
+        // D2DERR_RECREATE_TARGET means the underlying device is gone
+        // (driver reset, GPU removal, etc.) — drop the target so the next
+        // WM_PAINT's ensureRenderTarget() rebuilds it from scratch.
+        if (hr == D2DERR_RECREATE_TARGET) {
+          self->renderTarget_->Release();
+          self->renderTarget_ = nullptr;
+        }
       }
       EndPaint(hwnd, &ps);
       return 0;
@@ -1447,6 +1468,10 @@ private:
       if (self) {
         self->width_ = LOWORD(lp);
         self->height_ = HIWORD(lp);
+        if (self->renderTarget_)
+          self->renderTarget_->Resize(
+              D2D1::SizeU(static_cast<UINT32>(self->width_),
+                          static_cast<UINT32>(self->height_)));
         self->relayout();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
@@ -1465,141 +1490,112 @@ private:
     return DefWindowProcW(hwnd, msg, wp, lp);
   }
 
-  // Draws every queued box into the given device context via GDI.
-  void paintBoxes(HDC hdc) {
-    for (const auto &b : boxes_) {
-      RECT r{b.pos_x, b.pos_y, b.pos_x + b.width, b.pos_y + b.height};
-      HBRUSH brush = CreateSolidBrush(RGB(b.color.r, b.color.g, b.color.b));
-      FillRect(hdc, &r, brush);
-      DeleteObject(brush);
-    }
+  // Draws every queued box into the render target.
+  void paintBoxes(ID2D1RenderTarget *rt) {
+    for (const auto &b : boxes_)
+      d2dFillRect(rt, static_cast<float>(b.pos_x), static_cast<float>(b.pos_y),
+                  static_cast<float>(b.width), static_cast<float>(b.height),
+                  b.color);
   }
 
-  // Draws the layout tree (if any) using native GDI RoundRect, which handles
-  // border-radius directly — no manual pixel math needed on this platform.
-  void paintRoot(HDC hdc) {
+  // Draws the layout tree (if any). Border-radius is handled natively by
+  // D2D1_ROUNDED_RECT — no manual pixel math needed on this platform,
+  // same as the old RoundRect approach, just anti-aliased for free.
+  void paintRoot(ID2D1RenderTarget *rt) {
     if (hasRoot_) {
-      paintView(hdc, root_, ClipRect{});
+      paintView(rt, root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
       sortAbsolutes(absolutes);
       for (const auto &e : absolutes)
-        paintView(hdc, *e.view, ClipRect{});
+        paintView(rt, *e.view, ClipRect{});
     }
-  }
-
-  // Fills a GDI RECT with a solid color — small helper so scrollbar
-  // track/thumb painting below doesn't have to repeat the
-  // create-select-fill-restore-delete dance for every rectangle.
-  static void gdiFillRect(HDC hdc, int x, int y, int w, int h, Color c) {
-    RECT r{x, y, x + w, y + h};
-    HBRUSH brush = CreateSolidBrush(RGB(c.r, c.g, c.b));
-    FillRect(hdc, &r, brush);
-    DeleteObject(brush);
   }
 
   // Draws v's vertical/horizontal scrollbar (whichever are currently
-  // showing) using flat GDI fills — classic fixed track+thumb styling,
-  // unclipped by the content clip (a scrollbar always sits fully within
-  // its own view's box, which is itself already visible or this function
-  // wouldn't have been reached).
-  void paintScrollbars(HDC hdc, const View &v) {
+  // showing) using flat fills — same classic fixed track+thumb styling as
+  // before, unclipped by the content clip beyond whatever `clip` already
+  // restricts (a scrollbar always sits fully within its own view's box,
+  // which is itself already visible or this function wouldn't have been
+  // reached).
+  void paintScrollbars(ID2D1RenderTarget *rt, const View &v) {
     if (wantVBar(v)) {
       PixRect t = vTrackRect(v), th = vThumbRect(v);
-      gdiFillRect(hdc, static_cast<int>(t.x), static_cast<int>(t.y),
-                  static_cast<int>(t.w), static_cast<int>(t.h),
-                  {0xE0, 0xE0, 0xE0});
-      gdiFillRect(hdc, static_cast<int>(th.x), static_cast<int>(th.y),
-                  static_cast<int>(th.w), static_cast<int>(th.h),
-                  {0x90, 0x90, 0x90});
+      d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
+      d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
     }
     if (wantHBar(v)) {
       PixRect t = hTrackRect(v), th = hThumbRect(v);
-      gdiFillRect(hdc, static_cast<int>(t.x), static_cast<int>(t.y),
-                  static_cast<int>(t.w), static_cast<int>(t.h),
-                  {0xE0, 0xE0, 0xE0});
-      gdiFillRect(hdc, static_cast<int>(th.x), static_cast<int>(th.y),
-                  static_cast<int>(th.w), static_cast<int>(th.h),
-                  {0x90, 0x90, 0x90});
+      d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
+      d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
     }
     // Corner filler where both bars would otherwise leave a gap/overlap.
     if (wantVBar(v) && wantHBar(v))
-      gdiFillRect(hdc,
-                  static_cast<int>(v.computed.x + v.computed.w -
-                                    kScrollbarThickness),
-                  static_cast<int>(v.computed.y + v.computed.h -
-                                    kScrollbarThickness),
-                  static_cast<int>(kScrollbarThickness),
-                  static_cast<int>(kScrollbarThickness), {0xE0, 0xE0, 0xE0});
+      d2dFillRect(rt, v.computed.x + v.computed.w - kScrollbarThickness,
+                  v.computed.y + v.computed.h - kScrollbarThickness,
+                  kScrollbarThickness, kScrollbarThickness, {0xE0, 0xE0, 0xE0});
   }
 
-  // `clip` is the accumulated visible region from scrollable ancestors —
-  // GDI's own clip region (SelectClipRgn) is intersected with it for the
-  // duration of painting v and its subtree, then restored, so content
-  // scrolled out of a container's viewport is actually cut off rather than
-  // just drawn in the wrong place.
-  void paintView(HDC hdc, const View &v, ClipRect clip) {
+  // `clip` is the accumulated visible region from scrollable ancestors.
+  // Direct2D's clip stack is push/pop rather than GDI's set-and-restore,
+  // but since this function is itself called recursively (one call frame
+  // per View), pushing on entry and popping on exit naturally nests
+  // correctly with the call tree — no need to save/restore a previous
+  // clip handle the way SelectClipRgn did.
+  void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip) {
     const Style &s = v.style;
-    int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
-    int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
+    float x = v.computed.x, y = v.computed.y, w = v.computed.w,
+          h = v.computed.h;
 
-    // Always explicitly (re)select the clip region for `clip` on entry —
-    // never assume the HDC is in any particular clip state, since a
-    // sibling or child's own recursive paintView call may have left it set
-    // to something narrower (or unset). Passing nullptr to SelectClipRgn
-    // is itself well-defined: it clears any existing clip region, so the
-    // unclipped case is just as deterministic as the clipped one.
     bool clipped = clip.x0 != -std::numeric_limits<float>::infinity() ||
-                  clip.y0 != -std::numeric_limits<float>::infinity() ||
-                  clip.x1 != std::numeric_limits<float>::infinity() ||
-                  clip.y1 != std::numeric_limits<float>::infinity();
-    HRGN clipRgn = nullptr;
+                   clip.y0 != -std::numeric_limits<float>::infinity() ||
+                   clip.x1 != std::numeric_limits<float>::infinity() ||
+                   clip.y1 != std::numeric_limits<float>::infinity();
     if (clipped)
-      clipRgn = CreateRectRgn(static_cast<int>(clip.x0),
-                              static_cast<int>(clip.y0),
-                              static_cast<int>(clip.x1),
-                              static_cast<int>(clip.y1));
-    SelectClipRgn(hdc, clipRgn);
+      rt->PushAxisAlignedClip(D2D1::RectF(clip.x0, clip.y0, clip.x1, clip.y1),
+                              D2D1_ANTIALIAS_MODE_ALIASED);
 
-    HBRUSH bg = CreateSolidBrush(
-        RGB(s.backgroundColor.r, s.backgroundColor.g, s.backgroundColor.b));
-    HPEN pen =
-        s.borderWidth > 0
-            ? CreatePen(PS_SOLID, static_cast<int>(s.borderWidth),
-                        RGB(s.borderColor.r, s.borderColor.g, s.borderColor.b))
-            : static_cast<HPEN>(GetStockObject(NULL_PEN));
-    HGDIOBJ oldBrush = SelectObject(hdc, bg);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    int d = static_cast<int>(s.borderRadius) * 2;
-    RoundRect(hdc, x, y, x + w, y + h, d, d);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(bg);
-    if (s.borderWidth > 0)
-      DeleteObject(pen);
+    D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), s.borderRadius,
+                            s.borderRadius};
+    ID2D1SolidColorBrush *bgBrush = nullptr;
+    rt->CreateSolidColorBrush(toD2DColor(s.backgroundColor), &bgBrush);
+    if (bgBrush) {
+      rt->FillRoundedRectangle(rr, bgBrush);
+      bgBrush->Release();
+    }
+    if (s.borderWidth > 0) {
+      // D2D strokes are centered on the path (half in, half out), unlike
+      // the old GDI approach of an outer full-color box plus an inset
+      // background rect — visually equivalent for a uniform border, just
+      // computed differently.
+      ID2D1SolidColorBrush *borderBrush = nullptr;
+      rt->CreateSolidColorBrush(toD2DColor(s.borderColor), &borderBrush);
+      if (borderBrush) {
+        rt->DrawRoundedRectangle(rr, borderBrush, s.borderWidth);
+        borderBrush->Release();
+      }
+    }
 
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
-                                             v.computed.w, v.computed.h)
+                                              v.computed.w, v.computed.h)
                              : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute)
-        paintView(hdc, child, childClip);
+        paintView(rt, child, childClip);
 
-    // Scrollbars are drawn after children, back under v's own (ancestor,
-    // not child-narrowed) clip — the recursive child calls above left the
-    // HDC's clip region set to whatever they last needed, so it has to be
-    // re-selected here rather than assumed. Using `clip` rather than no
-    // clip at all keeps a scrollbar correctly hidden if v itself has
-    // scrolled out of some outer ancestor's viewport. Scrollbars sit in
-    // the gutter layout already reserved outside the children's placement
-    // area, so drawing them after children never overlaps content, and
-    // keeps them on top the way an overlay scrollbar should be.
-    SelectClipRgn(hdc, clipRgn);
+    // Scrollbars are drawn after children, still under v's own (ancestor,
+    // not child-narrowed) clip — we haven't popped it yet, so this is
+    // still exactly `clip`, matching the old GDI re-selection semantics.
+    // Scrollbars sit in the gutter layout already reserved outside the
+    // children's placement area, so drawing them after children never
+    // overlaps content, and keeps them on top the way an overlay
+    // scrollbar should be.
     if (v.scrollsX() || v.scrollsY())
-      paintScrollbars(hdc, v);
-    if (clipRgn)
-      DeleteObject(clipRgn);
+      paintScrollbars(rt, v);
+
+    if (clipped)
+      rt->PopAxisAlignedClip();
   }
 
 #else // Linux / Wayland
@@ -1619,8 +1615,7 @@ private:
                // (movable/resizable/closable) window.
   wl_shm *shm_ =
       nullptr; // The shared-memory global used to allocate pixel buffers.
-  wl_buffer *buffers_[2] = {
-      nullptr, nullptr}; 
+  wl_buffer *buffers_[2] = {nullptr, nullptr};
   wl_seat *seat_ = nullptr; // The seat global, representing one user's set of
                             // input devices (keyboard/mouse/etc.).
 
@@ -1695,18 +1690,16 @@ private:
       nullptr; // Pointer to the whole mmap'd region (both buffers back to
                // back); null until attachBuffer() runs.
   int singleBufSize_ = 0; // Size in bytes of ONE buffer (stride * height).
-  int bufferSize_ = 0;   // Total mapped size: singleBufSize_ * 2.
+  int bufferSize_ = 0;    // Total mapped size: singleBufSize_ * 2.
   bool bufBusy_[2] = {
-      false,
-      false}; // Whether the compositor still owns buffers_[i] (true from
-              // the moment we attach+commit it until its `release` event
-              // fires). redraw() refuses to draw into a busy buffer.
-  int drawBuf_ = 0; // Index of the buffer redraw() will draw into next;
-                    // flips after every successful draw.
-  uint8_t *activeBuf_ =
-      nullptr; // bufferData_ + drawBuf_*singleBufSize_ — set at the top of
-               // every redraw() call; this is what setPixel() actually
-               // writes into.
+      false, false}; // Whether the compositor still owns buffers_[i] (true from
+                     // the moment we attach+commit it until its `release` event
+                     // fires). redraw() refuses to draw into a busy buffer.
+  int drawBuf_ = 0;  // Index of the buffer redraw() will draw into next;
+                     // flips after every successful draw.
+  uint8_t *activeBuf_ = nullptr; // bufferData_ + drawBuf_*singleBufSize_ — set
+                                 // at the top of every redraw() call; this is
+                                 // what setPixel() actually writes into.
   bool redrawPending_ =
       false; // Set when redraw() was asked to draw but skipped because
              // drawBuf_ was still busy; retried automatically the moment
@@ -2108,9 +2101,9 @@ private:
     // that one pool/mmap region.
     wl_shm_pool *pool = wl_shm_create_pool(shm_, bufferFd_, bufferSize_);
     for (int i = 0; i < 2; ++i) {
-      buffers_[i] = wl_shm_pool_create_buffer(
-          pool, i * singleBufSize_, width_, height_, stride,
-          WL_SHM_FORMAT_XBGR8888);
+      buffers_[i] =
+          wl_shm_pool_create_buffer(pool, i * singleBufSize_, width_, height_,
+                                    stride, WL_SHM_FORMAT_XBGR8888);
       bufferSlots_[i] = {this, i};
       wl_buffer_add_listener(buffers_[i], &bufferListener, &bufferSlots_[i]);
       bufBusy_[i] = false;
@@ -2137,7 +2130,7 @@ private:
     setPixel(x, y, r, g, b, ClipRect{});
   }
   void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b,
-               const ClipRect &clip) {
+                const ClipRect &clip) {
     // Skip drawing anything outside the buffer's bounds or outside clip.
     if (x < 0 || y < 0 || x >= width_ || y >= height_)
       return;
@@ -2161,12 +2154,11 @@ private:
   }
   // Fills an axis-aligned rectangle with a solid color by calling setPixel for
   // every point inside it. Same unclipped/clipped overload split as setPixel.
-  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g,
-               uint8_t b) {
+  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
     fillRect(x0, y0, w, h, r, g, b, ClipRect{});
   }
   void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b,
-               const ClipRect &clip) {
+                const ClipRect &clip) {
     // Iterate every row of the rectangle.
     for (int y = y0; y < y0 + h; ++y)
       // Iterate every column of the current row.
@@ -2225,28 +2217,27 @@ private:
     if (wantVBar(v)) {
       PixRect t = vTrackRect(v), th = vThumbRect(v);
       fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
-              static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
-              clip);
+               static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
+               clip);
       fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
-              static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90,
-              0x90, clip);
+               static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90, 0x90,
+               clip);
     }
     if (wantHBar(v)) {
       PixRect t = hTrackRect(v), th = hThumbRect(v);
       fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
-              static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
-              clip);
+               static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
+               clip);
       fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
-              static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90,
-              0x90, clip);
+               static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90, 0x90,
+               clip);
     }
     if (wantVBar(v) && wantHBar(v))
-      fillRect(static_cast<int>(v.computed.x + v.computed.w -
-                                kScrollbarThickness),
-              static_cast<int>(v.computed.y + v.computed.h -
-                                kScrollbarThickness),
-              static_cast<int>(kScrollbarThickness),
-              static_cast<int>(kScrollbarThickness), 0xE0, 0xE0, 0xE0, clip);
+      fillRect(
+          static_cast<int>(v.computed.x + v.computed.w - kScrollbarThickness),
+          static_cast<int>(v.computed.y + v.computed.h - kScrollbarThickness),
+          static_cast<int>(kScrollbarThickness),
+          static_cast<int>(kScrollbarThickness), 0xE0, 0xE0, 0xE0, clip);
   }
 
   // Draws one View (background + border) using its already-computed layout,
@@ -2284,7 +2275,7 @@ private:
     }
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
-                                             v.computed.w, v.computed.h)
+                                              v.computed.w, v.computed.h)
                              : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute)
@@ -2482,7 +2473,8 @@ private:
     // through to the ordinary pending-click press, resolved later in
     // handleRelease().
     if (pointer_y_ >= kTitlebarHeight) {
-      float x = static_cast<float>(pointer_x_), y = static_cast<float>(pointer_y_);
+      float x = static_cast<float>(pointer_x_),
+            y = static_cast<float>(pointer_y_);
       if (!beginScrollPress(x, y))
         beginPress(x, y);
       redraw();
@@ -2579,6 +2571,14 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
   if (!hwnd_) {
     throw std::runtime_error("CreateWindowExW failed");
   }
+
+  // One factory per LiteUI instance is simplest here; a real app with many
+  // windows would normally share a single process-wide factory instead.
+  if (FAILED(
+          D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2dFactory_)))
+    throw std::runtime_error("D2D1CreateFactory failed");
+  ensureRenderTarget();
+
   // Make the window visible using the platform's default show behavior.
   ShowWindow(hwnd_, SW_SHOWDEFAULT);
   // Force an initial paint of the window.
@@ -2644,12 +2644,12 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
 inline LiteUI::~LiteUI() {
 // Windows-specific teardown path.
 #if defined(_WIN32)
-  // Release the off-screen back buffer, if one was ever created.
-  if (memDC_) {
-    SelectObject(memDC_, memBitmapOld_);
-    DeleteObject(memBitmap_);
-    DeleteDC(memDC_);
-  }
+  // Release Direct2D resources — order matters: the render target must
+  // go before the factory that created it.
+  if (renderTarget_)
+    renderTarget_->Release();
+  if (d2dFactory_)
+    d2dFactory_->Release();
   // Destroy the native window if it was successfully created.
   if (hwnd_)
     DestroyWindow(hwnd_);
