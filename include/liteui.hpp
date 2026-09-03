@@ -841,94 +841,6 @@ namespace liteui_layout
 
 } // namespace liteui_layout
 
-// ---- GLES2 rendering ----
-// Two tiny shader programs cover everything this UI draws:
-//  - rectProgram_: an axis-aligned box with an optional rounded-corner
-//    radius, via a signed-distance test in the fragment shader. Used for
-//    all backgrounds/borders/scrollbars (radius 0 == a plain rect).
-//  - flatProgram_: an arbitrary pixel-space quad with a flat color. Used
-//    only for drawLine's thick-line quads (titlebar icons).
-static constexpr const char *kRectVS = R"(
-    precision mediump float;
-    attribute vec2 a_pos;      // unit quad, 0..1
-    uniform vec2 u_rectPos;    // top-left, window pixels
-    uniform vec2 u_rectSize;   // pixels
-    uniform vec2 u_screen;     // window size, pixels
-    varying vec2 v_local;      // pixel offset within the rect
-    void main() {
-      v_local = a_pos * u_rectSize;
-      vec2 px = u_rectPos + a_pos * u_rectSize;
-      gl_Position = vec4(px.x / u_screen.x * 2.0 - 1.0,
-                         1.0 - px.y / u_screen.y * 2.0, 0.0, 1.0);
-    }
-  )";
-static constexpr const char *kRectFS = R"(
-    precision mediump float;
-    varying vec2 v_local;
-    uniform vec2 u_rectSize;
-    uniform float u_radius;
-    uniform vec4 u_color;
-    void main() {
-      vec2 half_ = u_rectSize * 0.5;
-      vec2 d = abs(v_local - half_) - (half_ - u_radius);
-      float dist = length(max(d, 0.0)) - u_radius;
-      float alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
-      gl_FragColor = vec4(u_color.rgb, u_color.a * alpha);
-    }
-  )";
-static constexpr const char *kFlatVS = R"(
-    precision mediump float;
-    attribute vec2 a_pos;   // window pixels, explicit per-vertex
-    uniform vec2 u_screen;
-    void main() {
-      gl_Position = vec4(a_pos.x / u_screen.x * 2.0 - 1.0,
-                         1.0 - a_pos.y / u_screen.y * 2.0, 0.0, 1.0);
-    }
-  )";
-static constexpr const char *kFlatFS = R"(
-    precision mediump float;
-    uniform vec4 u_color;
-    void main() { gl_FragColor = u_color; }
-  )";
-
-static GLuint compileShader(GLenum type, const char *src)
-{
-  GLuint s = glCreateShader(type);
-  glShaderSource(s, 1, &src, nullptr);
-  glCompileShader(s);
-  GLint ok = 0;
-  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-  if (!ok)
-  {
-    char log[512];
-    glGetShaderInfoLog(s, sizeof(log), nullptr, log);
-    fprintf(stderr, "shader compile error: %s\n", log);
-    throw std::runtime_error("GLSL shader compile failed");
-  }
-  return s;
-}
-static GLuint linkProgram(const char *vs, const char *fs)
-{
-  GLuint v = compileShader(GL_VERTEX_SHADER, vs);
-  GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
-  GLuint p = glCreateProgram();
-  glAttachShader(p, v);
-  glAttachShader(p, f);
-  glLinkProgram(p);
-  glDeleteShader(v);
-  glDeleteShader(f);
-  GLint ok = 0;
-  glGetProgramiv(p, GL_LINK_STATUS, &ok);
-  if (!ok)
-  {
-    char log[512];
-    glGetProgramInfoLog(p, sizeof(log), nullptr, log);
-    fprintf(stderr, "program link error: %s\n", log);
-    throw std::runtime_error("GLSL program link failed");
-  }
-  return p;
-}
-
 class LiteUI
 {
 
@@ -1967,6 +1879,94 @@ private:
                           // (the compositor may send 0x0 to mean "you decide").
   bool running_ = true;   // Controls the event loop in run(); set false to
                           // request a clean exit.
+
+  // ---- GLES2 rendering ----
+  // Two tiny shader programs cover everything this UI draws:
+  //  - rectProgram_: an axis-aligned box with an optional rounded-corner
+  //    radius, via a signed-distance test in the fragment shader. Used for
+  //    all backgrounds/borders/scrollbars (radius 0 == a plain rect).
+  //  - flatProgram_: an arbitrary pixel-space quad with a flat color. Used
+  //    only for drawLine's thick-line quads (titlebar icons).
+  static constexpr const char *kRectVS = R"(
+    precision mediump float;
+    attribute vec2 a_pos;      // unit quad, 0..1
+    uniform vec2 u_rectPos;    // top-left, window pixels
+    uniform vec2 u_rectSize;   // pixels
+    uniform vec2 u_screen;     // window size, pixels
+    varying vec2 v_local;      // pixel offset within the rect
+    void main() {
+      v_local = a_pos * u_rectSize;
+      vec2 px = u_rectPos + a_pos * u_rectSize;
+      gl_Position = vec4(px.x / u_screen.x * 2.0 - 1.0,
+                         1.0 - px.y / u_screen.y * 2.0, 0.0, 1.0);
+    }
+  )";
+  static constexpr const char *kRectFS = R"(
+    precision mediump float;
+    varying vec2 v_local;
+    uniform vec2 u_rectSize;
+    uniform float u_radius;
+    uniform vec4 u_color;
+    void main() {
+      vec2 half_ = u_rectSize * 0.5;
+      vec2 d = abs(v_local - half_) - (half_ - u_radius);
+      float dist = length(max(d, 0.0)) - u_radius;
+      float alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
+      gl_FragColor = vec4(u_color.rgb, u_color.a * alpha);
+    }
+  )";
+  static constexpr const char *kFlatVS = R"(
+    precision mediump float;
+    attribute vec2 a_pos;   // window pixels, explicit per-vertex
+    uniform vec2 u_screen;
+    void main() {
+      gl_Position = vec4(a_pos.x / u_screen.x * 2.0 - 1.0,
+                         1.0 - a_pos.y / u_screen.y * 2.0, 0.0, 1.0);
+    }
+  )";
+  static constexpr const char *kFlatFS = R"(
+    precision mediump float;
+    uniform vec4 u_color;
+    void main() { gl_FragColor = u_color; }
+  )";
+
+  static GLuint compileShader(GLenum type, const char *src)
+  {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok)
+    {
+      char log[512];
+      glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+      fprintf(stderr, "shader compile error: %s\n", log);
+      throw std::runtime_error("GLSL shader compile failed");
+    }
+    return s;
+  }
+  static GLuint linkProgram(const char *vs, const char *fs)
+  {
+    GLuint v = compileShader(GL_VERTEX_SHADER, vs);
+    GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glLinkProgram(p);
+    glDeleteShader(v);
+    glDeleteShader(f);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+      char log[512];
+      glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+      fprintf(stderr, "program link error: %s\n", log);
+      throw std::runtime_error("GLSL program link failed");
+    }
+    return p;
+  }
 
   // xdg_wm_base ping handler: the compositor periodically checks we're alive.
   static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial)
