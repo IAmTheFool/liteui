@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,7 +30,7 @@
 #pragma comment(lib, "dwrite")
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
-#include "xdg-shell-client-protocol.h"      // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
+#include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -43,8 +44,7 @@
 #endif
 
 // Plain RGB color, one byte per channel.
-struct Color
-{
+struct Color {
   uint8_t r = 0, g = 0, b = 0;
 };
 
@@ -53,8 +53,7 @@ struct Color
 // APIs require. File-scope (rather than a LiteUI member) because both
 // LiteUI's WndProc path and liteui_text's DirectWrite layout builder need
 // it, and DirectWrite objects aren't tied to any particular window.
-inline std::wstring toWide(const std::string &s)
-{
+inline std::wstring toWide(const std::string &s) {
   int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
   std::wstring w(wlen, L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), wlen);
@@ -64,8 +63,7 @@ inline std::wstring toWide(const std::string &s)
 
 // A static, axis-aligned filled rectangle the caller wants drawn on the
 // window. Position is in window-local pixel coordinates, (0,0) at top-left.
-struct Box
-{
+struct Box {
   int width = 0;
   int height = 0;
   int pos_x = 0;
@@ -87,15 +85,8 @@ constexpr float kScrollbarThickness = 12.0f;
 // to the sum/max of children (like CSS's "auto" on a flex item); Full fills
 // whatever space the parent gives along that axis (like width: 100%, but
 // resolved from available space rather than the parent's own size).
-struct Size
-{
-  enum class Kind
-  {
-    Fixed,
-    Percentage,
-    Fit,
-    Full
-  };
+struct Size {
+  enum class Kind { Fixed, Percentage, Fit, Full };
   Kind kind = Kind::Fit;
   float value = 0; // pixels for Fixed, 0-100 for Percentage; unused otherwise
 
@@ -105,13 +96,8 @@ struct Size
   static Size full() { return {Kind::Full, 0}; }
 };
 
-enum class FlexDirection
-{
-  Row,
-  Column
-};
-enum class Justify
-{
+enum class FlexDirection { Row, Column };
+enum class Justify {
   Start,
   End,
   Center,
@@ -120,28 +106,17 @@ enum class Justify
   SpaceEvenly
 };
 
-enum class Align
-{
-  Start,
-  End,
-  Center,
-  Stretch
-};
+enum class Align { Start, End, Center, Stretch };
 
 // Whether children that overflow the main axis wrap onto additional lines.
-enum class FlexWrap
-{
-  NoWrap,
-  Wrap
-};
+enum class FlexWrap { NoWrap, Wrap };
 
 // How multiple flex lines are distributed along the cross axis. Only
 // meaningful when FlexWrap::Wrap actually produces more than one line;
 // with a single line this reduces to Stretch filling crossAvail (matching
 // the old un-wrapped behavior) or the others packing that one line at the
 // start.
-enum class AlignContent
-{
+enum class AlignContent {
   Start,
   End,
   Center,
@@ -151,17 +126,12 @@ enum class AlignContent
   Stretch
 };
 
-struct EdgeInsets
-{
+struct EdgeInsets {
   float top = 0, right = 0, bottom = 0, left = 0;
   static EdgeInsets all(float v) { return {v, v, v, v}; }
 };
 
-enum class Position
-{
-  Static,
-  Absolute
-};
+enum class Position { Static, Absolute };
 
 // CSS-style overflow behavior for one axis of a container. Visible (the
 // default) behavior: children are never clipped and never
@@ -170,16 +140,9 @@ enum class Position
 // clips *and* always shows that axis's scrollbar, even if content
 // currently fits. Auto clips and shows the scrollbar only when content
 // actually exceeds the viewport on that axis.
-enum class Overflow
-{
-  Visible,
-  Hidden,
-  Scroll,
-  Auto
-};
+enum class Overflow { Visible, Hidden, Scroll, Auto };
 
-struct Style
-{
+struct Style {
   Size width = Size::fit();
   Size height = Size::fit();
 
@@ -210,6 +173,12 @@ struct Style
   Color borderColor{0, 0, 0};
   float borderRadius = 0;
 
+  // Applied instead of backgroundColor while the pointer is over this
+  // view. Set directly by the app; isHovered itself is derived
+  // automatically by LiteUI::updateHover from pointer position, never
+  // app-sourced.
+  std::optional<Color> hoverColor;
+
   // Absolute children are pulled out of flex distribution entirely and
   // placed against the parent's content box using left/top/right/bottom.
   // NaN means "unset" for each edge. If width/height is Fit and both
@@ -235,8 +204,7 @@ struct Style
 };
 
 // ---------------- Text: author-facing, leaf-only ----------------
-enum class FontWeight : int
-{
+enum class FontWeight : int {
   Thin = 100,
   ExtraLight = 200,
   Light = 300,
@@ -247,34 +215,15 @@ enum class FontWeight : int
   ExtraBold = 800,
   Black = 900
 };
-enum class FontStyle
-{
-  Normal,
-  Italic
-};
-enum class TextAlign
-{
-  Start,
-  Center,
-  End,
-  Justify
-};
-enum class TextOverflow
-{
-  Clip,
-  Ellipsis
-};
-enum class TextWrap
-{
-  Wrap,
-  NoWrap
-};
+enum class FontStyle { Normal, Italic };
+enum class TextAlign { Start, Center, End, Justify };
+enum class TextOverflow { Clip, Ellipsis };
+enum class TextWrap { Wrap, NoWrap };
 
 // Internal mirror of Text's styling fields, stored on the View a Text
 // flattens into (see View::toView below). Kept as its own struct so View
 // doesn't have to duplicate every Text field under a different name.
-struct TextStyle
-{
+struct TextStyle {
   float fontSize = 16.0f;
   FontWeight fontWeight = FontWeight::Regular;
   FontStyle fontStyle = FontStyle::Normal;
@@ -292,9 +241,9 @@ struct TextStyle
 
 // Author-facing leaf node. addChild(Text) flattens this into a View (see
 // View::toView) — Text itself never appears in the retained tree.
-struct Text
-{
+struct Text {
   std::string label;
+  std::function<std::string()> source; // optional: polled instead of `label`
   Style
       style; // layout only — width/height/margin/position/etc, reused from View
   float fontSize = 16.0f;
@@ -315,8 +264,7 @@ struct Text
 // A node in the retained layout tree. Set `style` and `children`; the engine
 // fills in `computed` (absolute window pixel coordinates) during layout.
 // Renderers only ever read `computed`, never re-derive it from `style`.
-class View
-{
+class View {
 public:
   Style style;
   std::vector<View> children;
@@ -333,9 +281,36 @@ public:
   // containing ancestor's onClick fires instead.
   std::function<void()> onClick;
 
-  struct Computed
-  {
+  // Polled dynamic state — compared against the stored value in
+  // LiteUI::checkForUpdates() after each dispatched event; only fields
+  // that actually changed get marked dirty. Each is optional; unset
+  // means "static", matching onClick's own empty-means-inert convention.
+  std::function<std::string()> textSource;
+  std::function<bool()> disabledSource;
+  std::function<float()> valueSource;    // 0..1 — drives style.width as a
+                                         // fraction of available width
+                                         // (progress bars)
+  std::function<float()> positionSource; // pixels — drives style.left
+                                         // directly (Position::Absolute
+                                         // slider thumbs)
+  std::function<Color()> backgroundColorSource;
+
+  bool disabled = false;
+  float value = 0.0f;
+
+  struct Computed {
     float x = 0, y = 0, w = 0, h = 0; // border-box, absolute window coords
+
+    // Set by LiteUI::updateHover from pointer position on every move
+    // event; drives style.hoverColor at paint time. Not app-sourced.
+    mutable bool isHovered = false;
+
+    // True whenever this node's own paint output may be stale — flipped
+    // by checkForUpdates()/updateHover() on any actual change, cleared by
+    // whichever paint pass consumes it. Not yet wired into per-node skip
+    // logic (both paintView/renderView still walk unconditionally today);
+    // this is scaffolding for that later.
+    mutable bool dirty = true;
 
     // Only meaningful when style.overflowX/Y != Visible. contentW/contentH
     // is how big this view's children naturally want to be (the scrollable
@@ -357,10 +332,12 @@ public:
 #if defined(_WIN32)
     mutable IDWriteTextLayout *textLayout = nullptr;
     mutable float textLayoutBuiltForWidth = -1.0f;
+    mutable std::string textLayoutBuiltForText;
 #else
     mutable GLuint textTexture = 0;
     mutable int textTexW = 0, textTexH = 0;
     mutable float textTextureBuiltForWidth = -1.0f;
+    mutable std::string textTextureBuiltForText;
 #endif
   } computed;
 
@@ -374,12 +351,10 @@ public:
   // Maximum scrollX/scrollY this view can currently have, given its last
   // computed content size vs its viewport size. 0 when content fits (or
   // the axis doesn't scroll).
-  float maxScrollX() const
-  {
+  float maxScrollX() const {
     return std::max(0.0f, computed.contentW - computed.w);
   }
-  float maxScrollY() const
-  {
+  float maxScrollY() const {
     return std::max(0.0f, computed.contentH - computed.h);
   }
 
@@ -387,17 +362,14 @@ public:
   // recurses into children. Must be called explicitly before a tree is
   // discarded/replaced — see setRoot() and ~LiteUI(), the only two
   // places a live tree is actually retired.
-  void freeTextResources()
-  {
+  void freeTextResources() {
 #if defined(_WIN32)
-    if (computed.textLayout)
-    {
+    if (computed.textLayout) {
       computed.textLayout->Release();
       computed.textLayout = nullptr;
     }
 #else
-    if (computed.textTexture)
-    {
+    if (computed.textTexture) {
       glDeleteTextures(1, &computed.textTexture);
       computed.textTexture = 0;
     }
@@ -410,12 +382,12 @@ private:
   static View toView(Text t);
 };
 
-inline View View::toView(Text t)
-{
+inline View View::toView(Text t) {
   View v;
   v.style = std::move(t.style);
   v.isText = true;
   v.text = std::move(t.label);
+  v.textSource = std::move(t.source);
   v.textStyle.fontSize = t.fontSize;
   v.textStyle.fontWeight = t.fontWeight;
   v.textStyle.fontStyle = t.fontStyle;
@@ -436,216 +408,195 @@ inline View View::toView(Text t)
 // Platform-specific: DirectWrite on Windows, Pango/Cairo on Linux. Only
 // liteui_layout::measureNatural (for sizing) and LiteUI's renderers (for
 // painting) call into this.
-namespace liteui_text
-{
+namespace liteui_text {
 
-  struct Measurement
-  {
-    float width, height;
-  };
+struct Measurement {
+  float width, height;
+};
 
 #if defined(_WIN32)
 
-  // Lazily-created, process-wide DirectWrite factory. DirectWrite objects
-  // aren't tied to any particular HWND/render target, so one factory serves
-  // every LiteUI window in the process.
-  inline IDWriteFactory *factory()
-  {
-    static IDWriteFactory *f = []
-    {
-      IDWriteFactory *p = nullptr;
-      if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                                     __uuidof(IDWriteFactory),
-                                     reinterpret_cast<IUnknown **>(&p))))
-        throw std::runtime_error("DWriteCreateFactory failed");
-      return p;
-    }();
-    return f;
+// Lazily-created, process-wide DirectWrite factory. DirectWrite objects
+// aren't tied to any particular HWND/render target, so one factory serves
+// every LiteUI window in the process.
+inline IDWriteFactory *factory() {
+  static IDWriteFactory *f = [] {
+    IDWriteFactory *p = nullptr;
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                                   __uuidof(IDWriteFactory),
+                                   reinterpret_cast<IUnknown **>(&p))))
+      throw std::runtime_error("DWriteCreateFactory failed");
+    return p;
+  }();
+  return f;
+}
+
+inline DWRITE_FONT_WEIGHT toDWriteWeight(FontWeight w) {
+  return static_cast<DWRITE_FONT_WEIGHT>(static_cast<int>(w));
+}
+inline DWRITE_FONT_STYLE toDWriteStyle(FontStyle s) {
+  return s == FontStyle::Italic ? DWRITE_FONT_STYLE_ITALIC
+                                : DWRITE_FONT_STYLE_NORMAL;
+}
+
+// Builds a ready-to-measure-or-draw layout. `availWidth`/`availHeight`
+// bound wrapping/trimming — pass a huge value for "unbounded" (used when
+// measuring a Fit-width node's intrinsic single-line size). Caller owns
+// the returned pointer.
+inline IDWriteTextLayout *makeLayout(const std::string &text,
+                                     const TextStyle &style, float availWidth,
+                                     float availHeight) {
+  std::wstring wfam =
+      style.fontFamily.empty() ? L"Segoe UI" : toWide(style.fontFamily);
+  IDWriteTextFormat *format = nullptr;
+  factory()->CreateTextFormat(
+      wfam.c_str(), nullptr, toDWriteWeight(style.fontWeight),
+      toDWriteStyle(style.fontStyle), DWRITE_FONT_STRETCH_NORMAL,
+      style.fontSize, L"", &format);
+  if (!format)
+    throw std::runtime_error("CreateTextFormat failed");
+  format->SetWordWrapping(style.wrap == TextWrap::Wrap
+                              ? DWRITE_WORD_WRAPPING_WRAP
+                              : DWRITE_WORD_WRAPPING_NO_WRAP);
+  switch (style.align) {
+  case TextAlign::Center:
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    break;
+  case TextAlign::End:
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    break;
+  case TextAlign::Justify:
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
+    break;
+  default:
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    break;
   }
 
-  inline DWRITE_FONT_WEIGHT toDWriteWeight(FontWeight w)
-  {
-    return static_cast<DWRITE_FONT_WEIGHT>(static_cast<int>(w));
-  }
-  inline DWRITE_FONT_STYLE toDWriteStyle(FontStyle s)
-  {
-    return s == FontStyle::Italic ? DWRITE_FONT_STYLE_ITALIC
-                                  : DWRITE_FONT_STYLE_NORMAL;
-  }
+  std::wstring wtext = toWide(text);
+  IDWriteTextLayout *layout = nullptr;
+  factory()->CreateTextLayout(wtext.c_str(), static_cast<UINT32>(wtext.size()),
+                              format, availWidth, availHeight, &layout);
+  format->Release(); // layout holds what it needs internally
+  if (!layout)
+    throw std::runtime_error("CreateTextLayout failed");
 
-  // Builds a ready-to-measure-or-draw layout. `availWidth`/`availHeight`
-  // bound wrapping/trimming — pass a huge value for "unbounded" (used when
-  // measuring a Fit-width node's intrinsic single-line size). Caller owns
-  // the returned pointer.
-  inline IDWriteTextLayout *makeLayout(const std::string &text,
-                                       const TextStyle &style, float availWidth,
-                                       float availHeight)
-  {
-    std::wstring wfam =
-        style.fontFamily.empty() ? L"Segoe UI" : toWide(style.fontFamily);
-    IDWriteTextFormat *format = nullptr;
-    factory()->CreateTextFormat(
-        wfam.c_str(), nullptr, toDWriteWeight(style.fontWeight),
-        toDWriteStyle(style.fontStyle), DWRITE_FONT_STRETCH_NORMAL,
-        style.fontSize, L"", &format);
-    if (!format)
-      throw std::runtime_error("CreateTextFormat failed");
-    format->SetWordWrapping(style.wrap == TextWrap::Wrap
-                                ? DWRITE_WORD_WRAPPING_WRAP
-                                : DWRITE_WORD_WRAPPING_NO_WRAP);
-    switch (style.align)
-    {
-    case TextAlign::Center:
-      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-      break;
-    case TextAlign::End:
-      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-      break;
-    case TextAlign::Justify:
-      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
-      break;
-    default:
-      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-      break;
+  DWRITE_TEXT_RANGE full{0, static_cast<UINT32>(wtext.size())};
+  if (style.letterSpacing != 0) {
+    // Character spacing is IDWriteTextLayout1 (Windows 8.1+); skip
+    // silently if the interface isn't available rather than failing the
+    // whole layout over a cosmetic feature.
+    IDWriteTextLayout1 *layout1 = nullptr;
+    if (SUCCEEDED(layout->QueryInterface(&layout1)) && layout1) {
+      layout1->SetCharacterSpacing(0, style.letterSpacing, 0, full);
+      layout1->Release();
     }
-
-    std::wstring wtext = toWide(text);
-    IDWriteTextLayout *layout = nullptr;
-    factory()->CreateTextLayout(wtext.c_str(), static_cast<UINT32>(wtext.size()),
-                                format, availWidth, availHeight, &layout);
-    format->Release(); // layout holds what it needs internally
-    if (!layout)
-      throw std::runtime_error("CreateTextLayout failed");
-
-    DWRITE_TEXT_RANGE full{0, static_cast<UINT32>(wtext.size())};
-    if (style.letterSpacing != 0)
-    {
-      // Character spacing is IDWriteTextLayout1 (Windows 8.1+); skip
-      // silently if the interface isn't available rather than failing the
-      // whole layout over a cosmetic feature.
-      IDWriteTextLayout1 *layout1 = nullptr;
-      if (SUCCEEDED(layout->QueryInterface(&layout1)) && layout1)
-      {
-        layout1->SetCharacterSpacing(0, style.letterSpacing, 0, full);
-        layout1->Release();
-      }
-    }
-    if (style.underline)
-      layout->SetUnderline(TRUE, full);
-    if (style.strikethrough)
-      layout->SetStrikethrough(TRUE, full);
-    if (style.overflow == TextOverflow::Ellipsis)
-    {
-      IDWriteInlineObject *ellipsis = nullptr;
-      factory()->CreateEllipsisTrimmingSign(layout, &ellipsis);
-      if (ellipsis)
-      {
-        DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
-        layout->SetTrimming(&trimming, ellipsis);
-        ellipsis->Release();
-      }
-    }
-    if (style.maxLines > 0)
-      layout->SetMaxHeight(availHeight);
-    return layout;
   }
-
-  // Used only by measureNatural — builds a throwaway layout purely to read
-  // metrics back. The renderer's own cached layout (built per-paint, see
-  // LiteUI::ensureTextLayout) is what's actually drawn.
-  inline Measurement measure(const std::string &text, const TextStyle &style,
-                             float availWidth)
-  {
-    float w =
-        availWidth >= 0 ? availWidth : std::numeric_limits<float>::max() / 4;
-    float h = std::numeric_limits<float>::max() / 4;
-    IDWriteTextLayout *layout = makeLayout(text, style, w, h);
-    DWRITE_TEXT_METRICS m;
-    layout->GetMetrics(&m);
-    float outH = m.height;
-    if (style.lineHeight > 0)
-    {
-      UINT32 lineCount = 0;
-      layout->GetLineMetrics(nullptr, 0, &lineCount);
-      outH = lineCount * style.lineHeight;
+  if (style.underline)
+    layout->SetUnderline(TRUE, full);
+  if (style.strikethrough)
+    layout->SetStrikethrough(TRUE, full);
+  if (style.overflow == TextOverflow::Ellipsis) {
+    IDWriteInlineObject *ellipsis = nullptr;
+    factory()->CreateEllipsisTrimmingSign(layout, &ellipsis);
+    if (ellipsis) {
+      DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+      layout->SetTrimming(&trimming, ellipsis);
+      ellipsis->Release();
     }
-    if (style.maxLines > 0 && style.lineHeight > 0)
-      outH = std::min(outH, style.maxLines * style.lineHeight);
-    Measurement result{m.widthIncludingTrailingWhitespace, outH};
-    layout->Release();
-    return result;
   }
+  if (style.maxLines > 0)
+    layout->SetMaxHeight(availHeight);
+  return layout;
+}
+
+// Used only by measureNatural — builds a throwaway layout purely to read
+// metrics back. The renderer's own cached layout (built per-paint, see
+// LiteUI::ensureTextLayout) is what's actually drawn.
+inline Measurement measure(const std::string &text, const TextStyle &style,
+                           float availWidth) {
+  float w =
+      availWidth >= 0 ? availWidth : std::numeric_limits<float>::max() / 4;
+  float h = std::numeric_limits<float>::max() / 4;
+  IDWriteTextLayout *layout = makeLayout(text, style, w, h);
+  DWRITE_TEXT_METRICS m;
+  layout->GetMetrics(&m);
+  float outH = m.height;
+  if (style.lineHeight > 0) {
+    UINT32 lineCount = 0;
+    layout->GetLineMetrics(nullptr, 0, &lineCount);
+    outH = lineCount * style.lineHeight;
+  }
+  if (style.maxLines > 0 && style.lineHeight > 0)
+    outH = std::min(outH, style.maxLines * style.lineHeight);
+  Measurement result{m.widthIncludingTrailingWhitespace, outH};
+  layout->Release();
+  return result;
+}
 
 #else // Linux — Pango/Cairo
 
-  inline PangoFontDescription *makeFontDescription(const TextStyle &style)
-  {
-    PangoFontDescription *desc = pango_font_description_new();
-    pango_font_description_set_family(
-        desc, style.fontFamily.empty() ? "Sans" : style.fontFamily.c_str());
-    pango_font_description_set_weight(
-        desc, static_cast<PangoWeight>(static_cast<int>(style.fontWeight)));
-    pango_font_description_set_style(desc, style.fontStyle == FontStyle::Italic
-                                               ? PANGO_STYLE_ITALIC
-                                               : PANGO_STYLE_NORMAL);
-    // Absolute pixel size sidesteps a DPI round-trip — everything else in
-    // this file (layout, GL) already works in plain screen pixels.
-    pango_font_description_set_absolute_size(desc, style.fontSize * PANGO_SCALE);
-    return desc;
-  }
+inline PangoFontDescription *makeFontDescription(const TextStyle &style) {
+  PangoFontDescription *desc = pango_font_description_new();
+  pango_font_description_set_family(
+      desc, style.fontFamily.empty() ? "Sans" : style.fontFamily.c_str());
+  pango_font_description_set_weight(
+      desc, static_cast<PangoWeight>(static_cast<int>(style.fontWeight)));
+  pango_font_description_set_style(desc, style.fontStyle == FontStyle::Italic
+                                             ? PANGO_STYLE_ITALIC
+                                             : PANGO_STYLE_NORMAL);
+  // Absolute pixel size sidesteps a DPI round-trip — everything else in
+  // this file (layout, GL) already works in plain screen pixels.
+  pango_font_description_set_absolute_size(desc, style.fontSize * PANGO_SCALE);
+  return desc;
+}
 
-  // One shared throwaway cairo context used only to create PangoLayouts for
-  // measurement — Pango requires *a* context to build a layout on, even one
-  // that's never painted to.
-  inline cairo_t *measureCr()
-  {
-    static cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-    static cairo_t *cr = cairo_create(surf);
-    return cr;
-  }
+// One shared throwaway cairo context used only to create PangoLayouts for
+// measurement — Pango requires *a* context to build a layout on, even one
+// that's never painted to.
+inline cairo_t *measureCr() {
+  static cairo_surface_t *surf =
+      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+  static cairo_t *cr = cairo_create(surf);
+  return cr;
+}
 
-  inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
-                                 float availWidth, cairo_t *cr)
-  {
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    pango_layout_set_text(layout, text.c_str(), -1);
-    PangoFontDescription *desc = makeFontDescription(style);
-    pango_layout_set_font_description(layout, desc);
-    pango_font_description_free(desc);
-    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-    pango_layout_set_width(layout,
-                           (style.wrap == TextWrap::Wrap && availWidth >= 0)
-                               ? static_cast<int>(availWidth * PANGO_SCALE)
-                               : -1);
-    if (style.maxLines > 0)
-    {
-      pango_layout_set_height(
-          layout, -style.maxLines); // Pango idiom: negative = max line count
-      pango_layout_set_ellipsize(layout, style.overflow == TextOverflow::Ellipsis
-                                             ? PANGO_ELLIPSIZE_END
-                                             : PANGO_ELLIPSIZE_NONE);
-    }
-    else if (style.overflow == TextOverflow::Ellipsis)
-    {
-      pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
-    }
-    switch (style.align)
-    {
-    case TextAlign::Center:
-      pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
-      break;
-    case TextAlign::End:
-      pango_layout_set_alignment(layout, PANGO_ALIGN_RIGHT);
-      break;
-    case TextAlign::Justify:
-      pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
-      pango_layout_set_justify(layout, TRUE);
-      break;
-    default:
-      pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
-      break;
-    }
+inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
+                               float availWidth, cairo_t *cr) {
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_text(layout, text.c_str(), -1);
+  PangoFontDescription *desc = makeFontDescription(style);
+  pango_layout_set_font_description(layout, desc);
+  pango_font_description_free(desc);
+  pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+  pango_layout_set_width(layout,
+                         (style.wrap == TextWrap::Wrap && availWidth >= 0)
+                             ? static_cast<int>(availWidth * PANGO_SCALE)
+                             : -1);
+  if (style.maxLines > 0) {
+    pango_layout_set_height(
+        layout, -style.maxLines); // Pango idiom: negative = max line count
+    pango_layout_set_ellipsize(layout, style.overflow == TextOverflow::Ellipsis
+                                           ? PANGO_ELLIPSIZE_END
+                                           : PANGO_ELLIPSIZE_NONE);
+  } else if (style.overflow == TextOverflow::Ellipsis) {
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+  }
+  switch (style.align) {
+  case TextAlign::Center:
+    pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+    break;
+  case TextAlign::End:
+    pango_layout_set_alignment(layout, PANGO_ALIGN_RIGHT);
+    break;
+  case TextAlign::Justify:
+    pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
+    pango_layout_set_justify(layout, TRUE);
+    break;
+  default:
+    pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
+    break;
+  }
   // Underline/strikethrough/letter-spacing are all plain PangoAttrList
   // entries — collected into one list and applied once.
   if (style.letterSpacing != 0 || style.underline || style.strikethrough) {
@@ -662,31 +613,29 @@ namespace liteui_text
     pango_layout_set_attributes(layout, attrs);
     pango_attr_list_unref(attrs);
   }
-    if (style.lineHeight > 0)
-    {
-      PangoContext *ctx = pango_layout_get_context(layout);
-      PangoFontMetrics *metrics = pango_context_get_metrics(
-          ctx, pango_layout_get_font_description(layout), nullptr);
-      double natural =
-          pango_font_metrics_get_height(metrics) / (double)PANGO_SCALE;
-      pango_font_metrics_unref(metrics);
-      if (natural > 0)
-        pango_layout_set_line_spacing(
-            layout, static_cast<float>(style.lineHeight / natural));
-    }
-    return layout;
+  if (style.lineHeight > 0) {
+    PangoContext *ctx = pango_layout_get_context(layout);
+    PangoFontMetrics *metrics = pango_context_get_metrics(
+        ctx, pango_layout_get_font_description(layout), nullptr);
+    double natural =
+        pango_font_metrics_get_height(metrics) / (double)PANGO_SCALE;
+    pango_font_metrics_unref(metrics);
+    if (natural > 0)
+      pango_layout_set_line_spacing(
+          layout, static_cast<float>(style.lineHeight / natural));
   }
+  return layout;
+}
 
-  inline Measurement measure(const std::string &text, const TextStyle &style,
-                             float availWidth)
-  {
-    PangoLayout *layout = makeLayout(text, style, availWidth, measureCr());
-    int w, h;
-    pango_layout_get_pixel_size(layout, &w, &h);
-    Measurement result{static_cast<float>(w), static_cast<float>(h)};
-    g_object_unref(layout);
-    return result;
-  }
+inline Measurement measure(const std::string &text, const TextStyle &style,
+                           float availWidth) {
+  PangoLayout *layout = makeLayout(text, style, availWidth, measureCr());
+  int w, h;
+  pango_layout_get_pixel_size(layout, &w, &h);
+  Measurement result{static_cast<float>(w), static_cast<float>(h)};
+  g_object_unref(layout);
+  return result;
+}
 
 #endif
 } // namespace liteui_text
@@ -710,609 +659,566 @@ namespace liteui_text
 // assumes a single line, since a Fit main axis has no definite width to
 // wrap against in the first place; give the container a definite/Full main
 // size if you want Fit-height wrapping content to actually wrap.
-namespace liteui_layout
-{
+namespace liteui_layout {
 
-  struct Natural
-  {
-    float w, h;
-  };
+struct Natural {
+  float w, h;
+};
 
-  inline float resolveAxis(const Size &s, float available, bool definite,
-                           float fitValue)
-  {
-    switch (s.kind)
-    {
-    case Size::Kind::Fixed:
-      return s.value;
-    case Size::Kind::Percentage:
-      return definite ? available * s.value / 100.0f : fitValue;
-    case Size::Kind::Full:
-      return definite ? available : fitValue;
-    case Size::Kind::Fit:
-      return fitValue;
-    }
+inline float resolveAxis(const Size &s, float available, bool definite,
+                         float fitValue) {
+  switch (s.kind) {
+  case Size::Kind::Fixed:
+    return s.value;
+  case Size::Kind::Percentage:
+    return definite ? available * s.value / 100.0f : fitValue;
+  case Size::Kind::Full:
+    return definite ? available : fitValue;
+  case Size::Kind::Fit:
     return fitValue;
   }
+  return fitValue;
+}
 
-  // Clamps a resolved axis size into [minV, maxV], guarding against a
-  // misconfigured maxV < minV by falling back to minV.
-  inline float clampSize(float v, float minV, float maxV)
-  {
-    return std::clamp(v, minV, std::max(minV, maxV));
-  }
+// Clamps a resolved axis size into [minV, maxV], guarding against a
+// misconfigured maxV < minV by falling back to minV.
+inline float clampSize(float v, float minV, float maxV) {
+  return std::clamp(v, minV, std::max(minV, maxV));
+}
 
-  // Whether a given axis's scrollbar should actually be drawn/interactive:
-  // Scroll always shows it, Auto shows it only once content overflows the
-  // viewport (the "+ 0.5" is just slack against float rounding so a
-  // perfectly-fitting container doesn't flicker a bar on and off), and
-  // Hidden/Visible never do. Used by both placeNode (to decide whether to
-  // reserve gutter space for it) and every renderer/hit-tester (to decide
-  // whether to draw/click it) — kept as one function so those two places
-  // can never disagree about whether a bar is showing.
-  inline bool axisScrollbarVisible(Overflow ov, float content, float viewport)
-  {
-    if (ov == Overflow::Scroll)
-      return true;
-    if (ov == Overflow::Auto)
-      return content > viewport + 0.5f;
-    return false; // Visible, Hidden
-  }
+// Whether a given axis's scrollbar should actually be drawn/interactive:
+// Scroll always shows it, Auto shows it only once content overflows the
+// viewport (the "+ 0.5" is just slack against float rounding so a
+// perfectly-fitting container doesn't flicker a bar on and off), and
+// Hidden/Visible never do. Used by both placeNode (to decide whether to
+// reserve gutter space for it) and every renderer/hit-tester (to decide
+// whether to draw/click it) — kept as one function so those two places
+// can never disagree about whether a bar is showing.
+inline bool axisScrollbarVisible(Overflow ov, float content, float viewport) {
+  if (ov == Overflow::Scroll)
+    return true;
+  if (ov == Overflow::Auto)
+    return content > viewport + 0.5f;
+  return false; // Visible, Hidden
+}
 
-  // Takes node by non-const reference (unlike the rest of this "measure"
-  // pass, which is conceptually read-only) for exactly one reason: a scroll
-  // container's natural content size — the scrollable extent — needs to be
-  // recorded somewhere for later use by placeNode() (to offset/clip
-  // children), by the scrollbar-thumb sizing code, and by input handling
-  // (to know how far a drag/wheel event is allowed to move the scroll
-  // offset). node.computed.contentW/contentH is that somewhere. Everything
-  // else this function does is still the same bottom-up size query it always
-  // was.
-  inline Natural measureNatural(View &node, float availW, float availH,
-                                bool wDefinite, bool hDefinite)
-  {
-    if (node.isText)
-    {
-      // Text is always a leaf. Fixed/Percentage/Full on width still make
-      // sense here (e.g. width:100% + wrap), so resolve those first;
-      // only a Fit width falls back to the text's own intrinsic size.
-      // Wrapping needs a concrete width to wrap against — a Fit-width (or
-      // indefinite Percentage) node has none yet, so it measures as a
-      // single unwrapped line, same as an ordinary Fit box sizing to its
-      // content. See the file-level note on this function's known
-      // limitations: the *final* width used for painting can differ from
-      // this basis-pass guess when Align::Stretch determines cross size;
-      // painting always re-measures against the true final width, so only
-      // the parent's flex allocation (not the rendered wrap) can be off.
-      const EdgeInsets &pad = node.style.padding;
-      bool widthIsFit = node.style.width.kind == Size::Kind::Fit;
-      bool widthIndefinitePercentage =
-          node.style.width.kind == Size::Kind::Percentage && !wDefinite;
-      float outerW =
-          clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
-                    node.style.minWidth, node.style.maxWidth);
-      float measureWidth = (widthIsFit || widthIndefinitePercentage)
-                               ? -1.0f
-                               : std::max(0.0f, outerW - pad.left - pad.right);
-      liteui_text::Measurement m =
-          liteui_text::measure(node.text, node.textStyle, measureWidth);
-      float w = (widthIsFit || widthIndefinitePercentage)
-                    ? clampSize(m.width + pad.left + pad.right,
-                                node.style.minWidth, node.style.maxWidth)
-                    : outerW;
-      float naturalH = m.height + pad.top + pad.bottom;
-      float h = clampSize(
-          node.style.height.kind == Size::Kind::Fit
-              ? naturalH
-              : resolveAxis(node.style.height, availH, hDefinite, naturalH),
-          node.style.minHeight, node.style.maxHeight);
-      return {w, h};
-    }
-    bool horizontal = node.style.direction == FlexDirection::Row;
+// Takes node by non-const reference (unlike the rest of this "measure"
+// pass, which is conceptually read-only) for exactly one reason: a scroll
+// container's natural content size — the scrollable extent — needs to be
+// recorded somewhere for later use by placeNode() (to offset/clip
+// children), by the scrollbar-thumb sizing code, and by input handling
+// (to know how far a drag/wheel event is allowed to move the scroll
+// offset). node.computed.contentW/contentH is that somewhere. Everything
+// else this function does is still the same bottom-up size query it always
+// was.
+inline Natural measureNatural(View &node, float availW, float availH,
+                              bool wDefinite, bool hDefinite) {
+  if (node.isText) {
+    // Text is always a leaf. Fixed/Percentage/Full on width still make
+    // sense here (e.g. width:100% + wrap), so resolve those first;
+    // only a Fit width falls back to the text's own intrinsic size.
+    // Wrapping needs a concrete width to wrap against — a Fit-width (or
+    // indefinite Percentage) node has none yet, so it measures as a
+    // single unwrapped line, same as an ordinary Fit box sizing to its
+    // content. See the file-level note on this function's known
+    // limitations: the *final* width used for painting can differ from
+    // this basis-pass guess when Align::Stretch determines cross size;
+    // painting always re-measures against the true final width, so only
+    // the parent's flex allocation (not the rendered wrap) can be off.
     const EdgeInsets &pad = node.style.padding;
-    bool needW = node.style.width.kind == Size::Kind::Fit;
-    bool needH = node.style.height.kind == Size::Kind::Fit;
-    bool scrollX = node.scrollsX();
-    bool scrollY = node.scrollsY();
-
-    float w = clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
-                        node.style.minWidth, node.style.maxWidth);
-    float h = clampSize(resolveAxis(node.style.height, availH, hDefinite, 0),
-                        node.style.minHeight, node.style.maxHeight);
-    // A scroll container must still visit its children even when neither
-    // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
-    // point: we need to know how big the content *wants* to be so we know
-    // how far it can scroll, even though the container's own box size
-    // doesn't depend on that at all.
-    if ((!needW && !needH && !scrollX && !scrollY) || node.children.empty())
-      return {w, h};
-
-    // Along an axis this node scrolls, children are measured against
-    // effectively unbounded space so they report their true desired size
-    // instead of being squeezed into the viewport — that natural total is
-    // exactly the "scrollable extent". Along a non-scrolling axis, sizing is
-    // unchanged from before (children measured against the resolved inner
-    // box, or against availW/availH while this node's own size is still
-    // being figured out).
-    constexpr float kUnbounded = std::numeric_limits<float>::max() / 4;
-    float innerW = scrollX ? kUnbounded
-                   : (wDefinite && !needW)
-                       ? std::max(0.0f, w - pad.left - pad.right)
-                       : availW;
-    float innerH = scrollY ? kUnbounded
-                   : (hDefinite && !needH)
-                       ? std::max(0.0f, h - pad.top - pad.bottom)
-                       : availH;
-
-    float mainTotal = 0, crossMax = 0;
-    bool firstFlow = true;
-    for (size_t i = 0; i < node.children.size(); ++i)
-    {
-      View &c = node.children[i];
-      if (c.style.position == Position::Absolute)
-        continue; // out of flow: doesn't affect the parent's Fit size at all
-      Natural cn = measureNatural(c, innerW, innerH,
-                                  scrollX ? false : (wDefinite || !needW),
-                                  scrollY ? false : (hDefinite || !needH));
-      float mm = c.style.margin.left + c.style.margin.right;
-      float mv = c.style.margin.top + c.style.margin.bottom;
-      float childMain = horizontal ? cn.w + mm : cn.h + mv;
-      float childCross = horizontal ? cn.h + mv : cn.w + mm;
-      if (!firstFlow)
-        mainTotal += node.style.gap;
-      mainTotal += childMain;
-      crossMax = std::max(crossMax, childCross);
-      firstFlow = false;
-    }
-    if (needW)
-      w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
-                    node.style.minWidth, node.style.maxWidth);
-
-    if (needH)
-      h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
-                    node.style.minHeight, node.style.maxHeight);
-
-    // Content extent is deliberately NOT run through clampSize/min-max: a
-    // container's max-width doesn't shrink its *content*, only its own box
-    // (that's the entire reason overflow is a thing).
-    if (scrollX)
-      node.computed.contentW =
-          (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
-    if (scrollY)
-      node.computed.contentH =
-          (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
+    bool widthIsFit = node.style.width.kind == Size::Kind::Fit;
+    bool widthIndefinitePercentage =
+        node.style.width.kind == Size::Kind::Percentage && !wDefinite;
+    float outerW =
+        clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
+                  node.style.minWidth, node.style.maxWidth);
+    float measureWidth = (widthIsFit || widthIndefinitePercentage)
+                             ? -1.0f
+                             : std::max(0.0f, outerW - pad.left - pad.right);
+    liteui_text::Measurement m =
+        liteui_text::measure(node.text, node.textStyle, measureWidth);
+    float w = (widthIsFit || widthIndefinitePercentage)
+                  ? clampSize(m.width + pad.left + pad.right,
+                              node.style.minWidth, node.style.maxWidth)
+                  : outerW;
+    float naturalH = m.height + pad.top + pad.bottom;
+    float h = clampSize(
+        node.style.height.kind == Size::Kind::Fit
+            ? naturalH
+            : resolveAxis(node.style.height, availH, hDefinite, naturalH),
+        node.style.minHeight, node.style.maxHeight);
     return {w, h};
   }
+  bool horizontal = node.style.direction == FlexDirection::Row;
+  const EdgeInsets &pad = node.style.padding;
+  bool needW = node.style.width.kind == Size::Kind::Fit;
+  bool needH = node.style.height.kind == Size::Kind::Fit;
+  bool scrollX = node.scrollsX();
+  bool scrollY = node.scrollsY();
 
-  inline void placeNode(View &node, float x, float y, float w, float h)
-  {
-    // contentW/contentH here already existed as "content's natural size" on
-    // node.computed before this call, set by the measureNatural() pass that
-    // ran over this same node earlier (either from the parent's per-child
-    // loop, or from layoutRoot() for the root). We're about to overwrite
-    // x/y/w/h with the final viewport box; contentW/contentH and
-    // scrollX/scrollY are left untouched by this assignment.
-    node.computed.x = x;
-    node.computed.y = y;
-    node.computed.w = w;
-    node.computed.h = h;
-    if (node.children.empty())
-    {
-      // No children means nothing to scroll regardless of overflow setting;
-      // pin the offset at 0 so a container that briefly had children (and
-      // therefore a scroll offset) doesn't leave a stale one behind if it's
-      // ever emptied out.
-      node.computed.scrollX = node.computed.scrollY = 0;
-      return;
+  float w = clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
+                      node.style.minWidth, node.style.maxWidth);
+  float h = clampSize(resolveAxis(node.style.height, availH, hDefinite, 0),
+                      node.style.minHeight, node.style.maxHeight);
+  // A scroll container must still visit its children even when neither
+  // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
+  // point: we need to know how big the content *wants* to be so we know
+  // how far it can scroll, even though the container's own box size
+  // doesn't depend on that at all.
+  if ((!needW && !needH && !scrollX && !scrollY) || node.children.empty())
+    return {w, h};
+
+  // Along an axis this node scrolls, children are measured against
+  // effectively unbounded space so they report their true desired size
+  // instead of being squeezed into the viewport — that natural total is
+  // exactly the "scrollable extent". Along a non-scrolling axis, sizing is
+  // unchanged from before (children measured against the resolved inner
+  // box, or against availW/availH while this node's own size is still
+  // being figured out).
+  constexpr float kUnbounded = std::numeric_limits<float>::max() / 4;
+  float innerW = scrollX ? kUnbounded
+                 : (wDefinite && !needW)
+                     ? std::max(0.0f, w - pad.left - pad.right)
+                     : availW;
+  float innerH = scrollY ? kUnbounded
+                 : (hDefinite && !needH)
+                     ? std::max(0.0f, h - pad.top - pad.bottom)
+                     : availH;
+
+  float mainTotal = 0, crossMax = 0;
+  bool firstFlow = true;
+  for (size_t i = 0; i < node.children.size(); ++i) {
+    View &c = node.children[i];
+    if (c.style.position == Position::Absolute)
+      continue; // out of flow: doesn't affect the parent's Fit size at all
+    Natural cn = measureNatural(c, innerW, innerH,
+                                scrollX ? false : (wDefinite || !needW),
+                                scrollY ? false : (hDefinite || !needH));
+    float mm = c.style.margin.left + c.style.margin.right;
+    float mv = c.style.margin.top + c.style.margin.bottom;
+    float childMain = horizontal ? cn.w + mm : cn.h + mv;
+    float childCross = horizontal ? cn.h + mv : cn.w + mm;
+    if (!firstFlow)
+      mainTotal += node.style.gap;
+    mainTotal += childMain;
+    crossMax = std::max(crossMax, childCross);
+    firstFlow = false;
+  }
+  if (needW)
+    w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
+                  node.style.minWidth, node.style.maxWidth);
+
+  if (needH)
+    h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
+                  node.style.minHeight, node.style.maxHeight);
+
+  // Content extent is deliberately NOT run through clampSize/min-max: a
+  // container's max-width doesn't shrink its *content*, only its own box
+  // (that's the entire reason overflow is a thing).
+  if (scrollX)
+    node.computed.contentW =
+        (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
+  if (scrollY)
+    node.computed.contentH =
+        (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
+  return {w, h};
+}
+
+inline void placeNode(View &node, float x, float y, float w, float h) {
+  // contentW/contentH here already existed as "content's natural size" on
+  // node.computed before this call, set by the measureNatural() pass that
+  // ran over this same node earlier (either from the parent's per-child
+  // loop, or from layoutRoot() for the root). We're about to overwrite
+  // x/y/w/h with the final viewport box; contentW/contentH and
+  // scrollX/scrollY are left untouched by this assignment.
+  node.computed.x = x;
+  node.computed.y = y;
+  node.computed.w = w;
+  node.computed.h = h;
+  if (node.children.empty()) {
+    // No children means nothing to scroll regardless of overflow setting;
+    // pin the offset at 0 so a container that briefly had children (and
+    // therefore a scroll offset) doesn't leave a stale one behind if it's
+    // ever emptied out.
+    node.computed.scrollX = node.computed.scrollY = 0;
+    return;
+  }
+
+  bool horizontal = node.style.direction == FlexDirection::Row;
+  const EdgeInsets &pad = node.style.padding;
+  float contentW = std::max(0.0f, w - pad.left - pad.right);
+  float contentH = std::max(0.0f, h - pad.top - pad.bottom);
+
+  // ---- Scrolling: gutter reservation, offset clamping, content origin ----
+  // Whether each axis's scrollbar is actually showing determines whether it
+  // eats into the space available for children — same rule CSS uses (a
+  // visible scrollbar shrinks the content box on the OTHER axis; the
+  // scrolling axis itself is unbounded so its own bar doesn't need to
+  // "make room" against itself).
+  bool showVBar =
+      node.scrollsY() &&
+      axisScrollbarVisible(node.style.overflowY, node.computed.contentH, h);
+  bool showHBar =
+      node.scrollsX() &&
+      axisScrollbarVisible(node.style.overflowX, node.computed.contentW, w);
+  if (showVBar)
+    contentW = std::max(0.0f, contentW - kScrollbarThickness);
+  if (showHBar)
+    contentH = std::max(0.0f, contentH - kScrollbarThickness);
+
+  // Scroll offsets are user/input-driven state that can go stale the
+  // instant content size or viewport size changes (a window resize, or
+  // content shrinking), so every relayout re-clamps them into range rather
+  // than trusting whatever a previous frame left behind.
+  if (node.scrollsX())
+    node.computed.scrollX =
+        std::clamp(node.computed.scrollX, 0.0f, node.maxScrollX());
+  else
+    node.computed.scrollX = 0;
+  if (node.scrollsY())
+    node.computed.scrollY =
+        std::clamp(node.computed.scrollY, 0.0f, node.maxScrollY());
+  else
+    node.computed.scrollY = 0;
+
+  // The content origin simply shifts by the (clamped) scroll offset —
+  // children are positioned exactly as they would be at scroll (0,0), then
+  // this single subtraction slides the whole subtree. Clipping (handled by
+  // the renderers/hit-testers, not here) is what actually hides the part
+  // that scrolls out of view.
+  float contentX = x + pad.left - node.computed.scrollX;
+  float contentY = y + pad.top - node.computed.scrollY;
+
+  float mainAvail = horizontal ? contentW : contentH;
+  float crossAvail = horizontal ? contentH : contentW;
+  // A scrolling main axis must never let flexShrink squeeze children below
+  // their natural size just because the viewport is smaller than the
+  // content — that's the entire point of scrolling instead of shrinking.
+  // Widening mainAvail to at least the natural content total makes
+  // "leftover" in the flex-resolution pass below >= 0, which keeps every
+  // shrink factor's candidate at-or-above its unclamped basis.
+  if (horizontal && node.scrollsX())
+    mainAvail =
+        std::max(mainAvail, node.computed.contentW - pad.left - pad.right);
+  if (!horizontal && node.scrollsY())
+    mainAvail =
+        std::max(mainAvail, node.computed.contentH - pad.top - pad.bottom);
+
+  size_t n = node.children.size();
+  bool wrap = node.style.flexWrap == FlexWrap::Wrap;
+  std::vector<size_t> flowIdx;
+  flowIdx.reserve(node.children.size());
+  for (size_t i = 0; i < node.children.size(); ++i)
+    if (node.children[i].style.position != Position::Absolute)
+      flowIdx.push_back(i);
+  n = flowIdx.size();
+  std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
+      mCrossE(n), minMain(n), maxMain(n), marginMain(n);
+
+  for (size_t k = 0; k < n; ++k) {
+    View &c = node.children[flowIdx[k]];
+    Natural cn = measureNatural(c, contentW, contentH, true, true);
+    basis[k] = horizontal ? cn.w : cn.h;
+    cross[k] = horizontal ? cn.h : cn.w;
+    mMainS[k] = horizontal ? c.style.margin.left : c.style.margin.top;
+    mMainE[k] = horizontal ? c.style.margin.right : c.style.margin.bottom;
+    mCrossS[k] = horizontal ? c.style.margin.top : c.style.margin.left;
+    mCrossE[k] = horizontal ? c.style.margin.bottom : c.style.margin.right;
+    minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
+    maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
+    marginMain[k] = mMainS[k] + mMainE[k];
+  }
+
+  // ---- Line breaking ----
+  // With wrap disabled this is always one line spanning every child (the
+  // original single-line behavior, byte-for-byte). With wrap enabled,
+  // children are greedily packed onto a line until the next child's basis
+  // would overflow mainAvail, at which point a new line starts. A line
+  // always takes at least one child, even an oversized one, so a single
+  // giant child can't stall the packer.
+  struct Line {
+    size_t begin, end; // half-open [begin, end) into node.children
+  };
+  std::vector<Line> lines;
+  if (!wrap) {
+    lines.push_back({0, n});
+  } else {
+    size_t start = 0;
+    float used = 0;
+    for (size_t i = 0; i < n; ++i) {
+      float itemMain = basis[i] + marginMain[i];
+      float withGap = (i > start) ? node.style.gap : 0.0f;
+      if (i > start && used + withGap + itemMain > mainAvail) {
+        lines.push_back({start, i});
+        start = i;
+        used = itemMain;
+      } else {
+        used += withGap + itemMain;
+      }
     }
+    lines.push_back({start, n});
+  }
 
-    bool horizontal = node.style.direction == FlexDirection::Row;
-    const EdgeInsets &pad = node.style.padding;
-    float contentW = std::max(0.0f, w - pad.left - pad.right);
-    float contentH = std::max(0.0f, h - pad.top - pad.bottom);
+  // ---- Per-line main-axis flex resolution ----
+  // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
+  // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
+  // algorithm, scoped to one line's children at a time. A single pass
+  // (basis + share of leftover, then clamp) would silently drop whatever a
+  // clamped child couldn't absorb; instead, any item whose share would
+  // violate its own bound gets frozen at that bound and removed from the
+  // pool, and the remaining free space is recalculated and redistributed
+  // among the still-flexible siblings. Repeats until nothing new freezes
+  // (at most one extra item freezes per pass, so ln+1 passes always
+  // suffices). Also tracks each line's cross size (max child cross extent)
+  // for the cross-axis distribution pass below.
+  std::vector<float> finalMain(n);
+  std::vector<float> lineCross(lines.size());
+  for (size_t li = 0; li < lines.size(); ++li) {
+    size_t lb = lines[li].begin, le = lines[li].end;
+    size_t ln = le - lb;
+    std::vector<bool> frozen(ln, false);
+    std::vector<float> lineFinal(ln);
+    float gapTotal = ln > 1 ? node.style.gap * (ln - 1) : 0.0f;
 
-    // ---- Scrolling: gutter reservation, offset clamping, content origin ----
-    // Whether each axis's scrollbar is actually showing determines whether it
-    // eats into the space available for children — same rule CSS uses (a
-    // visible scrollbar shrinks the content box on the OTHER axis; the
-    // scrolling axis itself is unbounded so its own bar doesn't need to
-    // "make room" against itself).
-    bool showVBar =
-        node.scrollsY() &&
-        axisScrollbarVisible(node.style.overflowY, node.computed.contentH, h);
-    bool showHBar =
-        node.scrollsX() &&
-        axisScrollbarVisible(node.style.overflowX, node.computed.contentW, w);
-    if (showVBar)
-      contentW = std::max(0.0f, contentW - kScrollbarThickness);
-    if (showHBar)
-      contentH = std::max(0.0f, contentH - kScrollbarThickness);
-
-    // Scroll offsets are user/input-driven state that can go stale the
-    // instant content size or viewport size changes (a window resize, or
-    // content shrinking), so every relayout re-clamps them into range rather
-    // than trusting whatever a previous frame left behind.
-    if (node.scrollsX())
-      node.computed.scrollX =
-          std::clamp(node.computed.scrollX, 0.0f, node.maxScrollX());
-    else
-      node.computed.scrollX = 0;
-    if (node.scrollsY())
-      node.computed.scrollY =
-          std::clamp(node.computed.scrollY, 0.0f, node.maxScrollY());
-    else
-      node.computed.scrollY = 0;
-
-    // The content origin simply shifts by the (clamped) scroll offset —
-    // children are positioned exactly as they would be at scroll (0,0), then
-    // this single subtraction slides the whole subtree. Clipping (handled by
-    // the renderers/hit-testers, not here) is what actually hides the part
-    // that scrolls out of view.
-    float contentX = x + pad.left - node.computed.scrollX;
-    float contentY = y + pad.top - node.computed.scrollY;
-
-    float mainAvail = horizontal ? contentW : contentH;
-    float crossAvail = horizontal ? contentH : contentW;
-    // A scrolling main axis must never let flexShrink squeeze children below
-    // their natural size just because the viewport is smaller than the
-    // content — that's the entire point of scrolling instead of shrinking.
-    // Widening mainAvail to at least the natural content total makes
-    // "leftover" in the flex-resolution pass below >= 0, which keeps every
-    // shrink factor's candidate at-or-above its unclamped basis.
-    if (horizontal && node.scrollsX())
-      mainAvail =
-          std::max(mainAvail, node.computed.contentW - pad.left - pad.right);
-    if (!horizontal && node.scrollsY())
-      mainAvail =
-          std::max(mainAvail, node.computed.contentH - pad.top - pad.bottom);
-
-    size_t n = node.children.size();
-    bool wrap = node.style.flexWrap == FlexWrap::Wrap;
-    std::vector<size_t> flowIdx;
-    flowIdx.reserve(node.children.size());
-    for (size_t i = 0; i < node.children.size(); ++i)
-      if (node.children[i].style.position != Position::Absolute)
-        flowIdx.push_back(i);
-    n = flowIdx.size();
-    std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
-        mCrossE(n), minMain(n), maxMain(n), marginMain(n);
-
-    for (size_t k = 0; k < n; ++k)
-    {
-      View &c = node.children[flowIdx[k]];
-      Natural cn = measureNatural(c, contentW, contentH, true, true);
-      basis[k] = horizontal ? cn.w : cn.h;
-      cross[k] = horizontal ? cn.h : cn.w;
-      mMainS[k] = horizontal ? c.style.margin.left : c.style.margin.top;
-      mMainE[k] = horizontal ? c.style.margin.right : c.style.margin.bottom;
-      mCrossS[k] = horizontal ? c.style.margin.top : c.style.margin.left;
-      mCrossE[k] = horizontal ? c.style.margin.bottom : c.style.margin.right;
-      minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
-      maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
-      marginMain[k] = mMainS[k] + mMainE[k];
-    }
-
-    // ---- Line breaking ----
-    // With wrap disabled this is always one line spanning every child (the
-    // original single-line behavior, byte-for-byte). With wrap enabled,
-    // children are greedily packed onto a line until the next child's basis
-    // would overflow mainAvail, at which point a new line starts. A line
-    // always takes at least one child, even an oversized one, so a single
-    // giant child can't stall the packer.
-    struct Line
-    {
-      size_t begin, end; // half-open [begin, end) into node.children
-    };
-    std::vector<Line> lines;
-    if (!wrap)
-    {
-      lines.push_back({0, n});
-    }
-    else
-    {
-      size_t start = 0;
-      float used = 0;
-      for (size_t i = 0; i < n; ++i)
-      {
-        float itemMain = basis[i] + marginMain[i];
-        float withGap = (i > start) ? node.style.gap : 0.0f;
-        if (i > start && used + withGap + itemMain > mainAvail)
-        {
-          lines.push_back({start, i});
-          start = i;
-          used = itemMain;
-        }
-        else
-        {
-          used += withGap + itemMain;
+    for (size_t pass = 0; pass <= ln; ++pass) {
+      float used = gapTotal, gsum = 0, ssum = 0;
+      for (size_t k = 0; k < ln; ++k) {
+        size_t i = lb + k;
+        used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
+        if (!frozen[k]) {
+          gsum += node.children[flowIdx[i]].style.flexGrow;
+          ssum += node.children[flowIdx[i]].style.flexShrink;
         }
       }
-      lines.push_back({start, n});
-    }
-
-    // ---- Per-line main-axis flex resolution ----
-    // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
-    // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
-    // algorithm, scoped to one line's children at a time. A single pass
-    // (basis + share of leftover, then clamp) would silently drop whatever a
-    // clamped child couldn't absorb; instead, any item whose share would
-    // violate its own bound gets frozen at that bound and removed from the
-    // pool, and the remaining free space is recalculated and redistributed
-    // among the still-flexible siblings. Repeats until nothing new freezes
-    // (at most one extra item freezes per pass, so ln+1 passes always
-    // suffices). Also tracks each line's cross size (max child cross extent)
-    // for the cross-axis distribution pass below.
-    std::vector<float> finalMain(n);
-    std::vector<float> lineCross(lines.size());
-    for (size_t li = 0; li < lines.size(); ++li)
-    {
-      size_t lb = lines[li].begin, le = lines[li].end;
-      size_t ln = le - lb;
-      std::vector<bool> frozen(ln, false);
-      std::vector<float> lineFinal(ln);
-      float gapTotal = ln > 1 ? node.style.gap * (ln - 1) : 0.0f;
-
-      for (size_t pass = 0; pass <= ln; ++pass)
-      {
-        float used = gapTotal, gsum = 0, ssum = 0;
+      float leftover = mainAvail - used;
+      if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
+          (leftover < 0 && ssum <= 0)) {
         for (size_t k = 0; k < ln; ++k)
-        {
-          size_t i = lb + k;
-          used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
           if (!frozen[k])
-          {
-            gsum += node.children[flowIdx[i]].style.flexGrow;
-            ssum += node.children[flowIdx[i]].style.flexShrink;
-          }
-        }
-        float leftover = mainAvail - used;
-        if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
-            (leftover < 0 && ssum <= 0))
-        {
-          for (size_t k = 0; k < ln; ++k)
-            if (!frozen[k])
-              lineFinal[k] =
-                  clampSize(basis[lb + k], minMain[lb + k], maxMain[lb + k]);
-          break;
-        }
-        bool frozeAny = false;
-        for (size_t k = 0; k < ln; ++k)
-        {
-          if (frozen[k])
-            continue;
-          size_t i = lb + k;
-          const Style &cs = node.children[flowIdx[i]].style;
-          float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
-                                     : leftover * (cs.flexShrink / ssum);
-          float candidate = std::max(0.0f, basis[i] + extra);
-          float clamped = clampSize(candidate, minMain[i], maxMain[i]);
-          lineFinal[k] = clamped;
-          if (clamped != candidate)
-          {
-            frozen[k] = true;
-            frozeAny = true;
-          }
-        }
-        if (!frozeAny)
-          break; // this pass's candidates all satisfied their bounds — done
+            lineFinal[k] =
+                clampSize(basis[lb + k], minMain[lb + k], maxMain[lb + k]);
+        break;
       }
-
-      float maxCross = 0;
-      for (size_t k = 0; k < ln; ++k)
-      {
+      bool frozeAny = false;
+      for (size_t k = 0; k < ln; ++k) {
+        if (frozen[k])
+          continue;
         size_t i = lb + k;
-        finalMain[i] = lineFinal[k];
-        maxCross = std::max(maxCross, cross[i] + mCrossS[i] + mCrossE[i]);
+        const Style &cs = node.children[flowIdx[i]].style;
+        float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
+                                   : leftover * (cs.flexShrink / ssum);
+        float candidate = std::max(0.0f, basis[i] + extra);
+        float clamped = clampSize(candidate, minMain[i], maxMain[i]);
+        lineFinal[k] = clamped;
+        if (clamped != candidate) {
+          frozen[k] = true;
+          frozeAny = true;
+        }
       }
-      lineCross[li] = maxCross;
+      if (!frozeAny)
+        break; // this pass's candidates all satisfied their bounds — done
     }
 
-    // ---- Distribute lines along the cross axis (align-content) ----
-    // With exactly one line this collapses to the old behavior: Stretch
-    // grows that line to fill crossAvail (matching the previous unconditional
-    // stretch-to-container-cross-size), everything else just packs the one
-    // line at the start.
-    size_t numLines = lines.size();
-    float lineGapTotal = numLines > 1 ? node.style.gap * (numLines - 1) : 0.0f;
-    float linesTotal = lineGapTotal;
-    for (float lc : lineCross)
-      linesTotal += lc;
-    float crossFree = std::max(0.0f, crossAvail - linesTotal);
+    float maxCross = 0;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      finalMain[i] = lineFinal[k];
+      maxCross = std::max(maxCross, cross[i] + mCrossS[i] + mCrossE[i]);
+    }
+    lineCross[li] = maxCross;
+  }
 
-    std::vector<float> lineOffset(numLines), lineSize(numLines);
-    float crossStart = 0, crossBetween = node.style.gap;
-    switch (node.style.alignContent)
-    {
-    case AlignContent::Start:
-      lineSize = lineCross;
-      break;
-    case AlignContent::End:
-      crossStart = crossFree;
-      lineSize = lineCross;
-      break;
-    case AlignContent::Center:
-      crossStart = crossFree / 2;
-      lineSize = lineCross;
-      break;
-    case AlignContent::SpaceBetween:
-      if (numLines > 1)
-        crossBetween += crossFree / (numLines - 1);
-      lineSize = lineCross;
-      break;
-    case AlignContent::SpaceAround:
-    {
-      float each = numLines ? crossFree / numLines : 0;
-      crossStart = each / 2;
-      crossBetween += each;
-      lineSize = lineCross;
-      break;
-    }
-    case AlignContent::SpaceEvenly:
-    {
-      float each = crossFree / (numLines + 1);
-      crossStart = each;
-      crossBetween += each;
-      lineSize = lineCross;
-      break;
-    }
-    case AlignContent::Stretch:
-    {
-      float extra = numLines ? crossFree / numLines : 0;
-      for (size_t li = 0; li < numLines; ++li)
-        lineSize[li] = lineCross[li] + extra;
-      break;
-    }
-    }
-    {
-      float pos = crossStart;
-      for (size_t li = 0; li < numLines; ++li)
-      {
-        lineOffset[li] = pos;
-        pos += lineSize[li] + crossBetween;
-      }
-    }
+  // ---- Distribute lines along the cross axis (align-content) ----
+  // With exactly one line this collapses to the old behavior: Stretch
+  // grows that line to fill crossAvail (matching the previous unconditional
+  // stretch-to-container-cross-size), everything else just packs the one
+  // line at the start.
+  size_t numLines = lines.size();
+  float lineGapTotal = numLines > 1 ? node.style.gap * (numLines - 1) : 0.0f;
+  float linesTotal = lineGapTotal;
+  for (float lc : lineCross)
+    linesTotal += lc;
+  float crossFree = std::max(0.0f, crossAvail - linesTotal);
 
-    // ---- Per-line: justify main axis, align children within the line's
-    // cross extent, then recurse ----
+  std::vector<float> lineOffset(numLines), lineSize(numLines);
+  float crossStart = 0, crossBetween = node.style.gap;
+  switch (node.style.alignContent) {
+  case AlignContent::Start:
+    lineSize = lineCross;
+    break;
+  case AlignContent::End:
+    crossStart = crossFree;
+    lineSize = lineCross;
+    break;
+  case AlignContent::Center:
+    crossStart = crossFree / 2;
+    lineSize = lineCross;
+    break;
+  case AlignContent::SpaceBetween:
+    if (numLines > 1)
+      crossBetween += crossFree / (numLines - 1);
+    lineSize = lineCross;
+    break;
+  case AlignContent::SpaceAround: {
+    float each = numLines ? crossFree / numLines : 0;
+    crossStart = each / 2;
+    crossBetween += each;
+    lineSize = lineCross;
+    break;
+  }
+  case AlignContent::SpaceEvenly: {
+    float each = crossFree / (numLines + 1);
+    crossStart = each;
+    crossBetween += each;
+    lineSize = lineCross;
+    break;
+  }
+  case AlignContent::Stretch: {
+    float extra = numLines ? crossFree / numLines : 0;
     for (size_t li = 0; li < numLines; ++li)
-    {
-      size_t lb = lines[li].begin, le = lines[li].end;
-      size_t ln = le - lb;
-      float lineCrossAvail = lineSize[li];
-      float lineCrossPos = (horizontal ? contentY : contentX) + lineOffset[li];
-
-      float totalUsed = 0;
-      for (size_t k = 0; k < ln; ++k)
-      {
-        size_t i = lb + k;
-        totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
-        if (k + 1 < ln)
-          totalUsed += node.style.gap;
-      }
-      float freeSpace = std::max(0.0f, mainAvail - totalUsed);
-      float startOffset = 0, between = node.style.gap;
-      switch (node.style.justifyContent)
-      {
-      case Justify::Start:
-        break;
-      case Justify::End:
-        startOffset = freeSpace;
-        break;
-      case Justify::Center:
-        startOffset = freeSpace / 2;
-        break;
-      case Justify::SpaceBetween:
-        if (ln > 1)
-          between += freeSpace / (ln - 1);
-        break;
-      case Justify::SpaceAround:
-      {
-        float each = ln ? freeSpace / ln : 0;
-        startOffset = each / 2;
-        between += each;
-        break;
-      }
-      case Justify::SpaceEvenly:
-      {
-        float each = freeSpace / (ln + 1);
-        startOffset = each;
-        between += each;
-        break;
-      }
-      }
-
-      float cursor = (horizontal ? contentX : contentY) + startOffset;
-      for (size_t k = 0; k < ln; ++k)
-      {
-        size_t i = lb + k;
-        View &ch = node.children[flowIdx[i]];
-        cursor += mMainS[i];
-
-        bool explicitCross = horizontal ? ch.style.height.kind != Size::Kind::Fit
-                                        : ch.style.width.kind != Size::Kind::Fit;
-        float finalCross = cross[i];
-        if (node.style.alignItems == Align::Stretch && !explicitCross)
-          finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
-
-        float minCross = horizontal ? ch.style.minHeight : ch.style.minWidth;
-        float maxCross = horizontal ? ch.style.maxHeight : ch.style.maxWidth;
-        finalCross = clampSize(finalCross, minCross, maxCross);
-
-        float crossOffset;
-        switch (node.style.alignItems)
-        {
-        case Align::End:
-          crossOffset = lineCrossAvail - finalCross - mCrossE[i];
-          break;
-        case Align::Center:
-          crossOffset = (lineCrossAvail - finalCross) / 2;
-          break;
-        default:
-          crossOffset = mCrossS[i];
-          break; // Start & Stretch
-        }
-
-        float cx = horizontal ? cursor : lineCrossPos + crossOffset;
-        float cy = horizontal ? lineCrossPos + crossOffset : cursor;
-        float cw = horizontal ? finalMain[i] : finalCross;
-        float chh = horizontal ? finalCross : finalMain[i];
-
-        placeNode(ch, cx, cy, cw, chh);
-        cursor += finalMain[i] + mMainE[i] + between;
-      }
-    }
-
-    // ---- Position::Absolute children ----
-    // Placed against this node's content box, entirely independent of the
-    // flex distribution above. Sizing reuses measureNatural: Fixed/
-    // Percentage/Full resolve normally against contentW/contentH (always
-    // definite here, since this node's own box is already finalized);
-    // Fit falls back to natural content size unless both opposing edges
-    // are set, in which case size is derived from them (CSS's "left+right
-    // implies width" rule).
-    for (auto &ch : node.children)
-    {
-      if (ch.style.position != Position::Absolute)
-        continue;
-      const Style &cs = ch.style;
-      bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
-      bool hasT = !std::isnan(cs.top), hasB = !std::isnan(cs.bottom);
-
-      Natural probe = measureNatural(ch, contentW, contentH, true, true);
-      float aw = (cs.width.kind == Size::Kind::Fit && hasL && hasR)
-                     ? contentW - cs.left - cs.right
-                     : probe.w;
-      float ah = (cs.height.kind == Size::Kind::Fit && hasT && hasB)
-                     ? contentH - cs.top - cs.bottom
-                     : probe.h;
-      aw = clampSize(aw, cs.minWidth, cs.maxWidth);
-      ah = clampSize(ah, cs.minHeight, cs.maxHeight);
-
-      float ax = hasL   ? contentX + cs.left + cs.margin.left
-                 : hasR ? contentX + contentW - cs.right - cs.margin.right - aw
-                        : contentX + cs.margin.left;
-      float ay = hasT   ? contentY + cs.top + cs.margin.top
-                 : hasB ? contentY + contentH - cs.bottom - cs.margin.bottom - ah
-                        : contentY + cs.margin.top;
-
-      placeNode(ch, ax, ay, aw, ah);
+      lineSize[li] = lineCross[li] + extra;
+    break;
+  }
+  }
+  {
+    float pos = crossStart;
+    for (size_t li = 0; li < numLines; ++li) {
+      lineOffset[li] = pos;
+      pos += lineSize[li] + crossBetween;
     }
   }
+
+  // ---- Per-line: justify main axis, align children within the line's
+  // cross extent, then recurse ----
+  for (size_t li = 0; li < numLines; ++li) {
+    size_t lb = lines[li].begin, le = lines[li].end;
+    size_t ln = le - lb;
+    float lineCrossAvail = lineSize[li];
+    float lineCrossPos = (horizontal ? contentY : contentX) + lineOffset[li];
+
+    float totalUsed = 0;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
+      if (k + 1 < ln)
+        totalUsed += node.style.gap;
+    }
+    float freeSpace = std::max(0.0f, mainAvail - totalUsed);
+    float startOffset = 0, between = node.style.gap;
+    switch (node.style.justifyContent) {
+    case Justify::Start:
+      break;
+    case Justify::End:
+      startOffset = freeSpace;
+      break;
+    case Justify::Center:
+      startOffset = freeSpace / 2;
+      break;
+    case Justify::SpaceBetween:
+      if (ln > 1)
+        between += freeSpace / (ln - 1);
+      break;
+    case Justify::SpaceAround: {
+      float each = ln ? freeSpace / ln : 0;
+      startOffset = each / 2;
+      between += each;
+      break;
+    }
+    case Justify::SpaceEvenly: {
+      float each = freeSpace / (ln + 1);
+      startOffset = each;
+      between += each;
+      break;
+    }
+    }
+
+    float cursor = (horizontal ? contentX : contentY) + startOffset;
+    for (size_t k = 0; k < ln; ++k) {
+      size_t i = lb + k;
+      View &ch = node.children[flowIdx[i]];
+      cursor += mMainS[i];
+
+      bool explicitCross = horizontal ? ch.style.height.kind != Size::Kind::Fit
+                                      : ch.style.width.kind != Size::Kind::Fit;
+      float finalCross = cross[i];
+      if (node.style.alignItems == Align::Stretch && !explicitCross)
+        finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
+
+      float minCross = horizontal ? ch.style.minHeight : ch.style.minWidth;
+      float maxCross = horizontal ? ch.style.maxHeight : ch.style.maxWidth;
+      finalCross = clampSize(finalCross, minCross, maxCross);
+
+      float crossOffset;
+      switch (node.style.alignItems) {
+      case Align::End:
+        crossOffset = lineCrossAvail - finalCross - mCrossE[i];
+        break;
+      case Align::Center:
+        crossOffset = (lineCrossAvail - finalCross) / 2;
+        break;
+      default:
+        crossOffset = mCrossS[i];
+        break; // Start & Stretch
+      }
+
+      float cx = horizontal ? cursor : lineCrossPos + crossOffset;
+      float cy = horizontal ? lineCrossPos + crossOffset : cursor;
+      float cw = horizontal ? finalMain[i] : finalCross;
+      float chh = horizontal ? finalCross : finalMain[i];
+
+      placeNode(ch, cx, cy, cw, chh);
+      cursor += finalMain[i] + mMainE[i] + between;
+    }
+  }
+
+  // ---- Position::Absolute children ----
+  // Placed against this node's content box, entirely independent of the
+  // flex distribution above. Sizing reuses measureNatural: Fixed/
+  // Percentage/Full resolve normally against contentW/contentH (always
+  // definite here, since this node's own box is already finalized);
+  // Fit falls back to natural content size unless both opposing edges
+  // are set, in which case size is derived from them (CSS's "left+right
+  // implies width" rule).
+  for (auto &ch : node.children) {
+    if (ch.style.position != Position::Absolute)
+      continue;
+    const Style &cs = ch.style;
+    bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
+    bool hasT = !std::isnan(cs.top), hasB = !std::isnan(cs.bottom);
+
+    Natural probe = measureNatural(ch, contentW, contentH, true, true);
+    float aw = (cs.width.kind == Size::Kind::Fit && hasL && hasR)
+                   ? contentW - cs.left - cs.right
+                   : probe.w;
+    float ah = (cs.height.kind == Size::Kind::Fit && hasT && hasB)
+                   ? contentH - cs.top - cs.bottom
+                   : probe.h;
+    aw = clampSize(aw, cs.minWidth, cs.maxWidth);
+    ah = clampSize(ah, cs.minHeight, cs.maxHeight);
+
+    float ax = hasL   ? contentX + cs.left + cs.margin.left
+               : hasR ? contentX + contentW - cs.right - cs.margin.right - aw
+                      : contentX + cs.margin.left;
+    float ay = hasT   ? contentY + cs.top + cs.margin.top
+               : hasB ? contentY + contentH - cs.bottom - cs.margin.bottom - ah
+                      : contentY + cs.margin.top;
+
+    placeNode(ch, ax, ay, aw, ah);
+  }
+}
 
 // originX/originY let a caller reserve space above/left of the root — used
 // on Linux to keep content out of the custom titlebar strip; Windows (no
 // custom titlebar) always passes the defaults of (0, 0).
 inline void layoutRoot(View &root, float windowW, float windowH,
-                       float originX = 0, float originY = 0)
-  {
-    Natural n = measureNatural(root, windowW, windowH, true, true);
-    placeNode(root, originX, originY, n.w, n.h);
-  }
+                       float originX = 0, float originY = 0) {
+  Natural n = measureNatural(root, windowW, windowH, true, true);
+  placeNode(root, originX, originY, n.w, n.h);
+}
 
 } // namespace liteui_layout
 
-class LiteUI
-{
+class LiteUI {
 
 public:
   // Constructor: explicit prevents accidental implicit conversions from a bare
@@ -1352,8 +1258,7 @@ private:
   bool hasRoot_ = false;
 
   // Re-runs the layout algorithm over root_ against the current window size.
-  void relayout()
-  {
+  void relayout() {
     if (!hasRoot_)
       return;
 #if defined(_WIN32)
@@ -1382,20 +1287,17 @@ private:
   // hit-testing can both tell "is this point/pixel actually visible, or
   // has it scrolled behind a clipping ancestor". Defaults to "the whole
   // plane" so the root of any walk starts unclipped.
-  struct ClipRect
-  {
+  struct ClipRect {
     float x0 = -std::numeric_limits<float>::infinity();
     float y0 = -std::numeric_limits<float>::infinity();
     float x1 = std::numeric_limits<float>::infinity();
     float y1 = std::numeric_limits<float>::infinity();
-    bool contains(float px, float py) const
-    {
+    bool contains(float px, float py) const {
       return px >= x0 && px < x1 && py >= y0 && py < y1;
     }
     // Narrows this clip to also be inside the given box — used every time
     // we descend into a scroll container's children.
-    ClipRect intersect(float bx, float by, float bw, float bh) const
-    {
+    ClipRect intersect(float bx, float by, float bw, float bh) const {
       return {std::max(x0, bx), std::max(y0, by), std::min(x1, bx + bw),
               std::min(y1, by + bh)};
     }
@@ -1404,8 +1306,7 @@ private:
   // Plain float rectangle for scrollbar geometry (track/thumb), kept
   // separate from Wayland's integer-pixel `Rect` below since scrollbar math
   // wants to stay in the same float space as View::Computed.
-  struct PixRect
-  {
+  struct PixRect {
     float x, y, w, h;
   };
 
@@ -1413,14 +1314,12 @@ private:
   // thin wrappers around axisScrollbarVisible() using v's own already-
   // computed sizes, so callers don't have to repeat the h vs. contentH /
   // w vs. contentW pairing correctly every time.
-  static bool wantVBar(const View &v)
-  {
+  static bool wantVBar(const View &v) {
     return v.scrollsY() &&
            liteui_layout::axisScrollbarVisible(
                v.style.overflowY, v.computed.contentH, v.computed.h);
   }
-  static bool wantHBar(const View &v)
-  {
+  static bool wantHBar(const View &v) {
     return v.scrollsX() &&
            liteui_layout::axisScrollbarVisible(
                v.style.overflowX, v.computed.contentW, v.computed.w);
@@ -1429,14 +1328,12 @@ private:
   // Track rectangles run the full length of their edge, minus the corner
   // square where both bars would otherwise overlap (only relevant when
   // both axes scroll at once).
-  static PixRect vTrackRect(const View &v)
-  {
+  static PixRect vTrackRect(const View &v) {
     float h = v.computed.h - (wantHBar(v) ? kScrollbarThickness : 0.0f);
     return {v.computed.x + v.computed.w - kScrollbarThickness, v.computed.y,
             kScrollbarThickness, std::max(0.0f, h)};
   }
-  static PixRect hTrackRect(const View &v)
-  {
+  static PixRect hTrackRect(const View &v) {
     float w = v.computed.w - (wantVBar(v) ? kScrollbarThickness : 0.0f);
     return {v.computed.x, v.computed.y + v.computed.h - kScrollbarThickness,
             std::max(0.0f, w), kScrollbarThickness};
@@ -1449,8 +1346,7 @@ private:
   // Thumb length is proportional to viewport/content (how much of the
   // content is visible at once); thumb position is proportional to how far
   // through the scrollable range the current offset is.
-  static PixRect vThumbRect(const View &v)
-  {
+  static PixRect vThumbRect(const View &v) {
     PixRect track = vTrackRect(v);
     float thumbH =
         v.computed.contentH > 0
@@ -1463,8 +1359,7 @@ private:
                     : 0.0f;
     return {track.x, track.y + pos, track.w, thumbH};
   }
-  static PixRect hThumbRect(const View &v)
-  {
+  static PixRect hThumbRect(const View &v) {
     PixRect track = hTrackRect(v);
     float thumbW =
         v.computed.contentW > 0
@@ -1477,8 +1372,7 @@ private:
                     : 0.0f;
     return {track.x + pos, track.y, thumbW, track.h};
   }
-  static bool pixRectContains(const PixRect &r, float px, float py)
-  {
+  static bool pixRectContains(const PixRect &r, float px, float py) {
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
   }
 
@@ -1489,17 +1383,8 @@ private:
   // Content means "this is inside some scrollable view's content area
   // (not its scrollbar)" — used both to start a possible pan-to-scroll
   // drag and, for wheel events, as the view to scroll.
-  enum class ScrollHit
-  {
-    None,
-    VThumb,
-    HThumb,
-    VTrack,
-    HTrack,
-    Content
-  };
-  struct ScrollPress
-  {
+  enum class ScrollHit { None, VThumb, HThumb, VTrack, HTrack, Content };
+  struct ScrollPress {
     ScrollHit kind = ScrollHit::None;
     View *view = nullptr;
     float trackFrac = 0; // 0..1 position along the track, for VTrack/HTrack
@@ -1517,15 +1402,12 @@ private:
   // acceptable for v1, matching this file's existing absolute-positioning
   // trade-offs.
   static ScrollPress resolveScrollTarget(View &v, float x, float y,
-                                         ClipRect clip)
-  {
+                                         ClipRect clip) {
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return {};
-    if (wantVBar(v))
-    {
+    if (wantVBar(v)) {
       PixRect track = vTrackRect(v);
-      if (pixRectContains(track, x, y))
-      {
+      if (pixRectContains(track, x, y)) {
         PixRect thumb = vThumbRect(v);
         if (pixRectContains(thumb, x, y))
           return {ScrollHit::VThumb, &v, 0};
@@ -1533,11 +1415,9 @@ private:
         return {ScrollHit::VTrack, &v, frac};
       }
     }
-    if (wantHBar(v))
-    {
+    if (wantHBar(v)) {
       PixRect track = hTrackRect(v);
-      if (pixRectContains(track, x, y))
-      {
+      if (pixRectContains(track, x, y)) {
         PixRect thumb = hThumbRect(v);
         if (pixRectContains(thumb, x, y))
           return {ScrollHit::HThumb, &v, 0};
@@ -1549,8 +1429,7 @@ private:
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
-    {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute)
         continue;
       ScrollPress r = resolveScrollTarget(*it, x, y, childClip);
@@ -1565,15 +1444,8 @@ private:
   // How a click-and-drag inside scrollable content is currently being
   // interpreted. Mirrors pressedView_'s press/release pairing, but for
   // scroll interactions instead of onClick.
-  enum class DragMode
-  {
-    None,
-    VThumb,
-    HThumb,
-    ContentPan
-  };
-  struct ScrollDrag
-  {
+  enum class DragMode { None, VThumb, HThumb, ContentPan };
+  struct ScrollDrag {
     DragMode mode = DragMode::None;
     View *target = nullptr;
     float startPointerX = 0, startPointerY = 0;
@@ -1597,25 +1469,22 @@ private:
   // which case a ContentPan drag is armed here but the ordinary click path
   // still runs too, since a small movement should behave as a click, not a
   // pan (see updateScrollDrag/endScrollPress).
-  bool beginScrollPress(float x, float y)
-  {
+  bool beginScrollPress(float x, float y) {
     if (!hasRoot_)
       return false;
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
-    switch (r.kind)
-    {
+    switch (r.kind) {
     case ScrollHit::VThumb:
       scrollDrag_ = {
-          DragMode::VThumb, r.view, x, y, r.view->computed.scrollX,
+          DragMode::VThumb,         r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
       return true;
     case ScrollHit::HThumb:
       scrollDrag_ = {
-          DragMode::HThumb, r.view, x, y, r.view->computed.scrollX,
+          DragMode::HThumb,         r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
       return true;
-    case ScrollHit::VTrack:
-    {
+    case ScrollHit::VTrack: {
       PixRect track = vTrackRect(*r.view), thumb = vThumbRect(*r.view);
       float target = r.trackFrac * track.h - thumb.h / 2;
       float maxScroll = r.view->maxScrollY();
@@ -1625,8 +1494,7 @@ private:
       relayout();
       return true;
     }
-    case ScrollHit::HTrack:
-    {
+    case ScrollHit::HTrack: {
       PixRect track = hTrackRect(*r.view), thumb = hThumbRect(*r.view);
       float target = r.trackFrac * track.w - thumb.w / 2;
       float maxScroll = r.view->maxScrollX();
@@ -1638,7 +1506,7 @@ private:
     }
     case ScrollHit::Content:
       scrollDrag_ = {
-          DragMode::ContentPan, r.view, x, y, r.view->computed.scrollX,
+          DragMode::ContentPan,     r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, false};
       return false; // ordinary click press still proceeds too
     case ScrollHit::None:
@@ -1650,20 +1518,17 @@ private:
   // Call on every pointer-motion event while a button is held. Advances an
   // in-progress scrollbar drag or content pan; a no-op if scrollDrag_ isn't
   // active. Returns true if it changed anything (caller should repaint).
-  bool updateScrollDrag(float x, float y)
-  {
+  bool updateScrollDrag(float x, float y) {
     if (scrollDrag_.mode == DragMode::None)
       return false;
     View &v = *scrollDrag_.target;
     float dx = x - scrollDrag_.startPointerX;
     float dy = y - scrollDrag_.startPointerY;
-    if (scrollDrag_.mode == DragMode::ContentPan)
-    {
+    if (scrollDrag_.mode == DragMode::ContentPan) {
       if (!scrollDrag_.moved && std::abs(dx) < kDragThreshold &&
           std::abs(dy) < kDragThreshold)
         return false; // still within click tolerance — not a pan yet
-      if (!scrollDrag_.moved)
-      {
+      if (!scrollDrag_.moved) {
         scrollDrag_.moved = true;
         // It just became a drag, not a click — cancel any pending onClick
         // so the eventual release doesn't also fire it.
@@ -1675,17 +1540,13 @@ private:
       if (v.scrollsY())
         v.computed.scrollY =
             std::clamp(scrollDrag_.startScrollY - dy, 0.0f, v.maxScrollY());
-    }
-    else if (scrollDrag_.mode == DragMode::VThumb)
-    {
+    } else if (scrollDrag_.mode == DragMode::VThumb) {
       PixRect track = vTrackRect(v), thumb = vThumbRect(v);
       float range = track.h - thumb.h;
       float delta = range > 0 ? (dy / range) * v.maxScrollY() : 0.0f;
       v.computed.scrollY =
           std::clamp(scrollDrag_.startScrollY + delta, 0.0f, v.maxScrollY());
-    }
-    else if (scrollDrag_.mode == DragMode::HThumb)
-    {
+    } else if (scrollDrag_.mode == DragMode::HThumb) {
       PixRect track = hTrackRect(v), thumb = hThumbRect(v);
       float range = track.w - thumb.w;
       float delta = range > 0 ? (dx / range) * v.maxScrollX() : 0.0f;
@@ -1702,11 +1563,13 @@ private:
   // scrollbar grab, or a pan that moved) just ends quietly. Always clears
   // scrollDrag_ so a stale target can't leak into some unrelated later
   // press.
-  void endScrollPress(float x, float y)
-  {
-    if (scrollDrag_.mode == DragMode::ContentPan && !scrollDrag_.moved)
-      endPress(x, y);
+  bool endScrollPress(float x, float y) {
+    bool changed = false;
+    if (scrollDrag_.mode == DragMode::None ||
+        (scrollDrag_.mode == DragMode::ContentPan && !scrollDrag_.moved))
+      changed = endPress(x, y);
     scrollDrag_ = {};
+    return changed;
   }
 
   // Call on every wheel/scroll event; deltaX/deltaY are in pixels (already
@@ -1716,8 +1579,7 @@ private:
   // for press resolution — scrollbar vs. content doesn't matter for wheel
   // input, both count as "the pointer is over this scrollable view".
   // Returns true if it changed anything (caller should repaint).
-  bool applyWheelScroll(float x, float y, float deltaX, float deltaY)
-  {
+  bool applyWheelScroll(float x, float y, float deltaX, float deltaY) {
     if (!hasRoot_)
       return false;
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
@@ -1725,14 +1587,12 @@ private:
       return false;
     View &v = *r.view;
     bool changed = false;
-    if (v.scrollsY() && deltaY != 0.0f)
-    {
+    if (v.scrollsY() && deltaY != 0.0f) {
       float ns = std::clamp(v.computed.scrollY + deltaY, 0.0f, v.maxScrollY());
       changed |= ns != v.computed.scrollY;
       v.computed.scrollY = ns;
     }
-    if (v.scrollsX() && deltaX != 0.0f)
-    {
+    if (v.scrollsX() && deltaX != 0.0f) {
       float ns = std::clamp(v.computed.scrollX + deltaX, 0.0f, v.maxScrollX());
       changed |= ns != v.computed.scrollX;
       v.computed.scrollX = ns;
@@ -1743,8 +1603,7 @@ private:
   }
 
   // Global z-index stacking, shared by both backends.
-  struct AbsoluteEntry
-  {
+  struct AbsoluteEntry {
     const View *view;
     int order; // document/discovery order, for stable z-index ties
   };
@@ -1754,10 +1613,8 @@ private:
   // Recurses into every node regardless of its own position, so nested
   // absolutes (an absolute inside another absolute's subtree) still get
   // their own top-level slot in the global list.
-  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out)
-  {
-    for (const auto &child : v.children)
-    {
+  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
+    for (const auto &child : v.children) {
       if (child.style.position == Position::Absolute)
         out.push_back({&child, static_cast<int>(out.size())});
       collectAbsolutes(child, out);
@@ -1766,11 +1623,9 @@ private:
 
   // Sorts absolute entries by zIndex ascending, document order breaking
   // ties — shared by paintRoot() (Windows) and redraw() (Linux).
-  static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes)
-  {
+  static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
     std::stable_sort(absolutes.begin(), absolutes.end(),
-                     [](const AbsoluteEntry &a, const AbsoluteEntry &b)
-                     {
+                     [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
                        if (a.view->style.zIndex != b.view->style.zIndex)
                          return a.view->style.zIndex < b.view->style.zIndex;
                        return a.order < b.order;
@@ -1778,8 +1633,7 @@ private:
   }
 
   // Returns whether (px, py) lies within v's already-computed border-box.
-  static bool containsPoint(const View &v, float px, float py)
-  {
+  static bool containsPoint(const View &v, float px, float py) {
     return px >= v.computed.x && px < v.computed.x + v.computed.w &&
            py >= v.computed.y && py < v.computed.y + v.computed.h;
   }
@@ -1798,16 +1652,14 @@ private:
   // there has scrolled out of view, so it can't be hit no matter what its
   // own box says. Only scrollable nodes narrow the clip further as we
   // descend, exactly mirroring how renderView() decides what to clip.
-  static View *hitTestFlow(View &v, float x, float y, ClipRect clip)
-  {
+  static View *hitTestFlow(View &v, float x, float y, ClipRect clip) {
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return nullptr;
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
-    {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute)
         continue;
       if (View *hit = hitTestFlow(*it, x, y, childClip))
@@ -1821,8 +1673,7 @@ private:
   // paint order (collectAbsolutes + sortAbsolutes are the same lists used
   // to paint on Windows/Linux). Absolutes are tested unclipped — see the
   // "known limitation" note on resolveScrollTarget() above.
-  View *hitTest(float x, float y)
-  {
+  View *hitTest(float x, float y) {
     if (!hasRoot_)
       return nullptr;
     std::vector<AbsoluteEntry> absolutes;
@@ -1835,10 +1686,85 @@ private:
     return hitTestFlow(root_, x, y, ClipRect{});
   }
 
+  // Polls every dynamic source in the subtree rooted at v, writing
+  // changes back in place and marking the affected node dirty. Called
+  // after a click is dispatched, since the handler may have mutated the
+  // plain variables these sources read from. Returns whether anything
+  // changed, so the caller knows whether to relayout/repaint.
+  static bool checkForUpdates(View &v) {
+    bool changed = false;
+    if (v.textSource) {
+      std::string next = v.textSource();
+      if (next != v.text) {
+        v.text = std::move(next);
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (v.disabledSource) {
+      bool next = v.disabledSource();
+      if (next != v.disabled) {
+        v.disabled = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (v.valueSource) {
+      float next = std::clamp(v.valueSource(), 0.0f, 1.0f);
+      if (next != v.value) {
+        v.value = next;
+        v.style.width = Size::percentage(next * 100.0f);
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (v.positionSource) {
+      float next = v.positionSource();
+      if (next != v.style.left) {
+        v.style.left = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (v.backgroundColorSource) {
+      Color next = v.backgroundColorSource();
+      Color &cur = v.style.backgroundColor;
+      if (next.r != cur.r || next.g != cur.g || next.b != cur.b) {
+        cur = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    for (auto &c : v.children)
+      changed |= checkForUpdates(c);
+    return changed;
+  }
+
+  // Updates v's (and its descendants') isHovered flag based on (x, y),
+  // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
+  // view is never marked hovered. Returns whether any flag actually
+  // flipped, so callers only repaint when hover state visibly changes.
+  static bool updateHover(View &v, float x, float y, ClipRect clip) {
+    bool inside = clip.contains(x, y) && containsPoint(v, x, y);
+    bool changed = false;
+    if (inside != v.computed.isHovered) {
+      v.computed.isHovered = inside;
+      if (v.style.hoverColor)
+        v.computed.dirty = true;
+      changed = true;
+    }
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
+    for (auto &c : v.children)
+      changed |= updateHover(c, x, y, childClip);
+    return changed;
+  }
+
   // Invokes v's onClick if it has one; no-op for nullptr or an unset handler.
-  static void dispatchClick(View *v)
-  {
-    if (v && v->onClick)
+  static void dispatchClick(View *v) {
+    if (v && v->onClick && !v->disabled)
       v->onClick();
   }
 
@@ -1855,12 +1781,18 @@ private:
   // release also landed on that same view, then clears the pending state
   // unconditionally (a press that never resolves shouldn't linger and
   // affect some later, unrelated release).
-  void endPress(float x, float y)
-  {
+  bool endPress(float x, float y) {
     View *released = hitTest(x, y);
     if (released && released == pressedView_)
       dispatchClick(released);
     pressedView_ = nullptr;
+    if (!hasRoot_)
+      return false;
+    if (checkForUpdates(root_)) {
+      relayout();
+      return true;
+    }
+    return false;
   }
 
 // Windows-only member/method block.
@@ -1882,8 +1814,7 @@ private:
   // A no-op once a valid target already exists; WM_SIZE calls Resize()
   // directly instead of tearing this down, so this only actually runs
   // once per (factory, hwnd) pair unless EndDraw() invalidates the target.
-  void ensureRenderTarget()
-  {
+  void ensureRenderTarget() {
     if (renderTarget_)
       return;
     RECT rc;
@@ -1899,20 +1830,17 @@ private:
   }
 
   // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
-  static D2D1::ColorF toD2DColor(Color c)
-  {
+  static D2D1::ColorF toD2DColor(Color c) {
     return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
   }
 
   // Draws a filled rectangle in one shot: create brush, fill, release.
   // Mirrors the old gdiFillRect's create-use-delete pattern 1:1.
   static void d2dFillRect(ID2D1RenderTarget *rt, float x, float y, float w,
-                          float h, Color c)
-  {
+                          float h, Color c) {
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(c), &brush);
-    if (brush)
-    {
+    if (brush) {
       rt->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brush);
       brush->Release();
     }
@@ -1920,15 +1848,13 @@ private:
 
   // The Win32 window procedure: Windows calls this for every message sent to
   // hwnd.
-  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-  {
+  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // Will hold the LiteUI instance associated with this hwnd, if any.
     LiteUI *self = nullptr;
 
     // WM_NCCREATE arrives before any other message and carries the creation
     // parameters.
-    if (msg == WM_NCCREATE)
-    {
+    if (msg == WM_NCCREATE) {
       // WM_NCCREATE is the very first message a window receives, sent
       // during CreateWindowExW itself, before the window is usable.
       // Reinterpret the message's lParam as the CREATESTRUCTW Windows built for
@@ -1943,25 +1869,21 @@ private:
     }
     // For every other message, the pointer was already stored by the
     // WM_NCCREATE branch above.
-    else
-    {
+    else {
       // Fetch the previously stored `this` pointer back out of the window's
       // user-data slot.
       self = reinterpret_cast<LiteUI *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
 
     // Dispatch on the specific message type.
-    switch (msg)
-    {
+    switch (msg) {
     // Repaint request: paint everything into the off-screen back buffer,
     // then blit it to the screen in a single BitBlt — see memDC_'s comment
     // for why (this is the actual flicker fix).
-    case WM_PAINT:
-    {
+    case WM_PAINT: {
       PAINTSTRUCT ps;
       BeginPaint(hwnd, &ps);
-      if (self)
-      {
+      if (self) {
         self->ensureRenderTarget();
         self->renderTarget_->BeginDraw();
         // Plain white background first — WM_ERASEBKGND below tells
@@ -1975,8 +1897,7 @@ private:
         // D2DERR_RECREATE_TARGET means the underlying device is gone
         // (driver reset, GPU removal, etc.) — drop the target so the next
         // WM_PAINT's ensureRenderTarget() rebuilds it from scratch.
-        if (hr == D2DERR_RECREATE_TARGET)
-        {
+        if (hr == D2DERR_RECREATE_TARGET) {
           self->renderTarget_->Release();
           self->renderTarget_ = nullptr;
         }
@@ -2000,10 +1921,8 @@ private:
     // click (see updateScrollDrag/endScrollPress). Capture the mouse so we
     // still get the matching WM_MOUSEMOVE/WM_LBUTTONUP even if the cursor
     // leaves the window before the button is released.
-    case WM_LBUTTONDOWN:
-    {
-      if (self)
-      {
+    case WM_LBUTTONDOWN: {
+      if (self) {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (!self->beginScrollPress(x, y))
@@ -2018,13 +1937,15 @@ private:
     // Pointer moved with a button held: advances an in-progress scrollbar
     // drag or content pan. No-op (returns false) if neither is active, so
     // this costs nothing on ordinary hover.
-    case WM_MOUSEMOVE:
-    {
-      if (self)
-      {
+    case WM_MOUSEMOVE: {
+      if (self) {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
-        if (self->updateScrollDrag(x, y) && self->hwnd_)
+        bool changed = self->updateScrollDrag(x, y);
+        if (self->hasRoot_ &&
+            LiteUI::updateHover(self->root_, x, y, ClipRect{}))
+          changed = true;
+        if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
       return 0;
@@ -2035,13 +1956,12 @@ private:
     // the original press target (endScrollPress handles the scroll-drag
     // side of this and defers to endPress() when a pan never actually
     // moved, i.e. it was really just a click).
-    case WM_LBUTTONUP:
-    {
-      if (self)
-      {
+    case WM_LBUTTONUP: {
+      if (self) {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
-        self->endScrollPress(x, y);
+        if (self->endScrollPress(x, y) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
       ReleaseCapture();
       return 0;
@@ -2052,10 +1972,8 @@ private:
     // client-space) — ScreenToClient converts before hit-testing. One
     // notch (WHEEL_DELTA = 120) scrolls a fixed 40px step; larger/precision
     // wheels report multiples/fractions of that.
-    case WM_MOUSEWHEEL:
-    {
-      if (self)
-      {
+    case WM_MOUSEWHEEL: {
+      if (self) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         float notches =
@@ -2074,10 +1992,8 @@ private:
     // Horizontal mouse-wheel rotation (tilt-wheel or shift+wheel on most
     // drivers). Same coordinate/notch handling as WM_MOUSEWHEEL, but
     // positive notches scroll right, so no negation here.
-    case WM_MOUSEHWHEEL:
-    {
-      if (self)
-      {
+    case WM_MOUSEHWHEEL: {
+      if (self) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         float notches =
@@ -2096,8 +2012,7 @@ private:
     // both the pending click and any in-progress scroll drag rather than
     // let a later, unrelated event resolve them.
     case WM_CAPTURECHANGED:
-      if (self)
-      {
+      if (self) {
         self->pressedView_ = nullptr;
         self->scrollDrag_ = {};
       }
@@ -2107,10 +2022,8 @@ private:
     // stored dimensions and re-run layout against the new size. GDI needs
     // no buffer reallocation (it paints straight into the window's DC), so
     // this is just relayout + repaint.
-    case WM_SIZE:
-    {
-      if (self)
-      {
+    case WM_SIZE: {
+      if (self) {
         self->width_ = LOWORD(lp);
         self->height_ = HIWORD(lp);
         if (self->renderTarget_)
@@ -2136,8 +2049,7 @@ private:
   }
 
   // Draws every queued box into the render target.
-  void paintBoxes(ID2D1RenderTarget *rt)
-  {
+  void paintBoxes(ID2D1RenderTarget *rt) {
     for (const auto &b : boxes_)
       d2dFillRect(rt, static_cast<float>(b.pos_x), static_cast<float>(b.pos_y),
                   static_cast<float>(b.width), static_cast<float>(b.height),
@@ -2147,10 +2059,8 @@ private:
   // Draws the layout tree (if any). Border-radius is handled natively by
   // D2D1_ROUNDED_RECT — no manual pixel math needed on this platform,
   // same as the old RoundRect approach, just anti-aliased for free.
-  void paintRoot(ID2D1RenderTarget *rt)
-  {
-    if (hasRoot_)
-    {
+  void paintRoot(ID2D1RenderTarget *rt) {
+    if (hasRoot_) {
       paintView(rt, root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
@@ -2166,16 +2076,13 @@ private:
   // restricts (a scrollbar always sits fully within its own view's box,
   // which is itself already visible or this function wouldn't have been
   // reached).
-  void paintScrollbars(ID2D1RenderTarget *rt, const View &v)
-  {
-    if (wantVBar(v))
-    {
+  void paintScrollbars(ID2D1RenderTarget *rt, const View &v) {
+    if (wantVBar(v)) {
       PixRect t = vTrackRect(v), th = vThumbRect(v);
       d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
       d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
     }
-    if (wantHBar(v))
-    {
+    if (wantHBar(v)) {
       PixRect t = hTrackRect(v), th = hThumbRect(v);
       d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
       d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
@@ -2191,13 +2098,12 @@ private:
   // different final width — a resize/relayout can change how the text
   // wraps even with no string/style change. `v` is const here (called
   // from paintView), which is exactly why the cache fields are mutable.
-  static void ensureTextLayout(const View &v)
-  {
+  static void ensureTextLayout(const View &v) {
     if (v.computed.textLayout &&
-        v.computed.textLayoutBuiltForWidth == v.computed.w)
+        v.computed.textLayoutBuiltForWidth == v.computed.w &&
+        v.computed.textLayoutBuiltForText == v.text)
       return;
-    if (v.computed.textLayout)
-    {
+    if (v.computed.textLayout) {
       v.computed.textLayout->Release();
       v.computed.textLayout = nullptr;
     }
@@ -2208,15 +2114,14 @@ private:
     v.computed.textLayout =
         liteui_text::makeLayout(v.text, v.textStyle, innerW, innerH);
     v.computed.textLayoutBuiltForWidth = v.computed.w;
+    v.computed.textLayoutBuiltForText = v.text;
   }
 
-  void paintText(ID2D1RenderTarget *rt, const View &v)
-  {
+  void paintText(ID2D1RenderTarget *rt, const View &v) {
     ensureTextLayout(v);
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(v.textStyle.color), &brush);
-    if (brush)
-    {
+    if (brush) {
       float x = v.computed.x + v.style.padding.left;
       float y = v.computed.y + v.style.padding.top;
       rt->DrawTextLayout(D2D1::Point2F(x, y), v.computed.textLayout, brush,
@@ -2231,8 +2136,7 @@ private:
   // per View), pushing on entry and popping on exit naturally nests
   // correctly with the call tree — no need to save/restore a previous
   // clip handle the way SelectClipRgn did.
-  void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip)
-  {
+  void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip) {
     const Style &s = v.style;
     float x = v.computed.x, y = v.computed.y, w = v.computed.w,
           h = v.computed.h;
@@ -2250,8 +2154,7 @@ private:
     // would otherwise paint an opaque box under the glyphs on every text
     // node, since Style::backgroundColor defaults to opaque white rather
     // than "none" (Color has no alpha channel to express transparent).
-    if (v.isText)
-    {
+    if (v.isText) {
       paintText(rt, v);
       if (clipped)
         rt->PopAxisAlignedClip();
@@ -2260,23 +2163,22 @@ private:
 
     D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), s.borderRadius,
                             s.borderRadius};
+    Color bg = (v.computed.isHovered && s.hoverColor) ? *s.hoverColor
+                                                      : s.backgroundColor;
     ID2D1SolidColorBrush *bgBrush = nullptr;
-    rt->CreateSolidColorBrush(toD2DColor(s.backgroundColor), &bgBrush);
-    if (bgBrush)
-    {
+    rt->CreateSolidColorBrush(toD2DColor(bg), &bgBrush);
+    if (bgBrush) {
       rt->FillRoundedRectangle(rr, bgBrush);
       bgBrush->Release();
     }
-    if (s.borderWidth > 0)
-    {
+    if (s.borderWidth > 0) {
       // D2D strokes are centered on the path (half in, half out), unlike
       // the old GDI approach of an outer full-color box plus an inset
       // background rect — visually equivalent for a uniform border, just
       // computed differently.
       ID2D1SolidColorBrush *borderBrush = nullptr;
       rt->CreateSolidColorBrush(toD2DColor(s.borderColor), &borderBrush);
-      if (borderBrush)
-      {
+      if (borderBrush) {
         rt->DrawRoundedRectangle(rr, borderBrush, s.borderWidth);
         borderBrush->Release();
       }
@@ -2310,7 +2212,7 @@ private:
       nullptr; // Connection handle to the Wayland compositor; null until
                // wl_display_connect succeeds.
   wl_compositor *compositor_ =
-      nullptr;                      // The compositor global, used to create surfaces.
+      nullptr; // The compositor global, used to create surfaces.
   xdg_wm_base *wm_base_ = nullptr;  // The xdg-shell global, used to turn a raw
                                     // surface into a desktop window.
   wl_surface *surface_ = nullptr;   // The raw drawable surface for this window.
@@ -2336,9 +2238,9 @@ private:
                // currently active; the compositor renders this at the
                // pointer position once we call wl_pointer_set_cursor.
   uint32_t pointerEnterSerial_ =
-      0;                          // Serial from the most recent pointer-enter event;
-                                  // wl_pointer_set_cursor requires one and it's not resent on motion, so
-                                  // we cache it.
+      0; // Serial from the most recent pointer-enter event;
+         // wl_pointer_set_cursor requires one and it's not resent on motion, so
+         // we cache it.
   std::string currentCursorName_; // Name of the cursor image currently shown,
                                   // so we don't reissue set_cursor every
                                   // single motion event for no reason.
@@ -2400,8 +2302,8 @@ private:
         texUTex_ = -1, texUColor_ = -1;
 
   bool configured_ =
-      false;              // Set true once the compositor has sent its first
-                          // configure event, meaning we're allowed to attach a buffer.
+      false; // Set true once the compositor has sent its first
+             // configure event, meaning we're allowed to attach a buffer.
   int pendingWidth_ = 0;  // Size most recently suggested by
   int pendingHeight_ = 0; // toplevelConfigure; 0 means "no suggestion yet"
                           // (the compositor may send 0x0 to mean "you decide").
@@ -2487,15 +2389,13 @@ private:
     }
   )";
 
-  static GLuint compileShader(GLenum type, const char *src)
-  {
+  static GLuint compileShader(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
     glCompileShader(s);
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok)
-    {
+    if (!ok) {
       char log[512];
       glGetShaderInfoLog(s, sizeof(log), nullptr, log);
       fprintf(stderr, "shader compile error: %s\n", log);
@@ -2503,8 +2403,7 @@ private:
     }
     return s;
   }
-  static GLuint linkProgram(const char *vs, const char *fs)
-  {
+  static GLuint linkProgram(const char *vs, const char *fs) {
     GLuint v = compileShader(GL_VERTEX_SHADER, vs);
     GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
     GLuint p = glCreateProgram();
@@ -2515,8 +2414,7 @@ private:
     glDeleteShader(f);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    if (!ok)
-    {
+    if (!ok) {
       char log[512];
       glGetProgramInfoLog(p, sizeof(log), nullptr, log);
       fprintf(stderr, "program link error: %s\n", log);
@@ -2526,8 +2424,7 @@ private:
   }
 
   // xdg_wm_base ping handler: the compositor periodically checks we're alive.
-  static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial)
-  {
+  static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial) {
     // Echo the serial straight back so the compositor knows we're responsive.
     xdg_wm_base_pong(base, serial);
   }
@@ -2536,8 +2433,7 @@ private:
   static constexpr xdg_wm_base_listener wmBaseListener = {wmBasePing};
 
   // Called when the compositor wants us to (re)configure our xdg_surface.
-  static void surfaceConfigure(void *data, xdg_surface *xs, uint32_t serial)
-  {
+  static void surfaceConfigure(void *data, xdg_surface *xs, uint32_t serial) {
     // Recover the LiteUI instance this callback belongs to.
     auto *self = static_cast<LiteUI *>(data);
     // Acknowledge the configure event with its serial, as the protocol
@@ -2550,11 +2446,9 @@ private:
     // first configure, no buffer exists yet, so create and attach one now.
     if (self->pendingWidth_ > 0 && self->pendingHeight_ > 0 &&
         (self->pendingWidth_ != self->width_ ||
-         self->pendingHeight_ != self->height_))
-    {
+         self->pendingHeight_ != self->height_)) {
       self->resize(self->pendingWidth_, self->pendingHeight_);
-    }
-    else if (!self->eglReady_)
+    } else if (!self->eglReady_)
       self->initEgl();
   }
   // Listener struct binding surfaceConfigure to xdg_surface's single event.
@@ -2562,23 +2456,20 @@ private:
 
   // Called when the compositor suggests a new size/state for the toplevel.
   static void toplevelConfigure(void *data, xdg_toplevel *, int32_t width,
-                                int32_t height, wl_array *)
-  {
+                                int32_t height, wl_array *) {
     // 0x0 means "you decide the size" — keep whatever we currently have.
     // The actual resize happens later, in surfaceConfigure, once this
     // configure is ack'd (that's the point at which the protocol allows us
     // to attach a differently-sized buffer).
     auto *self = static_cast<LiteUI *>(data);
-    if (width > 0 && height > 0)
-    {
+    if (width > 0 && height > 0) {
       self->pendingWidth_ = width;
       self->pendingHeight_ = height;
     }
   }
   // Called when the compositor/user requests the window be closed (e.g. via a
   // taskbar close action).
-  static void toplevelClose(void *data, xdg_toplevel *)
-  {
+  static void toplevelClose(void *data, xdg_toplevel *) {
     // Flip the running flag so run()'s dispatch loop exits on its next check.
     static_cast<LiteUI *>(data)->running_ = false;
   }
@@ -2591,13 +2482,11 @@ private:
 
   // Called when the seat announces which input capabilities
   // (pointer/keyboard/touch) it has.
-  static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps)
-  {
+  static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // Only act if the seat has a pointer and we haven't already grabbed one.
-    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_)
-    {
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_) {
       // Request the pointer object from the seat.
       self->pointer_ = wl_seat_get_pointer(seat);
       // Register our pointer event handlers on it.
@@ -2612,8 +2501,7 @@ private:
 
   // Called when the pointer enters this surface.
   static void pointerEnter(void *data, wl_pointer *, uint32_t serial,
-                           wl_surface *, wl_fixed_t sx, wl_fixed_t sy)
-  {
+                           wl_surface *, wl_fixed_t sx, wl_fixed_t sy) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // Convert Wayland's fixed-point x coordinate to a double and store it.
@@ -2634,14 +2522,12 @@ private:
   // Called when the pointer leaves this surface. Reset the cached cursor
   // name so re-entering always re-applies one, rather than skipping the
   // very next setCursor() as a no-op change.
-  static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *)
-  {
+  static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *) {
     static_cast<LiteUI *>(data)->currentCursorName_.clear();
   }
   // Called on every pointer movement while over this surface.
   static void pointerMotion(void *data, wl_pointer *, uint32_t, wl_fixed_t sx,
-                            wl_fixed_t sy)
-  {
+                            wl_fixed_t sy) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // Update the stored x position.
@@ -2652,8 +2538,13 @@ private:
     // Advance any in-progress scrollbar drag / content pan (see
     // beginScrollPress/handlePress). A no-op, and cheap, when nothing's
     // being dragged.
-    if (self->updateScrollDrag(static_cast<float>(self->pointer_x_),
-                               static_cast<float>(self->pointer_y_)))
+    bool changed = self->updateScrollDrag(static_cast<float>(self->pointer_x_),
+                                          static_cast<float>(self->pointer_y_));
+    if (self->hasRoot_ &&
+        LiteUI::updateHover(self->root_, static_cast<float>(self->pointer_x_),
+                            static_cast<float>(self->pointer_y_), ClipRect{}))
+      changed = true;
+    if (changed)
       self->redraw();
 
     // Re-derive which edge (if any) the pointer is over and update the
@@ -2668,8 +2559,7 @@ private:
   // wl_pointer protocol), so it's usable directly as a pixel delta with no
   // extra scaling, unlike Windows' notch-based WM_MOUSEWHEEL.
   static void pointerAxis(void *data, wl_pointer *, uint32_t, uint32_t axis,
-                          wl_fixed_t value)
-  {
+                          wl_fixed_t value) {
     auto *self = static_cast<LiteUI *>(data);
     float delta = static_cast<float>(wl_fixed_to_double(value));
     float dx = 0, dy = 0;
@@ -2683,8 +2573,7 @@ private:
   }
   // Called on every pointer button press/release.
   static void pointerButton(void *data, wl_pointer *, uint32_t serial, uint32_t,
-                            uint32_t button, uint32_t state)
-  {
+                            uint32_t button, uint32_t state) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // Ignore anything that isn't the left button (we don't handle
@@ -2705,20 +2594,17 @@ private:
 
   // Called once per global object the compositor advertises via the registry.
   static void registryGlobal(void *data, wl_registry *registry, uint32_t name,
-                             const char *interface, uint32_t)
-  {
+                             const char *interface, uint32_t) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
     // If this global is the compositor interface...
-    if (strcmp(interface, wl_compositor_interface.name) == 0)
-    {
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
       // ...bind to it at version 4 and store the resulting proxy.
       self->compositor_ = static_cast<wl_compositor *>(
           wl_registry_bind(registry, name, &wl_compositor_interface, 4));
     }
     // If instead this global is the xdg_wm_base (window-shell) interface...
-    else if (strcmp(interface, xdg_wm_base_interface.name) == 0)
-    {
+    else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
       // ...bind to it at version 1...
       self->wm_base_ = static_cast<xdg_wm_base *>(
           wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
@@ -2726,15 +2612,13 @@ private:
       xdg_wm_base_add_listener(self->wm_base_, &wmBaseListener, self);
     }
     // If instead this global is the shared-memory interface...
-    else if (strcmp(interface, wl_shm_interface.name) == 0)
-    {
+    else if (strcmp(interface, wl_shm_interface.name) == 0) {
       // ...bind to it so we can later allocate pixel buffers.
       self->shm_ = static_cast<wl_shm *>(
           wl_registry_bind(registry, name, &wl_shm_interface, 1));
     }
     // If instead this global is the seat (input devices) interface...
-    else if (strcmp(interface, wl_seat_interface.name) == 0)
-    {
+    else if (strcmp(interface, wl_seat_interface.name) == 0) {
       // ...bind to it...
       self->seat_ = static_cast<wl_seat *>(
           wl_registry_bind(registry, name, &wl_seat_interface, 1));
@@ -2744,8 +2628,7 @@ private:
     }
     // If instead this global is the decoration-manager interface...
     else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) ==
-             0)
-    {
+             0) {
       // ...bind to it so we can later request client-side (or server-side)
       // decorations.
       self->decoration_manager_ =
@@ -2769,8 +2652,7 @@ private:
   // Maps a pointer position to which edge (if any) an interactive resize
   // should grab, mirroring how most CSD toolkits treat a thin strip along
   // each window edge as a resize handle rather than ordinary content.
-  uint32_t resizeEdgeAt(double px, double py) const
-  {
+  uint32_t resizeEdgeAt(double px, double py) const {
     bool left = px < kResizeMargin;
     bool right = px >= width_ - kResizeMargin;
     bool top = py < kResizeMargin;
@@ -2796,10 +2678,8 @@ private:
 
   // Standard XCursor names for each edge/corner; "left_ptr" is the ordinary
   // arrow shown everywhere else.
-  static const char *cursorNameForEdge(uint32_t edge)
-  {
-    switch (edge)
-    {
+  static const char *cursorNameForEdge(uint32_t edge) {
+    switch (edge) {
     case XDG_TOPLEVEL_RESIZE_EDGE_TOP:
       return "top_side";
     case XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM:
@@ -2824,8 +2704,7 @@ private:
   // Swaps the pointer's visible cursor to the named XCursor image, skipping
   // the work entirely if it's already showing (motion events fire far more
   // often than the cursor actually needs to change).
-  void setCursor(const char *name)
-  {
+  void setCursor(const char *name) {
     if (!cursorTheme_ || !pointer_ || currentCursorName_ == name)
       return;
     wl_cursor *cursor = wl_cursor_theme_get_cursor(cursorTheme_, name);
@@ -2850,8 +2729,7 @@ private:
   // allocates+attaches fresh buffers at the new dimensions. Buffers can't
   // be resized in place — wl_shm buffers are fixed-size — so this is a full
   // destroy/recreate rather than a realloc.
-  void resize(int newWidth, int newHeight)
-  {
+  void resize(int newWidth, int newHeight) {
 
     width_ = newWidth;
     height_ = newHeight;
@@ -2866,8 +2744,7 @@ private:
   // compiles the two shader programs. Called once, from surfaceConfigure(),
   // the first time the compositor hands us a configure event — mirroring
   // when attachBuffer() used to run.
-  void initEgl()
-  {
+  void initEgl() {
     // eglGetDisplay() can't reliably tell "this pointer is a wl_display*"
     // apart from other native display types on multi-platform Mesa
     // builds — on some setups it silently falls back to the generic
@@ -2877,13 +2754,10 @@ private:
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
             eglGetProcAddress("eglGetPlatformDisplayEXT"));
-    if (eglGetPlatformDisplayEXT)
-    {
+    if (eglGetPlatformDisplayEXT) {
       eglDisplay_ =
           eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_EXT, display_, nullptr);
-    }
-    else
-    {
+    } else {
       eglDisplay_ =
           eglGetDisplay(reinterpret_cast<EGLNativeDisplayType>(display_));
     }
@@ -2982,8 +2856,7 @@ private:
   // Restricts subsequent draws to `clip`, intersected with the window
   // bounds. GL's scissor origin is bottom-left, so the y range is flipped
   // relative to ClipRect's top-left/y-down convention.
-  void applyScissor(const ClipRect &clip)
-  {
+  void applyScissor(const ClipRect &clip) {
     float x0 = std::max(clip.x0, 0.0f), y0 = std::max(clip.y0, 0.0f);
     float x1 = std::min(clip.x1, static_cast<float>(width_));
     float y1 = std::min(clip.y1, static_cast<float>(height_));
@@ -2998,8 +2871,7 @@ private:
   // Draws one filled, optionally rounded-corner rectangle. radius <= 0
   // renders a plain rect (same shader — the SDF collapses correctly).
   void drawRectGL(float x, float y, float w, float h, float radius, Color c,
-                  const ClipRect &clip)
-  {
+                  const ClipRect &clip) {
     if (w <= 0 || h <= 0)
       return;
     applyScissor(clip);
@@ -3019,8 +2891,7 @@ private:
   // Thick line as an oriented quad — needed (rather than a bbox rect) since
   // drawTitlebar uses this for the X icon's two diagonal strokes.
   void drawLineGL(float x0, float y0, float x1, float y1, Color c,
-                  float thickness = 2.0f)
-  {
+                  float thickness = 2.0f) {
     float dx = x1 - x0, dy = y1 - y0;
     float len = std::sqrt(dx * dx + dy * dy);
     float nx = len > 0.0001f ? -dy / len : 1.0f;
@@ -3043,13 +2914,11 @@ private:
 
   // Fills an axis-aligned rectangle with a solid color by calling setPixel for
   // every point inside it. Same unclipped/clipped overload split as setPixel.
-  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b)
-  {
+  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
     fillRect(x0, y0, w, h, r, g, b, ClipRect{});
   }
   void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b,
-                const ClipRect &clip)
-  {
+                const ClipRect &clip) {
     drawRectGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(w), static_cast<float>(h), 0.0f, {r, g, b},
                clip);
@@ -3060,13 +2929,11 @@ private:
   // check against each corner's circle center — fine at this scale, not
   // meant for huge boxes. Same unclipped/clipped overload split as setPixel.
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
-                       uint8_t g, uint8_t b)
-  {
+                       uint8_t g, uint8_t b) {
     fillRoundedRect(x0, y0, w, h, radius, r, g, b, ClipRect{});
   }
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
-                       uint8_t g, uint8_t b, const ClipRect &clip)
-  {
+                       uint8_t g, uint8_t b, const ClipRect &clip) {
     radius = std::max(0, std::min({radius, w / 2, h / 2}));
     drawRectGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(w), static_cast<float>(h),
@@ -3083,13 +2950,12 @@ private:
   // cairo's native ARGB32 buffer — GL_ALPHA is core GLES2, unlike the
   // BGRA extension and non-tightly-packed row uploads that ARGB32 would
   // otherwise require.
-  static void ensureTextTexture(const View &v)
-  {
+  static void ensureTextTexture(const View &v) {
     if (v.computed.textTexture &&
-        v.computed.textTextureBuiltForWidth == v.computed.w)
+        v.computed.textTextureBuiltForWidth == v.computed.w &&
+        v.computed.textTextureBuiltForText == v.text)
       return;
-    if (v.computed.textTexture)
-    {
+    if (v.computed.textTexture) {
       glDeleteTextures(1, &v.computed.textTexture);
       v.computed.textTexture = 0;
     }
@@ -3130,8 +2996,7 @@ private:
     // 32-bit pixel, which on the little-endian platforms this file
     // targets is byte offset 3.
     std::vector<unsigned char> alpha(static_cast<size_t>(innerW) * innerH);
-    for (int row = 0; row < innerH; ++row)
-    {
+    for (int row = 0; row < innerH; ++row) {
       const unsigned char *src = data + row * stride;
       unsigned char *dst = alpha.data() + row * innerW;
       for (int col = 0; col < innerW; ++col)
@@ -3154,7 +3019,8 @@ private:
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, innerW, innerH, 0, GL_ALPHA,
                  GL_UNSIGNED_BYTE, alpha.data());
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // restore GL's default for other uploads
+    glPixelStorei(GL_UNPACK_ALIGNMENT,
+                  4); // restore GL's default for other uploads
 
     cairo_destroy(cr);
     cairo_surface_destroy(surf);
@@ -3163,10 +3029,10 @@ private:
     v.computed.textTexW = innerW;
     v.computed.textTexH = innerH;
     v.computed.textTextureBuiltForWidth = v.computed.w;
+    v.computed.textTextureBuiltForText = v.text;
   }
 
-  void drawTextTexture(const View &v, const ClipRect &clip)
-  {
+  void drawTextTexture(const View &v, const ClipRect &clip) {
     ensureTextTexture(v);
     if (!v.computed.textTexture)
       return;
@@ -3196,10 +3062,8 @@ private:
   // ancestor-level clip (not narrowed by v's own children), so a
   // scrollbar correctly disappears if v itself has scrolled out of some
   // outer ancestor's viewport, same reasoning as the GDI version.
-  void renderScrollbars(const View &v, const ClipRect &clip)
-  {
-    if (wantVBar(v))
-    {
+  void renderScrollbars(const View &v, const ClipRect &clip) {
+    if (wantVBar(v)) {
       PixRect t = vTrackRect(v), th = vThumbRect(v);
       fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
                static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
@@ -3208,8 +3072,7 @@ private:
                static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90, 0x90,
                clip);
     }
-    if (wantHBar(v))
-    {
+    if (wantHBar(v)) {
       PixRect t = hTrackRect(v), th = hThumbRect(v);
       fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
                static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
@@ -3242,14 +3105,12 @@ private:
   // narrowed by v itself), while children are drawn under a further-
   // narrowed clip if v itself scrolls, which is what actually makes
   // scrolled-out content invisible instead of just mispositioned.
-  void renderView(const View &v, ClipRect clip)
-  {
+  void renderView(const View &v, ClipRect clip) {
     // Same reasoning as paintView (Windows): a text leaf's Style is
     // layout-only, so it must never paint its own opaque background —
     // otherwise white text (or any text) can end up invisible against
     // its own node's default-white box, as happened here.
-    if (v.isText)
-    {
+    if (v.isText) {
       drawTextTexture(v, clip);
       return;
     }
@@ -3257,20 +3118,18 @@ private:
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
     int radius = static_cast<int>(s.borderRadius);
-    if (s.borderWidth > 0)
-    {
+    Color bg = (v.computed.isHovered && s.hoverColor) ? *s.hoverColor
+                                                      : s.backgroundColor;
+
+    if (s.borderWidth > 0) {
       fillRoundedRect(x, y, w, h, radius, s.borderColor.r, s.borderColor.g,
                       s.borderColor.b, clip);
       int bw = static_cast<int>(s.borderWidth);
       fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw),
-                      std::max(0, h - 2 * bw), std::max(0, radius - bw),
-                      s.backgroundColor.r, s.backgroundColor.g,
-                      s.backgroundColor.b, clip);
-    }
-    else
-    {
-      fillRoundedRect(x, y, w, h, radius, s.backgroundColor.r,
-                      s.backgroundColor.g, s.backgroundColor.b, clip);
+                      std::max(0, h - 2 * bw), std::max(0, radius - bw), bg.r,
+                      bg.g, bg.b, clip);
+    } else {
+      fillRoundedRect(x, y, w, h, radius, bg.r, bg.g, bg.b, clip);
     }
 
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
@@ -3291,29 +3150,25 @@ private:
   // Draws a crude line between two points by linear interpolation, stepping
   // once per pixel along the longer axis.
   void drawLine(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g,
-                uint8_t b)
-  {
+                uint8_t b) {
     drawLineGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(x1), static_cast<float>(y1), {r, g, b});
   }
 
   // ---- titlebar button layout ----
   // Plain axis-aligned rectangle used for button hit-testing.
-  struct Rect
-  {
+  struct Rect {
     int x, y, w, h;
   };
   // Returns whether point (px, py) falls within rectangle r (using half-open
   // bounds).
-  static bool inside(const Rect &r, double px, double py)
-  {
+  static bool inside(const Rect &r, double px, double py) {
     // Standard axis-aligned bounding box containment test.
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
   }
   // Computes the close button's rectangle: flush against the right edge of the
   // titlebar.
-  Rect closeRect() const
-  {
+  Rect closeRect() const {
     // x is inset from the right edge by the margin and the button's own width;
     // y centers it vertically in the titlebar.
     return {width_ - kButtonMargin - kButtonSize,
@@ -3321,8 +3176,7 @@ private:
   }
   // Computes the maximize button's rectangle, positioned one button-width left
   // of the close button.
-  Rect maximizeRect() const
-  {
+  Rect maximizeRect() const {
     // Start from the close button's rectangle as a reference point.
     Rect c = closeRect();
     // Shift left by one margin plus one button width, keeping the same y/size.
@@ -3330,8 +3184,7 @@ private:
   }
   // Computes the minimize button's rectangle, positioned one button-width left
   // of the maximize button.
-  Rect minimizeRect() const
-  {
+  Rect minimizeRect() const {
     // Start from the maximize button's rectangle as a reference point.
     Rect m = maximizeRect();
     // Shift left by one margin plus one button width, keeping the same y/size.
@@ -3339,8 +3192,7 @@ private:
   }
 
   // Paints the custom titlebar background and its three buttons/icons.
-  void drawTitlebar()
-  {
+  void drawTitlebar() {
     // Fill the whole titlebar strip with a dark gray background.
     fillRect(0, 0, width_, kTitlebarHeight, 0x2D, 0x2D, 0x2D);
 
@@ -3388,8 +3240,7 @@ private:
   // retries automatically the moment that buffer frees up — a call to
   // redraw() should therefore be thought of as "request a repaint soon",
   // not "repaint synchronously right now".
-  void redraw()
-  {
+  void redraw() {
     if (!eglReady_)
       return;
     glViewport(0, 0, width_, height_);
@@ -3401,14 +3252,12 @@ private:
     for (const auto &b : boxes_)
       fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
                b.color.b);
-    if (hasRoot_)
-    {
+    if (hasRoot_) {
       renderView(root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
       std::stable_sort(absolutes.begin(), absolutes.end(),
-                       [](const AbsoluteEntry &a, const AbsoluteEntry &b)
-                       {
+                       [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
                          if (a.view->style.zIndex != b.view->style.zIndex)
                            return a.view->style.zIndex < b.view->style.zIndex;
                          return a.order < b.order;
@@ -3426,14 +3275,12 @@ private:
   // (close/maximize/minimize) still act immediately on press, same as
   // before — only content-area widget clicks wait for a matching release
   // (see beginPress/endPress).
-  void handlePress(uint32_t serial)
-  {
+  void handlePress(uint32_t serial) {
     // Clicks within kResizeMargin of any outer edge start an interactive
     // resize instead — checked first since the resize strip along the top
     // overlaps the first few pixels of the titlebar itself.
     uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
-    if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE)
-    {
+    if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
       if (seat_)
         xdg_toplevel_resize(toplevel_, seat_, serial, edge);
       return;
@@ -3444,8 +3291,7 @@ private:
     // grab or track click consumes it entirely; anything else falls
     // through to the ordinary pending-click press, resolved later in
     // handleRelease().
-    if (pointer_y_ >= kTitlebarHeight)
-    {
+    if (pointer_y_ >= kTitlebarHeight) {
       float x = static_cast<float>(pointer_x_),
             y = static_cast<float>(pointer_y_);
       if (!beginScrollPress(x, y))
@@ -3455,15 +3301,13 @@ private:
     }
 
     // If the click landed on the close button...
-    if (inside(closeRect(), pointer_x_, pointer_y_))
-    {
+    if (inside(closeRect(), pointer_x_, pointer_y_)) {
       // ...request the event loop to stop, ending run().
       running_ = false;
       return;
     }
     // If instead the click landed on the maximize button...
-    if (inside(maximizeRect(), pointer_x_, pointer_y_))
-    {
+    if (inside(maximizeRect(), pointer_x_, pointer_y_)) {
       // If we're currently maximized, ask the compositor to restore the normal
       // size...
       if (maximized_)
@@ -3478,8 +3322,7 @@ private:
       return;
     }
     // If instead the click landed on the minimize button...
-    if (inside(minimizeRect(), pointer_x_, pointer_y_))
-    {
+    if (inside(minimizeRect(), pointer_x_, pointer_y_)) {
       // ...ask the compositor to minimize the toplevel.
       xdg_toplevel_set_minimized(toplevel_);
       return;
@@ -3495,12 +3338,12 @@ private:
   // release. Chrome buttons and resize/move grabs don't need this — they
   // already acted on press — so this only matters for content-area
   // interactions below the titlebar.
-  void handleRelease()
-  {
-    if (pointer_y_ >= kTitlebarHeight)
-      endScrollPress(static_cast<float>(pointer_x_),
-                     static_cast<float>(pointer_y_));
-    else
+  void handleRelease() {
+    if (pointer_y_ >= kTitlebarHeight) {
+      if (endScrollPress(static_cast<float>(pointer_x_),
+                         static_cast<float>(pointer_y_)))
+        redraw();
+    } else
       pressedView_ = nullptr; // release moved back into the titlebar; cancel
     scrollDrag_ = {};
   }
@@ -3512,8 +3355,7 @@ private:
 // Out-of-line constructor definition; inline because this is a single-header
 // library.
 inline LiteUI::LiteUI(int w, int h, const std::string &title)
-    : width_(w), height_(h)
-{
+    : width_(w), height_(h) {
 // Windows-specific construction path.
 #if defined(_WIN32)
   // Handle to the current executable module, needed to register a window class.
@@ -3546,8 +3388,7 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
                           nullptr, nullptr, hInst, this);
   // If creation failed, surface it as an exception rather than continuing with
   // a null handle.
-  if (!hwnd_)
-  {
+  if (!hwnd_) {
     throw std::runtime_error("CreateWindowExW failed");
   }
 
@@ -3620,8 +3461,7 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
 }
 
 // Out-of-line destructor definition.
-inline LiteUI::~LiteUI()
-{
+inline LiteUI::~LiteUI() {
   if (hasRoot_)
     root_.freeTextResources(); // must run before releasing d2dFactory_ / before
                                // eglMakeCurrent(NO_CONTEXT) below
@@ -3639,8 +3479,7 @@ inline LiteUI::~LiteUI()
     DestroyWindow(hwnd_);
 // Linux/Wayland-specific teardown path.
 #else
-  if (eglDisplay_ != EGL_NO_DISPLAY)
-  {
+  if (eglDisplay_ != EGL_NO_DISPLAY) {
     eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (rectProgram_)
       glDeleteProgram(rectProgram_);
@@ -3689,12 +3528,14 @@ inline LiteUI::~LiteUI()
 // Ends the Windows/Linux teardown branch.
 #endif
 }
-inline void LiteUI::setRoot(View view)
-{
+inline void LiteUI::setRoot(View view) {
   if (hasRoot_)
     root_.freeTextResources();
   root_ = std::move(view);
   hasRoot_ = true;
+  checkForUpdates(root_); // populate any textSource/valueSource/etc. before
+                          // the first layout+paint, so a Text with only
+                          // `source` set (no static `label`) isn't blank
   relayout();
 #if defined(_WIN32)
   if (hwnd_)
@@ -3705,8 +3546,7 @@ inline void LiteUI::setRoot(View view)
 #endif
 }
 
-inline void LiteUI::addBox(const Box &box)
-{
+inline void LiteUI::addBox(const Box &box) {
   boxes_.push_back(box);
 #if defined(_WIN32)
   // Ask Windows to repaint; the actual drawing happens in WM_PAINT.
@@ -3721,16 +3561,14 @@ inline void LiteUI::addBox(const Box &box)
 }
 
 // Out-of-line definition of the blocking event loop.
-inline void LiteUI::run()
-{
+inline void LiteUI::run() {
 // Windows-specific message loop.
 #if defined(_WIN32)
   // Storage for each retrieved message.
   MSG msg;
   // GetMessage blocks until a message arrives and returns 0 on WM_QUIT, ending
   // the loop.
-  while (GetMessage(&msg, nullptr, 0, 0))
-  {
+  while (GetMessage(&msg, nullptr, 0, 0)) {
     // Translate virtual-key messages into character messages (needed for text
     // input).
     TranslateMessage(&msg);
@@ -3741,8 +3579,7 @@ inline void LiteUI::run()
 #else
   // Keep dispatching Wayland events as long as we haven't been asked to stop
   // and the connection is healthy.
-  while (running_ && wl_display_dispatch(display_) != -1)
-  {
+  while (running_ && wl_display_dispatch(display_) != -1) {
     // event loop
   }
 // Ends the Windows/Linux run() branch.
