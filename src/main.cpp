@@ -18,24 +18,13 @@ int main() {
   trigger.onClick = [&]() { menuOpen = !menuOpen; };
   trigger.addChild(triggerLabel);
 
-  // --- backdrop: full-window, catches "click outside to close" ---
-  // Caveat: disabledSource only stops onClick from firing when closed;
-  // hitTestFlow still finds this node (it only checks "has onClick", not
-  // "enabled") and it still physically covers the window, so anything
-  // underneath is unclickable even while the menu is closed. Needs a
-  // visibleSource-style skip in hitTestFlow/paint to fix properly.
-  View backdrop;
-  backdrop.style.position = Position::Absolute;
-  backdrop.style.left = 0;
-  backdrop.style.top = 0;
-  backdrop.style.right = 0;
-  backdrop.style.bottom = 0;
-  backdrop.style.zIndex = 100;
-  backdrop.style.backgroundColor = {255, 255, 255,2};
-  backdrop.disabledSource = [&]() { return !menuOpen; };
-  backdrop.onClick = [&]() { menuOpen = false; };
-
-  // --- menu itself: slid off-screen via positionSource when closed ---
+  // --- menu itself: still Position::Absolute, still display:none when
+  // closed — just resolved against backdrop's content box now instead of
+  // root's (they're numerically the same box, since backdrop fills the
+  // window). Built fully BEFORE it's nested into backdrop below — addChild
+  // takes View by value and moves it in, so anything added to `menu` after
+  // that point would silently vanish (it'd land on this now-orphaned local,
+  // not on the copy backdrop is holding).
   View menu;
   menu.style.position = Position::Absolute;
   menu.style.top = 60;
@@ -44,8 +33,6 @@ int main() {
   menu.style.borderWidth = 1;
   menu.style.borderColor = {200, 200, 200};
   menu.style.borderRadius = 6;
-  menu.style.zIndex = 101;
-  menu.positionSource = [&]() { return menuOpen ? 100.0f : -9999.0f; };
 
   Text deleteItem;
   deleteItem.label = "Delete";
@@ -71,8 +58,27 @@ int main() {
   };
   renameRow.addChild(renameItem);
 
-  menu.addChild(renameRow);
-  menu.addChild(deleteRow);
+  menu.addChild(renameRow);   // menu is fully built ...
+  menu.addChild(deleteRow);   // ... before it goes anywhere else
+
+  // --- backdrop: full-window, catches "click outside to close", and now
+  // owns menu directly. Its own displaySource gates both of them at once —
+  // collectAbsolutes still finds menu as its own top-level absolute entry
+  // (it recurses into every node's children regardless of the node's own
+  // position/display), so z-ordering and paint-once semantics are
+  // unaffected by the nesting; only backdrop's displaySource needs setting.
+  View backdrop;
+  backdrop.style.position = Position::Absolute;
+  backdrop.style.left = 0;
+  backdrop.style.top = 0;
+  backdrop.style.right = 0;
+  backdrop.style.bottom = 0;
+  backdrop.style.zIndex = 100;
+  backdrop.style.backgroundColor = {255, 255, 255, 2};
+  backdrop.displaySource = [&]() { return menuOpen; };
+  backdrop.onClick = [&]() { menuOpen = false; };
+  backdrop.addChild(menu);   // menu inherits backdrop's display gating —
+                             // no separate displaySource needed on menu
 
   // --- root ---
   View root;
@@ -83,7 +89,6 @@ int main() {
   root.style.height = Size::full();
   root.addChild(trigger);
   root.addChild(backdrop);
-  root.addChild(menu);
 
   LiteUI ui(400, 300, "Context Menu");
   ui.setRoot(root);

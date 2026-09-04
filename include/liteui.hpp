@@ -45,7 +45,7 @@
 
 // Plain RGB color, one byte per channel.
 struct Color {
-  uint8_t r = 0, g = 0, b = 0,a=255;
+  uint8_t r = 0, g = 0, b = 0, a = 255;
 };
 
 #if defined(_WIN32)
@@ -133,6 +133,15 @@ struct EdgeInsets {
 
 enum class Position { Static, Absolute };
 
+// display:none analog — a false-y node is skipped entirely by layout,
+// paint, and hit-testing, everywhere Position::Absolute is already
+// skipped for being "out of flow". Space is NOT reserved.
+enum class Display { Flex, None };
+
+// visibility:hidden analog — layout still reserves the node's space and
+// siblings flow around it normally; only paint/hit-test/hover skip it.
+enum class Visibility { Visible, Hidden };
+
 // CSS-style overflow behavior for one axis of a container. Visible (the
 // default) behavior: children are never clipped and never
 // scroll, regardless of how big they get. Hidden clips children to the
@@ -201,6 +210,9 @@ struct Style {
   // layout engine below for how the two axes are handled independently.
   Overflow overflowX = Overflow::Visible;
   Overflow overflowY = Overflow::Visible;
+
+  Display display = Display::Flex;
+  Visibility visibility = Visibility::Visible;
 };
 
 // ---------------- Text: author-facing, leaf-only ----------------
@@ -294,6 +306,10 @@ public:
                                          // directly (Position::Absolute
                                          // slider thumbs)
   std::function<Color()> backgroundColorSource;
+  std::function<bool()> displaySource;    // true -> Display::Flex,
+                                          // false -> Display::None
+  std::function<bool()> visibilitySource; // true -> Visibility::Visible,
+                                          // false -> Visibility::Hidden
 
   bool disabled = false;
   float value = 0.0f;
@@ -789,8 +805,9 @@ inline Natural measureNatural(View &node, float availW, float availH,
   bool firstFlow = true;
   for (size_t i = 0; i < node.children.size(); ++i) {
     View &c = node.children[i];
-    if (c.style.position == Position::Absolute)
-      continue; // out of flow: doesn't affect the parent's Fit size at all
+    if (c.style.position == Position::Absolute ||
+        c.style.display == Display::None)
+      continue; // out of flow / not rendered: doesn't affect Fit size
     Natural cn = measureNatural(c, innerW, innerH,
                                 scrollX ? false : (wDefinite || !needW),
                                 scrollY ? false : (hDefinite || !needH));
@@ -908,9 +925,11 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   bool wrap = node.style.flexWrap == FlexWrap::Wrap;
   std::vector<size_t> flowIdx;
   flowIdx.reserve(node.children.size());
-  for (size_t i = 0; i < node.children.size(); ++i)
-    if (node.children[i].style.position != Position::Absolute)
+  for (size_t i = 0; i < node.children.size(); ++i) {
+    const Style &cs = node.children[i].style;
+    if (cs.position != Position::Absolute && cs.display != Display::None)
       flowIdx.push_back(i);
+  }
   n = flowIdx.size();
   std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
       mCrossE(n), minMain(n), maxMain(n), marginMain(n);
@@ -1180,7 +1199,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   // are set, in which case size is derived from them (CSS's "left+right
   // implies width" rule).
   for (auto &ch : node.children) {
-    if (ch.style.position != Position::Absolute)
+    if (ch.style.position != Position::Absolute ||
+        ch.style.display == Display::None)
       continue;
     const Style &cs = ch.style;
     bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
@@ -1403,6 +1423,8 @@ private:
   // trade-offs.
   static ScrollPress resolveScrollTarget(View &v, float x, float y,
                                          ClipRect clip) {
+    if (v.style.visibility == Visibility::Hidden)
+      return {};
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return {};
     if (wantVBar(v)) {
@@ -1430,7 +1452,8 @@ private:
                                               v.computed.w, v.computed.h)
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
-      if (it->style.position == Position::Absolute)
+      if (it->style.position == Position::Absolute ||
+          it->style.display == Display::None)
         continue;
       ScrollPress r = resolveScrollTarget(*it, x, y, childClip);
       if (r.kind != ScrollHit::None)
@@ -1615,6 +1638,8 @@ private:
   // their own top-level slot in the global list.
   void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
     for (const auto &child : v.children) {
+      if (child.style.display == Display::None)
+        continue; // a display:none subtree contributes no absolutes either
       if (child.style.position == Position::Absolute)
         out.push_back({&child, static_cast<int>(out.size())});
       collectAbsolutes(child, out);
@@ -1653,6 +1678,8 @@ private:
   // own box says. Only scrollable nodes narrow the clip further as we
   // descend, exactly mirroring how renderView() decides what to clip.
   static View *hitTestFlow(View &v, float x, float y, ClipRect clip) {
+    if (v.style.visibility == Visibility::Hidden)
+      return nullptr;
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return nullptr;
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
@@ -1660,7 +1687,8 @@ private:
                                               v.computed.w, v.computed.h)
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
-      if (it->style.position == Position::Absolute)
+      if (it->style.position == Position::Absolute ||
+          it->style.display == Display::None)
         continue;
       if (View *hit = hitTestFlow(*it, x, y, childClip))
         return hit;
@@ -1736,6 +1764,23 @@ private:
         changed = true;
       }
     }
+    if (v.displaySource) {
+      Display next = v.displaySource() ? Display::Flex : Display::None;
+      if (next != v.style.display) {
+        v.style.display = next;
+        v.computed.dirty = true;
+        changed = true; // affects layout — relayout() picked up by caller
+      }
+    }
+    if (v.visibilitySource) {
+      Visibility next =
+          v.visibilitySource() ? Visibility::Visible : Visibility::Hidden;
+      if (next != v.style.visibility) {
+        v.style.visibility = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
     for (auto &c : v.children)
       changed |= checkForUpdates(c);
     return changed;
@@ -1746,6 +1791,12 @@ private:
   // view is never marked hovered. Returns whether any flag actually
   // flipped, so callers only repaint when hover state visibly changes.
   static bool updateHover(View &v, float x, float y, ClipRect clip) {
+    if (v.style.visibility == Visibility::Hidden) {
+      bool changed = v.computed.isHovered;
+      v.computed.isHovered = false; // scrolled-out/None already relied on
+                                    // this same "force false" idiom
+      return changed;
+    }
     bool inside = clip.contains(x, y) && containsPoint(v, x, y);
     bool changed = false;
     if (inside != v.computed.isHovered) {
@@ -1832,8 +1883,7 @@ private:
 
   // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
   static D2D1::ColorF toD2DColor(Color c) {
-    return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
-                        c.a / 255.0f);
+    return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
   }
 
   // Draws a filled rectangle in one shot: create brush, fill, release.
@@ -2139,6 +2189,8 @@ private:
   // correctly with the call tree — no need to save/restore a previous
   // clip handle the way SelectClipRgn did.
   void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip) {
+    if (v.style.visibility == Visibility::Hidden)
+      return; // space already reserved by layout; just don't draw it
     const Style &s = v.style;
     float x = v.computed.x, y = v.computed.y, w = v.computed.w,
           h = v.computed.h;
@@ -2191,7 +2243,8 @@ private:
                                               v.computed.w, v.computed.h)
                              : clip;
     for (const auto &child : v.children)
-      if (child.style.position != Position::Absolute)
+      if (child.style.position != Position::Absolute &&
+          child.style.display != Display::None)
         paintView(rt, child, childClip);
 
     // Scrollbars are drawn after children, still under v's own (ancestor,
@@ -3111,6 +3164,8 @@ private:
   // narrowed clip if v itself scrolls, which is what actually makes
   // scrolled-out content invisible instead of just mispositioned.
   void renderView(const View &v, ClipRect clip) {
+    if (v.style.visibility == Visibility::Hidden)
+      return; // space already reserved by layout; just don't draw it
     // Same reasoning as paintView (Windows): a text leaf's Style is
     // layout-only, so it must never paint its own opaque background —
     // otherwise white text (or any text) can end up invisible against
@@ -3142,7 +3197,8 @@ private:
                                               v.computed.w, v.computed.h)
                              : clip;
     for (const auto &child : v.children)
-      if (child.style.position != Position::Absolute)
+      if (child.style.position != Position::Absolute &&
+          child.style.display != Display::None)
         renderView(child, childClip);
     // Scrollbars sit in the gutter layout already reserved outside the
     // children's placement area, so drawing them after children never
