@@ -2,7 +2,6 @@
 //
 // Minimal example: a window with a fixed-size scrollable list.
 
-
 #include "liteui.hpp"
 #include <cstdio>
 
@@ -22,6 +21,14 @@ int main() {
   View heading;
   heading.style.width = Size::full();
   heading.style.height = Size::pixel(24);
+
+  Text headingText;
+  headingText.label = "Scrollable list";
+  headingText.fontSize = 18;
+  headingText.fontWeight = FontWeight::SemiBold;
+  headingText.color = {0x22, 0x22, 0x22};
+  heading.addChild(std::move(headingText));
+
   root.addChild(heading);
 
   // The scrollable list itself: a fixed-height box holding more rows than
@@ -31,7 +38,8 @@ int main() {
   View list;
   list.style.direction = FlexDirection::Column;
   list.style.width = Size::full();
-  list.style.height = Size::pixel(200); // fixed viewport — content will overflow it
+  list.style.height =
+      Size::pixel(200); // fixed viewport — content will overflow it
   list.style.gap = 8;
   list.style.padding = EdgeInsets::all(8);
   list.style.backgroundColor = {255, 255, 255};
@@ -48,12 +56,18 @@ int main() {
   for (int i = 0; i < 20; ++i) {
     View row;
     row.style.width = Size::full();
-    row.style.height = Size::pixel(36); // natural height; list scrolls once these overflow it
+    row.style.height =
+        Size::pixel(36); // natural height; list scrolls once these overflow it
     row.style.backgroundColor = rowColors[i % 5];
     row.style.borderRadius = 4;
     // Each row just prints its own index when clicked — swap in whatever
     // you'd actually do (open an item, toggle a selection, etc.).
     row.onClick = [i]() { std::printf("Row %d clicked\n", i); };
+    Text label;
+    label.label = "Item " + std::to_string(i);
+    label.color = {255, 255, 255};
+    label.style.padding = EdgeInsets::all(8);
+    row.addChild(std::move(label));
     list.addChild(std::move(row));
   }
 
