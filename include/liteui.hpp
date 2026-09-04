@@ -45,7 +45,7 @@
 
 // Plain RGB color, one byte per channel.
 struct Color {
-  uint8_t r = 0, g = 0, b = 0;
+  uint8_t r = 0, g = 0, b = 0,a=255;
 };
 
 #if defined(_WIN32)
@@ -1665,7 +1665,7 @@ private:
       if (View *hit = hitTestFlow(*it, x, y, childClip))
         return hit;
     }
-    return v.onClick ? &v : nullptr;
+    return (v.onClick && !v.disabled) ? &v : nullptr;
   }
 
   // Top-level hit test against the whole tree: absolutes take priority
@@ -1729,7 +1729,8 @@ private:
     if (v.backgroundColorSource) {
       Color next = v.backgroundColorSource();
       Color &cur = v.style.backgroundColor;
-      if (next.r != cur.r || next.g != cur.g || next.b != cur.b) {
+      if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
+          next.a != cur.a) {
         cur = next;
         v.computed.dirty = true;
         changed = true;
@@ -1831,7 +1832,8 @@ private:
 
   // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
   static D2D1::ColorF toD2DColor(Color c) {
-    return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+    return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
+                        c.a / 255.0f);
   }
 
   // Draws a filled rectangle in one shot: create brush, fill, release.
@@ -2884,7 +2886,9 @@ private:
     glUniform2f(rectUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
     glUniform1f(rectURadius_, std::max(0.0f, radius));
-    glUniform4f(rectUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1.0f);
+    glUniform4f(rectUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
+                c.a / 255.0f);
+
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
@@ -3052,7 +3056,8 @@ private:
     glUniform2f(texUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
     const Color &c = v.textStyle.color;
-    glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1.0f);
+    glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
+                c.a / 255.0f);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 

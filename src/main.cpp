@@ -1,75 +1,91 @@
 #include "liteui.hpp"
 
 int main() {
-  int count = 0;
-  float progress = 0.35f;
-  bool checked = false;
-  Text label;
-  label.source = [&]() { return "Count: " + std::to_string(count); };
-  label.fontSize = 20;
+  bool menuOpen = false;
 
-  View button;
-  button.style.width = Size::pixel(140);
-  button.style.height = Size::pixel(44);
-  button.style.borderRadius = 6;
-  button.style.backgroundColor = {230, 230, 230};
-  button.style.hoverColor = {210, 210, 210};
-  button.style.alignItems = Align::Center;
-  button.style.justifyContent = Justify::Center;
-  button.disabledSource = [&]() { return checked; };
-  button.onClick = [&]() {
-    count++;
-    progress += 0.1;
+  // --- trigger button ---
+  Text triggerLabel;
+  triggerLabel.label = "Options";
+
+  View trigger;
+  trigger.style.width = Size::pixel(100);
+  trigger.style.height = Size::pixel(36);
+  trigger.style.backgroundColor = {230, 230, 230};
+  trigger.style.hoverColor = {210, 210, 210};
+  trigger.style.borderRadius = 4;
+  trigger.style.alignItems = Align::Center;
+  trigger.style.justifyContent = Justify::Center;
+  trigger.onClick = [&]() { menuOpen = !menuOpen; };
+  trigger.addChild(triggerLabel);
+
+  // --- backdrop: full-window, catches "click outside to close" ---
+  // Caveat: disabledSource only stops onClick from firing when closed;
+  // hitTestFlow still finds this node (it only checks "has onClick", not
+  // "enabled") and it still physically covers the window, so anything
+  // underneath is unclickable even while the menu is closed. Needs a
+  // visibleSource-style skip in hitTestFlow/paint to fix properly.
+  View backdrop;
+  backdrop.style.position = Position::Absolute;
+  backdrop.style.left = 0;
+  backdrop.style.top = 0;
+  backdrop.style.right = 0;
+  backdrop.style.bottom = 0;
+  backdrop.style.zIndex = 100;
+  backdrop.style.backgroundColor = {255, 255, 255,2};
+  backdrop.disabledSource = [&]() { return !menuOpen; };
+  backdrop.onClick = [&]() { menuOpen = false; };
+
+  // --- menu itself: slid off-screen via positionSource when closed ---
+  View menu;
+  menu.style.position = Position::Absolute;
+  menu.style.top = 60;
+  menu.style.width = Size::pixel(160);
+  menu.style.backgroundColor = {255, 255, 255};
+  menu.style.borderWidth = 1;
+  menu.style.borderColor = {200, 200, 200};
+  menu.style.borderRadius = 6;
+  menu.style.zIndex = 101;
+  menu.positionSource = [&]() { return menuOpen ? 100.0f : -9999.0f; };
+
+  Text deleteItem;
+  deleteItem.label = "Delete";
+  deleteItem.style.padding = EdgeInsets::all(10);
+
+  View deleteRow;
+  deleteRow.style.hoverColor = {245, 245, 245};
+  deleteRow.onClick = [&]() {
+    menuOpen = false;
+    // ... actual delete logic here ...
   };
+  deleteRow.addChild(deleteItem);
 
-  Text buttonLabel;
-  buttonLabel.label = "Increment";
-  button.addChild(buttonLabel);
+  Text renameItem;
+  renameItem.label = "Rename";
+  renameItem.style.padding = EdgeInsets::all(10);
 
-  View box;
-  box.style.width = Size::pixel(20);
-  box.style.height = Size::pixel(20);
-  box.style.borderWidth = 2;
-  box.style.borderColor = {120, 120, 120};
-  box.style.borderRadius = 4;
-  box.backgroundColorSource = [&]() {
-    return checked ? Color{60, 130, 246} : Color{255, 255, 255};
+  View renameRow;
+  renameRow.style.hoverColor = {245, 245, 245};
+  renameRow.onClick = [&]() {
+    menuOpen = false;
+    // ... actual rename logic here ...
   };
-  box.onClick = [&]() { checked = !checked; };
+  renameRow.addChild(renameItem);
 
-  Text mark;
-  mark.color = {255, 255, 255};
-  mark.source = [&]() {
-    return checked ? std::string("\xE2\x9C\x93") : std::string();
-  };
-  box.addChild(mark);
+  menu.addChild(renameRow);
+  menu.addChild(deleteRow);
 
-  View track;
-  track.style.width = Size::full();
-  track.style.height = Size::pixel(8);
-  track.style.backgroundColor = {230, 230, 230};
-  track.style.borderRadius = 4;
-
-  View fill;
-  fill.style.height = Size::full();
-  fill.style.backgroundColor = {60, 130, 246};
-  fill.style.borderRadius = 4;
-  fill.valueSource = [&]() { return progress; };
-  track.addChild(fill);
-
+  // --- root ---
   View root;
   root.style.direction = FlexDirection::Column;
   root.style.alignItems = Align::Center;
   root.style.justifyContent = Justify::Center;
-  root.style.gap = 16;
   root.style.width = Size::full();
   root.style.height = Size::full();
-  root.addChild(label);
-  root.addChild(button);
-  root.addChild(box);
-  root.addChild(track);
+  root.addChild(trigger);
+  root.addChild(backdrop);
+  root.addChild(menu);
 
-  LiteUI ui(400, 200, "Counter");
+  LiteUI ui(400, 300, "Context Menu");
   ui.setRoot(root);
   ui.run();
   return 0;
