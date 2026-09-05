@@ -293,12 +293,28 @@ public:
   // containing ancestor's onClick fires instead.
   std::function<void()> onClick;
 
+  // Fired the instant a left-button press lands on this view (before
+  // any matching release/onClick pairing) — unlike onClick, this gives
+  // the press point in coordinates *local* to this view (0,0 at its
+  // own top-left), which onClick has no way to expose. Lets a view like
+  // a slider track compute "where along my width was I clicked" without
+  // the library needing to know anything about sliders specifically.
+  std::function<void(float localX, float localY)> onPressAt;
+
+  // Fired continuously while a left-button press that started on this
+  // view is still held and the pointer moves — unlike onPressAt (which
+  // fires once, at the instant of the initial press), this fires on
+  // every subsequent move until release, giving the *current* press
+  // point in this view's own local coordinates. Lets a view like a
+  // slider track drive a live drag instead of only sampling the
+  // initial click position.
+  std::function<void(float localX, float localY)> onDragTo;
+
   // Fired once per relayout(), right after placeNode() finalizes this
   // node's absolute on-screen box. Lets the app read a view's real
   // x/y/w/h to drive some other view's position — e.g. anchoring a
   // dropdown/menu to the button that opened it.
   std::function<void(float x, float y, float w, float h)> onLayout;
-
 
   // Polled dynamic state — compared against the stored value in
   // LiteUI::checkForUpdates() after each dispatched event; only fields
@@ -1705,7 +1721,7 @@ private:
       if (View *hit = hitTestFlow(*it, x, y, childClip))
         return hit;
     }
-    return (v.onClick && !v.disabled) ? &v : nullptr;
+    return ((v.onClick || v.onPressAt) && !v.disabled) ? &v : nullptr;
   }
 
   // Top-level hit test against the whole tree: absolutes take priority
@@ -1846,8 +1862,42 @@ private:
   // cancels; press and release both on the button fires it.
   View *pressedView_ = nullptr;
 
+  // The view beginPress() found to have an onDragTo handler, if any —
+  // kept separate from pressedView_ (which exists purely for onClick
+  // press/release pairing) so a click and a drag can be tracked
+  // independently. Cleared on release/capture-loss the same way
+  // pressedView_ is.
+  View *dragView_ = nullptr;
+
   // Records the view under (x, y) as the pending click's press target.
-  void beginPress(float x, float y) { pressedView_ = hitTest(x, y); }
+  void beginPress(float x, float y) {
+    pressedView_ = hitTest(x, y);
+    if (pressedView_ && pressedView_->onPressAt)
+      pressedView_->onPressAt(x - pressedView_->computed.x,
+                              y - pressedView_->computed.y);
+    dragView_ =
+        (pressedView_ && pressedView_->onDragTo) ? pressedView_ : nullptr;
+  }
+
+  // Call on every pointer-motion event while a button is held. Advances
+  // an in-progress onDragTo drag (armed by beginPress above) by
+  // re-invoking the handler with the current point translated into
+  // dragView_'s own local coordinates, then polling/applying whatever
+  // state the handler changed — same checkForUpdates+relayout idiom used
+  // everywhere else dynamic sources are re-read. A no-op, and cheap,
+  // when no drag is active.
+  bool updateDrag(float x, float y) {
+    if (!dragView_)
+      return false;
+    dragView_->onDragTo(x - dragView_->computed.x, y - dragView_->computed.y);
+    if (!hasRoot_)
+      return false;
+    if (checkForUpdates(root_)) {
+      relayout();
+      return true;
+    }
+    return false;
+  }
 
   // Completes a pending press: fires pressedView_'s onClick only if the
   // release also landed on that same view, then clears the pending state
@@ -1858,6 +1908,7 @@ private:
     if (released && released == pressedView_)
       dispatchClick(released);
     pressedView_ = nullptr;
+    dragView_ = nullptr;
     if (!hasRoot_)
       return false;
     if (checkForUpdates(root_)) {
@@ -2014,6 +2065,8 @@ private:
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         bool changed = self->updateScrollDrag(x, y);
+        if (self->updateDrag(x, y))
+          changed = true;
         if (self->hasRoot_ &&
             LiteUI::updateHover(self->root_, x, y, ClipRect{}))
           changed = true;
@@ -2086,6 +2139,7 @@ private:
     case WM_CAPTURECHANGED:
       if (self) {
         self->pressedView_ = nullptr;
+        self->dragView_ = nullptr;
         self->scrollDrag_ = {};
       }
       return 0;
@@ -2615,6 +2669,9 @@ private:
     // being dragged.
     bool changed = self->updateScrollDrag(static_cast<float>(self->pointer_x_),
                                           static_cast<float>(self->pointer_y_));
+    if (self->updateDrag(static_cast<float>(self->pointer_x_),
+                         static_cast<float>(self->pointer_y_)))
+      changed = true;
     if (self->hasRoot_ &&
         LiteUI::updateHover(self->root_, static_cast<float>(self->pointer_x_),
                             static_cast<float>(self->pointer_y_), ClipRect{}))
@@ -3426,6 +3483,7 @@ private:
         redraw();
     } else
       pressedView_ = nullptr; // release moved back into the titlebar; cancel
+    dragView_ = nullptr;
     scrollDrag_ = {};
   }
 
@@ -3614,9 +3672,19 @@ inline void LiteUI::setRoot(View view) {
     root_.freeTextResources();
   root_ = std::move(view);
   hasRoot_ = true;
-  checkForUpdates(root_); // populate any textSource/valueSource/etc. before
-                          // the first layout+paint, so a Text with only
-                          // `source` set (no static `label`) isn't blank
+  // First pass: runs every onLayout callback (e.g. a track capturing its
+  // own width into a plain variable) so any positionSource/valueSource
+  // that reads such app-side state sees a real value, not whatever it
+  // was default-initialized to.
+  relayout();
+  // Now poll dynamic sources — textSource/valueSource/positionSource/etc.
+  // — so a Text with only `source` set isn't blank, and anything whose
+  // source depends on state the pass above just populated computes
+  // correctly instead of against stale zeros.
+  checkForUpdates(root_);
+  // Second pass: applies whatever checkForUpdates just wrote (e.g. the
+  // now-correct style.left from positionSource) to the actual layout
+  // before the first paint.
   relayout();
 #if defined(_WIN32)
   if (hwnd_)
