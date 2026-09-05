@@ -293,6 +293,13 @@ public:
   // containing ancestor's onClick fires instead.
   std::function<void()> onClick;
 
+  // Fired once per relayout(), right after placeNode() finalizes this
+  // node's absolute on-screen box. Lets the app read a view's real
+  // x/y/w/h to drive some other view's position — e.g. anchoring a
+  // dropdown/menu to the button that opened it.
+  std::function<void(float x, float y, float w, float h)> onLayout;
+
+
   // Polled dynamic state — compared against the stored value in
   // LiteUI::checkForUpdates() after each dispatched event; only fields
   // that actually changed get marked dirty. Each is optional; unset
@@ -305,6 +312,8 @@ public:
   std::function<float()> positionSource; // pixels — drives style.left
                                          // directly (Position::Absolute
                                          // slider thumbs)
+  std::function<float()> topSource;      // pixels — drives style.top,
+                                         // same idea as positionSource
   std::function<Color()> backgroundColorSource;
   std::function<bool()> displaySource;    // true -> Display::Flex,
                                           // false -> Display::None
@@ -852,6 +861,9 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   node.computed.y = y;
   node.computed.w = w;
   node.computed.h = h;
+  if (node.onLayout)
+    node.onLayout(x, y, w, h);
+
   if (node.children.empty()) {
     // No children means nothing to scroll regardless of overflow setting;
     // pin the offset at 0 so a container that briefly had children (and
@@ -1750,6 +1762,14 @@ private:
       float next = v.positionSource();
       if (next != v.style.left) {
         v.style.left = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (v.topSource) {
+      float next = v.topSource();
+      if (next != v.style.top) {
+        v.style.top = next;
         v.computed.dirty = true;
         changed = true;
       }

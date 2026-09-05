@@ -110,11 +110,10 @@ int main() {
   backdrop.style.bottom = 0;
   backdrop.style.zIndex = 100;
   backdrop.style.backgroundColor = {0, 0, 0, 90}; // dimmed, unlike the
-                                                  // near-invisible menu
-                                                  // backdrop
+                                                   // near-invisible menu
+                                                   // backdrop
   backdrop.style.alignItems = Align::Center;      // <-- centers dialogBox
-  backdrop.style.justifyContent =
-      Justify::Center; // <-- vertically & horizontally
+  backdrop.style.justifyContent = Justify::Center; // <-- vertically & horizontally
   backdrop.displaySource = [&]() { return dialogOpen; };
   backdrop.onClick = [&]() { dialogOpen = false; }; // click outside -> cancel
   backdrop.addChild(dialogBox);
