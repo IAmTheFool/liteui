@@ -14,6 +14,7 @@
 #include "liteui.hpp"
 
 #include <cmath>
+#include <iostream>
 #include <vector>
 
 // The document's fixed pixel size — this is the actual "page" (like

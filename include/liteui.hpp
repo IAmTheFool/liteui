@@ -49,6 +49,13 @@ struct Color {
   uint8_t r = 0, g = 0, b = 0, a = 255;
 };
 
+
+// Which physical mouse button an event refers to. Used to key the
+// per-button press/drag tracking in LiteUI (pressedView_/dragView_) and
+// to select which of a View's onClick/onMiddleClick/onRightClick (etc.)
+// triple gets checked/fired.
+enum class MouseButton { Left, Middle, Right };
+
 #if defined(_WIN32)
 // Converts a UTF-8 std::string to the UTF-16 wide string Win32/DirectWrite
 // APIs require. File-scope (rather than a LiteUI member) because both
@@ -420,8 +427,16 @@ struct Canvas {
   Style style;
   std::function<void(CanvasContext &)> onPaint;
   std::function<void()> onClick;
+  std::function<void()> onMiddleClick;
+  std::function<void()> onRightClick;
   std::function<void(float localX, float localY)> onPressAt;
+  std::function<void(float localX, float localY)> onMiddlePressAt;
+  std::function<void(float localX, float localY)> onRightPressAt;
   std::function<void(float localX, float localY)> onDragTo;
+  std::function<void(float localX, float localY)> onMiddleDragTo;
+  std::function<void(float localX, float localY)> onRightDragTo;
+  std::function<void()> onScrollUp;
+  std::function<void()> onScrollDown;
   std::function<bool()> canvasDirtySource;
 };
 
@@ -452,6 +467,11 @@ public:
   // containing ancestor's onClick fires instead.
   std::function<void()> onClick;
 
+  // Same bubbling semantics as onClick, for the middle and right buttons.
+  std::function<void()> onMiddleClick;
+  std::function<void()> onRightClick;
+ 
+
   // Fired the instant a left-button press lands on this view (before
   // any matching release/onClick pairing) — unlike onClick, this gives
   // the press point in coordinates *local* to this view (0,0 at its
@@ -459,6 +479,9 @@ public:
   // a slider track compute "where along my width was I clicked" without
   // the library needing to know anything about sliders specifically.
   std::function<void(float localX, float localY)> onPressAt;
+  std::function<void(float localX, float localY)> onMiddlePressAt;
+  std::function<void(float localX, float localY)> onRightPressAt;
+ 
 
   // Fired continuously while a left-button press that started on this
   // view is still held and the pointer moves — unlike onPressAt (which
@@ -468,12 +491,28 @@ public:
   // slider track drive a live drag instead of only sampling the
   // initial click position.
   std::function<void(float localX, float localY)> onDragTo;
+  // Same idea as onDragTo, tracked independently per button — a
+  // middle-button drag and a left-button drag can't be started by the
+  // same physical press, but nothing stops an app from wiring both up
+  // on the same view for different purposes.
+  std::function<void(float localX, float localY)> onMiddleDragTo;
+  std::function<void(float localX, float localY)> onRightDragTo;
 
   // Fired once per relayout(), right after placeNode() finalizes this
   // node's absolute on-screen box. Lets the app read a view's real
   // x/y/w/h to drive some other view's position — e.g. anchoring a
   // dropdown/menu to the button that opened it.
   std::function<void(float x, float y, float w, float h)> onLayout;
+
+
+  // Fired on a discrete wheel notch (or trackpad step) whose point lands
+  // on this view, independent of pixel-based content scrolling — lets a
+  // plain, non-overflow view (e.g. a stepper/spinner arrow) react to the
+  // wheel the same way onClick reacts to a press. Bubbles exactly like
+  // onClick: the nearest ancestor with a handler fires if the deepest
+  // hit view has none.
+  std::function<void()> onScrollUp;
+  std::function<void()> onScrollDown;
 
   // Polled dynamic state — compared against the stored value in
   // LiteUI::checkForUpdates() after each dispatched event; only fields
@@ -672,8 +711,16 @@ inline View View::toView(Canvas c) {
   v.isCanvas = true;
   v.onPaint = std::move(c.onPaint);
   v.onClick = std::move(c.onClick);
+  v.onMiddleClick = std::move(c.onMiddleClick);
+  v.onRightClick = std::move(c.onRightClick);
   v.onPressAt = std::move(c.onPressAt);
+  v.onMiddlePressAt = std::move(c.onMiddlePressAt);
+  v.onRightPressAt = std::move(c.onRightPressAt);
   v.onDragTo = std::move(c.onDragTo);
+  v.onMiddleDragTo = std::move(c.onMiddleDragTo);
+  v.onRightDragTo = std::move(c.onRightDragTo);
+  v.onScrollUp = std::move(c.onScrollUp);
+  v.onScrollDown = std::move(c.onScrollDown);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
   return v;
 }
@@ -3255,7 +3302,7 @@ private:
         scrollDrag_.moved = true;
         // It just became a drag, not a click — cancel any pending onClick
         // so the eventual release doesn't also fire it.
-        pressedView_ = nullptr;
+        pressedView_[btnIdx(MouseButton::Left)] = nullptr;
       }
       if (v.scrollsX())
         v.computed.scrollX =
@@ -3363,6 +3410,23 @@ private:
            py >= v.computed.y && py < v.computed.y + v.computed.h;
   }
 
+  // Whether v itself would respond to a press/click of the given button —
+  // shared by hitTestFlow so each button tracks its own independent hit
+  // test instead of only ever matching onClick/onPressAt.
+  static bool hasButtonHandler(const View &v, MouseButton btn) {
+    if (v.disabled)
+      return false;
+    switch (btn) {
+    case MouseButton::Left:
+      return (bool)v.onClick || (bool)v.onPressAt;
+    case MouseButton::Middle:
+      return (bool)v.onMiddleClick || (bool)v.onMiddlePressAt;
+    case MouseButton::Right:
+      return (bool)v.onRightClick || (bool)v.onRightPressAt;
+    }
+    return false;
+  }
+
   // Recursively finds the topmost in-flow view under (x, y) with a
   // non-null onClick. Children are checked last-to-first (later siblings
   // paint on top), and Position::Absolute children are skipped here —
@@ -3377,7 +3441,8 @@ private:
   // there has scrolled out of view, so it can't be hit no matter what its
   // own box says. Only scrollable nodes narrow the clip further as we
   // descend, exactly mirroring how renderView() decides what to clip.
-  static View *hitTestFlow(View &v, float x, float y, ClipRect clip) {
+  static View *hitTestFlow(View &v, float x, float y, ClipRect clip,
+                           MouseButton btn) {
     if (v.style.visibility == Visibility::Hidden)
       return nullptr;
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
@@ -3390,10 +3455,10 @@ private:
       if (it->style.position == Position::Absolute ||
           it->style.display == Display::None)
         continue;
-      if (View *hit = hitTestFlow(*it, x, y, childClip))
+      if (View *hit = hitTestFlow(*it, x, y, childClip, btn))
         return hit;
     }
-    return ((v.onClick || v.onPressAt) && !v.disabled) ? &v : nullptr;
+    return hasButtonHandler(v, btn) ? &v : nullptr;
   }
 
   // Top-level hit test against the whole tree: absolutes take priority
@@ -3401,17 +3466,43 @@ private:
   // paint order (collectAbsolutes + sortAbsolutes are the same lists used
   // to paint on Windows/Linux). Absolutes are tested unclipped — see the
   // "known limitation" note on resolveScrollTarget() above.
-  View *hitTest(float x, float y) {
+  View *hitTest(float x, float y, MouseButton btn = MouseButton::Left) {
     if (!hasRoot_)
       return nullptr;
     std::vector<AbsoluteEntry> absolutes;
     collectAbsolutes(root_, absolutes);
     sortAbsolutes(absolutes);
     for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
-      if (View *hit =
-              hitTestFlow(const_cast<View &>(*it->view), x, y, ClipRect{}))
+      if (View *hit = hitTestFlow(const_cast<View &>(*it->view), x, y,
+                                 ClipRect{}, btn))
         return hit;
-    return hitTestFlow(root_, x, y, ClipRect{});
+    return hitTestFlow(root_, x, y, ClipRect{}, btn);
+  }
+
+  // Same bubbling shape as hitTestFlow, but matches on onScrollUp/
+  // onScrollDown instead of click/press handlers — kept as a separate
+  // walk (rather than folding into hasButtonHandler) since scroll
+  // notches aren't a MouseButton and can coexist with a view that also
+  // has click handlers.
+  static View *hitTestScroll(View &v, float x, float y, ClipRect clip,
+                             bool up) {
+    if (v.style.visibility == Visibility::Hidden)
+      return nullptr;
+    if (!clip.contains(x, y) || !containsPoint(v, x, y))
+      return nullptr;
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+      if (it->style.position == Position::Absolute ||
+          it->style.display == Display::None)
+        continue;
+      if (View *hit = hitTestScroll(*it, x, y, childClip, up))
+        return hit;
+    }
+    bool has = up ? (bool)v.onScrollUp : (bool)v.onScrollDown;
+    return has ? &v : nullptr;
   }
 
   // Polls every dynamic source in the subtree rooted at v, writing
@@ -3527,33 +3618,98 @@ private:
     return changed;
   }
 
-  // Invokes v's onClick if it has one; no-op for nullptr or an unset handler.
-  static void dispatchClick(View *v) {
-    if (v && v->onClick && !v->disabled)
-      v->onClick();
+  // Invokes v's click handler for `btn` if it has one; no-op for
+  // nullptr, a disabled view, or an unset handler.
+  static void dispatchClick(View *v, MouseButton btn) {
+    if (!v || v->disabled)
+      return;
+    switch (btn) {
+    case MouseButton::Left:
+      if (v->onClick)
+        v->onClick();
+      break;
+    case MouseButton::Middle:
+      if (v->onMiddleClick)
+        v->onMiddleClick();
+      break;
+    case MouseButton::Right:
+      if (v->onRightClick)
+        v->onRightClick();
+      break;
+    }
   }
 
-  // Tracks which view (if any) most recently received a left-button press,
-  // so a click only fires if the matching release lands back on the same
-  // view — ordinary UI click semantics: press, drag off, release elsewhere
-  // cancels; press and release both on the button fires it.
-  View *pressedView_ = nullptr;
+  // Fires onScrollUp/onScrollDown on the topmost view under (x, y) that
+  // declares one, via hitTestScroll. Independent of applyWheelScroll's
+  // pixel-based content scrolling, so a plain (non-overflow) view can
+  // still react to the wheel. `notches` > 0 means wheel-up. Returns
+  // whether a handler fired (caller should repaint) — poll/relayout for
+  // any state the handler mutated, same idiom as endPress/updateDrag.
+  bool dispatchScroll(float x, float y, float notches) {
+    if (notches == 0.0f || !hasRoot_)
+      return false;
+    bool up = notches > 0;
+    View *v = hitTestScroll(root_, x, y, ClipRect{}, up);
+    if (!v)
+      return false;
+    if (up) {
+      if (v->onScrollUp)
+        v->onScrollUp();
+    } else {
+      if (v->onScrollDown)
+        v->onScrollDown();
+    }
+    if (checkForUpdates(root_))
+      relayout();
+    return true;
+  }
 
-  // The view beginPress() found to have an onDragTo handler, if any —
-  // kept separate from pressedView_ (which exists purely for onClick
-  // press/release pairing) so a click and a drag can be tracked
-  // independently. Cleared on release/capture-loss the same way
-  // pressedView_ is.
-  View *dragView_ = nullptr;
+  // Tracks which view (if any) most recently received a press of each
+  // button, so a click only fires if the matching release lands back on
+  // the same view — ordinary UI click semantics: press, drag off,
+  // release elsewhere cancels; press and release both on the button
+  // fires it. Indexed by MouseButton so an independent left/middle/right
+  // press-release pairing can be in flight at once without clobbering
+  // each other.
+  View *pressedView_[3] = {nullptr, nullptr, nullptr};
 
-  // Records the view under (x, y) as the pending click's press target.
-  void beginPress(float x, float y) {
-    pressedView_ = hitTest(x, y);
-    if (pressedView_ && pressedView_->onPressAt)
-      pressedView_->onPressAt(x - pressedView_->computed.x,
-                              y - pressedView_->computed.y);
-    dragView_ =
-        (pressedView_ && pressedView_->onDragTo) ? pressedView_ : nullptr;
+  // The view beginPress() found to have the relevant onXDragTo handler
+  // for that button, if any — kept separate from pressedView_ (which
+  // exists purely for click press/release pairing) so a click and a
+  // drag can be tracked independently. Cleared on release/capture-loss
+  // the same way pressedView_ is. Also indexed by MouseButton.
+  View *dragView_[3] = {nullptr, nullptr, nullptr};
+
+  static int btnIdx(MouseButton b) { return static_cast<int>(b); }
+
+  // Records the view under (x, y) as the pending click's press target,
+  // for whichever button was pressed.
+  void beginPress(float x, float y, MouseButton btn = MouseButton::Left) {
+    int i = btnIdx(btn);
+    View *hit = hitTest(x, y, btn);
+    pressedView_[i] = hit;
+    if (hit) {
+      float lx = x - hit->computed.x, ly = y - hit->computed.y;
+      switch (btn) {
+      case MouseButton::Left:
+        if (hit->onPressAt)
+          hit->onPressAt(lx, ly);
+        break;
+      case MouseButton::Middle:
+        if (hit->onMiddlePressAt)
+          hit->onMiddlePressAt(lx, ly);
+        break;
+      case MouseButton::Right:
+        if (hit->onRightPressAt)
+          hit->onRightPressAt(lx, ly);
+        break;
+      }
+    }
+    bool hasDrag =
+        hit && (btn == MouseButton::Left     ? (bool)hit->onDragTo
+               : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
+                                            : (bool)hit->onRightDragTo);
+    dragView_[i] = hasDrag ? hit : nullptr;
   }
 
   // Call on every pointer-motion event while a button is held. Advances
@@ -3563,10 +3719,22 @@ private:
   // state the handler changed — same checkForUpdates+relayout idiom used
   // everywhere else dynamic sources are re-read. A no-op, and cheap,
   // when no drag is active.
-  bool updateDrag(float x, float y) {
-    if (!dragView_)
+  bool updateDrag(float x, float y, MouseButton btn = MouseButton::Left) {
+    View *v = dragView_[btnIdx(btn)];
+    if (!v)
       return false;
-    dragView_->onDragTo(x - dragView_->computed.x, y - dragView_->computed.y);
+    float lx = x - v->computed.x, ly = y - v->computed.y;
+    switch (btn) {
+    case MouseButton::Left:
+      v->onDragTo(lx, ly);
+      break;
+    case MouseButton::Middle:
+      v->onMiddleDragTo(lx, ly);
+      break;
+    case MouseButton::Right:
+      v->onRightDragTo(lx, ly);
+      break;
+    }
     if (!hasRoot_)
       return false;
     if (checkForUpdates(root_)) {
@@ -3576,16 +3744,29 @@ private:
     return false;
   }
 
+
+  // Advances any of the three buttons' drags at once — motion events
+  // don't carry "which button", so this just tries all three; each is a
+  // no-op unless that button's drag is actually in progress.
+  bool updateAllDrags(float x, float y) {
+    bool changed = false;
+    changed |= updateDrag(x, y, MouseButton::Left);
+    changed |= updateDrag(x, y, MouseButton::Middle);
+    changed |= updateDrag(x, y, MouseButton::Right);
+    return changed;
+  }
+
   // Completes a pending press: fires pressedView_'s onClick only if the
   // release also landed on that same view, then clears the pending state
   // unconditionally (a press that never resolves shouldn't linger and
   // affect some later, unrelated release).
-  bool endPress(float x, float y) {
-    View *released = hitTest(x, y);
-    if (released && released == pressedView_)
-      dispatchClick(released);
-    pressedView_ = nullptr;
-    dragView_ = nullptr;
+  bool endPress(float x, float y, MouseButton btn = MouseButton::Left) {
+    int i = btnIdx(btn);
+    View *released = hitTest(x, y, btn);
+    if (released && released == pressedView_[i])
+      dispatchClick(released, btn);
+    pressedView_[i] = nullptr;
+    dragView_[i] = nullptr;
     if (!hasRoot_)
       return false;
     if (checkForUpdates(root_)) {
@@ -3742,7 +3923,7 @@ private:
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         bool changed = self->updateScrollDrag(x, y);
-        if (self->updateDrag(x, y))
+        if (self->updateAllDrags(x, y))
           changed = true;
         if (self->hasRoot_ &&
             LiteUI::updateHover(self->root_, x, y, ClipRect{}))
@@ -3769,6 +3950,55 @@ private:
       return 0;
     }
 
+    // Middle/right buttons don't interact with scrollbars — that's a
+    // left-drag convention — so these go straight through the ordinary
+    // press/click path.
+    case WM_MBUTTONDOWN: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        self->beginPress(x, y, MouseButton::Middle);
+        SetCapture(hwnd);
+        if (self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
+    case WM_MBUTTONUP: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        if (self->endPress(x, y, MouseButton::Middle) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      ReleaseCapture();
+      return 0;
+    }
+
+    case WM_RBUTTONDOWN: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        self->beginPress(x, y, MouseButton::Right);
+        SetCapture(hwnd);
+        if (self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
+    case WM_RBUTTONUP: {
+      if (self) {
+        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
+        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        if (self->endPress(x, y, MouseButton::Right) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      ReleaseCapture();
+      return 0;
+    }
+
     // Vertical mouse-wheel rotation. WM_MOUSEWHEEL's cursor coordinates are
     // in *screen* space (unlike every other mouse message here, which are
     // client-space) — ScreenToClient converts before hit-testing. One
@@ -3782,10 +4012,13 @@ private:
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
         // Wheel-up (positive notches) should scroll content up, i.e.
         // decrease scrollY — hence the negation.
-        if (self->applyWheelScroll(static_cast<float>(pt.x),
-                                   static_cast<float>(pt.y), 0.0f,
-                                   -notches * 40.0f) &&
-            self->hwnd_)
+        bool changed = self->applyWheelScroll(
+            static_cast<float>(pt.x), static_cast<float>(pt.y), 0.0f,
+            -notches * 40.0f);
+        if (self->dispatchScroll(static_cast<float>(pt.x),
+                                 static_cast<float>(pt.y), notches))
+          changed = true;
+        if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
       return 0;
@@ -3815,8 +4048,10 @@ private:
     // let a later, unrelated event resolve them.
     case WM_CAPTURECHANGED:
       if (self) {
-        self->pressedView_ = nullptr;
-        self->dragView_ = nullptr;
+        for (int i = 0; i < 3; ++i) {
+          self->pressedView_[i] = nullptr;
+          self->dragView_[i] = nullptr;
+        }
         self->scrollDrag_ = {};
       }
       return 0;
@@ -4141,6 +4376,8 @@ private:
   // Raw Linux input-event code for the left mouse button (from
   // linux/input-event-codes.h).
   static constexpr uint32_t BTN_LEFT_CODE = 0x110; // linux/input-event-codes.h
+  static constexpr uint32_t BTN_RIGHT_CODE = 0x111;  // linux/input-event-codes.h
+  static constexpr uint32_t BTN_MIDDLE_CODE = 0x112; // linux/input-event-codes.h
 
   double pointer_x_ = 0,
          pointer_y_ = 0; // Last known pointer position within
@@ -4431,8 +4668,8 @@ private:
     // being dragged.
     bool changed = self->updateScrollDrag(static_cast<float>(self->pointer_x_),
                                           static_cast<float>(self->pointer_y_));
-    if (self->updateDrag(static_cast<float>(self->pointer_x_),
-                         static_cast<float>(self->pointer_y_)))
+    if (self->updateAllDrags(static_cast<float>(self->pointer_x_),
+                             static_cast<float>(self->pointer_y_)))
       changed = true;
     if (self->hasRoot_ &&
         LiteUI::updateHover(self->root_, static_cast<float>(self->pointer_x_),
@@ -4461,8 +4698,18 @@ private:
       dy = delta;
     else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
       dx = delta;
-    if (self->applyWheelScroll(static_cast<float>(self->pointer_x_),
-                               static_cast<float>(self->pointer_y_), dx, dy))
+    bool changed = self->applyWheelScroll(
+        static_cast<float>(self->pointer_x_),
+        static_cast<float>(self->pointer_y_), dx, dy);
+    // Wayland's vertical-scroll axis value is positive for
+    // scroll-down/content-down, matching applyWheelScroll's sign
+    // convention above — negate it here so dispatchScroll's "notches >
+    // 0 means wheel-up" contract stays consistent across platforms.
+    if (dy != 0.0f &&
+        self->dispatchScroll(static_cast<float>(self->pointer_x_),
+                             static_cast<float>(self->pointer_y_), -dy))
+      changed = true;
+    if (changed)
       self->redraw();
   }
   // Called on every pointer button press/release.
@@ -4470,16 +4717,21 @@ private:
                             uint32_t button, uint32_t state) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
-    // Ignore anything that isn't the left button (we don't handle
-    // right-click, middle-click, etc.).
-    if (button != BTN_LEFT_CODE)
-      return;
+    MouseButton btn;
+    if (button == BTN_LEFT_CODE)
+      btn = MouseButton::Left;
+    else if (button == BTN_MIDDLE_CODE)
+      btn = MouseButton::Middle;
+    else if (button == BTN_RIGHT_CODE)
+      btn = MouseButton::Right;
+    else
+      return; // some other device button we don't handle
     if (state == WL_POINTER_BUTTON_STATE_PRESSED)
       // Route the press to the custom titlebar hit-testing logic, passing
       // the event serial (needed for interactive resize/move grabs).
-      self->handlePress(serial);
+      self->handlePress(serial, btn);
     else if (state == WL_POINTER_BUTTON_STATE_RELEASED)
-      self->handleRelease();
+      self->handleRelease(btn);
   }
   // Listener struct binding all five pointer callbacks above to wl_pointer's
   // events, in the order the interface expects.
@@ -5303,15 +5555,18 @@ private:
   // (close/maximize/minimize) still act immediately on press, same as
   // before — only content-area widget clicks wait for a matching release
   // (see beginPress/endPress).
-  void handlePress(uint32_t serial) {
-    // Clicks within kResizeMargin of any outer edge start an interactive
-    // resize instead — checked first since the resize strip along the top
-    // overlaps the first few pixels of the titlebar itself.
-    uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
-    if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
-      if (seat_)
-        xdg_toplevel_resize(toplevel_, seat_, serial, edge);
-      return;
+  void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
+    // Resize/move grabs and the chrome buttons are a left-button-only
+    // convention (matching every desktop's own titlebar) — a middle/
+    // right click on the resize strip just falls through to whatever's
+    // below it instead of starting a grab.
+    if (btn == MouseButton::Left) {
+      uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
+      if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+        if (seat_)
+          xdg_toplevel_resize(toplevel_, seat_, serial, edge);
+        return;
+      }
     }
 
     // Presses below the titlebar strip first give scrollbars/scrollable
@@ -5322,11 +5577,17 @@ private:
     if (pointer_y_ >= kTitlebarHeight) {
       float x = static_cast<float>(pointer_x_),
             y = static_cast<float>(pointer_y_);
-      if (!beginScrollPress(x, y))
-        beginPress(x, y);
+      // Only the left button interacts with scrollbars — a thumb grab
+      // or track-click jump is a left-drag convention.
+      if (btn != MouseButton::Left || !beginScrollPress(x, y))
+        beginPress(x, y, btn);
       redraw();
       return;
     }
+
+    if (btn != MouseButton::Left)
+      return; // titlebar chrome (close/max/min/move) is left-button only
+
 
     // If the click landed on the close button...
     if (inside(closeRect(), pointer_x_, pointer_y_)) {
@@ -5355,7 +5616,7 @@ private:
       xdg_toplevel_set_minimized(toplevel_);
       return;
     }
-    // empty titlebar space -> drag to move
+
     // Any other click in the titlebar (empty space) starts an interactive move,
     // if we have a seat to drive it.
     if (seat_)
@@ -5366,15 +5627,23 @@ private:
   // release. Chrome buttons and resize/move grabs don't need this — they
   // already acted on press — so this only matters for content-area
   // interactions below the titlebar.
-  void handleRelease() {
+  void handleRelease(MouseButton btn = MouseButton::Left) {
     if (pointer_y_ >= kTitlebarHeight) {
-      if (endScrollPress(static_cast<float>(pointer_x_),
-                         static_cast<float>(pointer_y_)))
+      bool changed =
+          (btn == MouseButton::Left)
+              ? endScrollPress(static_cast<float>(pointer_x_),
+                              static_cast<float>(pointer_y_))
+              : endPress(static_cast<float>(pointer_x_),
+                        static_cast<float>(pointer_y_), btn);
+      if (changed)
         redraw();
-    } else
-      pressedView_ = nullptr; // release moved back into the titlebar; cancel
-    dragView_ = nullptr;
-    scrollDrag_ = {};
+    } else {
+      // release moved back into the titlebar; cancel the pending press
+      pressedView_[btnIdx(btn)] = nullptr;
+    }
+    dragView_[btnIdx(btn)] = nullptr;
+    if (btn == MouseButton::Left)
+      scrollDrag_ = {}; // scroll-drag tracking only ever exists for Left
   }
 
 // Ends the Windows/Linux member block.
