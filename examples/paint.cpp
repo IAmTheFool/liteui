@@ -280,7 +280,6 @@ static View buildRoot() {
   viewport.style.justifyContent = Justify::Center;
   viewport.style.alignItems = Align::Center;
   viewport.style.padding = EdgeInsets::all(24); // breathing room once scrolled
-  viewport.style.contentPanEnabled = false;
 
   // ---- Document (the actual page you draw on) ----
   // Fixed size, NOT flexGrow/full — this is what makes it a "document"
