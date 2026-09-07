@@ -44,8 +44,7 @@ struct PaintState {
   std::vector<Stroke> strokes;
   Color currentColor{20, 20, 20, 255};
   float currentWidth = 4.0f;
-  float zoom = 1.0f;    // 1.0 = 100%; scales the doc at paint time
-  bool panMode = false; // when true, drags pan instead of drawing
+  float zoom = 1.0f; // 1.0 = 100%; scales the doc at paint time
 
   // Polled by the canvas's canvasDirtySource (see liteui.hpp's own note on
   // View::canvasDirtySource) since onPressAt/onDragTo/onClick have no
@@ -239,20 +238,6 @@ static View buildRoot() {
 
   toolbar.addChild(textButton("+", [] { setZoom(state.zoom * kZoomStep); }));
 
-  // Toggles pan mode: while on, drags on the canvas pan the viewport
-  // (via the viewport's own built-in ContentPan handling) instead of
-  // drawing a stroke. backgroundColorSource is polled each frame so the
-  // button's own fill reflects whether panMode is currently on.
-  View panBtn = textButton("Pan", [] {
-    state.panMode = !state.panMode;
-    state.markDirty();
-  });
-  panBtn.backgroundColorSource = [] {
-    return state.panMode ? Color{190, 215, 250, 255}
-                         : Color{245, 245, 245, 255};
-  };
-  toolbar.addChild(std::move(panBtn));
-
   toolbar.addChild(textButton("Clear", [] {
     state.strokes.clear();
     state.markDirty();
@@ -302,16 +287,12 @@ static View buildRoot() {
 
   canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx, state); };
   canvas.onPressAt = [](float x, float y) {
-    if (state.panMode)
-      return; // let the viewport's own ContentPan drag handle this instead
     state.strokes.push_back(Stroke{{{x / state.zoom, y / state.zoom}},
                                    state.currentColor,
                                    state.currentWidth});
     state.markDirty();
   };
   canvas.onDragTo = [](float x, float y) {
-    if (state.panMode)
-      return;
     if (!state.strokes.empty()) {
       state.strokes.back().pts.push_back({x / state.zoom, y / state.zoom});
       state.markDirty();
@@ -321,6 +302,11 @@ static View buildRoot() {
     bool d = state.dirty;
     state.dirty = false;
     return d;
+  };
+  canvas.onScrollUp = []() { setZoom(state.zoom * kZoomStep); };
+  canvas.onScrollDown = []() { setZoom(state.zoom / kZoomStep); };
+  canvas.onMiddleDragTo = [](float, float) {
+
   };
 
   viewport.addChild(std::move(canvas));
