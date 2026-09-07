@@ -245,8 +245,8 @@ struct Style {
   // dispatchScroll, never gated), so the app can hook them to implement
   // its own effect instead.
   bool wheelScrollEnabled = true;
-  Display display = Display::Flex;
-  Visibility visibility = Visibility::Visible;
+  Dynamic<Display> display = Display::Flex;
+  Dynamic<Visibility> visibility = Visibility::Visible;
 };
 
 // ---------------- Text: author-facing, leaf-only ----------------
@@ -536,10 +536,6 @@ public:
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
 
-  std::function<bool()> displaySource;    // true -> Display::Flex,
-                                          // false -> Display::None
-  std::function<bool()> visibilitySource; // true -> Visibility::Visible,
-                                          // false -> Visibility::Hidden
   // isCanvas nodes only. Polled the same way as the sources above; return
   // true once to make the next paint/render pass re-invoke onPaint (see
   // Canvas's own comment), then go back to returning false until there's
@@ -600,6 +596,8 @@ public:
     mutable float resolvedTop = std::numeric_limits<float>::quiet_NaN();
     mutable float resolvedRight = std::numeric_limits<float>::quiet_NaN();
     mutable float resolvedBottom = std::numeric_limits<float>::quiet_NaN();
+    mutable Display resolvedDisplay = Display::Flex;
+    mutable Visibility resolvedVisibility = Visibility::Visible;
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -2562,7 +2560,8 @@ inline Natural measureNatural(View &node, float availW, float availH,
   for (size_t i = 0; i < node.children.size(); ++i) {
     View &c = node.children[i];
     if (c.style.position == Position::Absolute ||
-        c.style.display == Display::None)
+        resolveDynamic(c.style.display, c.computed.resolvedDisplay) ==
+            Display::None)
       continue; // out of flow / not rendered: doesn't affect Fit size
     Natural cn = measureNatural(c, innerW, innerH,
                                 scrollX ? false : (wDefinite || !needW),
@@ -2686,7 +2685,9 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   flowIdx.reserve(node.children.size());
   for (size_t i = 0; i < node.children.size(); ++i) {
     const Style &cs = node.children[i].style;
-    if (cs.position != Position::Absolute && cs.display != Display::None)
+    if (cs.position != Position::Absolute &&
+        resolveDynamic(cs.display, node.children[i].computed.resolvedDisplay) !=
+            Display::None)
       flowIdx.push_back(i);
   }
   n = flowIdx.size();
@@ -2963,7 +2964,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   // implies width" rule).
   for (auto &ch : node.children) {
     if (ch.style.position != Position::Absolute ||
-        ch.style.display == Display::None)
+        resolveDynamic(ch.style.display, ch.computed.resolvedDisplay) ==
+            Display::None)
       continue;
     const Style &cs = ch.style;
     const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
@@ -3193,7 +3195,8 @@ private:
   // trade-offs.
   static ScrollPress resolveScrollTarget(View &v, float x, float y,
                                          ClipRect clip) {
-    if (v.style.visibility == Visibility::Hidden)
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
       return {};
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return {};
@@ -3223,7 +3226,8 @@ private:
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute ||
-          it->style.display == Display::None)
+          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
+              Display::None)
         continue;
       ScrollPress r = resolveScrollTarget(*it, x, y, childClip);
       if (r.kind != ScrollHit::None)
@@ -3233,7 +3237,6 @@ private:
       return {ScrollHit::Content, &v, 0};
     return {};
   }
-
   // How a click-and-drag inside scrollable content is currently being
   // interpreted. Mirrors pressedView_'s press/release pairing, but for
   // scroll interactions instead of onClick.
@@ -3423,7 +3426,8 @@ private:
   // their own top-level slot in the global list.
   void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
     for (const auto &child : v.children) {
-      if (child.style.display == Display::None)
+      if (resolveDynamic(child.style.display, child.computed.resolvedDisplay) ==
+          Display::None)
         continue; // a display:none subtree contributes no absolutes either
       if (child.style.position == Position::Absolute)
         out.push_back({&child, static_cast<int>(out.size())});
@@ -3481,7 +3485,8 @@ private:
   // descend, exactly mirroring how renderView() decides what to clip.
   static View *hitTestFlow(View &v, float x, float y, ClipRect clip,
                            MouseButton btn) {
-    if (v.style.visibility == Visibility::Hidden)
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
       return nullptr;
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return nullptr;
@@ -3491,7 +3496,8 @@ private:
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute ||
-          it->style.display == Display::None)
+          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
+              Display::None)
         continue;
       if (View *hit = hitTestFlow(*it, x, y, childClip, btn))
         return hit;
@@ -3524,7 +3530,8 @@ private:
   // has click handlers.
   static View *hitTestScroll(View &v, float x, float y, ClipRect clip,
                              bool up) {
-    if (v.style.visibility == Visibility::Hidden)
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
       return nullptr;
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return nullptr;
@@ -3534,7 +3541,8 @@ private:
                              : clip;
     for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
       if (it->style.position == Position::Absolute ||
-          it->style.display == Display::None)
+          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
+              Display::None)
         continue;
       if (View *hit = hitTestScroll(*it, x, y, childClip, up))
         return hit;
@@ -3654,19 +3662,19 @@ private:
         changed = true;
       }
     }
-    if (v.displaySource) {
-      Display next = v.displaySource() ? Display::Flex : Display::None;
-      if (next != v.style.display) {
-        v.style.display = next;
+    if (auto *fn = std::get_if<std::function<Display()>>(&v.style.display)) {
+      Display next = (*fn)();
+      if (next != v.computed.resolvedDisplay) {
+        v.computed.resolvedDisplay = next;
         v.computed.dirty = true;
         changed = true; // affects layout — relayout() picked up by caller
       }
     }
-    if (v.visibilitySource) {
-      Visibility next =
-          v.visibilitySource() ? Visibility::Visible : Visibility::Hidden;
-      if (next != v.style.visibility) {
-        v.style.visibility = next;
+    if (auto *fn =
+            std::get_if<std::function<Visibility()>>(&v.style.visibility)) {
+      Visibility next = (*fn)();
+      if (next != v.computed.resolvedVisibility) {
+        v.computed.resolvedVisibility = next;
         v.computed.dirty = true;
         changed = true;
       }
@@ -3686,7 +3694,8 @@ private:
   // view is never marked hovered. Returns whether any flag actually
   // flipped, so callers only repaint when hover state visibly changes.
   static bool updateHover(View &v, float x, float y, ClipRect clip) {
-    if (v.style.visibility == Visibility::Hidden) {
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden) {
       bool changed = v.computed.isHovered;
       v.computed.isHovered = false; // scrolled-out/None already relied on
                                     // this same "force false" idiom
@@ -4324,8 +4333,10 @@ private:
   // correctly with the call tree — no need to save/restore a previous
   // clip handle the way SelectClipRgn did.
   void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip) {
-    if (v.style.visibility == Visibility::Hidden)
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
       return; // space already reserved by layout; just don't draw it
+
     const Style &s = v.style;
     float x = v.computed.x, y = v.computed.y, w = v.computed.w,
           h = v.computed.h;
@@ -4392,7 +4403,8 @@ private:
                              : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute &&
-          child.style.display != Display::None)
+          resolveDynamic(child.style.display, child.computed.resolvedDisplay) !=
+              Display::None)
         paintView(rt, child, childClip);
 
     // Scrollbars are drawn after children, still under v's own (ancestor,
@@ -5473,7 +5485,8 @@ private:
   // narrowed clip if v itself scrolls, which is what actually makes
   // scrolled-out content invisible instead of just mispositioned.
   void renderView(const View &v, ClipRect clip) {
-    if (v.style.visibility == Visibility::Hidden)
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
       return; // space already reserved by layout; just don't draw it
     // Same reasoning as paintView (Windows): a text leaf's Style is
     // layout-only, so it must never paint its own opaque background —
@@ -5520,7 +5533,8 @@ private:
                              : clip;
     for (const auto &child : v.children)
       if (child.style.position != Position::Absolute &&
-          child.style.display != Display::None)
+          resolveDynamic(child.style.display, child.computed.resolvedDisplay) !=
+              Display::None)
         renderView(child, childClip);
     // Scrollbars sit in the gutter layout already reserved outside the
     // children's placement area, so drawing them after children never
