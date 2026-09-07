@@ -10,7 +10,7 @@ int main() {
 
   // --- label showing the current percentage ---
   Text valueLabel;
-  valueLabel.source = [&]() {
+  valueLabel.label = [&]() {
     char buf[16];
     std::snprintf(buf, sizeof(buf), "%d%%",
                   static_cast<int>(sliderValue * 100 + 0.5f));
@@ -23,8 +23,8 @@ int main() {
   View track;
   track.style.height = Size::pixel(6);
   track.style.width = Size::full();
-  track.style.backgroundColor = {225, 225, 225};
-  track.style.borderRadius = 3;
+  track.style.backgroundColor = Color{225, 225, 225};
+  track.style.borderRadius = 3.0f;
   track.onLayout = [&](float x, float y, float w, float h) { trackWidth = w; };
   auto updateFromLocalX = [&](float localX) {
     if (trackWidth > 0)
@@ -43,9 +43,9 @@ int main() {
   // uses for progress bars. ---
   View fill;
   fill.style.height = Size::full();
-  fill.style.backgroundColor = {60, 120, 235};
-  fill.style.borderRadius = 3;
-  fill.valueSource = [&]() { return sliderValue; };
+  fill.style.backgroundColor = Color{60, 120, 235};
+  fill.style.borderRadius = 3.0f;
+  fill.style.width = [&]() { return Size::pixel(sliderValue * trackWidth); };
   track.addChild(fill);
 
   // --- thumb: Position::Absolute so it isn't squeezed by track's own
@@ -54,14 +54,14 @@ int main() {
   // View::positionSource's own doc. ---
   View thumb;
   thumb.style.position = Position::Absolute;
-  thumb.style.top = -6; // (18 - 6) / 2, centers it vertically on the track
+  thumb.style.top = -6.0f; // (18 - 6) / 2, centers it vertically on the track
   thumb.style.width = Size::pixel(kThumbSize);
   thumb.style.height = Size::pixel(kThumbSize);
-  thumb.style.backgroundColor = {255, 255, 255};
-  thumb.style.borderWidth = 2;
-  thumb.style.borderColor = {60, 120, 235};
+  thumb.style.backgroundColor =Color {255, 255, 255};
+  thumb.style.borderWidth = 2.0f;
+  thumb.style.borderColor =Color {60, 120, 235};
   thumb.style.borderRadius = kThumbSize / 2;
-  thumb.positionSource = [&]() {
+  thumb.style.left = [&]() {
     return sliderValue * trackWidth - kThumbSize / 2;
   };
 

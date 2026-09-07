@@ -48,6 +48,7 @@
 // Plain RGB color, one byte per channel.
 struct Color {
   uint8_t r = 0, g = 0, b = 0, a = 255;
+  bool operator==(const Color &) const = default;
 };
 
 // Which physical mouse button an event refers to. Used to key the
@@ -218,10 +219,10 @@ struct Style {
   // right); otherwise size resolves normally (Fixed/Percentage/Fit/Full)
   // against the containing block, same as an in-flow child would.
   Position position = Position::Static;
-  float left = std::numeric_limits<float>::quiet_NaN();
-  float top = std::numeric_limits<float>::quiet_NaN();
-  float right = std::numeric_limits<float>::quiet_NaN();
-  float bottom = std::numeric_limits<float>::quiet_NaN();
+  Dynamic<float> left = std::numeric_limits<float>::quiet_NaN();
+  Dynamic<float> top = std::numeric_limits<float>::quiet_NaN();
+  Dynamic<float> right = std::numeric_limits<float>::quiet_NaN();
+  Dynamic<float> bottom = std::numeric_limits<float>::quiet_NaN();
   // Stacking order among all Absolute nodes tree-wide (not just siblings).
   // Ties break by document order — see collectAbsolutes().
   int zIndex = 0;
@@ -535,11 +536,6 @@ public:
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
 
-  std::function<float()> positionSource;  // pixels — drives style.left
-                                          // directly (Position::Absolute
-                                          // slider thumbs)
-  std::function<float()> topSource;       // pixels — drives style.top,
-                                          // same idea as positionSource
   std::function<bool()> displaySource;    // true -> Display::Flex,
                                           // false -> Display::None
   std::function<bool()> visibilitySource; // true -> Visibility::Visible,
@@ -600,6 +596,10 @@ public:
     mutable float resolvedBorderWidth = 0.0f;
     mutable Color resolvedBorderColor{0, 0, 0};
     mutable float resolvedBorderRadius = 0.0f;
+    mutable float resolvedLeft = std::numeric_limits<float>::quiet_NaN();
+    mutable float resolvedTop = std::numeric_limits<float>::quiet_NaN();
+    mutable float resolvedRight = std::numeric_limits<float>::quiet_NaN();
+    mutable float resolvedBottom = std::numeric_limits<float>::quiet_NaN();
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -2969,24 +2969,28 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
     const Size &csHeight =
         resolveDynamic(cs.height, ch.computed.resolvedHeight);
-    bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
-    bool hasT = !std::isnan(cs.top), hasB = !std::isnan(cs.bottom);
+    float csLeft = resolveDynamic(cs.left, ch.computed.resolvedLeft);
+    float csTop = resolveDynamic(cs.top, ch.computed.resolvedTop);
+    float csRight = resolveDynamic(cs.right, ch.computed.resolvedRight);
+    float csBottom = resolveDynamic(cs.bottom, ch.computed.resolvedBottom);
+    bool hasL = !std::isnan(csLeft), hasR = !std::isnan(csRight);
+    bool hasT = !std::isnan(csTop), hasB = !std::isnan(csBottom);
 
     Natural probe = measureNatural(ch, contentW, contentH, true, true);
     float aw = (csWidth.kind == Size::Kind::Fit && hasL && hasR)
-                   ? contentW - cs.left - cs.right
+                   ? contentW - csLeft - csRight
                    : probe.w;
     float ah = (csHeight.kind == Size::Kind::Fit && hasT && hasB)
-                   ? contentH - cs.top - cs.bottom
+                   ? contentH - csTop - csBottom
                    : probe.h;
     aw = clampSize(aw, cs.minWidth, cs.maxWidth);
     ah = clampSize(ah, cs.minHeight, cs.maxHeight);
 
-    float ax = hasL   ? contentX + cs.left + cs.margin.left
-               : hasR ? contentX + contentW - cs.right - cs.margin.right - aw
+    float ax = hasL   ? contentX + csLeft + cs.margin.left
+               : hasR ? contentX + contentW - csRight - cs.margin.right - aw
                       : contentX + cs.margin.left;
-    float ay = hasT   ? contentY + cs.top + cs.margin.top
-               : hasB ? contentY + contentH - cs.bottom - cs.margin.bottom - ah
+    float ay = hasT   ? contentY + csTop + cs.margin.top
+               : hasB ? contentY + contentH - csBottom - cs.margin.bottom - ah
                       : contentY + cs.margin.top;
 
     placeNode(ch, ax, ay, aw, ah);
@@ -3607,18 +3611,34 @@ private:
         changed = true;
       }
     }
-    if (v.positionSource) {
-      float next = v.positionSource();
-      if (next != v.style.left) {
-        v.style.left = next;
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.left)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedLeft) {
+        v.computed.resolvedLeft = next;
+        v.computed.dirty = true;
+        changed = true; // affects layout — relayout() picked up by caller
+      }
+    }
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.top)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedTop) {
+        v.computed.resolvedTop = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (v.topSource) {
-      float next = v.topSource();
-      if (next != v.style.top) {
-        v.style.top = next;
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.right)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedRight) {
+        v.computed.resolvedRight = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.bottom)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedBottom) {
+        v.computed.resolvedBottom = next;
         v.computed.dirty = true;
         changed = true;
       }
@@ -4330,7 +4350,8 @@ private:
       return;
     }
 
-    float borderRadius = resolveDynamic(s.borderRadius, v.computed.resolvedBorderRadius);
+    float borderRadius =
+        resolveDynamic(s.borderRadius, v.computed.resolvedBorderRadius);
     D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), borderRadius,
                             borderRadius};
     Color bg = (v.computed.isHovered && s.hoverColor)
@@ -4343,11 +4364,13 @@ private:
       rt->FillRoundedRectangle(rr, bgBrush);
       bgBrush->Release();
     }
-    float borderWidth = resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
+    float borderWidth =
+        resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
     if (borderWidth > 0) {
       ID2D1SolidColorBrush *borderBrush = nullptr;
       rt->CreateSolidColorBrush(
-          toD2DColor(resolveDynamic(s.borderColor, v.computed.resolvedBorderColor)),
+          toD2DColor(
+              resolveDynamic(s.borderColor, v.computed.resolvedBorderColor)),
           &borderBrush);
       if (borderBrush) {
         rt->DrawRoundedRectangle(rr, borderBrush, borderWidth);

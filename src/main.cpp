@@ -101,9 +101,12 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
   v.style.height = Size::pixel(28);
   v.style.backgroundColor = color;
   v.style.borderRadius = 6.0f;
-  v.style.borderWidth = [&] { return selected ? 3 : 0; };
-  v.style.borderColor = [&] {
-    return selected ? Color{40, 120, 220, 255} : Color{160, 160, 160, 255};
+  v.style.borderWidth = [&state, color] {
+    return state.currentColor == color ? 3.0f : 1.0f;
+  };
+  v.style.borderColor = [&state, color] {
+    return state.currentColor == color ? Color{40, 120, 220, 255}
+                                       : Color{160, 160, 160, 255};
   };
   v.style.margin = EdgeInsets::all(3);
   v.onClick = [&state, color] {
@@ -115,17 +118,19 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
 
 // A round "brush size" button: bigger dot == thicker brush. `selected`
 // gets the same blue-ring treatment as colorSwatch above.
-static View sizeButton(float diameter, float width, PaintState &state,
-                       bool selected) {
+static View sizeButton(float diameter, float width, PaintState &state) {
   View outer;
   outer.style.width = Size::pixel(32);
   outer.style.height = Size::pixel(32);
   outer.style.justifyContent = Justify::Center;
   outer.style.alignItems = Align::Center;
   outer.style.borderRadius = 16.0f;
-  outer.style.borderWidth = [&] { return selected ? 2 : 1; };
-  outer.style.borderColor = [&] {
-    return selected ? Color{40, 120, 220, 255} : Color{200, 200, 200, 255};
+  outer.style.borderWidth = [&state, width] {
+    return state.currentWidth == width ? 2.0f : 1.0f;
+  };
+  outer.style.borderColor = [&state, width] {
+    return state.currentWidth == width ? Color{40, 120, 220, 255}
+                                       : Color{200, 200, 200, 255};
   };
   outer.style.backgroundColor = Color{250, 250, 250, 255};
   outer.style.margin = EdgeInsets::all(3);
@@ -209,18 +214,15 @@ static View buildRoot() {
       {120, 80, 50, 255},
   };
   for (Color c : kPalette)
-    toolbar.addChild(colorSwatch(c, state,
-                                 c.r == state.currentColor.r &&
-                                     c.g == state.currentColor.g &&
-                                     c.b == state.currentColor.b));
+    toolbar.addChild(colorSwatch(c, state, c == state.currentColor));
 
   View spacer1;
   spacer1.style.width = Size::pixel(16);
   toolbar.addChild(std::move(spacer1));
 
-  toolbar.addChild(sizeButton(6, 2, state, false));
-  toolbar.addChild(sizeButton(12, 4, state, true));
-  toolbar.addChild(sizeButton(20, 8, state, false));
+  toolbar.addChild(sizeButton(6, 2, state));
+  toolbar.addChild(sizeButton(12, 4, state));
+  toolbar.addChild(sizeButton(20, 8, state));
 
   View spacer2;
   spacer2.style.flexGrow = 1;

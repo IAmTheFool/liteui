@@ -100,10 +100,14 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
   v.style.width = Size::pixel(28);
   v.style.height = Size::pixel(28);
   v.style.backgroundColor = color;
-  v.style.borderRadius = 6;
-  v.style.borderWidth = selected ? 3 : 1;
-  v.style.borderColor =
-      selected ? Color{40, 120, 220, 255} : Color{160, 160, 160, 255};
+  v.style.borderRadius = 6.0f;
+  v.style.borderWidth = [&state, color] {
+    return state.currentColor == color ? 3.0f : 1.0f;
+  };
+  v.style.borderColor = [&state, color] {
+    return state.currentColor == color ? Color{40, 120, 220, 255}
+                                       : Color{160, 160, 160, 255};
+  };
   v.style.margin = EdgeInsets::all(3);
   v.onClick = [&state, color] {
     state.currentColor = color;
@@ -114,25 +118,28 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
 
 // A round "brush size" button: bigger dot == thicker brush. `selected`
 // gets the same blue-ring treatment as colorSwatch above.
-static View sizeButton(float diameter, float width, PaintState &state,
-                       bool selected) {
+static View sizeButton(float diameter, float width, PaintState &state) {
   View outer;
   outer.style.width = Size::pixel(32);
   outer.style.height = Size::pixel(32);
   outer.style.justifyContent = Justify::Center;
   outer.style.alignItems = Align::Center;
-  outer.style.borderRadius = 16;
-  outer.style.borderWidth = selected ? 2 : 1;
-  outer.style.borderColor =
-      selected ? Color{40, 120, 220, 255} : Color{200, 200, 200, 255};
-  outer.style.backgroundColor = {250, 250, 250, 255};
+  outer.style.borderRadius = 16.0f;
+  outer.style.borderWidth = [&state, width] {
+    return state.currentWidth == width ? 2.0f : 1.0f;
+  };
+  outer.style.borderColor = [&state, width] {
+    return state.currentWidth == width ? Color{40, 120, 220, 255}
+                                       : Color{200, 200, 200, 255};
+  };
+  outer.style.backgroundColor = Color{250, 250, 250, 255};
   outer.style.margin = EdgeInsets::all(3);
 
   View dot;
   dot.style.width = Size::pixel(diameter);
   dot.style.height = Size::pixel(diameter);
   dot.style.borderRadius = diameter / 2.0f;
-  dot.style.backgroundColor = {40, 40, 40, 255};
+  dot.style.backgroundColor = Color{40, 40, 40, 255};
   outer.addChild(std::move(dot));
 
   outer.onClick = [&state, width] {
@@ -148,11 +155,11 @@ static View textButton(const std::string &label,
   View v;
   v.style.padding = EdgeInsets{8, 14, 8, 14};
   v.style.margin = EdgeInsets{3, 3, 3, 12};
-  v.style.backgroundColor = {245, 245, 245, 255};
+  v.style.backgroundColor = Color{245, 245, 245, 255};
   v.style.hoverColor = Color{230, 230, 230, 255};
-  v.style.borderWidth = 1;
-  v.style.borderColor = {190, 190, 190, 255};
-  v.style.borderRadius = 6;
+  v.style.borderWidth = 1.0f;
+  v.style.borderColor = Color{190, 190, 190, 255};
+  v.style.borderRadius = 6.0f;
   v.style.justifyContent = Justify::Center;
   v.style.alignItems = Align::Center;
   v.onClick = std::move(onClick);
@@ -187,7 +194,7 @@ static View buildRoot() {
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
   root.style.height = Size::full();
-  root.style.backgroundColor = {235, 235, 235, 255};
+  root.style.backgroundColor = Color{235, 235, 235, 255};
 
   // ---- Toolbar ----
   View toolbar;
@@ -195,8 +202,8 @@ static View buildRoot() {
   toolbar.style.alignItems = Align::Center;
   toolbar.style.padding = EdgeInsets::all(8);
   toolbar.style.gap = 2;
-  toolbar.style.backgroundColor = {245, 245, 245, 255};
-  toolbar.style.borderWidth = 0;
+  toolbar.style.backgroundColor = Color{245, 245, 245, 255};
+  toolbar.style.borderWidth = 0.0f;
   toolbar.style.height = Size::pixel(52);
   toolbar.style.flexShrink = 0;
 
@@ -207,18 +214,15 @@ static View buildRoot() {
       {120, 80, 50, 255},
   };
   for (Color c : kPalette)
-    toolbar.addChild(colorSwatch(c, state,
-                                 c.r == state.currentColor.r &&
-                                     c.g == state.currentColor.g &&
-                                     c.b == state.currentColor.b));
+    toolbar.addChild(colorSwatch(c, state, c == state.currentColor));
 
   View spacer1;
   spacer1.style.width = Size::pixel(16);
   toolbar.addChild(std::move(spacer1));
 
-  toolbar.addChild(sizeButton(6, 2, state, false));
-  toolbar.addChild(sizeButton(12, 4, state, true));
-  toolbar.addChild(sizeButton(20, 8, state, false));
+  toolbar.addChild(sizeButton(6, 2, state));
+  toolbar.addChild(sizeButton(12, 4, state));
+  toolbar.addChild(sizeButton(20, 8, state));
 
   View spacer2;
   spacer2.style.flexGrow = 1;
@@ -228,7 +232,7 @@ static View buildRoot() {
   toolbar.addChild(textButton("-", [] { setZoom(state.zoom / kZoomStep); }));
 
   Text zoomLabel;
-  zoomLabel.source = [] {
+  zoomLabel.label = [] {
     return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 14;
@@ -246,7 +250,7 @@ static View buildRoot() {
     state.panMode = !state.panMode;
     state.markDirty();
   });
-  panBtn.backgroundColorSource = [] {
+  panBtn.style.backgroundColor = [] {
     return state.panMode ? Color{190, 215, 250, 255}
                          : Color{245, 245, 245, 255};
   };
@@ -274,12 +278,14 @@ static View buildRoot() {
   View viewport;
   viewport.style.height = Size::full();
   viewport.style.width = Size::full();
-  viewport.style.backgroundColor = {200, 200, 200, 255};
+  viewport.style.backgroundColor = Color{200, 200, 200, 255};
   viewport.style.overflowX = Overflow::Auto;
   viewport.style.overflowY = Overflow::Auto;
   viewport.style.justifyContent = Justify::Center;
   viewport.style.alignItems = Align::Center;
   viewport.style.padding = EdgeInsets::all(24); // breathing room once scrolled
+  viewport.style.contentPanEnabled = false;
+  viewport.style.wheelScrollEnabled = false;
 
   // ---- Document (the actual page you draw on) ----
   // Fixed size, NOT flexGrow/full — this is what makes it a "document"
@@ -293,9 +299,9 @@ static View buildRoot() {
   // so this is purely how big the "page" appears in the viewport.
   canvas.style.width = Size::pixel(kDocW * state.zoom);
   canvas.style.height = Size::pixel(kDocH * state.zoom);
-  canvas.style.borderWidth = 1;
-  canvas.style.borderColor = {150, 150, 150, 255};
-  canvas.style.backgroundColor = {255, 255, 255, 255};
+  canvas.style.borderWidth = 1.0f;
+  canvas.style.borderColor = Color{150, 150, 150, 255};
+  canvas.style.backgroundColor = Color{255, 255, 255, 255};
 
   canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx, state); };
   canvas.onPressAt = [](float x, float y) {
@@ -319,6 +325,8 @@ static View buildRoot() {
     state.dirty = false;
     return d;
   };
+  canvas.onScrollUp = []() { setZoom(state.zoom * kZoomStep); };
+  canvas.onScrollDown = []() { setZoom(state.zoom / kZoomStep); };
 
   viewport.addChild(std::move(canvas));
   root.addChild(std::move(viewport));
