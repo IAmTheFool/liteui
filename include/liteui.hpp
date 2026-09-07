@@ -219,6 +219,16 @@ struct Style {
   Overflow overflowX = Overflow::Visible;
   Overflow overflowY = Overflow::Visible;
   bool contentPanEnabled = true;
+  // Same idea as contentPanEnabled, but gates pixel scrolling driven by
+  // the mouse wheel/trackpad axis (see applyWheelScroll) instead of a
+  // click-and-drag pan. Defaults to true. Set to false to stop the wheel
+  // from directly moving this view's scroll position — the view can
+  // still be scrolled via its scrollbar (thumb drag or track click).
+  // onScrollUp/onScrollDown below still fire on every wheel notch
+  // regardless of this flag (they're dispatched independently by
+  // dispatchScroll, never gated), so the app can hook them to implement
+  // its own effect instead.
+  bool wheelScrollEnabled = true;
   Display display = Display::Flex;
   Visibility visibility = Visibility::Visible;
 };
@@ -3349,6 +3359,14 @@ private:
   // for press resolution — scrollbar vs. content doesn't matter for wheel
   // input, both count as "the pointer is over this scrollable view".
   // Returns true if it changed anything (caller should repaint).
+  //
+  // If the resolved view has style.wheelScrollEnabled == false, this is a
+  // no-op — the wheel no longer moves that view's scroll position at all,
+  // even though it's still scrollable via its scrollbar. This function is
+  // entirely separate from dispatchScroll()/onScrollUp/onScrollDown: a
+  // caller that wants "wheel does something custom instead of scrolling"
+  // (e.g. zoom) should turn this off and rely on those handlers, which
+  // fire regardless of wheelScrollEnabled.
   bool applyWheelScroll(float x, float y, float deltaX, float deltaY) {
     if (!hasRoot_)
       return false;
@@ -3356,6 +3374,11 @@ private:
     if (r.kind == ScrollHit::None || !r.view)
       return false;
     View &v = *r.view;
+    if (!v.style.wheelScrollEnabled)
+      return false; // pixel scroll disabled for this view; scrollbar
+                    // drag/track-click still work normally, and
+                    // onScrollUp/onScrollDown still fire via the
+                    // caller's separate dispatchScroll() call
     bool changed = false;
     if (v.scrollsY() && deltaY != 0.0f) {
       float ns = std::clamp(v.computed.scrollY + deltaY, 0.0f, v.maxScrollY());
