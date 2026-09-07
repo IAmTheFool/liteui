@@ -14,7 +14,6 @@
 #include "liteui.hpp"
 
 #include <cmath>
-#include <iostream>
 #include <vector>
 
 // The document's fixed pixel size — this is the actual "page" (like
@@ -44,7 +43,8 @@ struct PaintState {
   std::vector<Stroke> strokes;
   Color currentColor{20, 20, 20, 255};
   float currentWidth = 4.0f;
-  float zoom = 1.0f; // 1.0 = 100%; scales the doc at paint time
+  float zoom = 1.0f;    // 1.0 = 100%; scales the doc at paint time
+  bool panMode = false; // when true, drags pan instead of drawing
 
   // Polled by the canvas's canvasDirtySource (see liteui.hpp's own note on
   // View::canvasDirtySource) since onPressAt/onDragTo/onClick have no
@@ -100,10 +100,11 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
   v.style.width = Size::pixel(28);
   v.style.height = Size::pixel(28);
   v.style.backgroundColor = color;
-  v.style.borderRadius = 6;
-  v.style.borderWidth = selected ? 3 : 1;
-  v.style.borderColor =
-      selected ? Color{40, 120, 220, 255} : Color{160, 160, 160, 255};
+  v.style.borderRadius = 6.0f;
+  v.style.borderWidth = [&] { return selected ? 3 : 0; };
+  v.style.borderColor = [&] {
+    return selected ? Color{40, 120, 220, 255} : Color{160, 160, 160, 255};
+  };
   v.style.margin = EdgeInsets::all(3);
   v.onClick = [&state, color] {
     state.currentColor = color;
@@ -121,18 +122,19 @@ static View sizeButton(float diameter, float width, PaintState &state,
   outer.style.height = Size::pixel(32);
   outer.style.justifyContent = Justify::Center;
   outer.style.alignItems = Align::Center;
-  outer.style.borderRadius = 16;
-  outer.style.borderWidth = selected ? 2 : 1;
-  outer.style.borderColor =
-      selected ? Color{40, 120, 220, 255} : Color{200, 200, 200, 255};
-  outer.style.backgroundColor = {250, 250, 250, 255};
+  outer.style.borderRadius = 16.0f;
+  outer.style.borderWidth = [&] { return selected ? 2 : 1; };
+  outer.style.borderColor = [&] {
+    return selected ? Color{40, 120, 220, 255} : Color{200, 200, 200, 255};
+  };
+  outer.style.backgroundColor = Color{250, 250, 250, 255};
   outer.style.margin = EdgeInsets::all(3);
 
   View dot;
   dot.style.width = Size::pixel(diameter);
   dot.style.height = Size::pixel(diameter);
   dot.style.borderRadius = diameter / 2.0f;
-  dot.style.backgroundColor = {40, 40, 40, 255};
+  dot.style.backgroundColor = Color{40, 40, 40, 255};
   outer.addChild(std::move(dot));
 
   outer.onClick = [&state, width] {
@@ -148,11 +150,11 @@ static View textButton(const std::string &label,
   View v;
   v.style.padding = EdgeInsets{8, 14, 8, 14};
   v.style.margin = EdgeInsets{3, 3, 3, 12};
-  v.style.backgroundColor = {245, 245, 245, 255};
+  v.style.backgroundColor = Color{245, 245, 245, 255};
   v.style.hoverColor = Color{230, 230, 230, 255};
-  v.style.borderWidth = 1;
-  v.style.borderColor = {190, 190, 190, 255};
-  v.style.borderRadius = 6;
+  v.style.borderWidth = 1.0f;
+  v.style.borderColor = Color{190, 190, 190, 255};
+  v.style.borderRadius = 6.0f;
   v.style.justifyContent = Justify::Center;
   v.style.alignItems = Align::Center;
   v.onClick = std::move(onClick);
@@ -187,7 +189,7 @@ static View buildRoot() {
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
   root.style.height = Size::full();
-  root.style.backgroundColor = {235, 235, 235, 255};
+  root.style.backgroundColor = Color{235, 235, 235, 255};
 
   // ---- Toolbar ----
   View toolbar;
@@ -195,8 +197,8 @@ static View buildRoot() {
   toolbar.style.alignItems = Align::Center;
   toolbar.style.padding = EdgeInsets::all(8);
   toolbar.style.gap = 2;
-  toolbar.style.backgroundColor = {245, 245, 245, 255};
-  toolbar.style.borderWidth = 0;
+  toolbar.style.backgroundColor = Color{245, 245, 245, 255};
+  toolbar.style.borderWidth = 0.0f;
   toolbar.style.height = Size::pixel(52);
   toolbar.style.flexShrink = 0;
 
@@ -228,7 +230,7 @@ static View buildRoot() {
   toolbar.addChild(textButton("-", [] { setZoom(state.zoom / kZoomStep); }));
 
   Text zoomLabel;
-  zoomLabel.source = [] {
+  zoomLabel.label = [] {
     return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 14;
@@ -237,6 +239,20 @@ static View buildRoot() {
   toolbar.addChild(std::move(zoomLabel));
 
   toolbar.addChild(textButton("+", [] { setZoom(state.zoom * kZoomStep); }));
+
+  // Toggles pan mode: while on, drags on the canvas pan the viewport
+  // (via the viewport's own built-in ContentPan handling) instead of
+  // drawing a stroke. backgroundColorSource is polled each frame so the
+  // button's own fill reflects whether panMode is currently on.
+  View panBtn = textButton("Pan", [] {
+    state.panMode = !state.panMode;
+    state.markDirty();
+  });
+  panBtn.style.backgroundColor = [] {
+    return state.panMode ? Color{190, 215, 250, 255}
+                         : Color{245, 245, 245, 255};
+  };
+  toolbar.addChild(std::move(panBtn));
 
   toolbar.addChild(textButton("Clear", [] {
     state.strokes.clear();
@@ -260,7 +276,7 @@ static View buildRoot() {
   View viewport;
   viewport.style.height = Size::full();
   viewport.style.width = Size::full();
-  viewport.style.backgroundColor = {200, 200, 200, 255};
+  viewport.style.backgroundColor = Color{200, 200, 200, 255};
   viewport.style.overflowX = Overflow::Auto;
   viewport.style.overflowY = Overflow::Auto;
   viewport.style.justifyContent = Justify::Center;
@@ -281,18 +297,22 @@ static View buildRoot() {
   // so this is purely how big the "page" appears in the viewport.
   canvas.style.width = Size::pixel(kDocW * state.zoom);
   canvas.style.height = Size::pixel(kDocH * state.zoom);
-  canvas.style.borderWidth = 1;
-  canvas.style.borderColor = {150, 150, 150, 255};
-  canvas.style.backgroundColor = {255, 255, 255, 255};
+  canvas.style.borderWidth = 1.0f;
+  canvas.style.borderColor = Color{150, 150, 150, 255};
+  canvas.style.backgroundColor = Color{255, 255, 255, 255};
 
   canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx, state); };
   canvas.onPressAt = [](float x, float y) {
+    if (state.panMode)
+      return; // let the viewport's own ContentPan drag handle this instead
     state.strokes.push_back(Stroke{{{x / state.zoom, y / state.zoom}},
                                    state.currentColor,
                                    state.currentWidth});
     state.markDirty();
   };
   canvas.onDragTo = [](float x, float y) {
+    if (state.panMode)
+      return;
     if (!state.strokes.empty()) {
       state.strokes.back().pts.push_back({x / state.zoom, y / state.zoom});
       state.markDirty();
@@ -305,9 +325,6 @@ static View buildRoot() {
   };
   canvas.onScrollUp = []() { setZoom(state.zoom * kZoomStep); };
   canvas.onScrollDown = []() { setZoom(state.zoom / kZoomStep); };
-  canvas.onMiddleDragTo = [](float, float) {
-
-  };
 
   viewport.addChild(std::move(canvas));
   root.addChild(std::move(viewport));

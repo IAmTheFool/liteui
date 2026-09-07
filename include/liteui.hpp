@@ -16,6 +16,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #if defined(_WIN32)
@@ -48,7 +49,6 @@
 struct Color {
   uint8_t r = 0, g = 0, b = 0, a = 255;
 };
-
 
 // Which physical mouse button an event refers to. Used to key the
 // per-button press/drag tracking in LiteUI (pressedView_/dragView_) and
@@ -86,6 +86,21 @@ struct Box {
 // keeping it in one place means layout and painting can never disagree
 // about how much room a bar takes up.
 constexpr float kScrollbarThickness = 12.0f;
+
+// A field settable as either a fixed value or a callback polled after each
+// dispatched event (see checkForUpdates) — lets author code write
+// `x = "hello";` or `x = []{ return someVar; };` through plain assignment.
+template <class T> using Dynamic = std::variant<T, std::function<T()>>;
+
+// What every read site outside checkForUpdates should call: the stored
+// value directly if it's static (always fresh, no indirection), or `cache`
+// — the last value checkForUpdates polled from the callback — if dynamic.
+template <class T>
+inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache) {
+  if (auto *v = std::get_if<T>(&field))
+    return *v;
+  return cache;
+}
 
 // ---------------- Layout engine: Size / Style / View ----------------
 
@@ -160,8 +175,8 @@ enum class Visibility { Visible, Hidden };
 enum class Overflow { Visible, Hidden, Scroll, Auto };
 
 struct Style {
-  Size width = Size::fit();
-  Size height = Size::fit();
+  Dynamic<Size> width = Size::fit();
+  Dynamic<Size> height = Size::fit();
 
   // Clamp bounds applied (in pixels) after width/height above are resolved.
   // Defaults impose no constraint. maxWidth < minWidth (or the height
@@ -185,10 +200,10 @@ struct Style {
   float flexGrow = 0;
   float flexShrink = 1;
 
-  Color backgroundColor{255, 255, 255};
-  float borderWidth = 0;
-  Color borderColor{0, 0, 0};
-  float borderRadius = 0;
+  Dynamic<Color> backgroundColor = Color{255, 255, 255};
+  Dynamic<float> borderWidth = 0.0f;
+  Dynamic<Color> borderColor = Color{0, 0, 0};
+  Dynamic<float> borderRadius = 0.0f;
 
   // Applied instead of backgroundColor while the pointer is over this
   // view. Set directly by the app; isHovered itself is derived
@@ -272,8 +287,7 @@ struct TextStyle {
 // Author-facing leaf node. addChild(Text) flattens this into a View (see
 // View::toView) — Text itself never appears in the retained tree.
 struct Text {
-  std::string label;
-  std::function<std::string()> source; // optional: polled instead of `label`
+  Dynamic<std::string> label = std::string{};
   Style
       style; // layout only — width/height/margin/position/etc, reused from View
   float fontSize = 16.0f;
@@ -462,7 +476,7 @@ public:
   // implies children.empty() always; text/textStyle are meaningless
   // otherwise.
   bool isText = false;
-  std::string text;
+  Dynamic<std::string> text;
   TextStyle textStyle;
 
   // True for a View created via addChild(Canvas) — a canvas leaf. isCanvas
@@ -480,7 +494,6 @@ public:
   // Same bubbling semantics as onClick, for the middle and right buttons.
   std::function<void()> onMiddleClick;
   std::function<void()> onRightClick;
- 
 
   // Fired the instant a left-button press lands on this view (before
   // any matching release/onClick pairing) — unlike onClick, this gives
@@ -491,7 +504,6 @@ public:
   std::function<void(float localX, float localY)> onPressAt;
   std::function<void(float localX, float localY)> onMiddlePressAt;
   std::function<void(float localX, float localY)> onRightPressAt;
- 
 
   // Fired continuously while a left-button press that started on this
   // view is still held and the pointer moves — unlike onPressAt (which
@@ -514,7 +526,6 @@ public:
   // dropdown/menu to the button that opened it.
   std::function<void(float x, float y, float w, float h)> onLayout;
 
-
   // Fired on a discrete wheel notch (or trackpad step) whose point lands
   // on this view, independent of pixel-based content scrolling — lets a
   // plain, non-overflow view (e.g. a stepper/spinner arrow) react to the
@@ -524,21 +535,11 @@ public:
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
 
-  // Polled dynamic state — compared against the stored value in
-  // LiteUI::checkForUpdates() after each dispatched event; only fields
-  // that actually changed get marked dirty. Each is optional; unset
-  // means "static", matching onClick's own empty-means-inert convention.
-  std::function<std::string()> textSource;
-  std::function<bool()> disabledSource;
-  std::function<float()> valueSource;    // 0..1 — drives style.width as a
-                                         // fraction of available width
-                                         // (progress bars)
-  std::function<float()> positionSource; // pixels — drives style.left
-                                         // directly (Position::Absolute
-                                         // slider thumbs)
-  std::function<float()> topSource;      // pixels — drives style.top,
-                                         // same idea as positionSource
-  std::function<Color()> backgroundColorSource;
+  std::function<float()> positionSource;  // pixels — drives style.left
+                                          // directly (Position::Absolute
+                                          // slider thumbs)
+  std::function<float()> topSource;       // pixels — drives style.top,
+                                          // same idea as positionSource
   std::function<bool()> displaySource;    // true -> Display::Flex,
                                           // false -> Display::None
   std::function<bool()> visibilitySource; // true -> Visibility::Visible,
@@ -556,8 +557,7 @@ public:
   // `canvasDirtySource = [&]{ bool d = dirty; dirty = false; return d; };`
   std::function<bool()> canvasDirtySource;
 
-  bool disabled = false;
-  float value = 0.0f;
+  Dynamic<bool> disabled = false;
 
   struct Computed {
     float x = 0, y = 0, w = 0, h = 0; // border-box, absolute window coords
@@ -588,6 +588,18 @@ public:
     // ensureCanvasSurface/ensureCanvasTarget) — plain repaints (e.g. from
     // an unrelated sibling's hover change) do NOT re-invoke onPaint.
     mutable bool canvasNeedsRedraw = true;
+
+    // Last polled result when text/disabled/value hold a callback; unused
+    // (and untouched) when they hold a plain value — see resolveDynamic.
+    mutable std::string resolvedText;
+    mutable bool resolvedDisabled = false;
+    mutable float resolvedValue = 0.0f;
+    mutable Color resolvedBackgroundColor{255, 255, 255};
+    mutable Size resolvedWidth = Size::fit();
+    mutable Size resolvedHeight = Size::fit();
+    mutable float resolvedBorderWidth = 0.0f;
+    mutable Color resolvedBorderColor{0, 0, 0};
+    mutable float resolvedBorderRadius = 0.0f;
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -698,7 +710,6 @@ inline View View::toView(Text t) {
   v.style = std::move(t.style);
   v.isText = true;
   v.text = std::move(t.label);
-  v.textSource = std::move(t.source);
   v.textStyle.fontSize = t.fontSize;
   v.textStyle.fontWeight = t.fontWeight;
   v.textStyle.fontStyle = t.fontStyle;
@@ -2481,52 +2492,45 @@ inline bool axisScrollbarVisible(Overflow ov, float content, float viewport) {
 // was.
 inline Natural measureNatural(View &node, float availW, float availH,
                               bool wDefinite, bool hDefinite) {
+  const Size &styleWidth =
+      resolveDynamic(node.style.width, node.computed.resolvedWidth);
+  const Size &styleHeight =
+      resolveDynamic(node.style.height, node.computed.resolvedHeight);
   if (node.isText) {
-    // Text is always a leaf. Fixed/Percentage/Full on width still make
-    // sense here (e.g. width:100% + wrap), so resolve those first;
-    // only a Fit width falls back to the text's own intrinsic size.
-    // Wrapping needs a concrete width to wrap against — a Fit-width (or
-    // indefinite Percentage) node has none yet, so it measures as a
-    // single unwrapped line, same as an ordinary Fit box sizing to its
-    // content. See the file-level note on this function's known
-    // limitations: the *final* width used for painting can differ from
-    // this basis-pass guess when Align::Stretch determines cross size;
-    // painting always re-measures against the true final width, so only
-    // the parent's flex allocation (not the rendered wrap) can be off.
     const EdgeInsets &pad = node.style.padding;
-    bool widthIsFit = node.style.width.kind == Size::Kind::Fit;
+    bool widthIsFit = styleWidth.kind == Size::Kind::Fit;
     bool widthIndefinitePercentage =
-        node.style.width.kind == Size::Kind::Percentage && !wDefinite;
-    float outerW =
-        clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
-                  node.style.minWidth, node.style.maxWidth);
+        styleWidth.kind == Size::Kind::Percentage && !wDefinite;
+    float outerW = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
+                             node.style.minWidth, node.style.maxWidth);
     float measureWidth = (widthIsFit || widthIndefinitePercentage)
                              ? -1.0f
                              : std::max(0.0f, outerW - pad.left - pad.right);
-    liteui_text::Measurement m =
-        liteui_text::measure(node.text, node.textStyle, measureWidth);
+    liteui_text::Measurement m = liteui_text::measure(
+        resolveDynamic(node.text, node.computed.resolvedText), node.textStyle,
+        measureWidth);
     float w = (widthIsFit || widthIndefinitePercentage)
                   ? clampSize(m.width + pad.left + pad.right,
                               node.style.minWidth, node.style.maxWidth)
                   : outerW;
     float naturalH = m.height + pad.top + pad.bottom;
-    float h = clampSize(
-        node.style.height.kind == Size::Kind::Fit
-            ? naturalH
-            : resolveAxis(node.style.height, availH, hDefinite, naturalH),
-        node.style.minHeight, node.style.maxHeight);
+    float h =
+        clampSize(styleHeight.kind == Size::Kind::Fit
+                      ? naturalH
+                      : resolveAxis(styleHeight, availH, hDefinite, naturalH),
+                  node.style.minHeight, node.style.maxHeight);
     return {w, h};
   }
   bool horizontal = node.style.direction == FlexDirection::Row;
   const EdgeInsets &pad = node.style.padding;
-  bool needW = node.style.width.kind == Size::Kind::Fit;
-  bool needH = node.style.height.kind == Size::Kind::Fit;
+  bool needW = styleWidth.kind == Size::Kind::Fit;
+  bool needH = styleHeight.kind == Size::Kind::Fit;
   bool scrollX = node.scrollsX();
   bool scrollY = node.scrollsY();
 
-  float w = clampSize(resolveAxis(node.style.width, availW, wDefinite, 0),
+  float w = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
                       node.style.minWidth, node.style.maxWidth);
-  float h = clampSize(resolveAxis(node.style.height, availH, hDefinite, 0),
+  float h = clampSize(resolveAxis(styleHeight, availH, hDefinite, 0),
                       node.style.minHeight, node.style.maxHeight);
   // A scroll container must still visit its children even when neither
   // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
@@ -2912,8 +2916,12 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
       View &ch = node.children[flowIdx[i]];
       cursor += mMainS[i];
 
-      bool explicitCross = horizontal ? ch.style.height.kind != Size::Kind::Fit
-                                      : ch.style.width.kind != Size::Kind::Fit;
+      bool explicitCross =
+          horizontal
+              ? resolveDynamic(ch.style.height, ch.computed.resolvedHeight)
+                        .kind != Size::Kind::Fit
+              : resolveDynamic(ch.style.width, ch.computed.resolvedWidth)
+                        .kind != Size::Kind::Fit;
       float finalCross = cross[i];
       if (node.style.alignItems == Align::Stretch && !explicitCross)
         finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
@@ -2958,14 +2966,17 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
         ch.style.display == Display::None)
       continue;
     const Style &cs = ch.style;
+    const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
+    const Size &csHeight =
+        resolveDynamic(cs.height, ch.computed.resolvedHeight);
     bool hasL = !std::isnan(cs.left), hasR = !std::isnan(cs.right);
     bool hasT = !std::isnan(cs.top), hasB = !std::isnan(cs.bottom);
 
     Natural probe = measureNatural(ch, contentW, contentH, true, true);
-    float aw = (cs.width.kind == Size::Kind::Fit && hasL && hasR)
+    float aw = (csWidth.kind == Size::Kind::Fit && hasL && hasR)
                    ? contentW - cs.left - cs.right
                    : probe.w;
-    float ah = (cs.height.kind == Size::Kind::Fit && hasT && hasB)
+    float ah = (csHeight.kind == Size::Kind::Fit && hasT && hasB)
                    ? contentH - cs.top - cs.bottom
                    : probe.h;
     aw = clampSize(aw, cs.minWidth, cs.maxWidth);
@@ -3437,7 +3448,7 @@ private:
   // shared by hitTestFlow so each button tracks its own independent hit
   // test instead of only ever matching onClick/onPressAt.
   static bool hasButtonHandler(const View &v, MouseButton btn) {
-    if (v.disabled)
+    if (resolveDynamic(v.disabled, v.computed.resolvedDisabled))
       return false;
     switch (btn) {
     case MouseButton::Left:
@@ -3496,8 +3507,8 @@ private:
     collectAbsolutes(root_, absolutes);
     sortAbsolutes(absolutes);
     for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
-      if (View *hit = hitTestFlow(const_cast<View &>(*it->view), x, y,
-                                 ClipRect{}, btn))
+      if (View *hit =
+              hitTestFlow(const_cast<View &>(*it->view), x, y, ClipRect{}, btn))
         return hit;
     return hitTestFlow(root_, x, y, ClipRect{}, btn);
   }
@@ -3535,27 +3546,63 @@ private:
   // changed, so the caller knows whether to relayout/repaint.
   static bool checkForUpdates(View &v) {
     bool changed = false;
-    if (v.textSource) {
-      std::string next = v.textSource();
-      if (next != v.text) {
-        v.text = std::move(next);
+
+    if (auto *fn = std::get_if<std::function<std::string()>>(&v.text)) {
+      std::string next = (*fn)();
+      if (next != v.computed.resolvedText) {
+        v.computed.resolvedText = std::move(next);
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (v.disabledSource) {
-      bool next = v.disabledSource();
-      if (next != v.disabled) {
-        v.disabled = next;
+    if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled)) {
+      bool next = (*fn)();
+      if (next != v.computed.resolvedDisabled) {
+        v.computed.resolvedDisabled = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (v.valueSource) {
-      float next = std::clamp(v.valueSource(), 0.0f, 1.0f);
-      if (next != v.value) {
-        v.value = next;
-        v.style.width = Size::percentage(next * 100.0f);
+    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.width)) {
+      Size next = (*fn)();
+      Size &cur = v.computed.resolvedWidth;
+      if (next.kind != cur.kind || next.value != cur.value) {
+        cur = next;
+        v.computed.dirty = true;
+        changed = true; // affects layout — relayout() picked up by caller
+      }
+    }
+    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.height)) {
+      Size next = (*fn)();
+      Size &cur = v.computed.resolvedHeight;
+      if (next.kind != cur.kind || next.value != cur.value) {
+        cur = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderWidth)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedBorderWidth) {
+        v.computed.resolvedBorderWidth = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<Color()>>(&v.style.borderColor)) {
+      Color next = (*fn)();
+      Color &cur = v.computed.resolvedBorderColor;
+      if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
+          next.a != cur.a) {
+        cur = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderRadius)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedBorderRadius) {
+        v.computed.resolvedBorderRadius = next;
         v.computed.dirty = true;
         changed = true;
       }
@@ -3576,9 +3623,10 @@ private:
         changed = true;
       }
     }
-    if (v.backgroundColorSource) {
-      Color next = v.backgroundColorSource();
-      Color &cur = v.style.backgroundColor;
+    if (auto *fn =
+            std::get_if<std::function<Color()>>(&v.style.backgroundColor)) {
+      Color next = (*fn)();
+      Color &cur = v.computed.resolvedBackgroundColor;
       if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
           next.a != cur.a) {
         cur = next;
@@ -3644,7 +3692,7 @@ private:
   // Invokes v's click handler for `btn` if it has one; no-op for
   // nullptr, a disabled view, or an unset handler.
   static void dispatchClick(View *v, MouseButton btn) {
-    if (!v || v->disabled)
+    if (!v || resolveDynamic(v->disabled, v->computed.resolvedDisabled))
       return;
     switch (btn) {
     case MouseButton::Left:
@@ -3730,8 +3778,8 @@ private:
     }
     bool hasDrag =
         hit && (btn == MouseButton::Left     ? (bool)hit->onDragTo
-               : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
-                                            : (bool)hit->onRightDragTo);
+                : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
+                                             : (bool)hit->onRightDragTo);
     dragView_[i] = hasDrag ? hit : nullptr;
   }
 
@@ -3766,7 +3814,6 @@ private:
     }
     return false;
   }
-
 
   // Advances any of the three buttons' drags at once — motion events
   // don't carry "which button", so this just tries all three; each is a
@@ -4035,9 +4082,9 @@ private:
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
         // Wheel-up (positive notches) should scroll content up, i.e.
         // decrease scrollY — hence the negation.
-        bool changed = self->applyWheelScroll(
-            static_cast<float>(pt.x), static_cast<float>(pt.y), 0.0f,
-            -notches * 40.0f);
+        bool changed = self->applyWheelScroll(static_cast<float>(pt.x),
+                                              static_cast<float>(pt.y), 0.0f,
+                                              -notches * 40.0f);
         if (self->dispatchScroll(static_cast<float>(pt.x),
                                  static_cast<float>(pt.y), notches))
           changed = true;
@@ -4160,9 +4207,10 @@ private:
   // wraps even with no string/style change. `v` is const here (called
   // from paintView), which is exactly why the cache fields are mutable.
   static void ensureTextLayout(const View &v) {
+    const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
     if (v.computed.textLayout &&
         v.computed.textLayoutBuiltForWidth == v.computed.w &&
-        v.computed.textLayoutBuiltForText == v.text)
+        v.computed.textLayoutBuiltForText == text)
       return;
     if (v.computed.textLayout) {
       v.computed.textLayout->Release();
@@ -4173,9 +4221,9 @@ private:
     float innerH = std::max(0.0f, v.computed.h - v.style.padding.top -
                                       v.style.padding.bottom);
     v.computed.textLayout =
-        liteui_text::makeLayout(v.text, v.textStyle, innerW, innerH);
+        liteui_text::makeLayout(text, v.textStyle, innerW, innerH);
     v.computed.textLayoutBuiltForWidth = v.computed.w;
-    v.computed.textLayoutBuiltForText = v.text;
+    v.computed.textLayoutBuiltForText = text;
   }
 
   void paintText(ID2D1RenderTarget *rt, const View &v) {
@@ -4282,25 +4330,27 @@ private:
       return;
     }
 
-    D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), s.borderRadius,
-                            s.borderRadius};
-    Color bg = (v.computed.isHovered && s.hoverColor) ? *s.hoverColor
-                                                      : s.backgroundColor;
+    float borderRadius = resolveDynamic(s.borderRadius, v.computed.resolvedBorderRadius);
+    D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), borderRadius,
+                            borderRadius};
+    Color bg = (v.computed.isHovered && s.hoverColor)
+                   ? *s.hoverColor
+                   : resolveDynamic(s.backgroundColor,
+                                    v.computed.resolvedBackgroundColor);
     ID2D1SolidColorBrush *bgBrush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(bg), &bgBrush);
     if (bgBrush) {
       rt->FillRoundedRectangle(rr, bgBrush);
       bgBrush->Release();
     }
-    if (s.borderWidth > 0) {
-      // D2D strokes are centered on the path (half in, half out), unlike
-      // the old GDI approach of an outer full-color box plus an inset
-      // background rect — visually equivalent for a uniform border, just
-      // computed differently.
+    float borderWidth = resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
+    if (borderWidth > 0) {
       ID2D1SolidColorBrush *borderBrush = nullptr;
-      rt->CreateSolidColorBrush(toD2DColor(s.borderColor), &borderBrush);
+      rt->CreateSolidColorBrush(
+          toD2DColor(resolveDynamic(s.borderColor, v.computed.resolvedBorderColor)),
+          &borderBrush);
       if (borderBrush) {
-        rt->DrawRoundedRectangle(rr, borderBrush, s.borderWidth);
+        rt->DrawRoundedRectangle(rr, borderBrush, borderWidth);
         borderBrush->Release();
       }
     }
@@ -4398,9 +4448,10 @@ private:
          // and the window edge.
   // Raw Linux input-event code for the left mouse button (from
   // linux/input-event-codes.h).
-  static constexpr uint32_t BTN_LEFT_CODE = 0x110; // linux/input-event-codes.h
-  static constexpr uint32_t BTN_RIGHT_CODE = 0x111;  // linux/input-event-codes.h
-  static constexpr uint32_t BTN_MIDDLE_CODE = 0x112; // linux/input-event-codes.h
+  static constexpr uint32_t BTN_LEFT_CODE = 0x110;  // linux/input-event-codes.h
+  static constexpr uint32_t BTN_RIGHT_CODE = 0x111; // linux/input-event-codes.h
+  static constexpr uint32_t BTN_MIDDLE_CODE =
+      0x112; // linux/input-event-codes.h
 
   double pointer_x_ = 0,
          pointer_y_ = 0; // Last known pointer position within
@@ -4721,9 +4772,9 @@ private:
       dy = delta;
     else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
       dx = delta;
-    bool changed = self->applyWheelScroll(
-        static_cast<float>(self->pointer_x_),
-        static_cast<float>(self->pointer_y_), dx, dy);
+    bool changed =
+        self->applyWheelScroll(static_cast<float>(self->pointer_x_),
+                               static_cast<float>(self->pointer_y_), dx, dy);
     // Wayland's vertical-scroll axis value is positive for
     // scroll-down/content-down, matching applyWheelScroll's sign
     // convention above — negate it here so dispatchScroll's "notches >
@@ -5129,9 +5180,10 @@ private:
   // BGRA extension and non-tightly-packed row uploads that ARGB32 would
   // otherwise require.
   static void ensureTextTexture(const View &v) {
+    const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
     if (v.computed.textTexture &&
         v.computed.textTextureBuiltForWidth == v.computed.w &&
-        v.computed.textTextureBuiltForText == v.text)
+        v.computed.textTextureBuiltForText == text)
       return;
     if (v.computed.textTexture) {
       glDeleteTextures(1, &v.computed.textTexture);
@@ -5154,7 +5206,7 @@ private:
         cr, 1, 1, 1,
         1); // color is applied later via u_color; only alpha matters
     PangoLayout *layout = liteui_text::makeLayout(
-        v.text, v.textStyle, static_cast<float>(innerW), cr);
+        text, v.textStyle, static_cast<float>(innerW), cr);
     pango_cairo_update_layout(cr, layout);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
@@ -5207,7 +5259,7 @@ private:
     v.computed.textTexW = innerW;
     v.computed.textTexH = innerH;
     v.computed.textTextureBuiltForWidth = v.computed.w;
-    v.computed.textTextureBuiltForText = v.text;
+    v.computed.textTextureBuiltForText = text;
   }
 
   void drawTextTexture(const View &v, const ClipRect &clip) {
@@ -5411,21 +5463,26 @@ private:
     const Style &s = v.style;
     int x = static_cast<int>(v.computed.x), y = static_cast<int>(v.computed.y);
     int w = static_cast<int>(v.computed.w), h = static_cast<int>(v.computed.h);
-    int radius = static_cast<int>(s.borderRadius);
-    Color bg = (v.computed.isHovered && s.hoverColor) ? *s.hoverColor
-                                                      : s.backgroundColor;
-
-    if (s.borderWidth > 0) {
-      fillRoundedRect(x, y, w, h, radius, s.borderColor.r, s.borderColor.g,
-                      s.borderColor.b, clip);
-      int bw = static_cast<int>(s.borderWidth);
+    int radius = static_cast<int>(
+        resolveDynamic(s.borderRadius, v.computed.resolvedBorderRadius));
+    Color bg = (v.computed.isHovered && s.hoverColor)
+                   ? *s.hoverColor
+                   : resolveDynamic(s.backgroundColor,
+                                    v.computed.resolvedBackgroundColor);
+    float borderWidthVal =
+        resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
+    if (borderWidthVal > 0) {
+      Color borderColorVal =
+          resolveDynamic(s.borderColor, v.computed.resolvedBorderColor);
+      fillRoundedRect(x, y, w, h, radius, borderColorVal.r, borderColorVal.g,
+                      borderColorVal.b, clip);
+      int bw = static_cast<int>(borderWidthVal);
       fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw),
                       std::max(0, h - 2 * bw), std::max(0, radius - bw), bg.r,
                       bg.g, bg.b, clip);
     } else {
       fillRoundedRect(x, y, w, h, radius, bg.r, bg.g, bg.b, clip);
     }
-
     // A canvas node paints its own Style background/border like any
     // other box (above), then has its cached onPaint texture drawn on
     // top — unlike a text leaf, which skips background/border entirely.
@@ -5611,7 +5668,6 @@ private:
     if (btn != MouseButton::Left)
       return; // titlebar chrome (close/max/min/move) is left-button only
 
-
     // If the click landed on the close button...
     if (inside(closeRect(), pointer_x_, pointer_y_)) {
       // ...request the event loop to stop, ending run().
@@ -5652,12 +5708,11 @@ private:
   // interactions below the titlebar.
   void handleRelease(MouseButton btn = MouseButton::Left) {
     if (pointer_y_ >= kTitlebarHeight) {
-      bool changed =
-          (btn == MouseButton::Left)
-              ? endScrollPress(static_cast<float>(pointer_x_),
-                              static_cast<float>(pointer_y_))
-              : endPress(static_cast<float>(pointer_x_),
-                        static_cast<float>(pointer_y_), btn);
+      bool changed = (btn == MouseButton::Left)
+                         ? endScrollPress(static_cast<float>(pointer_x_),
+                                          static_cast<float>(pointer_y_))
+                         : endPress(static_cast<float>(pointer_x_),
+                                    static_cast<float>(pointer_y_), btn);
       if (changed)
         redraw();
     } else {
