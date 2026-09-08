@@ -153,6 +153,7 @@ enum class AlignContent {
 struct EdgeInsets {
   float top = 0, right = 0, bottom = 0, left = 0;
   static EdgeInsets all(float v) { return {v, v, v, v}; }
+  bool operator==(const EdgeInsets &) const = default;
 };
 
 enum class Position { Static, Absolute };
@@ -188,8 +189,8 @@ struct Style {
   float minHeight = 0;
   float maxHeight = std::numeric_limits<float>::infinity();
 
-  EdgeInsets margin;
-  EdgeInsets padding;
+  Dynamic<EdgeInsets> margin;
+  Dynamic<EdgeInsets> padding;
 
   FlexDirection direction = FlexDirection::Row;
   Justify justifyContent = Justify::Start;
@@ -600,6 +601,8 @@ public:
     mutable Visibility resolvedVisibility = Visibility::Visible;
     mutable int resolvedZIndex = 0;
     mutable Color resolvedTextColor{0, 0, 0};
+    mutable EdgeInsets resolvedMargin;
+    mutable EdgeInsets resolvedPadding;
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -2497,7 +2500,8 @@ inline Natural measureNatural(View &node, float availW, float availH,
   const Size &styleHeight =
       resolveDynamic(node.style.height, node.computed.resolvedHeight);
   if (node.isText) {
-    const EdgeInsets &pad = node.style.padding;
+    const EdgeInsets &pad =
+        resolveDynamic(node.style.padding, node.computed.resolvedPadding);
     bool widthIsFit = styleWidth.kind == Size::Kind::Fit;
     bool widthIndefinitePercentage =
         styleWidth.kind == Size::Kind::Percentage && !wDefinite;
@@ -2522,7 +2526,8 @@ inline Natural measureNatural(View &node, float availW, float availH,
     return {w, h};
   }
   bool horizontal = node.style.direction == FlexDirection::Row;
-  const EdgeInsets &pad = node.style.padding;
+  const EdgeInsets &pad =
+      resolveDynamic(node.style.padding, node.computed.resolvedPadding);
   bool needW = styleWidth.kind == Size::Kind::Fit;
   bool needH = styleHeight.kind == Size::Kind::Fit;
   bool scrollX = node.scrollsX();
@@ -2564,12 +2569,14 @@ inline Natural measureNatural(View &node, float availW, float availH,
     if (c.style.position == Position::Absolute ||
         resolveDynamic(c.style.display, c.computed.resolvedDisplay) ==
             Display::None)
-      continue; // out of flow / not rendered: doesn't affect Fit size
+      continue;
     Natural cn = measureNatural(c, innerW, innerH,
                                 scrollX ? false : (wDefinite || !needW),
                                 scrollY ? false : (hDefinite || !needH));
-    float mm = c.style.margin.left + c.style.margin.right;
-    float mv = c.style.margin.top + c.style.margin.bottom;
+    const EdgeInsets &cMargin =
+        resolveDynamic(c.style.margin, c.computed.resolvedMargin);
+    float mm = cMargin.left + cMargin.right;
+    float mv = cMargin.top + cMargin.bottom;
     float childMain = horizontal ? cn.w + mm : cn.h + mv;
     float childCross = horizontal ? cn.h + mv : cn.w + mm;
     if (!firstFlow)
@@ -2622,7 +2629,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   }
 
   bool horizontal = node.style.direction == FlexDirection::Row;
-  const EdgeInsets &pad = node.style.padding;
+    const EdgeInsets &pad =
+      resolveDynamic(node.style.padding, node.computed.resolvedPadding);
   float contentW = std::max(0.0f, w - pad.left - pad.right);
   float contentH = std::max(0.0f, h - pad.top - pad.bottom);
 
@@ -2699,12 +2707,14 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   for (size_t k = 0; k < n; ++k) {
     View &c = node.children[flowIdx[k]];
     Natural cn = measureNatural(c, contentW, contentH, true, true);
+    const EdgeInsets &cMargin =
+        resolveDynamic(c.style.margin, c.computed.resolvedMargin);
     basis[k] = horizontal ? cn.w : cn.h;
     cross[k] = horizontal ? cn.h : cn.w;
-    mMainS[k] = horizontal ? c.style.margin.left : c.style.margin.top;
-    mMainE[k] = horizontal ? c.style.margin.right : c.style.margin.bottom;
-    mCrossS[k] = horizontal ? c.style.margin.top : c.style.margin.left;
-    mCrossE[k] = horizontal ? c.style.margin.bottom : c.style.margin.right;
+    mMainS[k] = horizontal ? cMargin.left : cMargin.top;
+    mMainE[k] = horizontal ? cMargin.right : cMargin.bottom;
+    mCrossS[k] = horizontal ? cMargin.top : cMargin.left;
+    mCrossE[k] = horizontal ? cMargin.bottom : cMargin.right;
     minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
     maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
     marginMain[k] = mMainS[k] + mMainE[k];
@@ -2973,6 +2983,8 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
     const Size &csHeight =
         resolveDynamic(cs.height, ch.computed.resolvedHeight);
+    const EdgeInsets &csMargin =
+        resolveDynamic(cs.margin, ch.computed.resolvedMargin);
     float csLeft = resolveDynamic(cs.left, ch.computed.resolvedLeft);
     float csTop = resolveDynamic(cs.top, ch.computed.resolvedTop);
     float csRight = resolveDynamic(cs.right, ch.computed.resolvedRight);
@@ -2990,12 +3002,12 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
     aw = clampSize(aw, cs.minWidth, cs.maxWidth);
     ah = clampSize(ah, cs.minHeight, cs.maxHeight);
 
-    float ax = hasL   ? contentX + csLeft + cs.margin.left
-               : hasR ? contentX + contentW - csRight - cs.margin.right - aw
-                      : contentX + cs.margin.left;
-    float ay = hasT   ? contentY + csTop + cs.margin.top
-               : hasB ? contentY + contentH - csBottom - cs.margin.bottom - ah
-                      : contentY + cs.margin.top;
+    float ax = hasL   ? contentX + csLeft + csMargin.left
+               : hasR ? contentX + contentW - csRight - csMargin.right - aw
+                      : contentX + csMargin.left;
+    float ay = hasT   ? contentY + csTop + csMargin.top
+               : hasB ? contentY + contentH - csBottom - csMargin.bottom - ah
+                      : contentY + csMargin.top;
 
     placeNode(ch, ax, ay, aw, ah);
   }
@@ -3703,6 +3715,22 @@ private:
         changed = true; // affects stacking order — repaint picks it up
       }
     }
+    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.margin)) {
+      EdgeInsets next = (*fn)();
+      if (next != v.computed.resolvedMargin) {
+        v.computed.resolvedMargin = next;
+        v.computed.dirty = true;
+        changed = true; // affects layout — relayout() picked up by caller
+      }
+    }
+    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.padding)) {
+      EdgeInsets next = (*fn)();
+      if (next != v.computed.resolvedPadding) {
+        v.computed.resolvedPadding = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
     if (v.canvasDirtySource && v.canvasDirtySource()) {
       v.computed.canvasNeedsRedraw = true;
       v.computed.dirty = true;
@@ -4269,10 +4297,10 @@ private:
       v.computed.textLayout->Release();
       v.computed.textLayout = nullptr;
     }
-    float innerW = std::max(0.0f, v.computed.w - v.style.padding.left -
-                                      v.style.padding.right);
-    float innerH = std::max(0.0f, v.computed.h - v.style.padding.top -
-                                      v.style.padding.bottom);
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float innerW = std::max(0.0f, v.computed.w - pad.left - pad.right);
+    float innerH = std::max(0.0f, v.computed.h - pad.top - pad.bottom);
     v.computed.textLayout =
         liteui_text::makeLayout(text, v.textStyle, innerW, innerH);
     v.computed.textLayoutBuiltForWidth = v.computed.w;
@@ -4283,16 +4311,20 @@ private:
     ensureTextLayout(v);
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(
-        toD2DColor(resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor)),
+        toD2DColor(
+            resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor)),
         &brush);
     if (brush) {
-      float x = v.computed.x + v.style.padding.left;
-      float y = v.computed.y + v.style.padding.top;
+      const EdgeInsets &pad =
+          resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+      float x = v.computed.x + pad.left;
+      float y = v.computed.y + pad.top;
       rt->DrawTextLayout(D2D1::Point2F(x, y), v.computed.textLayout, brush,
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
       brush->Release();
     }
   }
+
 
   // (Re)builds v.computed.canvasTarget — an offscreen bitmap render
   // target sized to v's inner (padding-excluded) content box — whenever
@@ -4303,10 +4335,10 @@ private:
   // neither condition true is a no-op: the previous frame's bitmap is
   // simply reused.
   void ensureCanvasTarget(const View &v) {
-    float innerW = std::max(1.0f, v.computed.w - v.style.padding.left -
-                                      v.style.padding.right);
-    float innerH = std::max(1.0f, v.computed.h - v.style.padding.top -
-                                      v.style.padding.bottom);
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
+    float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
     bool resized = !v.computed.canvasTarget ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
@@ -4344,8 +4376,10 @@ private:
     v.computed.canvasTarget->GetBitmap(&bmp);
     if (!bmp)
       return;
-    float x = v.computed.x + v.style.padding.left;
-    float y = v.computed.y + v.style.padding.top;
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float x = v.computed.x + pad.left;
+    float y = v.computed.y + pad.top;
     D2D1_SIZE_F sz = bmp->GetSize();
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->DrawBitmap(bmp, D2D1::RectF(x, y, x + sz.width, y + sz.height));
@@ -5250,11 +5284,12 @@ private:
       glDeleteTextures(1, &v.computed.textTexture);
       v.computed.textTexture = 0;
     }
-    const Style &s = v.style;
-    int innerW = std::max(
-        1, static_cast<int>(v.computed.w - s.padding.left - s.padding.right));
-    int innerH = std::max(
-        1, static_cast<int>(v.computed.h - s.padding.top - s.padding.bottom));
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    int innerW =
+        std::max(1, static_cast<int>(v.computed.w - pad.left - pad.right));
+    int innerH =
+        std::max(1, static_cast<int>(v.computed.h - pad.top - pad.bottom));
 
     cairo_surface_t *surf =
         cairo_image_surface_create(CAIRO_FORMAT_ARGB32, innerW, innerH);
@@ -5335,14 +5370,17 @@ private:
     glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
     glEnableVertexAttribArray(texAPos_);
     glVertexAttribPointer(texAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    float x = v.computed.x + v.style.padding.left;
-    float y = v.computed.y + v.style.padding.top;
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float x = v.computed.x + pad.left;
+    float y = v.computed.y + pad.top;
     glUniform2f(texUPos_, x, y);
     glUniform2f(texUSize_, static_cast<float>(v.computed.textTexW),
                 static_cast<float>(v.computed.textTexH));
     glUniform2f(texUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
-    const Color &c = resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor);
+    const Color &c =
+        resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor);
     glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
                 c.a / 255.0f);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -5358,10 +5396,10 @@ private:
   // repaint with neither condition true reuses the existing texture
   // untouched.
   void ensureCanvasSurface(const View &v) {
-    float innerW = std::max(1.0f, v.computed.w - v.style.padding.left -
-                                      v.style.padding.right);
-    float innerH = std::max(1.0f, v.computed.h - v.style.padding.top -
-                                      v.style.padding.bottom);
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
+    float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
     int iw = std::max(1, static_cast<int>(innerW));
     int ih = std::max(1, static_cast<int>(innerH));
     bool resized = !v.computed.canvasSurface ||
@@ -5452,8 +5490,10 @@ private:
     glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
     glEnableVertexAttribArray(canvasAPos_);
     glVertexAttribPointer(canvasAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    float x = v.computed.x + v.style.padding.left;
-    float y = v.computed.y + v.style.padding.top;
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float x = v.computed.x + pad.left;
+    float y = v.computed.y + pad.top;
     glUniform2f(canvasUPos_, x, y);
     glUniform2f(canvasUSize_, v.computed.canvasBuiltForWidth,
                 v.computed.canvasBuiltForHeight);
