@@ -39,10 +39,14 @@
 #include <cairo/cairo.h>
 #include <fcntl.h>
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
+#include <poll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
 #include <wayland-cursor.h> // wl_cursor_theme_load / wl_cursor_theme_get_cursor, for showing resize/arrow cursors.
 #include <wayland-egl.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
+#include <xkbcommon/xkbcommon.h>
 #endif
 
 // Plain RGB color, one byte per channel.
@@ -57,6 +61,99 @@ struct Color {
 // triple gets checked/fired.
 enum class MouseButton { Left, Middle, Right };
 
+// Logical key identity, independent of platform scancode/VK. Extend as
+// needed — this covers what a typical text field / shortcut system wants.
+enum class Key {
+  Unknown = 0,
+  A,
+  B,
+  C,
+  D,
+  E,
+  F,
+  G,
+  H,
+  I,
+  J,
+  K,
+  L,
+  M,
+  N,
+  O,
+  P,
+  Q,
+  R,
+  S,
+  T,
+  U,
+  V,
+  W,
+  X,
+  Y,
+  Z,
+  N0,
+  N1,
+  N2,
+  N3,
+  N4,
+  N5,
+  N6,
+  N7,
+  N8,
+  N9,
+  F1,
+  F2,
+  F3,
+  F4,
+  F5,
+  F6,
+  F7,
+  F8,
+  F9,
+  F10,
+  F11,
+  F12,
+  Enter,
+  Escape,
+  Backspace,
+  Tab,
+  Space,
+  Delete,
+  Left,
+  Right,
+  Up,
+  Down,
+  Home,
+  End,
+  PageUp,
+  PageDown,
+  Shift,
+  Control,
+  Alt,
+  Super,
+  Minus,
+  Equal,
+  LeftBracket,
+  RightBracket,
+  Backslash,
+  Semicolon,
+  Quote,
+  Comma,
+  Period,
+  Slash,
+  Grave,
+};
+
+struct KeyModifiers {
+  bool shift = false, ctrl = false, alt = false, super = false;
+  bool operator==(const KeyModifiers &) const = default;
+};
+
+struct KeyEvent {
+  Key key = Key::Unknown;
+  KeyModifiers mods;
+};
+
 #if defined(_WIN32)
 // Converts a UTF-8 std::string to the UTF-16 wide string Win32/DirectWrite
 // APIs require. File-scope (rather than a LiteUI member) because both
@@ -67,6 +164,87 @@ inline std::wstring toWide(const std::string &s) {
   std::wstring w(wlen, L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), wlen);
   return w;
+}
+inline Key vkToKey(WPARAM vk) {
+  if (vk >= 'A' && vk <= 'Z')
+    return static_cast<Key>(static_cast<int>(Key::A) + (vk - 'A'));
+  if (vk >= '0' && vk <= '9')
+    return static_cast<Key>(static_cast<int>(Key::N0) + (vk - '0'));
+  if (vk >= VK_F1 && vk <= VK_F12)
+    return static_cast<Key>(static_cast<int>(Key::F1) + (vk - VK_F1));
+  switch (vk) {
+  case VK_RETURN:
+    return Key::Enter;
+  case VK_ESCAPE:
+    return Key::Escape;
+  case VK_BACK:
+    return Key::Backspace;
+  case VK_TAB:
+    return Key::Tab;
+  case VK_SPACE:
+    return Key::Space;
+  case VK_DELETE:
+    return Key::Delete;
+  case VK_LEFT:
+    return Key::Left;
+  case VK_RIGHT:
+    return Key::Right;
+  case VK_UP:
+    return Key::Up;
+  case VK_DOWN:
+    return Key::Down;
+  case VK_HOME:
+    return Key::Home;
+  case VK_END:
+    return Key::End;
+  case VK_PRIOR:
+    return Key::PageUp;
+  case VK_NEXT:
+    return Key::PageDown;
+  case VK_SHIFT:
+    return Key::Shift;
+  case VK_CONTROL:
+    return Key::Control;
+  case VK_MENU:
+    return Key::Alt;
+  case VK_LWIN:
+  case VK_RWIN:
+    return Key::Super;
+  case VK_OEM_MINUS:
+    return Key::Minus;
+  case VK_OEM_PLUS:
+    return Key::Equal;
+  case VK_OEM_4:
+    return Key::LeftBracket;
+  case VK_OEM_6:
+    return Key::RightBracket;
+  case VK_OEM_5:
+    return Key::Backslash;
+  case VK_OEM_1:
+    return Key::Semicolon;
+  case VK_OEM_7:
+    return Key::Quote;
+  case VK_OEM_COMMA:
+    return Key::Comma;
+  case VK_OEM_PERIOD:
+    return Key::Period;
+  case VK_OEM_2:
+    return Key::Slash;
+  case VK_OEM_3:
+    return Key::Grave;
+  default:
+    return Key::Unknown;
+  }
+}
+
+inline KeyModifiers currentModifiers() {
+  KeyModifiers m;
+  m.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  m.ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  m.alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  m.super = (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+            (GetKeyState(VK_RWIN) & 0x8000) != 0;
+  return m;
 }
 #endif
 
@@ -527,6 +705,31 @@ public:
   // x/y/w/h to drive some other view's position — e.g. anchoring a
   // dropdown/menu to the button that opened it.
   std::function<void(float x, float y, float w, float h)> onLayout;
+
+  // Set true to make this view eligible to receive keyboard focus via
+  // click-to-focus (see LiteUI::setFocus). Views default to non-focusable
+  // — a plain container/box should never steal focus from whatever the
+  // user was actually typing into.
+  bool focusable = false;
+
+  // Fired when this view gains/loses keyboard focus. Typical use: a text
+  // input shows/hides its caret here.
+  std::function<void()> onFocus;
+  std::function<void()> onBlur;
+
+  // Fired only while this view is the focused view (see LiteUI::focusedView_).
+  // No bubbling in v1 — exactly one view receives these, the one that has
+  // focus. onKeyDown fires on repeat too (both platform-native repeat on
+  // Windows, and LiteUI's own repeat timer on Linux — see the Linux
+  // keyboard listener).
+  std::function<void(KeyEvent)> onKeyDown;
+  std::function<void(KeyEvent)> onKeyUp;
+
+  // Fired only while focused, with an already-composed UTF-32 codepoint —
+  // this is what a text field should append, not onKeyDown. Separate from
+  // onKeyDown because "what character was typed" depends on shift/layout/
+  // dead keys in a way a raw Key never captures.
+  std::function<void(uint32_t codepoint)> onTextInput;
 
   // Fired on a discrete wheel notch (or trackpad step) whose point lands
   // on this view, independent of pixel-based content scrolling — lets a
@@ -2629,7 +2832,7 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   }
 
   bool horizontal = node.style.direction == FlexDirection::Row;
-    const EdgeInsets &pad =
+  const EdgeInsets &pad =
       resolveDynamic(node.style.padding, node.computed.resolvedPadding);
   float contentW = std::max(0.0f, w - pad.left - pad.right);
   float contentH = std::max(0.0f, h - pad.top - pad.bottom);
@@ -3023,6 +3226,86 @@ inline void layoutRoot(View &root, float windowW, float windowH,
 }
 
 } // namespace liteui_layout
+
+#if !defined(_WIN32)
+inline Key xkbKeysymToKey(xkb_keysym_t sym) {
+  if (sym >= XKB_KEY_a && sym <= XKB_KEY_z)
+    return static_cast<Key>(static_cast<int>(Key::A) + (sym - XKB_KEY_a));
+  if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z)
+    return static_cast<Key>(static_cast<int>(Key::A) + (sym - XKB_KEY_A));
+  if (sym >= XKB_KEY_0 && sym <= XKB_KEY_9)
+    return static_cast<Key>(static_cast<int>(Key::N0) + (sym - XKB_KEY_0));
+  if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12)
+    return static_cast<Key>(static_cast<int>(Key::F1) + (sym - XKB_KEY_F1));
+  switch (sym) {
+  case XKB_KEY_Return:
+  case XKB_KEY_KP_Enter:
+    return Key::Enter;
+  case XKB_KEY_Escape:
+    return Key::Escape;
+  case XKB_KEY_BackSpace:
+    return Key::Backspace;
+  case XKB_KEY_Tab:
+    return Key::Tab;
+  case XKB_KEY_space:
+    return Key::Space;
+  case XKB_KEY_Delete:
+    return Key::Delete;
+  case XKB_KEY_Left:
+    return Key::Left;
+  case XKB_KEY_Right:
+    return Key::Right;
+  case XKB_KEY_Up:
+    return Key::Up;
+  case XKB_KEY_Down:
+    return Key::Down;
+  case XKB_KEY_Home:
+    return Key::Home;
+  case XKB_KEY_End:
+    return Key::End;
+  case XKB_KEY_Prior:
+    return Key::PageUp;
+  case XKB_KEY_Next:
+    return Key::PageDown;
+  case XKB_KEY_Shift_L:
+  case XKB_KEY_Shift_R:
+    return Key::Shift;
+  case XKB_KEY_Control_L:
+  case XKB_KEY_Control_R:
+    return Key::Control;
+  case XKB_KEY_Alt_L:
+  case XKB_KEY_Alt_R:
+    return Key::Alt;
+  case XKB_KEY_Super_L:
+  case XKB_KEY_Super_R:
+    return Key::Super;
+  case XKB_KEY_minus:
+    return Key::Minus;
+  case XKB_KEY_equal:
+    return Key::Equal;
+  case XKB_KEY_bracketleft:
+    return Key::LeftBracket;
+  case XKB_KEY_bracketright:
+    return Key::RightBracket;
+  case XKB_KEY_backslash:
+    return Key::Backslash;
+  case XKB_KEY_semicolon:
+    return Key::Semicolon;
+  case XKB_KEY_apostrophe:
+    return Key::Quote;
+  case XKB_KEY_comma:
+    return Key::Comma;
+  case XKB_KEY_period:
+    return Key::Period;
+  case XKB_KEY_slash:
+    return Key::Slash;
+  case XKB_KEY_grave:
+    return Key::Grave;
+  default:
+    return Key::Unknown;
+  }
+}
+#endif
 
 class LiteUI {
 
@@ -3834,11 +4117,95 @@ private:
 
   static int btnIdx(MouseButton b) { return static_cast<int>(b); }
 
+  // The one view currently receiving keyboard events, or nullptr if
+  // nothing has focus. Unlike pressedView_[3] (per-button, click-only)
+  // there's exactly one keyboard focus at a time, independent of mouse
+  // button state.
+  View *focusedView_ = nullptr;
+
+  // Modifier state, kept current by whichever platform backend is
+  // handling raw key events (Win32's GetKeyState polling on each message,
+  // or Wayland's xkb_state on every "modifiers" event).
+  KeyModifiers modState_;
+
+  void setFocus(View *v) {
+    if (v == focusedView_)
+      return;
+    if (focusedView_ && focusedView_->onBlur)
+      focusedView_->onBlur();
+    focusedView_ = v;
+    if (focusedView_ && focusedView_->onFocus)
+      focusedView_->onFocus();
+  }
+
+  // App-global shortcut: fires regardless of what has focus (or whether
+  // anything does), checked before the focused view's own onKeyDown. Use
+  // this for things like Ctrl+S that should work even while a button (not
+  // a text field) has focus.
+  struct Shortcut {
+    KeyModifiers mods;
+    Key key;
+    std::function<void()> fn;
+  };
+  std::vector<Shortcut> shortcuts_;
+
+public:
+  void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
+    shortcuts_.push_back({mods, key, std::move(fn)});
+  }
+
+private:
+  // Called by both platform backends on every key press. Checks
+  // shortcuts_ first (global, focus-independent), then falls through to
+  // focusedView_->onKeyDown if nothing claimed it. Polls dynamic sources
+  // afterward, same idiom as dispatchClick/dispatchScroll, since a
+  // handler may have mutated app state a Dynamic<> field reads from.
+  bool dispatchKeyDown(KeyEvent e) {
+    for (auto &sc : shortcuts_) {
+      if (sc.key == e.key && sc.mods == e.mods) {
+        if (sc.fn)
+          sc.fn();
+        if (hasRoot_ && checkForUpdates(root_))
+          relayout();
+        return true;
+      }
+    }
+    if (focusedView_ && focusedView_->onKeyDown) {
+      focusedView_->onKeyDown(e);
+      if (hasRoot_ && checkForUpdates(root_))
+        relayout();
+      return true;
+    }
+    return false;
+  }
+
+  bool dispatchKeyUp(KeyEvent e) {
+    if (focusedView_ && focusedView_->onKeyUp) {
+      focusedView_->onKeyUp(e);
+      if (hasRoot_ && checkForUpdates(root_))
+        relayout();
+      return true;
+    }
+    return false;
+  }
+
+  bool dispatchTextInput(uint32_t codepoint) {
+    if (focusedView_ && focusedView_->onTextInput) {
+      focusedView_->onTextInput(codepoint);
+      if (hasRoot_ && checkForUpdates(root_))
+        relayout();
+      return true;
+    }
+    return false;
+  }
+
   // Records the view under (x, y) as the pending click's press target,
   // for whichever button was pressed.
   void beginPress(float x, float y, MouseButton btn = MouseButton::Left) {
     int i = btnIdx(btn);
     View *hit = hitTest(x, y, btn);
+    if (btn == MouseButton::Left)
+      setFocus((hit && hit->focusable) ? hit : nullptr);
     pressedView_[i] = hit;
     if (hit) {
       float lx = x - hit->computed.x, ly = y - hit->computed.y;
@@ -4207,6 +4574,60 @@ private:
       }
       return 0;
 
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+      if (self) {
+        KeyEvent e{vkToKey(wp), currentModifiers()};
+        if (self->dispatchKeyDown(e) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      // Fall through to DefWindowProcW so system accelerators (Alt+F4
+      // etc.) still work; we're not fully intercepting the message.
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+      if (self) {
+        KeyEvent e{vkToKey(wp), currentModifiers()};
+        if (self->dispatchKeyUp(e) && self->hwnd_)
+          InvalidateRect(self->hwnd_, nullptr, FALSE);
+      }
+      return 0;
+    }
+
+    // WM_CHAR gives already-composed text as UTF-16 code units — handle
+    // surrogate pairs since anything outside the BMP (emoji, etc.) arrives
+    // as a high/low surrogate pair across two messages.
+    case WM_CHAR: {
+      if (self) {
+        uint32_t cu = static_cast<uint32_t>(wp);
+        static uint32_t pendingHighSurrogate = 0;
+        if (cu >= 0xD800 && cu <= 0xDBFF) {
+          pendingHighSurrogate = cu;
+        } else if (cu >= 0xDC00 && cu <= 0xDFFF && pendingHighSurrogate) {
+          uint32_t cp =
+              0x10000 + ((pendingHighSurrogate - 0xD800) << 10) + (cu - 0xDC00);
+          pendingHighSurrogate = 0;
+          if (self->dispatchTextInput(cp) && self->hwnd_)
+            InvalidateRect(self->hwnd_, nullptr, FALSE);
+        } else if (cu >= 0x20 || cu == '\t') { // skip raw control chars
+          pendingHighSurrogate = 0;
+          if (self->dispatchTextInput(cu) && self->hwnd_)
+            InvalidateRect(self->hwnd_, nullptr, FALSE);
+        }
+      }
+      return 0;
+    }
+
+    // Window lost OS-level focus entirely (alt-tab, clicking another app)
+    // — blur our own focused view so a background window doesn't keep
+    // silently eating keystrokes meant for something else.
+    case WM_KILLFOCUS:
+      if (self)
+        self->setFocus(nullptr);
+      return 0;
+
     // Window was resized (including maximize/restore/snap): update our
     // stored dimensions and re-run layout against the new size. GDI needs
     // no buffer reallocation (it paints straight into the window's DC), so
@@ -4324,7 +4745,6 @@ private:
       brush->Release();
     }
   }
-
 
   // (Re)builds v.computed.canvasTarget — an offscreen bitmap render
   // target sized to v's inner (padding-excluded) content box — whenever
@@ -4501,6 +4921,22 @@ private:
 
   wl_seat *seat_ = nullptr; // The seat global, representing one user's set of
                             // input devices (keyboard/mouse/etc.).
+  wl_keyboard *keyboard_ = nullptr;
+  xkb_context *xkbContext_ = nullptr;
+  xkb_keymap *xkbKeymap_ = nullptr;
+  xkb_state *xkbState_ = nullptr;
+
+  // Key-repeat: Wayland does NOT auto-repeat key events for you (unlike
+  // Win32) — repeat_info tells you the rate/delay and you're expected to
+  // drive your own timer. Implemented with a POSIX timerfd folded into
+  // the event loop (see run()'s poll() rewrite in step 7). Until step 7
+  // is applied, holding a key down will fire onKeyDown once and then
+  // nothing until release — everything else in this step works fine
+  // without it.
+  int repeatTimerFd_ = -1;
+  uint32_t repeatKeycode_ = 0;
+  int32_t repeatRateHz_ = 0; // 0 = repeat disabled by compositor
+  int32_t repeatDelayMs_ = 0;
 
   wl_pointer *pointer_ =
       nullptr; // The pointer (mouse) device obtained from
@@ -4780,14 +5216,14 @@ private:
   // Called when the seat announces which input capabilities
   // (pointer/keyboard/touch) it has.
   static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps) {
-    // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
-    // Only act if the seat has a pointer and we haven't already grabbed one.
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_) {
-      // Request the pointer object from the seat.
       self->pointer_ = wl_seat_get_pointer(seat);
-      // Register our pointer event handlers on it.
       wl_pointer_add_listener(self->pointer_, &pointerListener, self);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !self->keyboard_) {
+      self->keyboard_ = wl_seat_get_keyboard(seat);
+      wl_keyboard_add_listener(self->keyboard_, &keyboardListener, self);
     }
   }
 
@@ -4907,6 +5343,138 @@ private:
   static constexpr wl_pointer_listener pointerListener = {
       pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis};
 
+  static void keyboardKeymap(void *data, wl_keyboard *, uint32_t format,
+                             int32_t fd, uint32_t size) {
+    auto *self = static_cast<LiteUI *>(data);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+      close(fd);
+      return;
+    }
+    char *map =
+        static_cast<char *>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    if (map == MAP_FAILED)
+      return;
+    if (!self->xkbContext_)
+      self->xkbContext_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (self->xkbKeymap_)
+      xkb_keymap_unref(self->xkbKeymap_);
+    self->xkbKeymap_ = xkb_keymap_new_from_string(self->xkbContext_, map,
+                                                  XKB_KEYMAP_FORMAT_TEXT_V1,
+                                                  XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    if (self->xkbState_)
+      xkb_state_unref(self->xkbState_);
+    self->xkbState_ =
+        self->xkbKeymap_ ? xkb_state_new(self->xkbKeymap_) : nullptr;
+  }
+
+  static void keyboardEnter(void *, wl_keyboard *, uint32_t, wl_surface *,
+                            wl_array *) {}
+
+  // Keyboard focus left our surface entirely (switched to another window)
+  // — blur, and stop any in-flight repeat, same reasoning as WM_KILLFOCUS.
+  static void keyboardLeave(void *data, wl_keyboard *, uint32_t, wl_surface *) {
+    auto *self = static_cast<LiteUI *>(data);
+    self->setFocus(nullptr);
+    self->repeatKeycode_ = 0;
+  }
+
+  static void keyboardKey(void *data, wl_keyboard *, uint32_t, uint32_t,
+                          uint32_t key, uint32_t state) {
+    auto *self = static_cast<LiteUI *>(data);
+    if (!self->xkbState_)
+      return;
+    // Wayland keycodes are evdev-based, offset by 8 from the X11/xkb
+    // numbering xkbcommon expects.
+    xkb_keycode_t xkbCode = key + 8;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(self->xkbState_, xkbCode);
+    KeyEvent e{xkbKeysymToKey(sym), self->modState_};
+    bool changed = false;
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+      changed = self->dispatchKeyDown(e);
+      uint32_t cp = xkb_state_key_get_utf32(self->xkbState_, xkbCode);
+      if (cp >= 0x20 || cp == '\t')
+        changed |= self->dispatchTextInput(cp);
+      // Arm repeat for this key if the compositor wants repeat and this
+      // key actually produces repeatable input (xkb flags this).
+      if (self->repeatRateHz_ > 0 &&
+          xkb_keymap_key_repeats(self->xkbKeymap_, xkbCode)) {
+        self->repeatKeycode_ = key;
+        self->armRepeatTimer(self->repeatDelayMs_);
+      }
+    } else {
+      changed = self->dispatchKeyUp(e);
+      if (self->repeatKeycode_ == key)
+        self->repeatKeycode_ = 0;
+    }
+    if (changed)
+      self->redraw();
+  }
+
+  static void keyboardModifiers(void *data, wl_keyboard *, uint32_t,
+                                uint32_t modsDepressed, uint32_t modsLatched,
+                                uint32_t modsLocked, uint32_t group) {
+    auto *self = static_cast<LiteUI *>(data);
+    if (!self->xkbState_)
+      return;
+    xkb_state_update_mask(self->xkbState_, modsDepressed, modsLatched,
+                          modsLocked, 0, 0, group);
+    KeyModifiers m;
+    m.shift = xkb_state_mod_name_is_active(self->xkbState_, XKB_MOD_NAME_SHIFT,
+                                           XKB_STATE_MODS_EFFECTIVE) > 0;
+    m.ctrl = xkb_state_mod_name_is_active(self->xkbState_, XKB_MOD_NAME_CTRL,
+                                          XKB_STATE_MODS_EFFECTIVE) > 0;
+    m.alt = xkb_state_mod_name_is_active(self->xkbState_, XKB_MOD_NAME_ALT,
+                                         XKB_STATE_MODS_EFFECTIVE) > 0;
+    m.super = xkb_state_mod_name_is_active(self->xkbState_, XKB_MOD_NAME_LOGO,
+                                           XKB_STATE_MODS_EFFECTIVE) > 0;
+    self->modState_ = m;
+  }
+
+  static void keyboardRepeatInfo(void *data, wl_keyboard *, int32_t rate,
+                                 int32_t delay) {
+    auto *self = static_cast<LiteUI *>(data);
+    self->repeatRateHz_ = rate;
+    self->repeatDelayMs_ = delay;
+  }
+
+  static constexpr wl_keyboard_listener keyboardListener = {
+      keyboardKeymap, keyboardEnter,     keyboardLeave,
+      keyboardKey,    keyboardModifiers, keyboardRepeatInfo};
+
+  void armRepeatTimer(int delayMs) {
+    if (repeatTimerFd_ < 0)
+      repeatTimerFd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (repeatTimerFd_ < 0)
+      return;
+    itimerspec spec{};
+    spec.it_value.tv_sec = delayMs / 1000;
+    spec.it_value.tv_nsec = (delayMs % 1000) * 1000000L;
+    if (repeatRateHz_ > 0) {
+      spec.it_interval.tv_sec = 0;
+      spec.it_interval.tv_nsec = 1000000000L / repeatRateHz_;
+    }
+    timerfd_settime(repeatTimerFd_, 0, &spec, nullptr);
+  }
+
+  void fireRepeatIfDue() {
+    if (repeatTimerFd_ < 0 || repeatKeycode_ == 0 || !xkbState_)
+      return;
+    uint64_t expirations;
+    if (read(repeatTimerFd_, &expirations, sizeof(expirations)) <= 0)
+      return; // not due yet (EAGAIN) or error
+    xkb_keycode_t xkbCode = repeatKeycode_ + 8;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(xkbState_, xkbCode);
+    KeyEvent e{xkbKeysymToKey(sym), modState_};
+    bool changed = dispatchKeyDown(e);
+    uint32_t cp = xkb_state_key_get_utf32(xkbState_, xkbCode);
+    if (cp >= 0x20 || cp == '\t')
+      changed |= dispatchTextInput(cp);
+    if (changed)
+      redraw();
+  }
+
   // Called once per global object the compositor advertises via the registry.
   static void registryGlobal(void *data, wl_registry *registry, uint32_t name,
                              const char *interface, uint32_t) {
@@ -4949,6 +5517,11 @@ private:
       self->decoration_manager_ =
           static_cast<zxdg_decoration_manager_v1 *>(wl_registry_bind(
               registry, name, &zxdg_decoration_manager_v1_interface, 1));
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+      self->seat_ = static_cast<wl_seat *>(
+          wl_registry_bind(registry, name, &wl_seat_interface,
+                           4)); // bump to 4 for keyboard repeat_info
+      wl_seat_add_listener(self->seat_, &seatListener, self);
     }
   }
   // Called when a global is removed; this minimal window doesn't need to react.
@@ -5994,6 +6567,16 @@ inline LiteUI::~LiteUI() {
   // Destroy the decoration-mode object if one was requested.
   if (toplevel_decoration_)
     zxdg_toplevel_decoration_v1_destroy(toplevel_decoration_);
+  if (keyboard_)
+    wl_keyboard_destroy(keyboard_);
+  if (xkbState_)
+    xkb_state_unref(xkbState_);
+  if (xkbKeymap_)
+    xkb_keymap_unref(xkbKeymap_);
+  if (xkbContext_)
+    xkb_context_unref(xkbContext_);
+  if (repeatTimerFd_ >= 0)
+    close(repeatTimerFd_);
   // Release the pointer device if one was obtained.
   if (pointer_)
     wl_pointer_destroy(pointer_);
@@ -6074,11 +6657,27 @@ inline void LiteUI::run() {
   }
 // Linux/Wayland-specific event loop.
 #else
-  // Keep dispatching Wayland events as long as we haven't been asked to stop
-  // and the connection is healthy.
-  while (running_ && wl_display_dispatch(display_) != -1) {
-    // event loop
+  while (running_) {
+    while (wl_display_prepare_read(display_) != 0)
+      wl_display_dispatch_pending(display_);
+    wl_display_flush(display_);
+
+    struct pollfd fds[2] = {
+        {wl_display_get_fd(display_), POLLIN, 0},
+        {repeatTimerFd_, repeatTimerFd_ >= 0 ? POLLIN : 0, 0}};
+    int n = poll(fds, repeatTimerFd_ >= 0 ? 2 : 1, -1);
+    if (n < 0) {
+      wl_display_cancel_read(display_);
+      break;
+    }
+    if (fds[0].revents & POLLIN)
+      wl_display_read_events(display_);
+    else
+      wl_display_cancel_read(display_);
+    wl_display_dispatch_pending(display_);
+
+    if (repeatTimerFd_ >= 0 && (fds[1].revents & POLLIN))
+      fireRepeatIfDue();
   }
-// Ends the Windows/Linux run() branch.
 #endif
 }

@@ -22,6 +22,7 @@ elseif(UNIX AND NOT APPLE)
     pkg_check_modules(GLES REQUIRED IMPORTED_TARGET glesv2)
     pkg_check_modules(WAYLAND_EGL REQUIRED IMPORTED_TARGET wayland-egl)
     pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
+    pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 
     find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner REQUIRED)
     pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
