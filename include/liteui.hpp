@@ -274,7 +274,7 @@ struct TextStyle {
   FontWeight fontWeight = FontWeight::Regular;
   FontStyle fontStyle = FontStyle::Normal;
   std::string fontFamily; // empty = platform default UI font
-  Color color{0, 0, 0};
+  Dynamic<Color> color = Color{0, 0, 0};
   TextAlign align = TextAlign::Start;
   TextOverflow overflow = TextOverflow::Clip;
   TextWrap wrap = TextWrap::Wrap;
@@ -295,7 +295,7 @@ struct Text {
   FontWeight fontWeight = FontWeight::Regular;
   FontStyle fontStyle = FontStyle::Normal;
   std::string fontFamily;
-  Color color{0, 0, 0};
+  Dynamic<Color> color = Color{0, 0, 0};
   TextAlign align = TextAlign::Start;
   TextOverflow overflow = TextOverflow::Clip;
   TextWrap wrap = TextWrap::Wrap;
@@ -599,6 +599,7 @@ public:
     mutable Display resolvedDisplay = Display::Flex;
     mutable Visibility resolvedVisibility = Visibility::Visible;
     mutable int resolvedZIndex = 0;
+    mutable Color resolvedTextColor{0, 0, 0};
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -3572,6 +3573,16 @@ private:
         changed = true;
       }
     }
+    if (auto *fn = std::get_if<std::function<Color()>>(&v.textStyle.color)) {
+      Color next = (*fn)();
+      Color &cur = v.computed.resolvedTextColor;
+      if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
+          next.a != cur.a) {
+        cur = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
     if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled)) {
       bool next = (*fn)();
       if (next != v.computed.resolvedDisabled) {
@@ -4271,7 +4282,9 @@ private:
   void paintText(ID2D1RenderTarget *rt, const View &v) {
     ensureTextLayout(v);
     ID2D1SolidColorBrush *brush = nullptr;
-    rt->CreateSolidColorBrush(toD2DColor(v.textStyle.color), &brush);
+    rt->CreateSolidColorBrush(
+        toD2DColor(resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor)),
+        &brush);
     if (brush) {
       float x = v.computed.x + v.style.padding.left;
       float y = v.computed.y + v.style.padding.top;
@@ -5329,7 +5342,7 @@ private:
                 static_cast<float>(v.computed.textTexH));
     glUniform2f(texUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
-    const Color &c = v.textStyle.color;
+    const Color &c = resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor);
     glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
                 c.a / 255.0f);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -5668,10 +5681,12 @@ private:
       collectAbsolutes(root_, absolutes);
       std::stable_sort(absolutes.begin(), absolutes.end(),
                        [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
-                         int za = resolveDynamic(
-                             a.view->style.zIndex, a.view->computed.resolvedZIndex);
-                         int zb = resolveDynamic(
-                             b.view->style.zIndex, b.view->computed.resolvedZIndex);
+                         int za =
+                             resolveDynamic(a.view->style.zIndex,
+                                            a.view->computed.resolvedZIndex);
+                         int zb =
+                             resolveDynamic(b.view->style.zIndex,
+                                            b.view->computed.resolvedZIndex);
                          if (za != zb)
                            return za < zb;
                          return a.order < b.order;

@@ -167,7 +167,7 @@ static View textButton(const std::string &label,
   Text t;
   t.label = label;
   t.fontSize = 14;
-  t.color = {30, 30, 30, 255};
+  t.color = Color{30, 30, 30, 255};
   v.addChild(std::move(t));
   return v;
 }
@@ -236,7 +236,7 @@ static View buildRoot() {
     return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 14;
-  zoomLabel.color = {30, 30, 30, 255};
+  zoomLabel.color = Color{30, 30, 30, 255};
   zoomLabel.style.margin = EdgeInsets{0, 6, 0, 6};
   toolbar.addChild(std::move(zoomLabel));
 
