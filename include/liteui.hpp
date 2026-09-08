@@ -225,7 +225,7 @@ struct Style {
   Dynamic<float> bottom = std::numeric_limits<float>::quiet_NaN();
   // Stacking order among all Absolute nodes tree-wide (not just siblings).
   // Ties break by document order — see collectAbsolutes().
-  int zIndex = 0;
+  Dynamic<int> zIndex = 0;
 
   // When either axis is non-Visible, this view becomes a scroll container:
   // its children are measured at their natural size (not squeezed to fit)
@@ -598,6 +598,7 @@ public:
     mutable float resolvedBottom = std::numeric_limits<float>::quiet_NaN();
     mutable Display resolvedDisplay = Display::Flex;
     mutable Visibility resolvedVisibility = Visibility::Visible;
+    mutable int resolvedZIndex = 0;
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -3440,8 +3441,12 @@ private:
   static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
     std::stable_sort(absolutes.begin(), absolutes.end(),
                      [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
-                       if (a.view->style.zIndex != b.view->style.zIndex)
-                         return a.view->style.zIndex < b.view->style.zIndex;
+                       int za = resolveDynamic(a.view->style.zIndex,
+                                               a.view->computed.resolvedZIndex);
+                       int zb = resolveDynamic(b.view->style.zIndex,
+                                               b.view->computed.resolvedZIndex);
+                       if (za != zb)
+                         return za < zb;
                        return a.order < b.order;
                      });
   }
@@ -3677,6 +3682,14 @@ private:
         v.computed.resolvedVisibility = next;
         v.computed.dirty = true;
         changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<int()>>(&v.style.zIndex)) {
+      int next = (*fn)();
+      if (next != v.computed.resolvedZIndex) {
+        v.computed.resolvedZIndex = next;
+        v.computed.dirty = true;
+        changed = true; // affects stacking order — repaint picks it up
       }
     }
     if (v.canvasDirtySource && v.canvasDirtySource()) {
@@ -5655,8 +5668,12 @@ private:
       collectAbsolutes(root_, absolutes);
       std::stable_sort(absolutes.begin(), absolutes.end(),
                        [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
-                         if (a.view->style.zIndex != b.view->style.zIndex)
-                           return a.view->style.zIndex < b.view->style.zIndex;
+                         int za = resolveDynamic(
+                             a.view->style.zIndex, a.view->computed.resolvedZIndex);
+                         int zb = resolveDynamic(
+                             b.view->style.zIndex, b.view->computed.resolvedZIndex);
+                         if (za != zb)
+                           return za < zb;
                          return a.order < b.order;
                        });
       for (const auto &e : absolutes)
