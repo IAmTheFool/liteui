@@ -1,11 +1,11 @@
 # LiteUI
 
-A single-header, cross-platform C++ UI library. No dependencies to manage beyond your platform's native stack — just `#include <liteui.hpp>` and go.
+A single-header, cross-platform C++ UI library. No dependencies to manage beyond your platform's native stack just `#include "liteui.hpp"` and go.
 
 - **Windows**: renders with Direct2D + DirectWrite
 - **Linux**: renders with Wayland + EGL/GLES2 (text/vector fallback via Cairo + Pango)
 
-One `LiteUI` class definition exists per build — the platform is picked with `#ifdef`, so there's no vtable, no `Impl` pointer, no indirection. What you write is what runs.
+
 
 ## Requirements
 
@@ -16,38 +16,52 @@ One `LiteUI` class definition exists per build — the platform is picked with `
 ## Quick start
 
 ```cpp
-#include <liteui.hpp>
+#include "liteui.hpp"
 
 int main() {
-    LiteUI ui(800, 600, "My App");
+  int count = 0;
 
-    View root;
-    root.style.direction = FlexDirection::Column;
-    root.style.padding = EdgeInsets::all(16);
-    root.style.gap = 12;
+  Text label;
+  label.label = [&]() { return "Count: " + std::to_string(count); };
+  label.fontSize = 20;
 
-    Text heading;
-    heading.label = "Hello, LiteUI!";
-    heading.fontSize = 24;
-    heading.fontWeight = FontWeight::Bold;
-    root.addChild(heading);
+  View button;
+  button.style.width = Size::pixel(140);
+  button.style.height = Size::pixel(44);
+  button.style.borderRadius = 6.0f;
+  button.style.backgroundColor = Color{230, 230, 230};
+  button.style.hoverColor = {210, 210, 210};
+  button.style.alignItems = Align::Center;
+  button.style.justifyContent = Justify::Center;
 
-    View button;
-    button.style.width = Size::pixel(120);
-    button.style.height = Size::pixel(40);
-    button.style.backgroundColor = Color{50, 120, 220};
-    button.style.borderRadius = 8;
-    button.onClick = [] { printf("clicked!\n"); };
-    root.addChild(button);
+  button.onClick = [&]() {
+    count++;
+  };
 
-    ui.setRoot(std::move(root));
-    ui.run(); // blocks, pumps the platform event loop
+  Text buttonLabel;
+  buttonLabel.label = "Increment";
+  button.addChild(buttonLabel);
+
+  View root;
+  root.style.direction = FlexDirection::Column;
+  root.style.alignItems = Align::Center;
+  root.style.justifyContent = Justify::Center;
+  root.style.gap = 16;
+  root.style.width = Size::full();
+  root.style.height = Size::full();
+  root.addChild(label);
+  root.addChild(button);
+
+  LiteUI ui(400, 200, "Counter");
+  ui.setRoot(root);
+  ui.run(); // blocks, pumps the platform event loop
+  return 0;
 }
 ```
 
 ## Core concepts
 
-### `View` — the tree
+### `View` the tree
 
 Everything on screen is a `View`. Build a tree, hand the root to `ui.setRoot()`, and the library lays it out, paints it, and hit-tests it for you.
 
@@ -58,9 +72,9 @@ container.addChild(Text{...});   // flattened into a text-leaf View
 container.addChild(Canvas{...}); // flattened into a canvas-leaf View
 ```
 
-`Text` and `Canvas` are author-facing convenience structs — they get flattened into a `View` the moment you call `addChild`, and never appear in the retained tree themselves.
+`Text` and `Canvas` are author-facing convenience structs they get flattened into a `View` the moment you call `addChild`, and never appear in the retained tree themselves.
 
-### Layout — a flexbox subset
+### Layout a flexbox subset
 
 `Style` controls sizing and layout, and mirrors CSS flexbox on purpose:
 
@@ -121,7 +135,7 @@ Global shortcuts (work regardless of focus):
 ui.addShortcut({.ctrl = true}, Key::S, [] { save(); });
 ```
 
-### Canvas — immediate-mode 2D drawing
+### Canvas immediate-mode 2D drawing
 
 For custom drawing, add a `Canvas` node and draw HTML5-canvas-style:
 
@@ -139,9 +153,9 @@ c.onPaint = [](CanvasContext &ctx) {
 root.addChild(c);
 ```
 
-`CanvasContext` supports paths, gradients, transforms, text, images, and pixel data (`getImageData`/`putImageData`) — see the header's own comment block above `CanvasContext` for the small list of platform differences (e.g. `clearRect` clips per-rectangle on Linux but clears the whole surface on Windows).
+`CanvasContext` supports paths, gradients, transforms, text, images, and pixel data (`getImageData`/`putImageData`) see the header's own comment block above `CanvasContext` for the small list of platform differences (e.g. `clearRect` clips per-rectangle on Linux but clears the whole surface on Windows).
 
-`onPaint` is **not** a per-frame render loop — it only re-runs when something asks it to. From inside an interactive canvas handler, set a dirty flag and report it via `canvasDirtySource`:
+`onPaint` is **not** a per-frame render loop it only re-runs when something asks it to. From inside an interactive canvas handler, set a dirty flag and report it via `canvasDirtySource`:
 
 ```cpp
 bool dirty = false;
@@ -151,9 +165,9 @@ c.canvasDirtySource = [&] { bool d = dirty; dirty = false; return d; };
 
 ## State management
 
-LiteUI has **no** internal reactive/observable system — state lives wherever your app keeps it (plain variables, a struct, whatever). Two mechanisms connect that state to the UI:
+LiteUI has **no** internal reactive/observable system state lives wherever your app keeps it (plain variables, a struct, whatever). Two mechanisms connect that state to the UI:
 
-### 1. `Dynamic<T>` — poll-based bindings
+### 1. `Dynamic<T>` poll-based bindings
 
 Most `Style`/`Text` fields (`backgroundColor`, `width`, `text`, `disabled`, `left`, `display`, etc.) are `Dynamic<T> = std::variant<T, std::function<T()>>`. Assign a plain value for something static, or a lambda for something that should track app state:
 
@@ -170,7 +184,7 @@ toggle.style.backgroundColor = [&]() -> Color {
 toggle.onClick = [&] { isOn = !isOn; };
 ```
 
-After **any** event handler runs (click, key, drag, scroll...), LiteUI automatically walks the tree, re-invokes every `Dynamic` callback, and diffs the result against the cached value. If anything changed, it marks the node dirty and re-lays-out/repaints — you never call this yourself.
+After **any** event handler runs (click, key, drag, scroll...), LiteUI automatically walks the tree, re-invokes every `Dynamic` callback, and diffs the result against the cached value. If anything changed, it marks the node dirty and re-lays-out/repaints you never call this yourself.
 
 ### 2. Manual mutation + `requestCanvasRedraw()`
 
@@ -192,15 +206,15 @@ someView.requestCanvasRedraw(); // only meaningful for canvas nodes
 
 ## How the header works internally
 
-- **Two-pass layout** (`liteui_layout::measureNatural` then `placeNode`): a bottom-up sizing pass followed by a top-down placement pass that distributes flex space, wraps lines, and resolves scrolling — the same shape as the CSS flexbox algorithm.
+- **Two-pass layout** (`liteui_layout::measureNatural` then `placeNode`): a bottom-up sizing pass followed by a top-down placement pass that distributes flex space, wraps lines, and resolves scrolling the same shape as the CSS flexbox algorithm.
 - **`View::Computed`** holds everything layout/paint derive: final pixel box, scroll offsets, resolved `Dynamic` values, and platform-specific cached resources (a `IDWriteTextLayout*`/GL texture per text node, etc.).
-- **One `LiteUI` definition per build.** Platform members (window handles, GL/D2D state, Wayland listeners) are compiled in via `#ifdef _WIN32` — there's exactly one code path per platform, not a runtime abstraction layer.
+- **One `LiteUI` definition per build.** Platform members (window handles, GL/D2D state, Wayland listeners) are compiled in via `#ifdef _WIN32` there's exactly one code path per platform, not a runtime abstraction layer.
 - **Hit-testing, hover, and scroll resolution** all walk the same tree shape (clip-aware, bubbling), so a click, a hover highlight, and a scrollbar drag all agree about what's actually visible.
 - **Repaint is request-driven**, not a fixed frame loop: `run()` blocks on the platform's native event queue and only repaints when something changed.
 
 ## Building
 
-The included `CMakeLists.txt` handles both platforms — on Linux it also generates the `xdg-shell`/`xdg-decoration` protocol bindings via `wayland-scanner` before compiling. Just:
+The included `CMakeLists.txt` handles both platforms on Linux it also generates the `xdg-shell`/`xdg-decoration` protocol bindings via `wayland-scanner` before compiling. Just:
 
 ```bash
 cmake -B build
@@ -209,7 +223,7 @@ cmake --build build
 
 ## Known limitations (v1)
 
-- No image decoding (PNG/JPEG) — `CanvasImage` expects already-decoded RGBA8 pixels.
+- No image decoding (PNG/JPEG) `CanvasImage` expects already-decoded RGBA8 pixels.
 - `getImageData` is unsupported on Windows (returns `std::nullopt`).
 - `Canvas::clearRect` clears the whole surface on Windows, only the given rect on Linux.
 - `strokeText` approximates a glyph outline; it isn't a true contour stroke.
