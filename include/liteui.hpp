@@ -16,6 +16,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -643,6 +644,11 @@ struct Canvas {
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
   std::function<bool()> canvasDirtySource;
+  bool focusable = false;
+  std::function<void()> onFocus;
+  std::function<void()> onBlur;
+  std::function<void(KeyEvent)> onKeyDown;
+  std::function<void(uint32_t)> onTextInput;
 };
 
 // A node in the retained layout tree. Set `style` and `children`; the engine
@@ -950,6 +956,11 @@ inline View View::toView(Canvas c) {
   v.onScrollUp = std::move(c.onScrollUp);
   v.onScrollDown = std::move(c.onScrollDown);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
+  v.focusable = c.focusable;
+  v.onFocus = std::move(c.onFocus);
+  v.onBlur = std::move(c.onBlur);
+  v.onKeyDown = std::move(c.onKeyDown);
+  v.onTextInput = std::move(c.onTextInput);
   return v;
 }
 
@@ -4151,9 +4162,16 @@ private:
   std::vector<Shortcut> shortcuts_;
 
 public:
+  // Runs fn every `ms` milliseconds until removeInterval() is called with
+  // the returned handle. Each tick automatically triggers the same
+  // checkForUpdates+relayout+repaint cycle as a click/key dispatch, so fn
+  // can freely flip plain bools/state and have it show up on screen.
+  int addInterval(int ms, std::function<void()> fn);
+  void removeInterval(int handle);
   void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
     shortcuts_.push_back({mods, key, std::move(fn)});
   }
+  void requestRepaint();
 
 private:
   // Called by both platform backends on every key press. Checks
@@ -4299,6 +4317,7 @@ private:
 #if defined(_WIN32)
   // Native window handle; null until CreateWindowExW succeeds.
   HWND hwnd_ = nullptr;
+  std::unordered_map<UINT_PTR, std::function<void()>> timers_;
 
   // Device-independent: created once in the constructor, lives for the
   // process (well, the LiteUI instance's) lifetime.
@@ -4646,6 +4665,16 @@ private:
       }
       return 0;
     }
+    case WM_TIMER: {
+      if (self) {
+        auto it = self->timers_.find(wp);
+        if (it != self->timers_.end()) {
+          it->second();
+          self->requestRepaint();
+        }
+      }
+      return 0;
+    }
     // When the window is being destroyed...
     case WM_DESTROY:
       // ...tell Windows to post a WM_QUIT message, which ends the GetMessage
@@ -4926,6 +4955,15 @@ private:
   xkb_context *xkbContext_ = nullptr;
   xkb_keymap *xkbKeymap_ = nullptr;
   xkb_state *xkbState_ = nullptr;
+
+  struct IntervalTimer {
+    int fd;
+    std::function<void()> fn;
+  };
+  std::vector<IntervalTimer> intervalTimers_;
+  int nextIntervalHandle_ = 1;
+  std::unordered_map<int, int>
+      intervalHandleToFd_; // handle -> fd, for removeInterval
 
   // Key-repeat: Wayland does NOT auto-repeat key events for you (unlike
   // Win32) — repeat_info tells you the rate/delay and you're expected to
@@ -6599,6 +6637,56 @@ inline LiteUI::~LiteUI() {
 // Ends the Windows/Linux teardown branch.
 #endif
 }
+inline void LiteUI::requestRepaint() {
+  if (checkForUpdates(root_))
+    relayout();
+#if defined(_WIN32)
+  if (hwnd_)
+    InvalidateRect(hwnd_, nullptr, FALSE);
+#else
+  if (eglReady_)
+    redraw();
+#endif
+}
+
+#if defined(_WIN32)
+inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
+  UINT_PTR id =
+      SetTimer(hwnd_, timers_.size() + 1, static_cast<UINT>(ms), nullptr);
+  timers_[id] = std::move(fn);
+  return static_cast<int>(id);
+}
+inline void LiteUI::removeInterval(int handle) {
+  KillTimer(hwnd_, static_cast<UINT_PTR>(handle));
+  timers_.erase(static_cast<UINT_PTR>(handle));
+}
+#else
+inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
+  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  itimerspec spec{};
+  spec.it_value.tv_sec = ms / 1000;
+  spec.it_value.tv_nsec = (ms % 1000) * 1000000L;
+  spec.it_interval = spec.it_value; // repeating
+  timerfd_settime(fd, 0, &spec, nullptr);
+  int handle = nextIntervalHandle_++;
+  intervalHandleToFd_[handle] = fd;
+  intervalTimers_.push_back({fd, std::move(fn)});
+  return handle;
+}
+inline void LiteUI::removeInterval(int handle) {
+  auto it = intervalHandleToFd_.find(handle);
+  if (it == intervalHandleToFd_.end())
+    return;
+  int fd = it->second;
+  intervalTimers_.erase(
+      std::remove_if(intervalTimers_.begin(), intervalTimers_.end(),
+                     [fd](const IntervalTimer &t) { return t.fd == fd; }),
+      intervalTimers_.end());
+  close(fd);
+  intervalHandleToFd_.erase(it);
+}
+#endif
+
 inline void LiteUI::setRoot(View view) {
   if (hasRoot_)
     root_.freeTextResources();
@@ -6663,10 +6751,16 @@ inline void LiteUI::run() {
       wl_display_dispatch_pending(display_);
     wl_display_flush(display_);
 
-    struct pollfd fds[2] = {
-        {wl_display_get_fd(display_), POLLIN, 0},
-        {repeatTimerFd_, static_cast<short>(repeatTimerFd_ >= 0 ? POLLIN : 0), 0}};
-    int n = poll(fds, repeatTimerFd_ >= 0 ? 2 : 1, -1);
+    std::vector<pollfd> fds;
+    fds.push_back({wl_display_get_fd(display_), POLLIN, 0});
+    size_t repeatIdx = fds.size();
+    if (repeatTimerFd_ >= 0)
+      fds.push_back({repeatTimerFd_, POLLIN, 0});
+    size_t intervalStart = fds.size();
+    for (auto &t : intervalTimers_)
+      fds.push_back({t.fd, POLLIN, 0});
+
+    int n = poll(fds.data(), static_cast<nfds_t>(fds.size()), -1);
     if (n < 0) {
       wl_display_cancel_read(display_);
       break;
@@ -6677,8 +6771,17 @@ inline void LiteUI::run() {
       wl_display_cancel_read(display_);
     wl_display_dispatch_pending(display_);
 
-    if (repeatTimerFd_ >= 0 && (fds[1].revents & POLLIN))
+    if (repeatTimerFd_ >= 0 && fds[repeatIdx].revents & POLLIN)
       fireRepeatIfDue();
+
+    for (size_t i = 0; i < intervalTimers_.size(); ++i) {
+      if (fds[intervalStart + i].revents & POLLIN) {
+        uint64_t exp;
+        read(intervalTimers_[i].fd, &exp, sizeof(exp));
+        intervalTimers_[i].fn();
+        requestRepaint();
+      }
+    }
   }
 #endif
 }
