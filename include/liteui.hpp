@@ -41,6 +41,7 @@
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
 #include <wayland-cursor.h> // wl_cursor_theme_load / wl_cursor_theme_get_cursor, for showing resize/arrow cursors.
@@ -6664,7 +6665,7 @@ inline void LiteUI::run() {
 
     struct pollfd fds[2] = {
         {wl_display_get_fd(display_), POLLIN, 0},
-        {repeatTimerFd_, repeatTimerFd_ >= 0 ? POLLIN : 0, 0}};
+        {repeatTimerFd_, static_cast<short>(repeatTimerFd_ >= 0 ? POLLIN : 0), 0}};
     int n = poll(fds, repeatTimerFd_ >= 0 ? 2 : 1, -1);
     if (n < 0) {
       wl_display_cancel_read(display_);

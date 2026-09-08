@@ -79,6 +79,7 @@ elseif(UNIX AND NOT APPLE)
         PkgConfig::EGL
         PkgConfig::GLES
         PkgConfig::WAYLAND_EGL
+        PkgConfig::XKBCOMMON
     )
     add_dependencies(main xdg_shell_protocol)
 
