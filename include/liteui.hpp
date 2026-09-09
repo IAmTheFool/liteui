@@ -1328,6 +1328,26 @@ inline Measurement measure(const std::string &text, const TextStyle &style,
   return result;
 }
 
+// Finds the character boundary whose x-position is closest to clickX
+// (clickX measured from the text's own left edge). O(n) — fine for
+// typical single-line field text. Mirrors the Windows/DirectWrite
+// implementation above; only depends on measure(), so the logic is
+// identical on both platforms.
+inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                             float clickX) {
+  float best = 1e9f;
+  size_t bestIdx = 0;
+  for (size_t i = 0; i <= text.size(); ++i) {
+    Measurement m = measure(text.substr(0, i), style, -1);
+    float d = std::abs(m.width - clickX);
+    if (d < best) {
+      best = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
 #endif
 } // namespace liteui_text
 
