@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -651,6 +652,43 @@ struct Canvas {
   std::function<void(uint32_t)> onTextInput;
 };
 
+// Mutable state for a TextInput, held by shared_ptr so every copy of the
+// View a TextInput flattens into (addChild copies Views) still shares one
+// live cursor/focus/blink state.
+struct TextInputState {
+  std::string text;
+  size_t cursor = 0; // byte offset; ASCII-only, same limitation as before
+  bool focused = false;
+  bool blinkOn = true;
+  bool dirty = true;
+  int blinkTimerHandle = -1;
+  float scrollOffset = 0.0f;
+};
+
+// Author-facing single-line text field. addChild(TextInput) flattens this
+// into a Canvas-backed View (see View::toView(TextInput)) with a blinking
+// caret, click-to-position, arrow-key navigation, and text editing already
+// wired up. For anything this doesn't cover, build a Canvas node by hand
+// using the same liteui_text::caretIndexForX helper this uses internally.
+struct TextInput {
+  Style style;
+  std::string text;
+  std::string placeholder;
+  float fontSize = 16.0f;
+  FontWeight fontWeight = FontWeight::Regular;
+  std::string fontFamily;
+  Color textColor = Color{0, 0, 0};
+  Color placeholderColor = Color{160, 160, 160};
+  Color caretColor = Color{20, 20, 20};
+  Color borderColor = Color{180, 180, 180};
+  Color focusedBorderColor = Color{50, 120, 220};
+  float leftPadding = 6.0f;
+  std::function<void(const std::string &)> onChange;
+  std::function<void(const std::string &)> onSubmit; // fires on Enter
+
+  std::shared_ptr<TextInputState> state = std::make_shared<TextInputState>();
+};
+
 // A node in the retained layout tree. Set `style` and `children`; the engine
 // fills in `computed` (absolute window pixel coordinates) during layout.
 // Renderers only ever read `computed`, never re-derive it from `style`.
@@ -855,6 +893,7 @@ public:
   void addChild(View child) { children.push_back(std::move(child)); }
   void addChild(Text t) { children.push_back(toView(std::move(t))); }
   void addChild(Canvas c) { children.push_back(toView(std::move(c))); }
+  void addChild(TextInput ti) { children.push_back(toView(std::move(ti))); }
 
   // Marks this canvas node's cached backing surface stale, so the next
   // paint/render pass re-invokes onPaint instead of reusing whatever it
@@ -916,6 +955,7 @@ public:
 private:
   static View toView(Text t);
   static View toView(Canvas c);
+  static View toView(TextInput ti);
 };
 
 inline View View::toView(Text t) {
@@ -1092,6 +1132,24 @@ inline Measurement measure(const std::string &text, const TextStyle &style,
   Measurement result{m.widthIncludingTrailingWhitespace, outH};
   layout->Release();
   return result;
+}
+
+// Finds the character boundary whose x-position is closest to clickX
+// (clickX measured from the text's own left edge). O(n) — fine for
+// typical single-line field text.
+inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                             float clickX) {
+  float best = 1e9f;
+  size_t bestIdx = 0;
+  for (size_t i = 0; i <= text.size(); ++i) {
+    Measurement m = measure(text.substr(0, i), style, -1);
+    float d = std::abs(m.width - clickX);
+    if (d < best) {
+      best = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
 }
 
 #else // Linux — Pango/Cairo
@@ -3357,6 +3415,7 @@ private:
   std::vector<Box> boxes_;
   View root_;
   bool hasRoot_ = false;
+  static inline LiteUI *activeInstance_ = nullptr;
 
   // Re-runs the layout algorithm over root_ against the current window size.
   void relayout() {
@@ -4172,6 +4231,7 @@ public:
     shortcuts_.push_back({mods, key, std::move(fn)});
   }
   void requestRepaint();
+  static LiteUI *current() { return activeInstance_; }
 
 private:
   // Called by both platform backends on every key press. Checks
@@ -6453,6 +6513,7 @@ private:
 // library.
 inline LiteUI::LiteUI(int w, int h, const std::string &title)
     : width_(w), height_(h) {
+  activeInstance_ = this;
 // Windows-specific construction path.
 #if defined(_WIN32)
   // Handle to the current executable module, needed to register a window class.
@@ -6559,6 +6620,8 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
 
 // Out-of-line destructor definition.
 inline LiteUI::~LiteUI() {
+  if (activeInstance_ == this)
+    activeInstance_ = nullptr;
   if (hasRoot_)
     root_.freeTextResources(); // must run before releasing d2dFactory_ / before
                                // eglMakeCurrent(NO_CONTEXT) below
@@ -6637,6 +6700,175 @@ inline LiteUI::~LiteUI() {
 // Ends the Windows/Linux teardown branch.
 #endif
 }
+
+inline View View::toView(TextInput ti) {
+  auto state = ti.state;
+  state->text = ti.text;
+  state->cursor = state->text.size();
+
+  TextStyle ts;
+  ts.fontSize = ti.fontSize;
+  ts.fontWeight = ti.fontWeight;
+  ts.fontFamily = ti.fontFamily;
+
+  Color textColor = ti.textColor;
+  Color placeholderColor = ti.placeholderColor;
+  Color caretColor = ti.caretColor;
+  Color borderColor = ti.borderColor;
+  Color focusedBorderColor = ti.focusedBorderColor;
+  float leftPad = ti.leftPadding;
+  std::string placeholder = ti.placeholder;
+  auto onChange = ti.onChange;
+  auto onSubmit = ti.onSubmit;
+
+  View v;
+  v.style = std::move(ti.style);
+  v.isCanvas = true;
+  v.focusable = true;
+
+  // Border color reflects focus automatically — overrides whatever the
+  // caller set on style.borderColor.
+  v.style.borderColor = [state, borderColor, focusedBorderColor] {
+    return state->focused ? focusedBorderColor : borderColor;
+  };
+
+  v.canvasDirtySource = [state] {
+    bool d = state->dirty;
+    state->dirty = false;
+    return d;
+  };
+
+  v.onPaint = [state, ts, textColor, placeholderColor, caretColor, leftPad,
+               placeholder](CanvasContext &ctx) {
+    float availW = std::max(0.0f, ctx.width() - leftPad * 2.0f);
+
+    // Keep the caret in view: scroll right if it's past the visible edge,
+    // scroll left if it's before the start of the visible window.
+    liteui_text::Measurement cursorM =
+        liteui_text::measure(state->text.substr(0, state->cursor), ts, -1);
+    float cursorX = cursorM.width;
+    if (cursorX - state->scrollOffset > availW)
+      state->scrollOffset = cursorX - availW;
+    if (cursorX - state->scrollOffset < 0.0f)
+      state->scrollOffset = cursorX;
+
+    // Never scroll past the end of the text (e.g. after deleting chars).
+    liteui_text::Measurement fullM = liteui_text::measure(state->text, ts, -1);
+    float maxScroll = std::max(0.0f, fullM.width - availW);
+    state->scrollOffset = std::clamp(state->scrollOffset, 0.0f, maxScroll);
+
+    // Clip to the field's own bounds so scrolled-off text/caret don't
+    // paint outside the box.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, ctx.width(), ctx.height());
+    ctx.clip();
+
+    ctx.setFont(ts.fontFamily, ts.fontSize, ts.fontWeight, ts.fontStyle);
+    ctx.setTextBaseline(TextBaseline::Middle);
+    ctx.setTextAlign(TextAlign::Start);
+
+    float textX = leftPad - state->scrollOffset;
+    if (state->text.empty() && !state->focused) {
+      ctx.setFillColor(placeholderColor);
+      ctx.fillText(placeholder, leftPad, ctx.height() / 2.0f);
+    } else {
+      ctx.setFillColor(textColor);
+      ctx.fillText(state->text, textX, ctx.height() / 2.0f);
+    }
+
+    if (state->focused && state->blinkOn) {
+      float cx = textX + cursorX;
+      ctx.setFillColor(caretColor);
+      ctx.fillRect(cx, 5.0f, 1.5f, std::max(0.0f, ctx.height() - 10.0f));
+    }
+
+    ctx.restore();
+  };
+
+  v.onPressAt = [state, ts, leftPad](float lx, float) {
+    state->cursor = liteui_text::caretIndexForX(
+        state->text, ts, lx - leftPad + state->scrollOffset);
+    state->blinkOn = true;
+    state->dirty = true;
+  };
+
+  v.onFocus = [state] {
+    state->focused = true;
+    state->blinkOn = true;
+    state->dirty = true;
+    if (state->blinkTimerHandle < 0 && LiteUI::current()) {
+      state->blinkTimerHandle = LiteUI::current()->addInterval(530, [state] {
+        state->blinkOn = !state->blinkOn;
+        state->dirty = true;
+      });
+    }
+  };
+  v.onBlur = [state] {
+    state->focused = false;
+    state->dirty = true;
+    if (state->blinkTimerHandle >= 0 && LiteUI::current()) {
+      LiteUI::current()->removeInterval(state->blinkTimerHandle);
+      state->blinkTimerHandle = -1;
+    }
+  };
+
+  v.onKeyDown = [state, onChange, onSubmit](KeyEvent e) {
+    switch (e.key) {
+    case Key::Left:
+      if (state->cursor > 0)
+        state->cursor--;
+      break;
+    case Key::Right:
+      if (state->cursor < state->text.size())
+        state->cursor++;
+      break;
+    case Key::Home:
+      state->cursor = 0;
+      break;
+    case Key::End:
+      state->cursor = state->text.size();
+      break;
+    case Key::Backspace:
+      if (state->cursor > 0) {
+        state->text.erase(state->cursor - 1, 1);
+        state->cursor--;
+        if (onChange)
+          onChange(state->text);
+      }
+      break;
+    case Key::Delete:
+      if (state->cursor < state->text.size()) {
+        state->text.erase(state->cursor, 1);
+        if (onChange)
+          onChange(state->text);
+      }
+      break;
+    case Key::Enter:
+      if (onSubmit)
+        onSubmit(state->text);
+      return; // don't touch blink/dirty for a submit
+    default:
+      return;
+    }
+    state->blinkOn = true;
+    state->dirty = true;
+  };
+
+  v.onTextInput = [state, onChange](uint32_t cp) {
+    if (cp >= 0x20 && cp < 128) {
+      state->text.insert(state->cursor, 1, static_cast<char>(cp));
+      state->cursor++;
+      state->blinkOn = true;
+      state->dirty = true;
+      if (onChange)
+        onChange(state->text);
+    }
+  };
+
+  return v;
+}
+
 inline void LiteUI::requestRepaint() {
   if (checkForUpdates(root_))
     relayout();
