@@ -21,6 +21,10 @@
 #include <variant>
 #include <vector>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_FAILURE_USERMSG
+#include "stb_image.h"
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -550,6 +554,50 @@ struct CanvasImage {
         pixels(static_cast<size_t>(std::max(0, w)) * std::max(0, h) * 4, 0) {}
 };
 
+// How a decoded image's aspect ratio is reconciled with the box it's
+// drawn into — same semantics as CSS object-fit.
+enum class ObjectFit { Fill, Contain, Cover, None, ScaleDown };
+
+namespace liteui_image {
+
+// Decodes any stb_image-supported format (PNG/JPEG/BMP/GIF/etc.) into a
+// straight-alpha RGBA8 CanvasImage. Always requests 4 channels regardless
+// of the source's actual channel count, so callers never need to branch
+// on format.
+inline std::optional<CanvasImage>
+decodeMemory(const unsigned char *data, size_t len,
+             std::string *errorOut = nullptr) {
+  int w = 0, h = 0, channels = 0;
+  unsigned char *pixels =
+      stbi_load_from_memory(data, static_cast<int>(len), &w, &h, &channels, 4);
+  if (!pixels) {
+    if (errorOut)
+      *errorOut = stbi_failure_reason();
+    return std::nullopt;
+  }
+  CanvasImage img(w, h);
+  std::memcpy(img.pixels.data(), pixels, static_cast<size_t>(w) * h * 4);
+  stbi_image_free(pixels);
+  return img;
+}
+
+inline std::optional<CanvasImage> decodeFile(const std::string &path,
+                                             std::string *errorOut = nullptr) {
+  int w = 0, h = 0, channels = 0;
+  unsigned char *pixels = stbi_load(path.c_str(), &w, &h, &channels, 4);
+  if (!pixels) {
+    if (errorOut)
+      *errorOut = stbi_failure_reason();
+    return std::nullopt;
+  }
+  CanvasImage img(w, h);
+  std::memcpy(img.pixels.data(), pixels, static_cast<size_t>(w) * h * 4);
+  stbi_image_free(pixels);
+  return img;
+}
+
+} // namespace liteui_image
+
 struct CanvasGradientStop {
   float offset; // 0..1
   Color color;
@@ -650,6 +698,29 @@ struct Canvas {
   std::function<void()> onBlur;
   std::function<void(KeyEvent)> onKeyDown;
   std::function<void(uint32_t)> onTextInput;
+};
+
+// Author-facing leaf node, addChild(Image)'d the same way Canvas/Text
+// are — flattens into an isCanvas View whose onPaint blits a decoded
+// CanvasImage (see View::toView(Image)). Set exactly one of `path` /
+// `source`: `path` is decoded synchronously via stb_image at addChild
+// time; `source` is used as-is (for procedurally generated pixels, or
+// pixels the app decoded/cached itself). If neither yields a usable
+// image, the node simply paints nothing (onError still fires).
+struct Image {
+  Style style;
+  std::string path;
+  std::shared_ptr<CanvasImage> source;
+  ObjectFit fit = ObjectFit::Fill;
+  // Painted behind the image before it's drawn — visible in the
+  // letterboxed margins Contain/ScaleDown/None can leave. Alpha 0
+  // (default) means "leave transparent".
+  Color backgroundColor = Color{0, 0, 0, 0};
+  // Fired once, synchronously, from addChild(Image) — decoding happens
+  // eagerly, not on a background thread — with the image's pixel
+  // dimensions if decoding succeeded.
+  std::function<void(int width, int height)> onLoad;
+  std::function<void(const std::string &error)> onError;
 };
 
 // Mutable state for a TextInput, held by shared_ptr so every copy of the
@@ -894,6 +965,7 @@ public:
   void addChild(Text t) { children.push_back(toView(std::move(t))); }
   void addChild(Canvas c) { children.push_back(toView(std::move(c))); }
   void addChild(TextInput ti) { children.push_back(toView(std::move(ti))); }
+  void addChild(Image img) { children.push_back(toView(std::move(img))); }
 
   // Marks this canvas node's cached backing surface stale, so the next
   // paint/render pass re-invokes onPaint instead of reusing whatever it
@@ -956,6 +1028,7 @@ private:
   static View toView(Text t);
   static View toView(Canvas c);
   static View toView(TextInput ti);
+  static View toView(Image img);
 };
 
 inline View View::toView(Text t) {
@@ -1631,11 +1704,14 @@ public:
     if (img.width <= 0 || img.height <= 0)
       return;
     ID2D1Bitmap *bmp = makeBitmap(img);
-    if (!bmp)
+    if (!bmp) {
+
       return;
+    }
     rt_->SetTransform(transform_);
     D2D1_RECT_F dst = D2D1::RectF(dx, dy, dx + dw, dy + dh);
     D2D1_RECT_F src = D2D1::RectF(sx, sy, sx + sw, sy + sh);
+
     rt_->DrawBitmap(bmp, dst, globalAlpha_,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
     bmp->Release();
@@ -1935,15 +2011,28 @@ private:
 
   ID2D1Bitmap *makeBitmap(const CanvasImage &img) {
     ID2D1Bitmap *bmp = nullptr;
+    // D2D1 bitmaps require BGRA byte order AND premultiplied alpha for
+    // CreateBitmap on an ID2D1RenderTarget (straight alpha is rejected
+    // with D2DERR_UNSUPPORTED_PIXEL_FORMAT for this creation path).
+    std::vector<uint8_t> bgra(static_cast<size_t>(img.width) * img.height * 4);
+    for (size_t i = 0; i + 3 < bgra.size(); i += 4) {
+      uint8_t r = img.pixels[i + 0];
+      uint8_t g = img.pixels[i + 1];
+      uint8_t b = img.pixels[i + 2];
+      uint8_t a = img.pixels[i + 3];
+      bgra[i + 0] = static_cast<uint8_t>(b * a / 255);
+      bgra[i + 1] = static_cast<uint8_t>(g * a / 255);
+      bgra[i + 2] = static_cast<uint8_t>(r * a / 255);
+      bgra[i + 3] = a;
+    }
     D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(
-        DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_STRAIGHT));
-    rt_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(img.width),
-                                  static_cast<UINT32>(img.height)),
-                      img.pixels.data(), static_cast<UINT32>(img.width) * 4,
-                      props, &bmp);
-    return bmp;
+        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    HRESULT hr = rt_->CreateBitmap(
+        D2D1::SizeU(static_cast<UINT32>(img.width),
+                    static_cast<UINT32>(img.height)),
+        bgra.data(), static_cast<UINT32>(img.width) * 4, props, &bmp);
+    return FAILED(hr) ? nullptr : bmp;
   }
-
   TextStyle fontToTextStyle() const {
     TextStyle ts = font_;
     ts.wrap = TextWrap::NoWrap;
@@ -6864,6 +6953,87 @@ inline View View::toView(TextInput ti) {
       if (onChange)
         onChange(state->text);
     }
+  };
+
+  return v;
+}
+
+inline View View::toView(Image img) {
+  std::string err;
+  auto pixels = std::make_shared<std::optional<CanvasImage>>();
+  if (img.source)
+    *pixels = *img.source;
+  else if (!img.path.empty())
+    *pixels = liteui_image::decodeFile(img.path, &err);
+
+  if (pixels->has_value() && img.onLoad)
+    img.onLoad((*pixels)->width, (*pixels)->height);
+  else if (!pixels->has_value() && img.onError)
+    img.onError(err.empty() ? "liteui: no image source given" : err);
+
+  View v;
+  v.style = std::move(img.style);
+  v.isCanvas = true;
+
+  // Default to the image's own pixel size wherever the caller left
+  // width/height as Fit — matches how a plain <img> sizes itself before
+  // any CSS overrides it.
+  if (pixels->has_value()) {
+    if (std::get_if<Size>(&v.style.width) &&
+        std::get<Size>(v.style.width).kind == Size::Kind::Fit)
+      v.style.width = Size::pixel(static_cast<float>((*pixels)->width));
+    if (std::get_if<Size>(&v.style.height) &&
+        std::get<Size>(v.style.height).kind == Size::Kind::Fit)
+      v.style.height = Size::pixel(static_cast<float>((*pixels)->height));
+  }
+
+  ObjectFit fit = img.fit;
+  Color bg = img.backgroundColor;
+
+  v.onPaint = [pixels, fit, bg](CanvasContext &ctx) {
+    if (bg.a > 0) {
+      ctx.setFillColor(bg);
+      ctx.fillRect(0, 0, ctx.width(), ctx.height());
+    }
+    if (!pixels->has_value())
+      return;
+    const CanvasImage &im = **pixels;
+    if (im.width <= 0 || im.height <= 0)
+      return;
+    float cw = ctx.width(), ch = ctx.height();
+    float iw = static_cast<float>(im.width), ih = static_cast<float>(im.height);
+    float dw = cw, dh = ch, dx = 0, dy = 0;
+    switch (fit) {
+    case ObjectFit::Fill:
+      break; // dw/dh/dx/dy already = full box
+    case ObjectFit::None:
+      dw = iw;
+      dh = ih;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
+      break;
+    case ObjectFit::Contain:
+    case ObjectFit::ScaleDown: {
+      float scale = std::min(cw / iw, ch / ih);
+      if (fit == ObjectFit::ScaleDown)
+        scale = std::min(scale, 1.0f);
+      dw = iw * scale;
+      dh = ih * scale;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
+      break;
+    }
+    case ObjectFit::Cover: {
+      float scale = std::max(cw / iw, ch / ih);
+      dw = iw * scale;
+      dh = ih * scale;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
+      break;
+    }
+    }
+
+    ctx.drawImage(im, dx, dy, dw, dh);
   };
 
   return v;
