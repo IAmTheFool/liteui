@@ -11,7 +11,7 @@ if(WIN32)
         src/main.cpp
     )
     target_include_directories(main PRIVATE include)
-    target_link_libraries(main PRIVATE user32 gdi32 d3d11 dxgi d2d1 dwrite)
+    target_link_libraries(main PRIVATE user32 gdi32 d3d11 dxgi d2d1 dwrite windowscodecs)
 
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
@@ -23,6 +23,8 @@ elseif(UNIX AND NOT APPLE)
     pkg_check_modules(WAYLAND_EGL REQUIRED IMPORTED_TARGET wayland-egl)
     pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo)
     pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
+    pkg_check_modules(PNG REQUIRED IMPORTED_TARGET libpng)
+    pkg_check_modules(JPEG REQUIRED IMPORTED_TARGET libjpeg)
 
     find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner REQUIRED)
     pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
@@ -80,6 +82,8 @@ elseif(UNIX AND NOT APPLE)
         PkgConfig::GLES
         PkgConfig::WAYLAND_EGL
         PkgConfig::XKBCOMMON
+        PkgConfig::PNG 
+        PkgConfig::JPEG
     )
     add_dependencies(main xdg_shell_protocol)
 

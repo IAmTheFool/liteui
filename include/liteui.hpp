@@ -21,10 +21,6 @@
 #include <variant>
 #include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_FAILURE_USERMSG
-#include "stb_image.h"
-
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -32,6 +28,7 @@
 #include <dwrite.h>
 #include <dwrite_1.h>
 #include <dxgiformat.h> // DXGI_FORMAT_R8G8B8A8_UNORM, used by Canvas::drawImage/putImageData
+#include <wincodec.h>
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
 #pragma comment(lib, "d2d1")
@@ -44,7 +41,9 @@
 #include <GLES2/gl2.h>
 #include <cairo/cairo.h>
 #include <fcntl.h>
+#include <jpeglib.h>
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
+#include <png.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
@@ -560,41 +559,238 @@ enum class ObjectFit { Fill, Contain, Cover, None, ScaleDown };
 
 namespace liteui_image {
 
-// Decodes any stb_image-supported format (PNG/JPEG/BMP/GIF/etc.) into a
-// straight-alpha RGBA8 CanvasImage. Always requests 4 channels regardless
-// of the source's actual channel count, so callers never need to branch
-// on format.
-inline std::optional<CanvasImage>
-decodeMemory(const unsigned char *data, size_t len,
-             std::string *errorOut = nullptr) {
-  int w = 0, h = 0, channels = 0;
-  unsigned char *pixels =
-      stbi_load_from_memory(data, static_cast<int>(len), &w, &h, &channels, 4);
-  if (!pixels) {
-    if (errorOut)
-      *errorOut = stbi_failure_reason();
-    return std::nullopt;
-  }
-  CanvasImage img(w, h);
-  std::memcpy(img.pixels.data(), pixels, static_cast<size_t>(w) * h * 4);
-  stbi_image_free(pixels);
-  return img;
-}
+
+#if defined(_WIN32)
 
 inline std::optional<CanvasImage> decodeFile(const std::string &path,
                                              std::string *errorOut = nullptr) {
-  int w = 0, h = 0, channels = 0;
-  unsigned char *pixels = stbi_load(path.c_str(), &w, &h, &channels, 4);
-  if (!pixels) {
+  // WIC needs an apartment; tolerate "already initialized differently"
+  // rather than fail, since the host app may have called this itself.
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  bool weInitialized = coHr == S_OK;
+
+  IWICImagingFactory *factory = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
     if (errorOut)
-      *errorOut = stbi_failure_reason();
+      *errorOut = "WIC: CoCreateInstance failed";
     return std::nullopt;
   }
-  CanvasImage img(w, h);
-  std::memcpy(img.pixels.data(), pixels, static_cast<size_t>(w) * h * 4);
-  stbi_image_free(pixels);
+
+  std::wstring wpath = toWide(path);
+  IWICBitmapDecoder *decoder = nullptr;
+  hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ,
+                                          WICDecodeMetadataCacheOnDemand,
+                                          &decoder);
+  if (FAILED(hr)) {
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: failed to open/decode file";
+    return std::nullopt;
+  }
+
+  IWICBitmapFrameDecode *frame = nullptr;
+  hr = decoder->GetFrame(0, &frame);
+  IWICFormatConverter *converter = nullptr;
+  if (SUCCEEDED(hr)) {
+    hr = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr))
+      // Straight (non-premultiplied) alpha, matching CanvasImage's contract.
+      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                 WICBitmapDitherTypeNone, nullptr, 0.0,
+                                 WICBitmapPaletteTypeCustom);
+  }
+  if (FAILED(hr)) {
+    if (converter)
+      converter->Release();
+    if (frame)
+      frame->Release();
+    decoder->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: decode/convert failed";
+    return std::nullopt;
+  }
+
+  UINT w = 0, h = 0;
+  converter->GetSize(&w, &h);
+  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+  hr = converter->CopyPixels(
+      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
+
+  converter->Release();
+  frame->Release();
+  decoder->Release();
+  factory->Release();
+  if (weInitialized)
+    CoUninitialize();
+
+  if (FAILED(hr)) {
+    if (errorOut)
+      *errorOut = "WIC: CopyPixels failed";
+    return std::nullopt;
+  }
   return img;
 }
+
+#else // Linux
+
+namespace detail {
+
+inline std::string lowerExt(const std::string &path) {
+  auto dot = path.find_last_of('.');
+  if (dot == std::string::npos)
+    return "";
+  std::string ext = path.substr(dot + 1);
+  std::transform(ext.begin(), ext.end(), ext.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return ext;
+}
+
+inline std::optional<CanvasImage> decodePngFile(const std::string &path,
+                                                std::string *errorOut) {
+  FILE *fp = fopen(path.c_str(), "rb");
+  if (!fp) {
+    if (errorOut)
+      *errorOut = "failed to open file";
+    return std::nullopt;
+  }
+  png_byte header[8];
+  if (fread(header, 1, 8, fp) != 8 || png_sig_cmp(header, 0, 8)) {
+    fclose(fp);
+    if (errorOut)
+      *errorOut = "not a valid PNG file";
+    return std::nullopt;
+  }
+  png_structp png =
+      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+  png_infop info = png ? png_create_info_struct(png) : nullptr;
+  if (!png || !info) {
+    if (png)
+      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
+    fclose(fp);
+    if (errorOut)
+      *errorOut = "libpng init failed";
+    return std::nullopt;
+  }
+  if (setjmp(png_jmpbuf(png))) {
+    png_destroy_read_struct(&png, &info, nullptr);
+    fclose(fp);
+    if (errorOut)
+      *errorOut = "libpng decode error";
+    return std::nullopt;
+  }
+  png_init_io(png, fp);
+  png_set_sig_bytes(png, 8);
+  png_read_info(png, info);
+
+  png_uint_32 w = png_get_image_width(png, info);
+  png_uint_32 h = png_get_image_height(png, info);
+  int bitDepth = png_get_bit_depth(png, info);
+  int colorType = png_get_color_type(png, info);
+
+  // Normalize every PNG variant (palette/gray/gray+alpha/RGB/RGBA, 1-16 bit)
+  // down to straight-alpha 8-bit RGBA.
+  if (bitDepth == 16)
+    png_set_strip_16(png);
+  if (colorType == PNG_COLOR_TYPE_PALETTE)
+    png_set_palette_to_rgb(png);
+  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
+    png_set_expand_gray_1_2_4_to_8(png);
+  if (png_get_valid(png, info, PNG_INFO_tRNS))
+    png_set_tRNS_to_alpha(png);
+  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
+      colorType == PNG_COLOR_TYPE_PALETTE)
+    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+  if (colorType == PNG_COLOR_TYPE_GRAY ||
+      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
+    png_set_gray_to_rgb(png);
+  png_set_interlace_handling(png);
+  png_read_update_info(png, info);
+
+  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+  size_t rowBytes = png_get_rowbytes(png, info);
+  std::vector<png_bytep> rows(h);
+  for (png_uint_32 y = 0; y < h; ++y)
+    rows[y] = img.pixels.data() + y * rowBytes;
+  png_read_image(png, rows.data());
+
+  png_destroy_read_struct(&png, &info, nullptr);
+  fclose(fp);
+  return img;
+}
+
+inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
+                                                 std::string *errorOut) {
+  FILE *fp = fopen(path.c_str(), "rb");
+  if (!fp) {
+    if (errorOut)
+      *errorOut = "failed to open file";
+    return std::nullopt;
+  }
+  // NOTE: jpeg_std_error's default error_exit calls exit() on a corrupt
+  // file — fine for a first pass, but before shipping this should install
+  // a custom error_mgr with a setjmp/longjmp escape, same idiom as
+  // libpng's png_jmpbuf above, so a bad JPEG returns nullopt instead of
+  // killing the process.
+  jpeg_decompress_struct cinfo;
+  jpeg_error_mgr jerr;
+  cinfo.err = jpeg_std_error(&jerr);
+  jpeg_create_decompress(&cinfo);
+  jpeg_stdio_src(&cinfo, fp);
+  jpeg_read_header(&cinfo, TRUE);
+  jpeg_start_decompress(&cinfo);
+
+  int w = static_cast<int>(cinfo.output_width);
+  int h = static_cast<int>(cinfo.output_height);
+  int channels = cinfo.output_components; // 1 (gray) or 3 (RGB) — no alpha
+
+  CanvasImage img(w, h);
+  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
+  unsigned char *rowPtr = row.data();
+  while (cinfo.output_scanline < cinfo.output_height) {
+    int y = static_cast<int>(cinfo.output_scanline);
+    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
+    for (int x = 0; x < w; ++x) {
+      if (channels == 1) {
+        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
+      } else {
+        dst[x * 4 + 0] = row[x * 3 + 0];
+        dst[x * 4 + 1] = row[x * 3 + 1];
+        dst[x * 4 + 2] = row[x * 3 + 2];
+      }
+      dst[x * 4 + 3] = 255; // JPEG carries no alpha channel
+    }
+  }
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  fclose(fp);
+  return img;
+}
+
+} // namespace detail
+
+inline std::optional<CanvasImage> decodeFile(const std::string &path,
+                                             std::string *errorOut = nullptr) {
+  std::string ext = detail::lowerExt(path);
+  if (ext == "png")
+    return detail::decodePngFile(path, errorOut);
+  if (ext == "jpg" || ext == "jpeg")
+    return detail::decodeJpegFile(path, errorOut);
+  if (errorOut)
+    *errorOut = "unsupported image extension: ." + ext;
+  return std::nullopt;
+}
+
+#endif
 
 } // namespace liteui_image
 
