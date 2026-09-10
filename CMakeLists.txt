@@ -11,7 +11,7 @@ if(WIN32)
         src/main.cpp
     )
     target_include_directories(main PRIVATE include)
-    target_link_libraries(main PRIVATE user32 gdi32 d3d11 dxgi d2d1 dwrite windowscodecs)
+    target_link_libraries(main PRIVATE user32 gdi32 d3d11 dxgi d2d1 dwrite windowscodecs ole32)
 
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)

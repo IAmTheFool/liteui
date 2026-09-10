@@ -28,6 +28,7 @@
 #include <dwrite.h>
 #include <dwrite_1.h>
 #include <dxgiformat.h> // DXGI_FORMAT_R8G8B8A8_UNORM, used by Canvas::drawImage/putImageData
+#include <shobjidl.h>
 #include <wincodec.h>
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
@@ -40,6 +41,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <cairo/cairo.h>
+#include <cstdio>  // popen, pclose, fgets
 #include <fcntl.h>
 #include <jpeglib.h>
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
@@ -557,8 +559,338 @@ struct CanvasImage {
 // drawn into — same semantics as CSS object-fit.
 enum class ObjectFit { Fill, Contain, Cover, None, ScaleDown };
 
-namespace liteui_image {
+// A single filter entry — Windows-style pattern syntax on both platforms
+// ("*.png;*.jpg"), so one filter list works unmodified either way.
+struct FileFilter {
+  std::string name;
+  std::string pattern; // ';'-separated globs, e.g. "*.png;*.jpg"
+};
 
+// Blocks until the user picks a file or cancels. Returns the chosen path,
+// or std::nullopt on cancel/failure. Safe to call from an onClick handler —
+// it's a modal, synchronous call on both platforms, matching how
+// IFileOpenDialog::Show() already blocks.
+std::optional<std::string>
+openFilePicker(const std::string &title = "Open File",
+               const std::vector<FileFilter> &filters = {});
+
+#if defined(_WIN32)
+
+inline std::optional<std::string>
+openFilePicker(const std::string &title,
+               const std::vector<FileFilter> &filters) {
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileOpenDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+
+  // COMDLG_FILTERSPEC just points at wide strings we own, so keep the
+  // backing wstrings alive until after SetFileTypes/Show.
+  std::vector<std::wstring> names, patterns;
+  std::vector<COMDLG_FILTERSPEC> specs;
+  names.reserve(filters.size());
+  patterns.reserve(filters.size());
+  for (auto &f : filters) {
+    names.push_back(toWide(f.name));
+    patterns.push_back(toWide(f.pattern));
+  }
+  for (size_t i = 0; i < filters.size(); ++i)
+    specs.push_back({names[i].c_str(), patterns[i].c_str()});
+  if (!specs.empty())
+    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr); // blocks until closed
+  if (SUCCEEDED(hr)) {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+namespace liteui_filepicker {
+
+inline bool commandExists(const char *name) {
+  std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
+  return std::system(check.c_str()) == 0;
+}
+
+// Very small shell-arg escaper: single-quote the whole thing, escaping any
+// embedded single quotes. Titles/patterns here are app-supplied, but this
+// keeps popen() safe regardless.
+inline std::string shellQuote(const std::string &s) {
+  std::string out = "'";
+  for (char c : s)
+    out += (c == '\'') ? "'\\''" : std::string(1, c);
+  out += "'";
+  return out;
+}
+
+} // namespace liteui_filepicker
+
+inline std::optional<std::string>
+openFilePicker(const std::string &title,
+               const std::vector<FileFilter> &filters) {
+  using namespace liteui_filepicker;
+
+  std::string cmd;
+  if (commandExists("zenity")) {
+    cmd = "zenity --file-selection --title=" + shellQuote(title);
+    for (auto &f : filters) {
+      // zenity wants space-separated globs; our pattern is ';'-separated.
+      std::string globs = f.pattern;
+      std::replace(globs.begin(), globs.end(), ';', ' ');
+      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+    }
+  } else if (commandExists("kdialog")) {
+    // kdialog's filter syntax is "*.png *.jpg|Images\n*.mp3|Audio" — build
+    // it from all filters at once, appended as a single trailing arg.
+    cmd = "kdialog --getopenfilename . --title " + shellQuote(title);
+    if (!filters.empty()) {
+      std::string spec;
+      for (size_t i = 0; i < filters.size(); ++i) {
+        std::string globs = filters[i].pattern;
+        std::replace(globs.begin(), globs.end(), ';', ' ');
+        if (i)
+          spec += "\n";
+        spec += globs + "|" + filters[i].name;
+      }
+      cmd += " " + shellQuote(spec);
+    }
+  } else {
+    return std::nullopt; // no picker binary available
+  }
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+#endif
+
+// Blocks until the user picks a save location or cancels. `defaultName` is
+// the pre-filled filename (e.g. "export.png"); `defaultExt` (no leading
+// dot, e.g. "png") gets appended if the user's typed name doesn't already
+// end in a known extension from `filters`. Returns the chosen path, or
+// std::nullopt on cancel/failure.
+std::optional<std::string>
+saveFilePicker(const std::string &title = "Save File",
+               const std::string &defaultName = "",
+               const std::vector<FileFilter> &filters = {},
+               const std::string &defaultExt = "");
+
+#if defined(_WIN32)
+
+inline std::optional<std::string>
+saveFilePicker(const std::string &title, const std::string &defaultName,
+               const std::vector<FileFilter> &filters,
+               const std::string &defaultExt) {
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileSaveDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  if (!defaultName.empty())
+    dlg->SetFileName(toWide(defaultName).c_str());
+  if (!defaultExt.empty())
+    dlg->SetDefaultExtension(toWide(defaultExt).c_str());
+
+  // Prompt-on-overwrite is IFileSaveDialog's default behavior already
+  // (unlike zenity below, which needs it requested explicitly), so
+  // nothing extra is needed here.
+
+  std::vector<std::wstring> names, patterns;
+  std::vector<COMDLG_FILTERSPEC> specs;
+  names.reserve(filters.size());
+  patterns.reserve(filters.size());
+  for (auto &f : filters) {
+    names.push_back(toWide(f.name));
+    patterns.push_back(toWide(f.pattern));
+  }
+  for (size_t i = 0; i < filters.size(); ++i)
+    specs.push_back({names[i].c_str(), patterns[i].c_str()});
+  if (!specs.empty())
+    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr); // blocks until closed
+  if (SUCCEEDED(hr)) {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+namespace liteui_filepicker {
+
+// Appends defaultExt to path if it doesn't already end in one of the
+// extensions listed in `filters`' patterns. Keeps zenity/kdialog (which
+// don't reliably force an extension the way Windows' dialog does) from
+// producing "export" instead of "export.png".
+inline std::string ensureExtension(std::string path,
+                                   const std::string &defaultExt,
+                                   const std::vector<FileFilter> &filters) {
+  if (defaultExt.empty() || path.empty())
+    return path;
+  auto endsWithAny = [&](const std::string &p) {
+    for (auto &f : filters) {
+      size_t start = 0;
+      while (start < f.pattern.size()) {
+        size_t sep = f.pattern.find(';', start);
+        std::string glob = f.pattern.substr(start, sep - start);
+        // glob is like "*.png" — check the suffix after '*'
+        size_t star = glob.find('*');
+        if (star != std::string::npos) {
+          std::string suffix = glob.substr(star + 1);
+          if (suffix.size() <= p.size() &&
+              std::equal(suffix.rbegin(), suffix.rend(), p.rbegin(),
+                         [](char a, char b) {
+                           return std::tolower(a) == std::tolower(b);
+                         }))
+            return true;
+        }
+        if (sep == std::string::npos)
+          break;
+        start = sep + 1;
+      }
+    }
+    return false;
+  };
+  if (!filters.empty() && endsWithAny(path))
+    return path;
+  if (path.size() >= defaultExt.size() + 1 &&
+      path[path.size() - defaultExt.size() - 1] == '.' &&
+      std::equal(
+          defaultExt.rbegin(), defaultExt.rend(), path.rbegin(),
+          [](char a, char b) { return std::tolower(a) == std::tolower(b); }))
+    return path;
+  return path + "." + defaultExt;
+}
+
+} // namespace liteui_filepicker
+
+inline std::optional<std::string>
+saveFilePicker(const std::string &title, const std::string &defaultName,
+               const std::vector<FileFilter> &filters,
+               const std::string &defaultExt) {
+  using namespace liteui_filepicker;
+
+  std::string cmd;
+  if (commandExists("zenity")) {
+    cmd = "zenity --file-selection --save --confirm-overwrite --title=" +
+          shellQuote(title);
+    if (!defaultName.empty())
+      cmd += " --filename=" + shellQuote(defaultName);
+    for (auto &f : filters) {
+      std::string globs = f.pattern;
+      std::replace(globs.begin(), globs.end(), ';', ' ');
+      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+    }
+  } else if (commandExists("kdialog")) {
+    cmd = "kdialog --getsavefilename";
+    cmd += " " + shellQuote(defaultName.empty() ? "." : defaultName);
+    if (!filters.empty()) {
+      std::string spec;
+      for (size_t i = 0; i < filters.size(); ++i) {
+        std::string globs = filters[i].pattern;
+        std::replace(globs.begin(), globs.end(), ';', ' ');
+        if (i)
+          spec += "\n";
+        spec += globs + "|" + filters[i].name;
+      }
+      cmd += " " + shellQuote(spec);
+    }
+    cmd += " --title " + shellQuote(title);
+    // kdialog itself prompts on overwrite by default.
+  } else {
+    return std::nullopt;
+  }
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return ensureExtension(result, defaultExt, filters);
+}
+
+#endif
+
+namespace liteui_image {
 
 #if defined(_WIN32)
 
@@ -749,7 +1081,8 @@ inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
                                                  std::string *errorOut) {
   FILE *fp = fopen(path.c_str(), "rb");
   if (!fp) {
-    if (errorOut) *errorOut = "failed to open file";
+    if (errorOut)
+      *errorOut = "failed to open file";
     return std::nullopt;
   }
 
@@ -765,7 +1098,8 @@ inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
   if (setjmp(jerr.escape)) {
     jpeg_destroy_decompress(&cinfo);
     fclose(fp);
-    if (errorOut) *errorOut = jerr.message;
+    if (errorOut)
+      *errorOut = jerr.message;
     return std::nullopt;
   }
 
