@@ -1118,6 +1118,24 @@ inline void pngMemRead(png_structp png, png_bytep out, png_size_t count) {
   r->offset += count;
 }
 
+// Custom error manager so a corrupt/truncated JPEG returns nullopt instead
+// of libjpeg's default error_exit calling exit() and killing the process.
+// Mirrors the setjmp/longjmp escape libpng uses via png_jmpbuf above.
+struct JpegErrorMgr {
+  jpeg_error_mgr pub; // must be first member — libjpeg treats this struct
+                      // as a jpeg_error_mgr* via reinterpret_cast
+  jmp_buf escape;
+  std::string message;
+};
+
+inline void jpegErrorExit(j_common_ptr cinfo) {
+  auto *err = reinterpret_cast<JpegErrorMgr *>(cinfo->err);
+  char buf[JMSG_LENGTH_MAX];
+  (*cinfo->err->format_message)(cinfo, buf);
+  err->message = buf;
+  longjmp(err->escape, 1);
+}
+
 inline std::optional<CanvasImage>
 decodePngMemory(const uint8_t *data, size_t size, std::string *errorOut) {
   if (size < 8 || png_sig_cmp(data, 0, 8)) {
@@ -1302,23 +1320,7 @@ inline std::optional<CanvasImage> decodePngFile(const std::string &path,
   return img;
 }
 
-// Custom error manager so a corrupt/truncated JPEG returns nullopt instead
-// of libjpeg's default error_exit calling exit() and killing the process.
-// Mirrors the setjmp/longjmp escape libpng uses via png_jmpbuf above.
-struct JpegErrorMgr {
-  jpeg_error_mgr pub; // must be first member — libjpeg treats this struct
-                      // as a jpeg_error_mgr* via reinterpret_cast
-  jmp_buf escape;
-  std::string message;
-};
 
-inline void jpegErrorExit(j_common_ptr cinfo) {
-  auto *err = reinterpret_cast<JpegErrorMgr *>(cinfo->err);
-  char buf[JMSG_LENGTH_MAX];
-  (*cinfo->err->format_message)(cinfo, buf);
-  err->message = buf;
-  longjmp(err->escape, 1);
-}
 
 inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
                                                  std::string *errorOut) {
