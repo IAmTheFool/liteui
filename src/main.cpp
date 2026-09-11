@@ -3,6 +3,7 @@
 #include "liteui.hpp"
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <sstream>
 
 static std::string formatSize(uintmax_t bytes) {
@@ -20,9 +21,8 @@ static std::string formatSize(uintmax_t bytes) {
   return out.str();
 }
 
-// Takes the already-decoded image (or nullptr if decoding failed/wasn't an
-// image) so we don't decode the file twice.
-static std::string describeFile(const std::string &path, const CanvasImage *img) {
+static std::string describeFile(const std::string &path,
+                                const CanvasImage *img) {
   std::error_code ec;
   std::filesystem::path p(path);
 
@@ -43,13 +43,8 @@ static std::string describeFile(const std::string &path, const CanvasImage *img)
   return out.str();
 }
 
-// Shared state the button's onClick writes into and the preview Canvas
-// reads from. Kept separate from the View tree entirely — no tree
-// mutation happens after setRoot(), only this struct's contents change.
 struct PreviewState {
-  std::optional<CanvasImage> image;
-  bool dirty = true; // starts true; View::computed.canvasNeedsRedraw also
-                     // starts true, so the first frame paints regardless
+  std::shared_ptr<CanvasImage> image; // null until a file is picked
 };
 
 int main() {
@@ -63,7 +58,6 @@ int main() {
   root.style.gap = 12;
   root.style.backgroundColor = Color{0xF2, 0xF2, 0xF2};
 
-  // ---- Open button ----
   Text buttonText;
   buttonText.label = "Open File";
 
@@ -75,9 +69,9 @@ int main() {
   button.style.borderRadius = 4.0f;
   button.style.alignItems = Align::Center;
   button.style.justifyContent = Justify::Center;
+
   button.addChild(buttonText);
 
-  // ---- Metadata text ----
   auto fileInfo = std::make_shared<std::string>("No file selected");
 
   Text infoText;
@@ -95,62 +89,34 @@ int main() {
   infoBox.style.borderColor = Color{220, 220, 220};
   infoBox.addChild(infoText);
 
-  // ---- Image preview canvas ----
   auto preview = std::make_shared<PreviewState>();
 
-  Canvas previewCanvas;
-  previewCanvas.style.width = Size::full();
-  previewCanvas.style.flexGrow = 1; // fill remaining vertical space
-  previewCanvas.style.backgroundColor = Color{255, 255, 255};
-  previewCanvas.style.borderWidth = 1.0f;
-  previewCanvas.style.borderColor = Color{220, 220, 220};
-  previewCanvas.style.borderRadius = 4.0f;
-
-  previewCanvas.canvasDirtySource = [preview] {
-    bool d = preview->dirty;
-    preview->dirty = false;
-    return d;
-  };
-
-  previewCanvas.onPaint = [preview](CanvasContext &ctx) {
-    ctx.setFillColor(Color{255, 255, 255});
-    ctx.fillRect(0, 0, ctx.width(), ctx.height());
-
-    if (!preview->image) {
-      ctx.setFillColor(Color{160, 160, 160});
-      ctx.setFont("", 14.0f);
-      ctx.setTextAlign(TextAlign::Center);
-      ctx.setTextBaseline(TextBaseline::Middle);
-      ctx.fillText("No image selected", ctx.width() / 2.0f, ctx.height() / 2.0f);
-      return;
-    }
-
-    // Contain-fit into the canvas, same math View::toView(Image) uses.
-    const CanvasImage &im = *preview->image;
-    float cw = ctx.width(), ch = ctx.height();
-    float iw = static_cast<float>(im.width), ih = static_cast<float>(im.height);
-    float scale = std::min(cw / iw, ch / ih);
-    float dw = iw * scale, dh = ih * scale;
-    float dx = (cw - dw) / 2.0f, dy = (ch - dh) / 2.0f;
-    ctx.drawImage(im, dx, dy, dw, dh);
-  };
+  Image previewImage;
+  previewImage.style.width = Size::full();
+  previewImage.style.flexGrow = 1;
+  previewImage.style.backgroundColor = Color{255, 255, 255};
+  previewImage.style.borderWidth = 1.0f;
+  previewImage.style.borderColor = Color{220, 220, 220};
+  previewImage.style.borderRadius = 4.0f;
+  previewImage.fit = ObjectFit::Contain;
+  previewImage.source = [preview] { return preview->image; };
 
   button.onClick = [fileInfo, preview]() {
-    auto path = openFilePicker("Open Image", {{"Images", "*.png;*.jpg;*.jpeg"}});
+    auto path =
+        openFilePicker("Open Image", {{"Images", "*.png;*.jpg;*.jpeg"}});
     if (!path)
-      return; // cancelled — leave existing state alone
+      return;
 
-    preview->image = liteui_image::decodeFile(*path);
-    preview->dirty = true; // triggers the Canvas's next repaint
-    *fileInfo = describeFile(*path, preview->image ? &*preview->image : nullptr);
-    // No ui.setRoot() call here — we only mutate shared state; the click
-    // dispatch that invoked this lambda already runs checkForUpdates()
-    // and relayout() right after, which is what actually picks this up.
+    std::string err;
+    auto decoded = liteui_image::decodeFile(*path, &err);
+    preview->image =
+        decoded ? std::make_shared<CanvasImage>(std::move(*decoded)) : nullptr;
+    *fileInfo = describeFile(*path, preview->image.get());
   };
 
   root.addChild(std::move(button));
   root.addChild(std::move(infoBox));
-  root.addChild(std::move(previewCanvas));
+  root.addChild(std::move(previewImage));
   ui.setRoot(std::move(root));
 
   ui.run();

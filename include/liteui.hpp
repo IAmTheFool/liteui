@@ -41,7 +41,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <cairo/cairo.h>
-#include <cstdio>  // popen, pclose, fgets
+#include <cstdio> // popen, pclose, fgets
 #include <fcntl.h>
 #include <jpeglib.h>
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
@@ -894,6 +894,108 @@ namespace liteui_image {
 
 #if defined(_WIN32)
 
+inline std::optional<CanvasImage>
+decodeMemory(const uint8_t *data, size_t size,
+             std::string *errorOut = nullptr) {
+  if (!data || size == 0) {
+    if (errorOut)
+      *errorOut = "empty buffer";
+    return std::nullopt;
+  }
+
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  bool weInitialized = coHr == S_OK;
+
+  IWICImagingFactory *factory = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: CoCreateInstance failed";
+    return std::nullopt;
+  }
+
+  // IWICStream::InitializeFromMemory wraps the buffer in place (no copy),
+  // so `data` must stay valid for the lifetime of this call — fine here
+  // since decoding happens synchronously before we return.
+  IWICStream *stream = nullptr;
+  hr = factory->CreateStream(&stream);
+  if (SUCCEEDED(hr))
+    hr = stream->InitializeFromMemory(const_cast<BYTE *>(data),
+                                      static_cast<DWORD>(size));
+  if (FAILED(hr)) {
+    if (stream)
+      stream->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: InitializeFromMemory failed";
+    return std::nullopt;
+  }
+
+  IWICBitmapDecoder *decoder = nullptr;
+  hr = factory->CreateDecoderFromStream(
+      stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+  if (FAILED(hr)) {
+    stream->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: failed to decode buffer (unrecognized format?)";
+    return std::nullopt;
+  }
+
+  IWICBitmapFrameDecode *frame = nullptr;
+  hr = decoder->GetFrame(0, &frame);
+  IWICFormatConverter *converter = nullptr;
+  if (SUCCEEDED(hr)) {
+    hr = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr))
+      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                 WICBitmapDitherTypeNone, nullptr, 0.0,
+                                 WICBitmapPaletteTypeCustom);
+  }
+  if (FAILED(hr)) {
+    if (converter)
+      converter->Release();
+    if (frame)
+      frame->Release();
+    decoder->Release();
+    stream->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: decode/convert failed";
+    return std::nullopt;
+  }
+
+  UINT w = 0, h = 0;
+  converter->GetSize(&w, &h);
+  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+  hr = converter->CopyPixels(
+      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
+
+  converter->Release();
+  frame->Release();
+  decoder->Release();
+  stream->Release();
+  factory->Release();
+  if (weInitialized)
+    CoUninitialize();
+
+  if (FAILED(hr)) {
+    if (errorOut)
+      *errorOut = "WIC: CopyPixels failed";
+    return std::nullopt;
+  }
+  return img;
+}
+
 inline std::optional<CanvasImage> decodeFile(const std::string &path,
                                              std::string *errorOut = nullptr) {
   // WIC needs an apartment; tolerate "already initialized differently"
@@ -984,6 +1086,147 @@ inline std::string lowerExt(const std::string &path) {
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return std::tolower(c); });
   return ext;
+}
+
+// Since there's no filename/extension for a memory buffer, sniff the
+// format from its magic bytes instead — same signatures libpng/libjpeg
+// themselves check internally.
+enum class ImageFormat { Unknown, Png, Jpeg };
+inline ImageFormat sniffFormat(const uint8_t *data, size_t size) {
+  static const uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47,
+                                     0x0D, 0x0A, 0x1A, 0x0A};
+  if (size >= 8 && std::memcmp(data, kPngSig, 8) == 0)
+    return ImageFormat::Png;
+  if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+    return ImageFormat::Jpeg;
+  return ImageFormat::Unknown;
+}
+
+// Read-callback state for libpng's png_set_read_fn — tracks how far
+// we've consumed into the caller's buffer.
+struct PngMemReader {
+  const uint8_t *data;
+  size_t size, offset = 0;
+};
+inline void pngMemRead(png_structp png, png_bytep out, png_size_t count) {
+  auto *r = static_cast<PngMemReader *>(png_get_io_ptr(png));
+  if (r->offset + count > r->size) {
+    png_error(png, "liteui: PNG read past end of buffer");
+    return;
+  }
+  std::memcpy(out, r->data + r->offset, count);
+  r->offset += count;
+}
+
+inline std::optional<CanvasImage>
+decodePngMemory(const uint8_t *data, size_t size, std::string *errorOut) {
+  if (size < 8 || png_sig_cmp(data, 0, 8)) {
+    if (errorOut)
+      *errorOut = "not a valid PNG buffer";
+    return std::nullopt;
+  }
+  png_structp png =
+      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+  png_infop info = png ? png_create_info_struct(png) : nullptr;
+  if (!png || !info) {
+    if (png)
+      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
+    if (errorOut)
+      *errorOut = "libpng init failed";
+    return std::nullopt;
+  }
+  if (setjmp(png_jmpbuf(png))) {
+    png_destroy_read_struct(&png, &info, nullptr);
+    if (errorOut)
+      *errorOut = "libpng decode error";
+    return std::nullopt;
+  }
+
+  PngMemReader reader{data, size};
+  png_set_read_fn(png, &reader, pngMemRead);
+  png_read_info(png, info);
+
+  png_uint_32 w = png_get_image_width(png, info);
+  png_uint_32 h = png_get_image_height(png, info);
+  int bitDepth = png_get_bit_depth(png, info);
+  int colorType = png_get_color_type(png, info);
+
+  if (bitDepth == 16)
+    png_set_strip_16(png);
+  if (colorType == PNG_COLOR_TYPE_PALETTE)
+    png_set_palette_to_rgb(png);
+  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
+    png_set_expand_gray_1_2_4_to_8(png);
+  if (png_get_valid(png, info, PNG_INFO_tRNS))
+    png_set_tRNS_to_alpha(png);
+  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
+      colorType == PNG_COLOR_TYPE_PALETTE)
+    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+  if (colorType == PNG_COLOR_TYPE_GRAY ||
+      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
+    png_set_gray_to_rgb(png);
+  png_set_interlace_handling(png);
+  png_read_update_info(png, info);
+
+  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+  size_t rowBytes = png_get_rowbytes(png, info);
+  std::vector<png_bytep> rows(h);
+  for (png_uint_32 y = 0; y < h; ++y)
+    rows[y] = img.pixels.data() + y * rowBytes;
+  png_read_image(png, rows.data());
+
+  png_destroy_read_struct(&png, &info, nullptr);
+  return img;
+}
+
+inline std::optional<CanvasImage>
+decodeJpegMemory(const uint8_t *data, size_t size, std::string *errorOut) {
+  jpeg_decompress_struct cinfo;
+  JpegErrorMgr jerr;
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = jpegErrorExit;
+
+  if (setjmp(jerr.escape)) {
+    jpeg_destroy_decompress(&cinfo);
+    if (errorOut)
+      *errorOut = jerr.message;
+    return std::nullopt;
+  }
+
+  jpeg_create_decompress(&cinfo);
+  // jpeg_mem_src takes a non-const unsigned char* in some libjpeg
+  // versions; it never writes through it, so the cast is safe.
+  jpeg_mem_src(&cinfo, const_cast<unsigned char *>(data),
+               static_cast<unsigned long>(size));
+  jpeg_read_header(&cinfo, TRUE);
+  jpeg_start_decompress(&cinfo);
+
+  int w = static_cast<int>(cinfo.output_width);
+  int h = static_cast<int>(cinfo.output_height);
+  int channels = cinfo.output_components;
+
+  CanvasImage img(w, h);
+  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
+  unsigned char *rowPtr = row.data();
+  while (cinfo.output_scanline < cinfo.output_height) {
+    int y = static_cast<int>(cinfo.output_scanline);
+    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
+    for (int x = 0; x < w; ++x) {
+      if (channels == 1) {
+        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
+      } else {
+        dst[x * 4 + 0] = row[x * 3 + 0];
+        dst[x * 4 + 1] = row[x * 3 + 1];
+        dst[x * 4 + 2] = row[x * 3 + 2];
+      }
+      dst[x * 4 + 3] = 255;
+    }
+  }
+
+  jpeg_finish_decompress(&cinfo);
+  jpeg_destroy_decompress(&cinfo);
+  return img;
 }
 
 inline std::optional<CanvasImage> decodePngFile(const std::string &path,
@@ -1139,6 +1382,21 @@ inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
 
 } // namespace detail
 
+inline std::optional<CanvasImage>
+decodeMemory(const uint8_t *data, size_t size,
+             std::string *errorOut = nullptr) {
+  switch (detail::sniffFormat(data, size)) {
+  case detail::ImageFormat::Png:
+    return detail::decodePngMemory(data, size, errorOut);
+  case detail::ImageFormat::Jpeg:
+    return detail::decodeJpegMemory(data, size, errorOut);
+  default:
+    if (errorOut)
+      *errorOut = "unrecognized image format (not PNG or JPEG)";
+    return std::nullopt;
+  }
+}
+
 inline std::optional<CanvasImage> decodeFile(const std::string &path,
                                              std::string *errorOut = nullptr) {
   std::string ext = detail::lowerExt(path);
@@ -1257,6 +1515,18 @@ struct Canvas {
   std::function<void(uint32_t)> onTextInput;
 };
 
+// Mutable state for an Image with a dynamic (callback) source, held by
+// shared_ptr so every copy of the View an Image flattens into (addChild
+// copies Views — same reasoning as TextInputState above) still shares
+// one live "currently resolved pixels" cache. Untouched for a plain
+// static source (a fixed shared_ptr, or path/memoryData decoded once at
+// build time) — those just populate `pixels` a single time and `dirty`
+// never flips again after the first paint.
+struct ImageState {
+  std::shared_ptr<CanvasImage> pixels;
+  bool dirty = true; // starts true so the very first paint always runs
+};
+
 // Author-facing leaf node, addChild(Image)'d the same way Canvas/Text
 // are — flattens into an isCanvas View whose onPaint blits a decoded
 // CanvasImage (see View::toView(Image)). Set exactly one of `path` /
@@ -1267,7 +1537,17 @@ struct Canvas {
 struct Image {
   Style style;
   std::string path;
-  std::shared_ptr<CanvasImage> source;
+  std::vector<uint8_t> memoryData;
+  // Works exactly like Text::label: assign a plain
+  // std::shared_ptr<CanvasImage> for a fixed image (as before), or a
+  // std::function<std::shared_ptr<CanvasImage>()> to have it re-polled
+  // every dispatch cycle (click/key/timer) the same way a Text label
+  // re-polls its own callback. Return a *different* shared_ptr when the
+  // picture actually changes (comparison is by pointer, not pixel
+  // content — cheap, and matches how the app naturally already tracks
+  // "which image is current" in its own state) and this node repaints
+  // itself with the new pixels; no addChild/setRoot needed.
+  Dynamic<std::shared_ptr<CanvasImage>> source;
   ObjectFit fit = ObjectFit::Fill;
   // Painted behind the image before it's drawn — visible in the
   // letterboxed margins Contain/ScaleDown/None can leave. Alpha 0
@@ -7536,45 +7816,104 @@ inline View View::toView(TextInput ti) {
 }
 
 inline View View::toView(Image img) {
-  std::string err;
-  auto pixels = std::make_shared<std::optional<CanvasImage>>();
-  if (img.source)
-    *pixels = *img.source;
-  else if (!img.path.empty())
-    *pixels = liteui_image::decodeFile(img.path, &err);
+  auto state = std::make_shared<ImageState>();
 
-  if (pixels->has_value() && img.onLoad)
-    img.onLoad((*pixels)->width, (*pixels)->height);
-  else if (!pixels->has_value() && img.onError)
-    img.onError(err.empty() ? "liteui: no image source given" : err);
+  // A dynamic source is polled every dispatch cycle (see
+  // canvasDirtySource below); a fixed value or path/memoryData is
+  // resolved exactly once, right here, matching the old one-shot-decode
+  // behavior.
+  std::function<std::shared_ptr<CanvasImage>()> sourceFn;
+  std::string err;
+  if (auto *fn = std::get_if<std::function<std::shared_ptr<CanvasImage>()>>(
+          &img.source)) {
+    sourceFn = *fn;
+    state->pixels = sourceFn ? sourceFn() : nullptr;
+  } else if (auto *fixed = std::get_if<std::shared_ptr<CanvasImage>>(&img.source);
+             fixed && *fixed) {
+    state->pixels = *fixed;
+  } else if (!img.path.empty()) {
+    if (auto decoded = liteui_image::decodeFile(img.path, &err))
+      state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
+  } else if (!img.memoryData.empty()) {
+    if (auto decoded = liteui_image::decodeMemory(
+            img.memoryData.data(), img.memoryData.size(), &err))
+      state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
+  }
+
+  auto onLoad = img.onLoad;
+  auto onError = img.onError;
+  if (state->pixels && onLoad)
+    onLoad(state->pixels->width, state->pixels->height);
+  else if (!state->pixels && onError)
+    onError(err.empty() ? "liteui: no image source given" : err);
 
   View v;
   v.style = std::move(img.style);
   v.isCanvas = true;
 
-  // Default to the image's own pixel size wherever the caller left
-  // width/height as Fit — matches how a plain <img> sizes itself before
-  // any CSS overrides it.
-  if (pixels->has_value()) {
-    if (std::get_if<Size>(&v.style.width) &&
-        std::get<Size>(v.style.width).kind == Size::Kind::Fit)
-      v.style.width = Size::pixel(static_cast<float>((*pixels)->width));
-    if (std::get_if<Size>(&v.style.height) &&
-        std::get<Size>(v.style.height).kind == Size::Kind::Fit)
-      v.style.height = Size::pixel(static_cast<float>((*pixels)->height));
+  // Fit-size defaulting: for a STATIC source this is a one-time pixel
+  // size, same as before. For a DYNAMIC source, install a
+  // std::function<Size()> instead — checkForUpdates() already knows how
+  // to re-poll a dynamic style.width/height on every View (see its
+  // generic per-field handling), so swapping to a differently-sized
+  // image reflows automatically with no new machinery.
+  bool widthIsFit = std::get_if<Size>(&v.style.width) &&
+                    std::get<Size>(v.style.width).kind == Size::Kind::Fit;
+  bool heightIsFit = std::get_if<Size>(&v.style.height) &&
+                     std::get<Size>(v.style.height).kind == Size::Kind::Fit;
+  if (sourceFn) {
+    if (widthIsFit)
+      v.style.width = std::function<Size()>([state] {
+        return state->pixels
+                   ? Size::pixel(static_cast<float>(state->pixels->width))
+                   : Size::fit();
+      });
+    if (heightIsFit)
+      v.style.height = std::function<Size()>([state] {
+        return state->pixels
+                   ? Size::pixel(static_cast<float>(state->pixels->height))
+                   : Size::fit();
+      });
+  } else if (state->pixels) {
+    if (widthIsFit)
+      v.style.width = Size::pixel(static_cast<float>(state->pixels->width));
+    if (heightIsFit)
+      v.style.height = Size::pixel(static_cast<float>(state->pixels->height));
   }
 
   ObjectFit fit = img.fit;
   Color bg = img.backgroundColor;
 
-  v.onPaint = [pixels, fit, bg](CanvasContext &ctx) {
+  // Polled every dispatch cycle exactly like TextInput's blink timer
+  // (see toView(TextInput)) — re-invokes sourceFn, and if it handed back
+  // a different shared_ptr than last time, swaps it in, re-fires
+  // onLoad/onError, and marks this canvas dirty. A no-op (one call, one
+  // pointer compare) for a static source, since sourceFn is empty there.
+  v.canvasDirtySource = [state, sourceFn, onLoad, onError] {
+    if (sourceFn) {
+      std::shared_ptr<CanvasImage> next = sourceFn();
+      if (next != state->pixels) {
+        state->pixels = next;
+        state->dirty = true;
+        if (state->pixels && onLoad)
+          onLoad(state->pixels->width, state->pixels->height);
+        else if (!state->pixels && onError)
+          onError("liteui: dynamic image source returned null");
+      }
+    }
+    bool d = state->dirty;
+    state->dirty = false;
+    return d;
+  };
+
+  v.onPaint = [state, fit, bg](CanvasContext &ctx) {
     if (bg.a > 0) {
       ctx.setFillColor(bg);
       ctx.fillRect(0, 0, ctx.width(), ctx.height());
     }
-    if (!pixels->has_value())
+    if (!state->pixels)
       return;
-    const CanvasImage &im = **pixels;
+    const CanvasImage &im = *state->pixels;
     if (im.width <= 0 || im.height <= 0)
       return;
     float cw = ctx.width(), ch = ctx.height();
@@ -7582,34 +7921,26 @@ inline View View::toView(Image img) {
     float dw = cw, dh = ch, dx = 0, dy = 0;
     switch (fit) {
     case ObjectFit::Fill:
-      break; // dw/dh/dx/dy already = full box
+      break;
     case ObjectFit::None:
-      dw = iw;
-      dh = ih;
-      dx = (cw - dw) / 2.0f;
-      dy = (ch - dh) / 2.0f;
+      dw = iw; dh = ih;
+      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
       break;
     case ObjectFit::Contain:
     case ObjectFit::ScaleDown: {
       float scale = std::min(cw / iw, ch / ih);
-      if (fit == ObjectFit::ScaleDown)
-        scale = std::min(scale, 1.0f);
-      dw = iw * scale;
-      dh = ih * scale;
-      dx = (cw - dw) / 2.0f;
-      dy = (ch - dh) / 2.0f;
+      if (fit == ObjectFit::ScaleDown) scale = std::min(scale, 1.0f);
+      dw = iw * scale; dh = ih * scale;
+      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
       break;
     }
     case ObjectFit::Cover: {
       float scale = std::max(cw / iw, ch / ih);
-      dw = iw * scale;
-      dh = ih * scale;
-      dx = (cw - dw) / 2.0f;
-      dy = (ch - dh) / 2.0f;
+      dw = iw * scale; dh = ih * scale;
+      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
       break;
     }
     }
-
     ctx.drawImage(im, dx, dy, dw, dh);
   };
 
