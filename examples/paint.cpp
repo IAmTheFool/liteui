@@ -1,7 +1,8 @@
 // A tiny MS-Paint-style app: a color palette, three brush sizes, a clear
-// button, and a fixed-size "document" page you draw on, sitting inside a
-// scrollable gray viewport (the same document-vs-viewport split MS Paint
-// and Photoshop use — see the comment above kDocW/kDocH below).
+// button, save/open buttons, and a fixed-size "document" page you draw on,
+// sitting inside a scrollable gray viewport (the same document-vs-viewport
+// split MS Paint and Photoshop use — see the comment above kDocW/kDocH
+// below).
 //
 // All drawing state (the list of strokes, current color/size) lives in
 // `PaintState` below and is captured by reference into the view tree's
@@ -10,17 +11,20 @@
 // fresh transparent surface (see the canvas's onPaint). That's simple and
 // plenty fast for an app like this; a resolution-independent "redraw the
 // whole scene" is the same approach real vector-graphics apps use.
+//
+// Save/Open persist that same stroke list to/from a tiny custom text
+// format (see saveDocument/loadDocument below) rather than pixels — this
+// keeps things simple, fully cross-platform (no dependency on
+// CanvasContext::getImageData, which liteui.hpp notes is unsupported on
+// Windows), and means a saved file re-opens at full quality at any zoom.
 
 #include "liteui.hpp"
 
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <vector>
 
-// The document's fixed pixel size — this is the actual "page" (like
-// Paint's or Photoshop's canvas size), independent of the window size.
-// A4 at 96 DPI is roughly 816x1056; pick whatever fits your use case.
-// Everything else in this file (the gray viewport around it, scrolling)
-// stays the same regardless of what you set this to.
 constexpr float kDocW = 816.0f;
 constexpr float kDocH = 1056.0f;
 
@@ -28,6 +32,10 @@ constexpr float kDocH = 1056.0f;
 constexpr float kZoomMin = 0.25f;
 constexpr float kZoomMax = 4.0f;
 constexpr float kZoomStep = 1.25f;
+
+// Magic header written/checked by saveDocument/loadDocument, so an open
+// on a garbage/unrelated file fails cleanly instead of parsing nonsense.
+constexpr const char *kFileMagic = "LITEPAINT1";
 
 struct Point {
   float x, y;
@@ -43,30 +51,90 @@ struct PaintState {
   std::vector<Stroke> strokes;
   Color currentColor{20, 20, 20, 255};
   float currentWidth = 4.0f;
-  float zoom = 1.0f;    // 1.0 = 100%; scales the doc at paint time
-  bool panMode = false; // when true, drags pan instead of drawing
-
-  // Polled by the canvas's canvasDirtySource (see liteui.hpp's own note on
-  // View::canvasDirtySource) since onPressAt/onDragTo/onClick have no
-  // direct reference back into the tree to call requestCanvasRedraw()
-  // themselves.
+  float zoom = 1.0f; // 1.0 = 100%; scales the doc at paint time
   bool dirty = true;
   void markDirty() { dirty = true; }
 };
 
-// File-scope so buildRoot()/setZoom() (added below) can both reach it —
-// previously this lived as a local `static` inside main().
 static PaintState state;
-static LiteUI *g_ui = nullptr;
 
-// Draws every accumulated stroke. A single-point "stroke" (a plain click,
-// no drag) is drawn as a filled dot so a tap still leaves a visible mark.
+// ---------------- Save / Open ----------------
+//
+// Plain whitespace-separated text, one stroke per block:
+//   LITEPAINT1
+//   <strokeCount>
+//   <r> <g> <b> <a> <width> <pointCount>
+//   <x> <y>
+//   <x> <y>
+//   ...
+// repeated per stroke. Coordinates are stored in fixed document units
+// (not scaled by zoom), matching what onPressAt/onDragTo already store in
+// state.strokes — so a save/open round-trip is zoom-independent.
+
+static bool saveDocument(const std::string &path) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out)
+    return false;
+  out << kFileMagic << "\n";
+  out << state.strokes.size() << "\n";
+  for (const Stroke &s : state.strokes) {
+    out << static_cast<int>(s.color.r) << ' ' << static_cast<int>(s.color.g)
+        << ' ' << static_cast<int>(s.color.b) << ' '
+        << static_cast<int>(s.color.a) << ' ' << s.width << ' ' << s.pts.size()
+        << "\n";
+    for (const Point &p : s.pts)
+      out << p.x << ' ' << p.y << "\n";
+  }
+  return static_cast<bool>(out);
+}
+
+static bool loadDocument(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return false;
+
+  std::string magic;
+  if (!(in >> magic) || magic != kFileMagic)
+    return false;
+
+  size_t strokeCount = 0;
+  if (!(in >> strokeCount))
+    return false;
+
+  std::vector<Stroke> loaded;
+  loaded.reserve(strokeCount);
+  for (size_t i = 0; i < strokeCount; ++i) {
+    int r = 0, g = 0, b = 0, a = 255;
+    float width = 1.0f;
+    size_t pointCount = 0;
+    if (!(in >> r >> g >> b >> a >> width >> pointCount))
+      return false;
+
+    Stroke s;
+    s.color = Color{static_cast<uint8_t>(std::clamp(r, 0, 255)),
+                    static_cast<uint8_t>(std::clamp(g, 0, 255)),
+                    static_cast<uint8_t>(std::clamp(b, 0, 255)),
+                    static_cast<uint8_t>(std::clamp(a, 0, 255))};
+    s.width = width;
+    s.pts.reserve(pointCount);
+    for (size_t j = 0; j < pointCount; ++j) {
+      Point p;
+      if (!(in >> p.x >> p.y))
+        return false;
+      s.pts.push_back(p);
+    }
+    loaded.push_back(std::move(s));
+  }
+
+  state.strokes = std::move(loaded);
+  state.markDirty();
+  return true;
+}
+
 static void paintCanvas(CanvasContext &ctx, const PaintState &state) {
   ctx.setFillColor({255, 255, 255, 255});
   ctx.fillRect(0, 0, ctx.width(), ctx.height());
-  // Everything below is drawn in fixed document units; scaling here
-  // (rather than scaling stroke coordinates themselves) means strokes
-  // never need to be rewritten when zoom changes.
+
   ctx.save();
   ctx.scale(state.zoom, state.zoom);
   for (const Stroke &s : state.strokes) {
@@ -92,9 +160,6 @@ static void paintCanvas(CanvasContext &ctx, const PaintState &state) {
   ctx.restore();
 }
 
-// A small square swatch button. Clicking it makes `state.currentColor`
-// this swatch's color; `selected` gets a slightly heavier border so the
-// active color is easy to spot.
 static View colorSwatch(Color color, PaintState &state, bool selected) {
   View v;
   v.style.width = Size::pixel(28);
@@ -116,8 +181,6 @@ static View colorSwatch(Color color, PaintState &state, bool selected) {
   return v;
 }
 
-// A round "brush size" button: bigger dot == thicker brush. `selected`
-// gets the same blue-ring treatment as colorSwatch above.
 static View sizeButton(float diameter, float width, PaintState &state) {
   View outer;
   outer.style.width = Size::pixel(32);
@@ -149,12 +212,11 @@ static View sizeButton(float diameter, float width, PaintState &state) {
   return outer;
 }
 
-// A plain rectangular text button (Clear).
 static View textButton(const std::string &label,
                        std::function<void()> onClick) {
   View v;
   v.style.padding = EdgeInsets{8, 14, 8, 14};
-  v.style.margin = EdgeInsets{3, 3, 3, 12};
+  v.style.margin = EdgeInsets{3, 3, 3, 3};
   v.style.backgroundColor = Color{245, 245, 245, 255};
   v.style.hoverColor = Color{230, 230, 230, 255};
   v.style.borderWidth = 1.0f;
@@ -172,24 +234,13 @@ static View textButton(const std::string &label,
   return v;
 }
 
-// Rebuilds the whole view tree. Called once from main(), and again from
-// setZoom() below whenever zoom changes — the canvas's on-screen size has
-// to actually change, and this library has no widthSource/heightSource to
-// mutate that in place, so a full setRoot() relayout is the way to do it.
-static View buildRoot();
-
-// Changes zoom and asks LiteUI to relayout against the new canvas size.
-// Kept as a free function (rather than inline in the button's onClick) so
-// both the "-"/"+" buttons below can share it.
 static void setZoom(float z) {
   state.zoom = std::clamp(z, kZoomMin, kZoomMax);
   state.markDirty();
-  if (g_ui)
-    g_ui->setRoot(buildRoot());
 }
 
-static View buildRoot() {
-
+int main() {
+  LiteUI ui(900, 650, "Paint");
   View root;
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
@@ -242,19 +293,24 @@ static View buildRoot() {
 
   toolbar.addChild(textButton("+", [] { setZoom(state.zoom * kZoomStep); }));
 
-  // Toggles pan mode: while on, drags on the canvas pan the viewport
-  // (via the viewport's own built-in ContentPan handling) instead of
-  // drawing a stroke. backgroundColorSource is polled each frame so the
-  // button's own fill reflects whether panMode is currently on.
-  View panBtn = textButton("Pan", [] {
-    state.panMode = !state.panMode;
-    state.markDirty();
-  });
-  panBtn.style.backgroundColor = [] {
-    return state.panMode ? Color{190, 215, 250, 255}
-                         : Color{245, 245, 245, 255};
-  };
-  toolbar.addChild(std::move(panBtn));
+  View spacer3;
+  spacer3.style.width = Size::pixel(12);
+  toolbar.addChild(std::move(spacer3));
+
+  toolbar.addChild(textButton("Open", [] {
+    auto path =
+        openFilePicker("Open Painting", {{"LiteUI Paint", "*.litepaint"}});
+    if (!path)
+      return; // user cancelled
+    loadDocument(*path);
+  }));
+
+  toolbar.addChild(textButton("Save", [] {
+    auto path = saveFilePicker("Save Painting", "untitled.litepaint",
+                               {{"LiteUI Paint", "*.litepaint"}}, "litepaint");
+    if (path)
+      saveDocument(*path);
+  }));
 
   toolbar.addChild(textButton("Clear", [] {
     state.strokes.clear();
@@ -263,18 +319,6 @@ static View buildRoot() {
 
   root.addChild(std::move(toolbar));
 
-  // ---- Viewport ----
-  // This is the "desk" — the scrollable gray area the window shows you,
-  // as opposed to the document itself (kDocW x kDocH, added below). It
-  // takes the window's remaining height (flexGrow:1, same reasoning as
-  // the previous version's canvas did), and centers its one child
-  // (the document) when the document is smaller than the viewport,
-  // exactly like Paint/Photoshop's page-on-a-desk look.
-  //
-  // overflowX/Y = Auto means: no scrollbar and no clipping while the
-  // document fits, but the instant the window gets smaller than the
-  // document, both a scrollbar AND clipping kick in automatically — you
-  // don't have to handle that yourself.
   View viewport;
   viewport.style.height = Size::full();
   viewport.style.width = Size::full();
@@ -283,38 +327,28 @@ static View buildRoot() {
   viewport.style.overflowY = Overflow::Auto;
   viewport.style.justifyContent = Justify::Center;
   viewport.style.alignItems = Align::Center;
-  viewport.style.padding = EdgeInsets::all(24); // breathing room once scrolled
+  viewport.style.padding = EdgeInsets::all(24);
   viewport.style.contentPanEnabled = false;
   viewport.style.wheelScrollEnabled = false;
 
-  // ---- Document (the actual page you draw on) ----
-  // Fixed size, NOT flexGrow/full — this is what makes it a "document"
-  // rather than "whatever space is left", and what makes onPressAt/
-  // onDragTo's local coordinates always mean the same (x,y) in the
-  // picture regardless of scroll position or window size.
   View canvas;
   canvas.isCanvas = true;
-  // On-screen size follows zoom; onPaint below still draws in fixed
-  // kDocW x kDocH document units and scales internally (see paintCanvas),
-  // so this is purely how big the "page" appears in the viewport.
-  canvas.style.width = Size::pixel(kDocW * state.zoom);
-  canvas.style.height = Size::pixel(kDocH * state.zoom);
+  canvas.style.width =
+      std::function<Size()>([] { return Size::pixel(kDocW * state.zoom); });
+  canvas.style.height =
+      std::function<Size()>([] { return Size::pixel(kDocH * state.zoom); });
   canvas.style.borderWidth = 1.0f;
   canvas.style.borderColor = Color{150, 150, 150, 255};
   canvas.style.backgroundColor = Color{255, 255, 255, 255};
 
   canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx, state); };
   canvas.onPressAt = [](float x, float y) {
-    if (state.panMode)
-      return; // let the viewport's own ContentPan drag handle this instead
     state.strokes.push_back(Stroke{{{x / state.zoom, y / state.zoom}},
                                    state.currentColor,
                                    state.currentWidth});
     state.markDirty();
   };
   canvas.onDragTo = [](float x, float y) {
-    if (state.panMode)
-      return;
     if (!state.strokes.empty()) {
       state.strokes.back().pts.push_back({x / state.zoom, y / state.zoom});
       state.markDirty();
@@ -330,14 +364,7 @@ static View buildRoot() {
 
   viewport.addChild(std::move(canvas));
   root.addChild(std::move(viewport));
-
-  return root;
-}
-
-int main() {
-  LiteUI ui(900, 650, "Paint");
-  g_ui = &ui;
-  ui.setRoot(buildRoot());
+  ui.setRoot(std::move(root));
   ui.run();
   return 0;
 }
