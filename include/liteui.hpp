@@ -1,9 +1,7 @@
 // include/liteui.hpp
 //
-// Single-header, PImpl-free cross-platform window.
-// Platform members/methods are selected at compile time via #ifdef,
-// so there's exactly one LiteUI definition per build — no vtable,
-// no heap-allocated Impl, no indirection through a pointer.
+// Single-header, cross-platform window.
+// Platform members/methods are selected at compile time via #ifdef
 
 #pragma once
 
@@ -1320,8 +1318,6 @@ inline std::optional<CanvasImage> decodePngFile(const std::string &path,
   return img;
 }
 
-
-
 inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
                                                  std::string *errorOut) {
   FILE *fp = fopen(path.c_str(), "rb");
@@ -1414,6 +1410,1119 @@ inline std::optional<CanvasImage> decodeFile(const std::string &path,
 #endif
 
 } // namespace liteui_image
+
+// ---------------- Minimal XML parser (general-purpose subset) -----------
+// Supports: elements, attributes, nested content, comments, PIs, DOCTYPE
+// (with bracketed internal subset), CDATA sections, named + numeric
+// character references, and concatenated text content per element.
+// Still not a full XML implementation: no external entities, no DTD
+// validation, no namespace resolution (prefixes are kept as plain name
+// text, e.g. "xlink:href"), and mixed content order (interleaved text vs.
+// child elements) is not preserved — all text at a given level is
+// concatenated into that node's `text`, in document order, regardless of
+// where child elements fall between the runs. That's sufficient for
+// SVG (which never relies on interleaving) and most simple config/markup
+// use; a caller needing faithful mixed-content order would need a
+// different Node design (e.g. a single ordered vector of variant
+// text/element children).
+namespace liteui_xml {
+struct Node {
+  std::string tag;
+  std::unordered_map<std::string, std::string> attrs;
+  std::vector<Node> children;
+  std::string text; // concatenated character data (CDATA + decoded entities)
+};
+
+inline void skipWs(const std::string &s, size_t &i) {
+  while (i < s.size() && (unsigned char)s[i] <= ' ')
+    ++i;
+}
+
+inline void appendUtf8(std::string &out, unsigned long cp) {
+  if (cp <= 0x7F) {
+    out += (char)cp;
+  } else if (cp <= 0x7FF) {
+    out += (char)(0xC0 | (cp >> 6));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else if (cp <= 0xFFFF) {
+    out += (char)(0xE0 | (cp >> 12));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else {
+    out += (char)(0xF0 | (cp >> 18));
+    out += (char)(0x80 | ((cp >> 12) & 0x3F));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  }
+}
+
+inline std::string decodeEntities(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size();) {
+    if (in[i] == '&') {
+      size_t semi = in.find(';', i);
+      if (semi != std::string::npos && semi - i <= 12) {
+        std::string ent = in.substr(i + 1, semi - i - 1);
+        if (ent == "amp") {
+          out += '&';
+          i = semi + 1;
+          continue;
+        }
+        if (ent == "lt") {
+          out += '<';
+          i = semi + 1;
+          continue;
+        }
+        if (ent == "gt") {
+          out += '>';
+          i = semi + 1;
+          continue;
+        }
+        if (ent == "quot") {
+          out += '"';
+          i = semi + 1;
+          continue;
+        }
+        if (ent == "apos") {
+          out += '\'';
+          i = semi + 1;
+          continue;
+        }
+        if (ent.size() > 1 && ent[0] == '#') {
+          bool hex = ent.size() > 2 && (ent[1] == 'x' || ent[1] == 'X');
+          const char *numStart = ent.c_str() + (hex ? 2 : 1);
+          char *end = nullptr;
+          unsigned long cp = std::strtoul(numStart, &end, hex ? 16 : 10);
+          if (end && *end == '\0') {
+            appendUtf8(out, cp);
+            i = semi + 1;
+            continue;
+          }
+        }
+      }
+    }
+    out += in[i++];
+  }
+  return out;
+}
+
+inline std::string parseAttrValue(const std::string &s, size_t &i) {
+  char q = s[i++];
+  size_t start = i;
+  while (i < s.size() && s[i] != q)
+    ++i;
+  std::string raw = s.substr(start, i - start);
+  if (i < s.size())
+    ++i;
+  return decodeEntities(raw);
+}
+
+inline void parseAttrs(const std::string &s, size_t &i, Node &node) {
+  while (true) {
+    skipWs(s, i);
+    if (i >= s.size() || s[i] == '>' || s[i] == '/' || s[i] == '?')
+      break;
+    size_t nameStart = i;
+    while (i < s.size() && s[i] != '=' && (unsigned char)s[i] > ' ' &&
+           s[i] != '>' && s[i] != '/')
+      ++i;
+    std::string name = s.substr(nameStart, i - nameStart);
+    skipWs(s, i);
+    std::string value;
+    if (i < s.size() && s[i] == '=') {
+      ++i;
+      skipWs(s, i);
+      if (i < s.size() && (s[i] == '"' || s[i] == '\''))
+        value = parseAttrValue(s, i);
+      else {
+        // Unquoted attribute value (invalid XML, but tolerate it — common
+        // in hand-written or HTML-ish markup).
+        size_t vs = i;
+        while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
+               s[i] != '/')
+          ++i;
+        value = decodeEntities(s.substr(vs, i - vs));
+      }
+    }
+    if (!name.empty())
+      node.attrs[name] = value;
+  }
+}
+
+// Skips a comment, processing instruction, or DOCTYPE (including a
+// bracketed internal subset, which may itself contain '>' characters
+// before the subset's closing ']'). Returns true if it consumed something.
+inline bool skipMisc(const std::string &s, size_t &i) {
+  if (s.compare(i, 4, "<!--") == 0) {
+    size_t end = s.find("-->", i);
+    i = (end == std::string::npos) ? s.size() : end + 3;
+    return true;
+  }
+  if (s.compare(i, 2, "<?") == 0) {
+    size_t end = s.find("?>", i);
+    i = (end == std::string::npos) ? s.size() : end + 2;
+    return true;
+  }
+  if (s.compare(i, 9, "<![CDATA[") != 0 && s.compare(i, 2, "<!") == 0) {
+    size_t j = i + 2;
+    int depth = 0;
+    while (j < s.size()) {
+      if (s[j] == '[')
+        ++depth;
+      else if (s[j] == ']')
+        --depth;
+      else if (s[j] == '>' && depth <= 0) {
+        ++j;
+        break;
+      }
+      ++j;
+    }
+    i = j;
+    return true;
+  }
+  return false;
+}
+
+inline bool parseElement(const std::string &s, size_t &i, Node &out) {
+  skipWs(s, i);
+  while (i < s.size() && s[i] == '<' && skipMisc(s, i))
+    skipWs(s, i);
+  if (i >= s.size() || s[i] != '<')
+    return false;
+  ++i;
+  size_t nameStart = i;
+  while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
+         s[i] != '/')
+    ++i;
+  out.tag = s.substr(nameStart, i - nameStart);
+  parseAttrs(s, i, out);
+  skipWs(s, i);
+  if (i < s.size() && s[i] == '/') {
+    ++i;
+    if (i < s.size() && s[i] == '>')
+      ++i;
+    return true;
+  }
+  if (i < s.size() && s[i] == '>')
+    ++i;
+  while (true) {
+    if (i >= s.size())
+      break;
+    if (s.compare(i, 2, "</") == 0) {
+      size_t end = s.find('>', i);
+      i = (end == std::string::npos) ? s.size() : end + 1;
+      break;
+    }
+    if (s.compare(i, 9, "<![CDATA[") == 0) {
+      size_t start = i + 9;
+      size_t end = s.find("]]>", start);
+      size_t stop = (end == std::string::npos) ? s.size() : end;
+      out.text += s.substr(start, stop - start); // raw, no entity decoding
+      i = (end == std::string::npos) ? s.size() : end + 3;
+      continue;
+    }
+    if (s[i] == '<') {
+      if (skipMisc(s, i))
+        continue;
+      Node child;
+      if (!parseElement(s, i, child))
+        break;
+      out.children.push_back(std::move(child));
+      continue;
+    }
+    size_t next = s.find('<', i);
+    size_t stop = (next == std::string::npos) ? s.size() : next;
+    out.text += decodeEntities(s.substr(i, stop - i));
+    i = stop;
+  }
+  return true;
+}
+
+inline std::optional<Node> parse(const std::string &xml) {
+  size_t i = 0;
+  Node root;
+  if (!parseElement(xml, i, root))
+    return std::nullopt;
+  return root;
+}
+} // namespace liteui_xml
+
+namespace liteui_svg {
+
+struct Mat2x3 {
+  float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+  static Mat2x3 identity() { return {}; }
+  static Mat2x3 translate(float tx, float ty) { return {1, 0, 0, 1, tx, ty}; }
+  static Mat2x3 scaleM(float sx, float sy) { return {sx, 0, 0, sy, 0, 0}; }
+  static Mat2x3 rotate(float rad) {
+    float c = std::cos(rad), s = std::sin(rad);
+    return {c, s, -s, c, 0, 0};
+  }
+  static Mat2x3 skewX(float rad) { return {1, 0, std::tan(rad), 1, 0, 0}; }
+  static Mat2x3 skewY(float rad) { return {1, std::tan(rad), 0, 1, 0, 0}; }
+  Mat2x3 multiply(const Mat2x3 &r) const {
+    return {a * r.a + c * r.b, b * r.a + d * r.b,     a * r.c + c * r.d,
+            b * r.c + d * r.d, a * r.e + c * r.f + e, b * r.e + d * r.f + f};
+  }
+};
+
+inline void skipSep(const std::string &s, size_t &i) {
+  while (i < s.size() && (s[i] == ',' || (unsigned char)s[i] <= ' '))
+    ++i;
+}
+inline bool scanNumber(const std::string &s, size_t &i, float &out) {
+  skipSep(s, i);
+  size_t start = i;
+  if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+    ++i;
+  bool any = false;
+  while (i < s.size() && isdigit((unsigned char)s[i])) {
+    ++i;
+    any = true;
+  }
+  if (i < s.size() && s[i] == '.') {
+    ++i;
+    while (i < s.size() && isdigit((unsigned char)s[i])) {
+      ++i;
+      any = true;
+    }
+  }
+  if (!any) {
+    i = start;
+    return false;
+  }
+  if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+    size_t save = i;
+    ++i;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+      ++i;
+    bool expDigits = false;
+    while (i < s.size() && isdigit((unsigned char)s[i])) {
+      ++i;
+      expDigits = true;
+    }
+    if (!expDigits)
+      i = save;
+  }
+  out = std::strtof(s.c_str() + start, nullptr);
+  return true;
+}
+
+inline Mat2x3 parseTransform(const std::string &str) {
+  Mat2x3 m = Mat2x3::identity();
+  size_t i = 0;
+  while (i < str.size()) {
+    skipSep(str, i);
+    size_t nameStart = i;
+    while (i < str.size() && isalpha((unsigned char)str[i]))
+      ++i;
+    std::string fn = str.substr(nameStart, i - nameStart);
+    if (fn.empty())
+      break;
+    skipSep(str, i);
+    if (i >= str.size() || str[i] != '(')
+      break;
+    ++i;
+    std::vector<float> args;
+    float v;
+    while (scanNumber(str, i, v))
+      args.push_back(v);
+    skipSep(str, i);
+    if (i < str.size() && str[i] == ')')
+      ++i;
+    constexpr float kDeg2Rad = 3.14159265358979f / 180.0f;
+    if (fn == "translate" && args.size() >= 1)
+      m = m.multiply(Mat2x3::translate(args[0], args.size() > 1 ? args[1] : 0));
+    else if (fn == "scale" && args.size() >= 1)
+      m = m.multiply(
+          Mat2x3::scaleM(args[0], args.size() > 1 ? args[1] : args[0]));
+    else if (fn == "rotate" && args.size() >= 1) {
+      float rad = args[0] * kDeg2Rad;
+      if (args.size() >= 3) {
+        m = m.multiply(Mat2x3::translate(args[1], args[2]));
+        m = m.multiply(Mat2x3::rotate(rad));
+        m = m.multiply(Mat2x3::translate(-args[1], -args[2]));
+      } else
+        m = m.multiply(Mat2x3::rotate(rad));
+    } else if (fn == "skewX" && args.size() >= 1)
+      m = m.multiply(Mat2x3::skewX(args[0] * kDeg2Rad));
+    else if (fn == "skewY" && args.size() >= 1)
+      m = m.multiply(Mat2x3::skewY(args[0] * kDeg2Rad));
+    else if (fn == "matrix" && args.size() >= 6)
+      m = m.multiply(
+          Mat2x3{args[0], args[1], args[2], args[3], args[4], args[5]});
+  }
+  return m;
+}
+
+inline bool parseHexColor(const std::string &s, Color &out) {
+  auto hex1 = [](char c) -> int {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+      return c - 'A' + 10;
+    return -1;
+  };
+  if (s.size() == 4) {
+    int r = hex1(s[1]), g = hex1(s[2]), b = hex1(s[3]);
+    if (r < 0 || g < 0 || b < 0)
+      return false;
+    out = {(uint8_t)(r * 17), (uint8_t)(g * 17), (uint8_t)(b * 17), 255};
+    return true;
+  }
+  if (s.size() == 7 || s.size() == 9) {
+    int vals[4] = {255, 255, 255, 255};
+    for (size_t k = 0; k * 2 + 1 < s.size() - 1; ++k) {
+      int hi = hex1(s[1 + k * 2]), lo = hex1(s[2 + k * 2]);
+      if (hi < 0 || lo < 0)
+        return false;
+      vals[k] = hi * 16 + lo;
+    }
+    out = {(uint8_t)vals[0], (uint8_t)vals[1], (uint8_t)vals[2],
+           (uint8_t)vals[3]};
+    return true;
+  }
+  return false;
+}
+
+// Extend as needed — small deliberately.
+inline bool namedColor(const std::string &name, Color &out) {
+  static const std::unordered_map<std::string, Color> kNames = {
+      {"black", {0, 0, 0, 255}},      {"white", {255, 255, 255, 255}},
+      {"red", {255, 0, 0, 255}},      {"green", {0, 128, 0, 255}},
+      {"blue", {0, 0, 255, 255}},     {"yellow", {255, 255, 0, 255}},
+      {"gray", {128, 128, 128, 255}}, {"grey", {128, 128, 128, 255}},
+      {"orange", {255, 165, 0, 255}}, {"purple", {128, 0, 128, 255}},
+      {"cyan", {0, 255, 255, 255}},   {"magenta", {255, 0, 255, 255}},
+      {"lime", {0, 255, 0, 255}},     {"navy", {0, 0, 128, 255}},
+      {"transparent", {0, 0, 0, 0}},
+  };
+  auto it = kNames.find(name);
+  if (it == kNames.end())
+    return false;
+  out = it->second;
+  return true;
+}
+
+inline bool parsePaint(const std::string &raw, Color &out) {
+  std::string s = raw;
+  size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+  if (b == std::string::npos)
+    return false;
+  s = s.substr(b, e - b + 1);
+  if (s == "none" || s.empty())
+    return false;
+  if (s[0] == '#')
+    return parseHexColor(s, out);
+  if (s.compare(0, 4, "rgb(") == 0 || s.compare(0, 5, "rgba(") == 0) {
+    size_t p = s.find('(');
+    std::string inner = s.substr(p + 1, s.size() - p - 2);
+    std::vector<float> vals;
+    size_t i = 0;
+    float v;
+    while (scanNumber(inner, i, v)) {
+      skipSep(inner, i);
+      if (i < inner.size() && inner[i] == '%') {
+        v = v * 255.0f / 100.0f;
+        ++i;
+      }
+      vals.push_back(v);
+      skipSep(inner, i);
+    }
+    if (vals.size() < 3)
+      return false;
+    out = {(uint8_t)std::clamp(vals[0], 0.0f, 255.0f),
+           (uint8_t)std::clamp(vals[1], 0.0f, 255.0f),
+           (uint8_t)std::clamp(vals[2], 0.0f, 255.0f),
+           (uint8_t)std::clamp(vals.size() > 3 ? vals[3] * 255.0f : 255.0f,
+                               0.0f, 255.0f)};
+    return true;
+  }
+  return namedColor(s, out);
+}
+
+inline float parseOpacity(const std::string &s) {
+  if (s.empty())
+    return 1.0f;
+  float v = std::strtof(s.c_str(), nullptr);
+  if (s.back() == '%')
+    v /= 100.0f;
+  return std::clamp(v, 0.0f, 1.0f);
+}
+
+struct PathOp {
+  enum class Kind { Move, Line, Cubic, Quad, Close } kind;
+  float x = 0, y = 0;
+  float c1x = 0, c1y = 0, c2x = 0, c2y = 0; // Cubic
+  float qx = 0, qy = 0;                     // Quad control point
+};
+
+// SVG-1.1 Appendix-F endpoint->center arc conversion, then split into
+// <=90-degree cubic segments (same kappa approach CanvasContext's own
+// appendArc uses for arc()/ellipse()) — kept independent of that internal
+// helper since path parsing only talks to CanvasContext's public API.
+inline void arcToCubics(std::vector<PathOp> &out, float x0, float y0, float rx,
+                        float ry, float xAxisRotDeg, bool largeArc, bool sweep,
+                        float x1, float y1) {
+  if (rx == 0 || ry == 0) {
+    out.push_back({PathOp::Kind::Line, x1, y1});
+    return;
+  }
+  rx = std::abs(rx);
+  ry = std::abs(ry);
+  float phi = xAxisRotDeg * 3.14159265358979f / 180.0f;
+  float cosPhi = std::cos(phi), sinPhi = std::sin(phi);
+  float dx2 = (x0 - x1) / 2.0f, dy2 = (y0 - y1) / 2.0f;
+  float x1p = cosPhi * dx2 + sinPhi * dy2, y1p = -sinPhi * dx2 + cosPhi * dy2;
+  float rxsq = rx * rx, rysq = ry * ry, x1psq = x1p * x1p, y1psq = y1p * y1p;
+  float lambda = x1psq / rxsq + y1psq / rysq;
+  if (lambda > 1.0f) {
+    float s = std::sqrt(lambda);
+    rx *= s;
+    ry *= s;
+    rxsq = rx * rx;
+    rysq = ry * ry;
+  }
+  float sign = (largeArc != sweep) ? 1.0f : -1.0f;
+  float num = rxsq * rysq - rxsq * y1psq - rysq * x1psq;
+  float den = rxsq * y1psq + rysq * x1psq;
+  float coef = den > 1e-9f ? sign * std::sqrt(std::max(0.0f, num / den)) : 0.0f;
+  float cxp = coef * (rx * y1p / ry), cyp = coef * -(ry * x1p / rx);
+  float cx = cosPhi * cxp - sinPhi * cyp + (x0 + x1) / 2.0f;
+  float cy = sinPhi * cxp + cosPhi * cyp + (y0 + y1) / 2.0f;
+  auto angle = [](float ux, float uy, float vx, float vy) {
+    float dot = ux * vx + uy * vy,
+          len = std::sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+    float a = std::acos(std::clamp(dot / len, -1.0f, 1.0f));
+    return (ux * vy - uy * vx) < 0 ? -a : a;
+  };
+  float theta1 = angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+  float dtheta = angle((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx,
+                       (-y1p - cyp) / ry);
+  if (!sweep && dtheta > 0)
+    dtheta -= 6.28318530718f;
+  if (sweep && dtheta < 0)
+    dtheta += 6.28318530718f;
+  int segCount =
+      std::max(1, (int)std::ceil(std::abs(dtheta) / (3.14159265f / 2)));
+  float segAngle = dtheta / segCount, t = theta1;
+  for (int i = 0; i < segCount; ++i) {
+    float t2 = t + segAngle;
+    float alpha = std::sin(segAngle) *
+                  (std::sqrt(4.0f + 3.0f * std::tan(segAngle / 4.0f) *
+                                        std::tan(segAngle / 4.0f)) -
+                   1.0f) /
+                  3.0f;
+    auto ellipsePt = [&](float ang, float &px, float &py) {
+      float ex = rx * std::cos(ang), ey = ry * std::sin(ang);
+      px = cx + ex * cosPhi - ey * sinPhi;
+      py = cy + ex * sinPhi + ey * cosPhi;
+    };
+    auto ellipseDeriv = [&](float ang, float &dx, float &dy) {
+      float ex = -rx * std::sin(ang), ey = ry * std::cos(ang);
+      dx = ex * cosPhi - ey * sinPhi;
+      dy = ex * sinPhi + ey * cosPhi;
+    };
+    float p1x, p1y, p2x, p2y, d1x, d1y, d2x, d2y;
+    ellipsePt(t, p1x, p1y);
+    ellipsePt(t2, p2x, p2y);
+    ellipseDeriv(t, d1x, d1y);
+    ellipseDeriv(t2, d2x, d2y);
+    out.push_back({PathOp::Kind::Cubic, p2x, p2y, p1x + alpha * d1x,
+                   p1y + alpha * d1y, p2x - alpha * d2x, p2y - alpha * d2y});
+    t = t2;
+  }
+}
+
+inline std::vector<PathOp> parsePathData(const std::string &d) {
+  std::vector<PathOp> ops;
+  size_t i = 0;
+  float cx = 0, cy = 0, startX = 0, startY = 0, lastCtrlX = 0, lastCtrlY = 0;
+  char lastCmd = 0;
+  auto isCmd = [](char c) {
+    return std::string("MmLlHhVvCcSsQqTtAaZz").find(c) != std::string::npos;
+  };
+  while (i < d.size()) {
+    skipSep(d, i);
+    if (i >= d.size())
+      break;
+    char cmd = d[i];
+    if (isCmd(cmd))
+      ++i;
+    else {
+      cmd = lastCmd;
+      if (cmd == 0)
+        break;
+      if (cmd == 'M')
+        cmd = 'L';
+      if (cmd == 'm')
+        cmd = 'l';
+    }
+    bool rel = islower((unsigned char)cmd);
+    char up = (char)toupper(cmd);
+    float n[7];
+    auto need = [&](int count) {
+      for (int k = 0; k < count; ++k)
+        if (!scanNumber(d, i, n[k]))
+          return false;
+      return true;
+    };
+    switch (up) {
+    case 'M':
+      if (!need(2)) {
+        i = d.size();
+        break;
+      }
+      cx = rel ? cx + n[0] : n[0];
+      cy = rel ? cy + n[1] : n[1];
+      startX = cx;
+      startY = cy;
+      ops.push_back({PathOp::Kind::Move, cx, cy});
+      break;
+    case 'L':
+      if (!need(2)) {
+        i = d.size();
+        break;
+      }
+      cx = rel ? cx + n[0] : n[0];
+      cy = rel ? cy + n[1] : n[1];
+      ops.push_back({PathOp::Kind::Line, cx, cy});
+      break;
+    case 'H':
+      if (!need(1)) {
+        i = d.size();
+        break;
+      }
+      cx = rel ? cx + n[0] : n[0];
+      ops.push_back({PathOp::Kind::Line, cx, cy});
+      break;
+    case 'V':
+      if (!need(1)) {
+        i = d.size();
+        break;
+      }
+      cy = rel ? cy + n[0] : n[0];
+      ops.push_back({PathOp::Kind::Line, cx, cy});
+      break;
+    case 'C': {
+      if (!need(6)) {
+        i = d.size();
+        break;
+      }
+      float c1x = rel ? cx + n[0] : n[0], c1y = rel ? cy + n[1] : n[1],
+            c2x = rel ? cx + n[2] : n[2], c2y = rel ? cy + n[3] : n[3];
+      float ex = rel ? cx + n[4] : n[4], ey = rel ? cy + n[5] : n[5];
+      ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
+      lastCtrlX = c2x;
+      lastCtrlY = c2y;
+      cx = ex;
+      cy = ey;
+      break;
+    }
+    case 'S': {
+      if (!need(4)) {
+        i = d.size();
+        break;
+      }
+      bool prevCubic =
+          lastCmd == 'C' || lastCmd == 'c' || lastCmd == 'S' || lastCmd == 's';
+      float c1x = prevCubic ? 2 * cx - lastCtrlX : cx,
+            c1y = prevCubic ? 2 * cy - lastCtrlY : cy;
+      float c2x = rel ? cx + n[0] : n[0], c2y = rel ? cy + n[1] : n[1];
+      float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
+      ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
+      lastCtrlX = c2x;
+      lastCtrlY = c2y;
+      cx = ex;
+      cy = ey;
+      break;
+    }
+    case 'Q': {
+      if (!need(4)) {
+        i = d.size();
+        break;
+      }
+      float qx = rel ? cx + n[0] : n[0], qy = rel ? cy + n[1] : n[1];
+      float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
+      ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
+      lastCtrlX = qx;
+      lastCtrlY = qy;
+      cx = ex;
+      cy = ey;
+      break;
+    }
+    case 'T': {
+      if (!need(2)) {
+        i = d.size();
+        break;
+      }
+      bool prevQuad =
+          lastCmd == 'Q' || lastCmd == 'q' || lastCmd == 'T' || lastCmd == 't';
+      float qx = prevQuad ? 2 * cx - lastCtrlX : cx,
+            qy = prevQuad ? 2 * cy - lastCtrlY : cy;
+      float ex = rel ? cx + n[0] : n[0], ey = rel ? cy + n[1] : n[1];
+      ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
+      lastCtrlX = qx;
+      lastCtrlY = qy;
+      cx = ex;
+      cy = ey;
+      break;
+    }
+    case 'A': {
+      if (!need(7)) {
+        i = d.size();
+        break;
+      }
+      float ex = rel ? cx + n[5] : n[5], ey = rel ? cy + n[6] : n[6];
+      arcToCubics(ops, cx, cy, n[0], n[1], n[2], n[3] != 0, n[4] != 0, ex, ey);
+      cx = ex;
+      cy = ey;
+      break;
+    }
+    case 'Z':
+      ops.push_back({PathOp::Kind::Close});
+      cx = startX;
+      cy = startY;
+      break;
+    default:
+      i = d.size();
+      break;
+    }
+    lastCmd = cmd;
+  }
+  return ops;
+}
+
+inline std::vector<PathOp> rectToOps(float x, float y, float w, float h,
+                                     float rx, float ry) {
+  std::vector<PathOp> ops;
+  if (w <= 0 || h <= 0)
+    return ops;
+  rx = std::clamp(rx, 0.0f, w / 2.0f);
+  ry = std::clamp(ry, 0.0f, h / 2.0f);
+  if (rx <= 0 || ry <= 0) {
+    ops = {{PathOp::Kind::Move, x, y},
+           {PathOp::Kind::Line, x + w, y},
+           {PathOp::Kind::Line, x + w, y + h},
+           {PathOp::Kind::Line, x, y + h},
+           {PathOp::Kind::Close}};
+    return ops;
+  }
+  constexpr float k = 0.5522847498f;
+  ops.push_back({PathOp::Kind::Move, x + rx, y});
+  ops.push_back({PathOp::Kind::Line, x + w - rx, y});
+  ops.push_back({PathOp::Kind::Cubic, x + w, y + ry, x + w - rx + k * rx, y,
+                 x + w, y + ry - k * ry});
+  ops.push_back({PathOp::Kind::Line, x + w, y + h - ry});
+  ops.push_back({PathOp::Kind::Cubic, x + w - rx, y + h, x + w,
+                 y + h - ry + k * ry, x + w - rx + k * rx, y + h});
+  ops.push_back({PathOp::Kind::Line, x + rx, y + h});
+  ops.push_back({PathOp::Kind::Cubic, x, y + h - ry, x + rx - k * rx, y + h, x,
+                 y + h - ry + k * ry});
+  ops.push_back({PathOp::Kind::Line, x, y + ry});
+  ops.push_back(
+      {PathOp::Kind::Cubic, x + rx, y, x, y + ry - k * ry, x + rx - k * rx, y});
+  ops.push_back({PathOp::Kind::Close});
+  return ops;
+}
+
+inline std::vector<PathOp> ellipseToOps(float cx, float cy, float rx,
+                                        float ry) {
+  std::vector<PathOp> ops;
+  if (rx <= 0 || ry <= 0)
+    return ops;
+  constexpr float k = 0.5522847498f;
+  ops.push_back({PathOp::Kind::Move, cx + rx, cy});
+  ops.push_back({PathOp::Kind::Cubic, cx, cy + ry, cx + rx, cy + k * ry,
+                 cx + k * rx, cy + ry});
+  ops.push_back({PathOp::Kind::Cubic, cx - rx, cy, cx - k * rx, cy + ry,
+                 cx - rx, cy + k * ry});
+  ops.push_back({PathOp::Kind::Cubic, cx, cy - ry, cx - rx, cy - k * ry,
+                 cx - k * rx, cy - ry});
+  ops.push_back({PathOp::Kind::Cubic, cx + rx, cy, cx + k * rx, cy - ry,
+                 cx + rx, cy - k * ry});
+  ops.push_back({PathOp::Kind::Close});
+  return ops;
+}
+
+inline std::vector<PathOp> polyToOps(const std::string &pts, bool close) {
+  std::vector<PathOp> ops;
+  size_t i = 0;
+  bool first = true;
+  float x, y;
+  while (scanNumber(pts, i, x) && scanNumber(pts, i, y)) {
+    ops.push_back({first ? PathOp::Kind::Move : PathOp::Kind::Line, x, y});
+    first = false;
+  }
+  if (close && !ops.empty())
+    ops.push_back({PathOp::Kind::Close});
+  return ops;
+}
+
+struct Shape {
+  std::vector<PathOp> ops;
+  Mat2x3 transform;
+  bool hasFill = false;
+  Color fill{0, 0, 0, 255};
+  bool hasStroke = false;
+  Color stroke{0, 0, 0, 255};
+  float strokeWidth = 1.0f;
+  bool evenOdd = false;
+  int lineCap = 0;
+  int lineJoin = 0;
+  float miterLimit = 4.0f;
+  std::vector<float> dashArray;
+  float dashOffset = 0.0f;
+};
+
+struct Document {
+  std::vector<Shape> shapes;
+  float width = 0, height = 0;
+  float viewBoxX = 0, viewBoxY = 0;
+};
+
+struct InheritedStyle {
+  bool hasFill = true;
+  Color fill{0, 0, 0, 255};
+  float fillOpacity = 1.0f;
+  bool hasStroke = false;
+  Color stroke{0, 0, 0, 255};
+  float strokeOpacity = 1.0f;
+  float strokeWidth = 1.0f;
+  float opacity = 1.0f;
+  bool evenOdd = false;
+  int lineCap = 0;         // 0=butt, 1=round, 2=square (SVG default: butt)
+  int lineJoin = 0;        // 0=miter, 1=round, 2=bevel (SVG default: miter)
+  float miterLimit = 4.0f; // SVG default
+  std::vector<float> dashArray; // empty = solid (SVG default: none)
+  float dashOffset = 0.0f;
+};
+
+inline std::vector<float> parseDashArray(const std::string &val) {
+  std::vector<float> out;
+  if (val.empty() || val == "none")
+    return out;
+  size_t i = 0;
+  float v;
+  while (scanNumber(val, i, v)) {
+    skipSep(val, i);
+    if (i < val.size() &&
+        val[i] == '%') // percentages unsupported; skip the sign
+      ++i;
+    out.push_back(v);
+    skipSep(val, i);
+  }
+  return out;
+}
+
+inline InheritedStyle
+applyStyle(const std::unordered_map<std::string, std::string> &attrs,
+           const InheritedStyle &inherited) {
+  InheritedStyle s = inherited;
+  auto apply = [&](const std::string &key, const std::string &val) {
+    Color c;
+    if (key == "fill") {
+      if (val == "none")
+        s.hasFill = false;
+      else if (parsePaint(val, c)) {
+        s.hasFill = true;
+        s.fill = c;
+      }
+    } else if (key == "stroke") {
+      if (val == "none")
+        s.hasStroke = false;
+      else if (parsePaint(val, c)) {
+        s.hasStroke = true;
+        s.stroke = c;
+      }
+    } else if (key == "fill-opacity")
+      s.fillOpacity = parseOpacity(val);
+    else if (key == "stroke-opacity")
+      s.strokeOpacity = parseOpacity(val);
+    else if (key == "opacity")
+      s.opacity = parseOpacity(val);
+    else if (key == "stroke-width")
+      s.strokeWidth = std::strtof(val.c_str(), nullptr);
+    else if (key == "fill-rule")
+      s.evenOdd = (val == "evenodd");
+    else if (key == "stroke-linecap")
+      s.lineCap = val == "round" ? 1 : val == "square" ? 2 : 0;
+    else if (key == "stroke-linejoin")
+      s.lineJoin = val == "round"   ? 1
+                   : val == "bevel" ? 2
+                                    : 0; // miter,
+                                         // miter-clip,
+                                         // arcs all
+                                         // fall back
+                                         // to miter
+    else if (key == "stroke-miterlimit")
+      s.miterLimit = std::strtof(val.c_str(), nullptr);
+    else if (key == "stroke-dasharray")
+      s.dashArray = parseDashArray(val);
+    else if (key == "stroke-dashoffset")
+      s.dashOffset = std::strtof(val.c_str(), nullptr);
+  };
+  auto tryAttr = [&](const char *key) {
+    auto it = attrs.find(key);
+    if (it != attrs.end())
+      apply(key, it->second);
+  };
+  tryAttr("fill");
+  tryAttr("stroke");
+  tryAttr("fill-opacity");
+  tryAttr("stroke-opacity");
+  tryAttr("opacity");
+  tryAttr("stroke-width");
+  tryAttr("fill-rule");
+  tryAttr("stroke-linecap");
+  tryAttr("stroke-linejoin");
+  tryAttr("stroke-miterlimit");
+  tryAttr("stroke-dasharray");
+  tryAttr("stroke-dashoffset");
+  auto styleIt = attrs.find("style");
+  if (styleIt != attrs.end()) {
+    size_t i = 0;
+    const std::string &st = styleIt->second;
+    while (i < st.size()) {
+      size_t semi = st.find(';', i);
+      std::string decl = st.substr(
+          i, semi == std::string::npos ? std::string::npos : semi - i);
+      size_t colon = decl.find(':');
+      if (colon != std::string::npos) {
+        std::string k = decl.substr(0, colon), v = decl.substr(colon + 1);
+        auto trim = [](std::string &x) {
+          size_t b = x.find_first_not_of(" \t\r\n"),
+                 e = x.find_last_not_of(" \t\r\n");
+          x = b == std::string::npos ? "" : x.substr(b, e - b + 1);
+        };
+        trim(k);
+        trim(v);
+        apply(k, v);
+      }
+      if (semi == std::string::npos)
+        break;
+      i = semi + 1;
+    }
+  }
+  return s;
+}
+
+inline std::string attrOr(const std::unordered_map<std::string, std::string> &a,
+                          const std::string &k, const std::string &def = "") {
+  auto it = a.find(k);
+  return it == a.end() ? def : it->second;
+}
+inline float attrF(const std::unordered_map<std::string, std::string> &a,
+                   const std::string &k, float def = 0) {
+  auto it = a.find(k);
+  return it == a.end() || it->second.empty()
+             ? def
+             : std::strtof(it->second.c_str(), nullptr);
+}
+
+// Builds an id -> node index over the whole tree (including inside <defs>,
+// which is exactly where <use> targets usually live). Called once per
+// document before walking; the returned pointers stay valid for the
+// lifetime of the root Node they point into, which parseString keeps
+// alive for the whole parse — Document itself stores no tree pointers.
+inline void
+collectIds(const liteui_xml::Node &node,
+           std::unordered_map<std::string, const liteui_xml::Node *> &idMap) {
+  auto it = node.attrs.find("id");
+  if (it != node.attrs.end() && !it->second.empty())
+    idMap.emplace(it->second, &node); // first occurrence wins on duplicate ids
+  for (auto &child : node.children)
+    collectIds(child, idMap);
+}
+
+// Threaded through every walk() call. idMap resolves <use href="#id">
+// targets; useStack guards against reference cycles (A uses B uses A) and
+// caps total nesting depth so a pathological file can't recurse unbounded.
+struct WalkContext {
+  const std::unordered_map<std::string, const liteui_xml::Node *> *idMap;
+  std::vector<const liteui_xml::Node *> useStack;
+};
+
+inline void walk(const liteui_xml::Node &node, Mat2x3 parentTransform,
+                 InheritedStyle inherited, Document &doc, WalkContext &ctx,
+                 bool isUseTarget = false) {
+  Mat2x3 transform = parentTransform;
+  auto txIt = node.attrs.find("transform");
+  if (txIt != node.attrs.end())
+    transform = transform.multiply(parseTransform(txIt->second));
+  InheritedStyle style = applyStyle(node.attrs, inherited);
+
+  // <defs> and <symbol> are template containers — only rendered when
+  // reached as the direct resolution target of a <use> (isUseTarget),
+  // never when walked as ordinary document content.
+  if (!isUseTarget && (node.tag == "defs" || node.tag == "symbol"))
+    return;
+
+  if (node.tag == "use") {
+    std::string href = attrOr(node.attrs, "href");
+    if (href.empty())
+      href = attrOr(node.attrs, "xlink:href");
+    if (!href.empty() && href[0] == '#' && ctx.idMap) {
+      std::string id = href.substr(1);
+      auto it = ctx.idMap->find(id);
+      if (it != ctx.idMap->end()) {
+        const liteui_xml::Node *target = it->second;
+        bool cycle = false;
+        for (auto *n : ctx.useStack)
+          if (n == target) {
+            cycle = true;
+            break;
+          }
+        constexpr size_t kMaxUseDepth =
+            32; // guards runaway/pathological nesting
+        if (!cycle && ctx.useStack.size() < kMaxUseDepth) {
+          // <use x="".."" y=""..""> is an implicit extra translate applied
+          // on top of the <use> element's own transform="" (already folded
+          // into `transform` above).
+          float ux = attrF(node.attrs, "x"), uy = attrF(node.attrs, "y");
+          Mat2x3 useTransform = transform.multiply(Mat2x3::translate(ux, uy));
+          ctx.useStack.push_back(target);
+          walk(*target, useTransform, style, doc, ctx, /*isUseTarget=*/true);
+          ctx.useStack.pop_back();
+        }
+      }
+    }
+    return; // <use> has no children of its own to walk
+  }
+
+  auto emit = [&](std::vector<PathOp> ops) {
+    if (ops.empty())
+      return;
+    Shape shape;
+    shape.ops = std::move(ops);
+    shape.transform = transform;
+    shape.hasFill = style.hasFill;
+    if (style.hasFill) {
+      shape.fill = style.fill;
+      shape.fill.a =
+          (uint8_t)(shape.fill.a * style.fillOpacity * style.opacity);
+    }
+    shape.hasStroke = style.hasStroke;
+    if (style.hasStroke) {
+      shape.stroke = style.stroke;
+      shape.stroke.a =
+          (uint8_t)(shape.stroke.a * style.strokeOpacity * style.opacity);
+      shape.strokeWidth = style.strokeWidth;
+      shape.lineCap = style.lineCap;
+      shape.lineJoin = style.lineJoin;
+      shape.miterLimit = style.miterLimit;
+      shape.dashArray = style.dashArray;
+      shape.dashOffset = style.dashOffset;
+    }
+    shape.evenOdd = style.evenOdd;
+    doc.shapes.push_back(std::move(shape));
+  };
+
+  bool isShape = true;
+  if (node.tag == "path")
+    emit(parsePathData(attrOr(node.attrs, "d")));
+  else if (node.tag == "rect") {
+    float rx = attrF(node.attrs, "rx"), ry = attrF(node.attrs, "ry", rx);
+    if (node.attrs.count("rx") && !node.attrs.count("ry"))
+      ry = rx;
+    emit(rectToOps(attrF(node.attrs, "x"), attrF(node.attrs, "y"),
+                   attrF(node.attrs, "width"), attrF(node.attrs, "height"), rx,
+                   ry));
+  } else if (node.tag == "circle")
+    emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
+                      attrF(node.attrs, "r"), attrF(node.attrs, "r")));
+  else if (node.tag == "ellipse")
+    emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
+                      attrF(node.attrs, "rx"), attrF(node.attrs, "ry")));
+  else if (node.tag == "line")
+    emit(
+        {{PathOp::Kind::Move, attrF(node.attrs, "x1"), attrF(node.attrs, "y1")},
+         {PathOp::Kind::Line, attrF(node.attrs, "x2"),
+          attrF(node.attrs, "y2")}});
+  else if (node.tag == "polyline")
+    emit(polyToOps(attrOr(node.attrs, "points"), false));
+  else if (node.tag == "polygon")
+    emit(polyToOps(attrOr(node.attrs, "points"), true));
+  else
+    isShape = false;
+
+  // <g>, <symbol> (only reached here when isUseTarget was true above),
+  // nested <svg>, and unsupported containers all just recurse with the
+  // accumulated transform/style. Children recurse with isUseTarget reset
+  // to false (the default) — a <defs> nested inside a used <symbol> still
+  // shouldn't render on its own, only via its own <use>.
+  if (!isShape)
+    for (auto &child : node.children)
+      walk(child, transform, style, doc, ctx);
+}
+
+inline std::optional<Document> parseString(const std::string &xml) {
+  auto root = liteui_xml::parse(xml);
+  if (!root || root->tag != "svg")
+    return std::nullopt;
+  Document doc;
+  float vbX = 0, vbY = 0, vbW = 0, vbH = 0;
+  bool hasViewBox = false;
+  auto vbIt = root->attrs.find("viewBox");
+  if (vbIt != root->attrs.end()) {
+    size_t i = 0;
+    float vals[4];
+    int n = 0;
+    while (n < 4 && scanNumber(vbIt->second, i, vals[n]))
+      ++n;
+    if (n == 4) {
+      vbX = vals[0];
+      vbY = vals[1];
+      vbW = vals[2];
+      vbH = vals[3];
+      hasViewBox = true;
+    }
+  }
+  float attrW = attrF(root->attrs, "width", 0),
+        attrH = attrF(root->attrs, "height", 0);
+  doc.width = hasViewBox ? vbW : (attrW > 0 ? attrW : 100.0f);
+  doc.height = hasViewBox ? vbH : (attrH > 0 ? attrH : 100.0f);
+  doc.viewBoxX = hasViewBox ? vbX : 0;
+  doc.viewBoxY = hasViewBox ? vbY : 0;
+
+  std::unordered_map<std::string, const liteui_xml::Node *> idMap;
+  collectIds(*root, idMap);
+  WalkContext ctx{&idMap, {}};
+
+  InheritedStyle rootStyle = applyStyle(root->attrs, InheritedStyle());
+  Mat2x3 rootTf = Mat2x3::translate(-doc.viewBoxX, -doc.viewBoxY);
+  for (auto &child : root->children)
+    walk(child, rootTf, rootStyle, doc, ctx);
+  return doc;
+}
+
+inline std::optional<Document> parseFile(const std::string &path,
+                                         std::string *errorOut = nullptr) {
+  FILE *fp = fopen(path.c_str(), "rb");
+  if (!fp) {
+    if (errorOut)
+      *errorOut = "liteui_svg: failed to open " + path;
+    return std::nullopt;
+  }
+  fseek(fp, 0, SEEK_END);
+  long sz = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+  std::string data((size_t)std::max(0L, sz), '\0');
+  if (sz > 0) {
+    size_t got = fread(data.data(), 1, (size_t)sz, fp);
+    data.resize(got);
+  }
+  fclose(fp);
+  auto doc = parseString(data);
+  if (!doc && errorOut)
+    *errorOut = "liteui_svg: failed to parse " + path;
+  return doc;
+}
+
+} // namespace liteui_svg
 
 struct CanvasGradientStop {
   float offset; // 0..1
@@ -1597,6 +2706,35 @@ struct TextInput {
   std::function<void(const std::string &)> onSubmit; // fires on Enter
 
   std::shared_ptr<TextInputState> state = std::make_shared<TextInputState>();
+};
+
+// Author-facing leaf node, addChild(Svg)'d the same way Image is — parses
+// and flattens into an isCanvas View whose onPaint replays the parsed
+// vector shapes through CanvasContext (see View::toView(Svg)). Unlike
+// Image, this stays fully vector: it re-renders at whatever pixel size the
+// node's box resolves to, including across a window resize, so it never
+// blurs the way a pre-rasterized bitmap would.
+//
+// Known limitations (fine for v1, revisit if needed): no gradients,
+// patterns, clipPath/mask, text, or CSS stylesheets (<style> blocks /
+// class selectors) — only presentation attributes and inline style="" on
+// individual elements. <use> resolves both href and xlink:href, supports
+// x/y offset and its own transform/style context, and is guarded against
+// reference cycles and excessive nesting depth — but a referenced
+// <symbol>'s own width/height/viewBox/preserveAspectRatio is not honored
+// (it's rendered at its natural coordinates, un-rescaled, same as a plain
+// <g>). Group opacity is approximated by folding into each descendant
+// shape's own fill/stroke alpha rather than true isolated-layer
+// compositing, so it won't look exactly right where a group's shapes
+// overlap each other.
+struct Svg {
+  Style style;
+  std::string path;   // exactly one of path / source should be set
+  std::string source; // inline SVG XML text, used if path is empty
+  ObjectFit fit = ObjectFit::Contain; // SVG's default "meet" == Contain
+  Color backgroundColor = Color{0, 0, 0, 0};
+  std::function<void()> onLoad;
+  std::function<void(const std::string &error)> onError;
 };
 
 // A node in the retained layout tree. Set `style` and `children`; the engine
@@ -1805,6 +2943,7 @@ public:
   void addChild(Canvas c) { children.push_back(toView(std::move(c))); }
   void addChild(TextInput ti) { children.push_back(toView(std::move(ti))); }
   void addChild(Image img) { children.push_back(toView(std::move(img))); }
+  void addChild(Svg s) { children.push_back(toView(std::move(s))); }
 
   // Marks this canvas node's cached backing surface stale, so the next
   // paint/render pass re-invokes onPaint instead of reusing whatever it
@@ -1868,6 +3007,7 @@ private:
   static View toView(Canvas c);
   static View toView(TextInput ti);
   static View toView(Image img);
+  static View toView(Svg s);
 };
 
 inline View View::toView(Text t) {
@@ -7830,15 +8970,16 @@ inline View View::toView(Image img) {
           &img.source)) {
     sourceFn = *fn;
     state->pixels = sourceFn ? sourceFn() : nullptr;
-  } else if (auto *fixed = std::get_if<std::shared_ptr<CanvasImage>>(&img.source);
+  } else if (auto *fixed =
+                 std::get_if<std::shared_ptr<CanvasImage>>(&img.source);
              fixed && *fixed) {
     state->pixels = *fixed;
   } else if (!img.path.empty()) {
     if (auto decoded = liteui_image::decodeFile(img.path, &err))
       state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
   } else if (!img.memoryData.empty()) {
-    if (auto decoded = liteui_image::decodeMemory(
-            img.memoryData.data(), img.memoryData.size(), &err))
+    if (auto decoded = liteui_image::decodeMemory(img.memoryData.data(),
+                                                  img.memoryData.size(), &err))
       state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
   }
 
@@ -7925,27 +9066,152 @@ inline View View::toView(Image img) {
     case ObjectFit::Fill:
       break;
     case ObjectFit::None:
-      dw = iw; dh = ih;
-      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
+      dw = iw;
+      dh = ih;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
       break;
     case ObjectFit::Contain:
     case ObjectFit::ScaleDown: {
       float scale = std::min(cw / iw, ch / ih);
-      if (fit == ObjectFit::ScaleDown) scale = std::min(scale, 1.0f);
-      dw = iw * scale; dh = ih * scale;
-      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
+      if (fit == ObjectFit::ScaleDown)
+        scale = std::min(scale, 1.0f);
+      dw = iw * scale;
+      dh = ih * scale;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
       break;
     }
     case ObjectFit::Cover: {
       float scale = std::max(cw / iw, ch / ih);
-      dw = iw * scale; dh = ih * scale;
-      dx = (cw - dw) / 2.0f; dy = (ch - dh) / 2.0f;
+      dw = iw * scale;
+      dh = ih * scale;
+      dx = (cw - dw) / 2.0f;
+      dy = (ch - dh) / 2.0f;
       break;
     }
     }
     ctx.drawImage(im, dx, dy, dw, dh);
   };
 
+  return v;
+}
+
+inline View View::toView(Svg s) {
+  std::string err;
+  auto doc = std::make_shared<std::optional<liteui_svg::Document>>();
+  *doc = s.path.empty() ? liteui_svg::parseString(s.source)
+                        : liteui_svg::parseFile(s.path, &err);
+
+  if (doc->has_value() && s.onLoad)
+    s.onLoad();
+  else if (!doc->has_value() && s.onError)
+    s.onError(err.empty() ? "liteui: no SVG source given or failed to parse"
+                          : err);
+
+  View v;
+  v.style = std::move(s.style);
+  v.isCanvas = true;
+
+  if (doc->has_value()) {
+    if (std::get_if<Size>(&v.style.width) &&
+        std::get<Size>(v.style.width).kind == Size::Kind::Fit)
+      v.style.width = Size::pixel((*doc)->width);
+    if (std::get_if<Size>(&v.style.height) &&
+        std::get<Size>(v.style.height).kind == Size::Kind::Fit)
+      v.style.height = Size::pixel((*doc)->height);
+  }
+
+  ObjectFit fit = s.fit;
+  Color bg = s.backgroundColor;
+
+  v.onPaint = [doc, fit, bg](CanvasContext &ctx) {
+    if (bg.a > 0) {
+      ctx.setFillColor(bg);
+      ctx.fillRect(0, 0, ctx.width(), ctx.height());
+    }
+    if (!doc->has_value())
+      return;
+    const liteui_svg::Document &d = **doc;
+    if (d.width <= 0 || d.height <= 0)
+      return;
+    float cw = ctx.width(), ch = ctx.height();
+    float sx = cw / d.width, sy = ch / d.height, dx = 0, dy = 0;
+    switch (fit) {
+    case ObjectFit::Fill:
+      break;
+    case ObjectFit::None:
+      sx = sy = 1.0f;
+      dx = (cw - d.width) / 2.0f;
+      dy = (ch - d.height) / 2.0f;
+      break;
+    case ObjectFit::Contain:
+    case ObjectFit::ScaleDown: {
+      float scale = std::min(sx, sy);
+      if (fit == ObjectFit::ScaleDown)
+        scale = std::min(scale, 1.0f);
+      sx = sy = scale;
+      dx = (cw - d.width * scale) / 2.0f;
+      dy = (ch - d.height * scale) / 2.0f;
+      break;
+    }
+    case ObjectFit::Cover: {
+      float scale = std::max(sx, sy);
+      sx = sy = scale;
+      dx = (cw - d.width * scale) / 2.0f;
+      dy = (ch - d.height * scale) / 2.0f;
+      break;
+    }
+    }
+    ctx.save();
+    ctx.translate(dx, dy);
+    ctx.scale(sx, sy);
+    for (const auto &shape : d.shapes) {
+      ctx.save();
+      ctx.transformBy(shape.transform.a, shape.transform.b, shape.transform.c,
+                      shape.transform.d, shape.transform.e, shape.transform.f);
+      ctx.beginPath();
+      for (const auto &op : shape.ops) {
+        switch (op.kind) {
+        case liteui_svg::PathOp::Kind::Move:
+          ctx.moveTo(op.x, op.y);
+          break;
+        case liteui_svg::PathOp::Kind::Line:
+          ctx.lineTo(op.x, op.y);
+          break;
+        case liteui_svg::PathOp::Kind::Cubic:
+          ctx.bezierCurveTo(op.c1x, op.c1y, op.c2x, op.c2y, op.x, op.y);
+          break;
+        case liteui_svg::PathOp::Kind::Quad:
+          ctx.quadraticCurveTo(op.qx, op.qy, op.x, op.y);
+          break;
+        case liteui_svg::PathOp::Kind::Close:
+          ctx.closePath();
+          break;
+        }
+      }
+      if (shape.hasFill) {
+        ctx.setFillColor(shape.fill);
+        ctx.fill(shape.evenOdd ? FillRule::EvenOdd : FillRule::NonZero);
+      }
+      if (shape.hasStroke) {
+        ctx.setStrokeColor(shape.stroke);
+        ctx.setLineWidth(shape.strokeWidth);
+        ctx.setLineCap(shape.lineCap == 1   ? LineCap::Round
+                       : shape.lineCap == 2 ? LineCap::Square
+                                            : LineCap::Butt);
+        ctx.setLineJoin(shape.lineJoin == 1   ? LineJoin::Round
+                        : shape.lineJoin == 2 ? LineJoin::Bevel
+                                              : LineJoin::Miter);
+        ctx.setMiterLimit(shape.miterLimit);
+        ctx.setLineDash(shape.dashArray);
+        ctx.setLineDashOffset(shape.dashOffset);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  };
   return v;
 }
 
