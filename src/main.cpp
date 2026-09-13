@@ -27,6 +27,7 @@ int main() {
     triggerY = y;
     triggerH = h;
   };
+  trigger.tooltip = "Open options menu";
   trigger.addChild(triggerLabel);
 
   View menu;
@@ -112,6 +113,7 @@ int main() {
 
   LiteUI ui(400, 300, "Context Menu");
   ui.setRoot(root);
+  ui.setTooltipStyle({.delayMs = 400});
   ui.run();
   return 0;
 }

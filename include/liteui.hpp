@@ -2804,6 +2804,10 @@ public:
   // — a plain container/box should never steal focus from whatever the
   // user was actually typing into.
   bool focusable = false;
+  // Tooltip text shown after hovering this view for LiteUI's configured
+  // delay. Empty (default) = no tooltip. Plain field, not Dynamic<> —
+  // looked up once when the tooltip shows, not re-evaluated every frame.
+  std::string tooltip;
 
   // Fired when this view gains/loses keyboard focus. Typical use: a text
   // input shows/hides its caret here.
@@ -5465,6 +5469,15 @@ inline Key xkbKeysymToKey(xkb_keysym_t sym) {
 }
 #endif
 
+struct TooltipStyle {
+  int delayMs = 500;
+  Color background{50, 50, 50, 230};
+  Color textColor{255, 255, 255, 255};
+  float padding = 6.0f;
+  float fontSize = 13.0f;
+  std::string fontFamily; // empty = platform default
+};
+
 class LiteUI {
 
 public:
@@ -5983,6 +5996,43 @@ private:
     return hitTestFlow(root_, x, y, ClipRect{}, btn);
   }
 
+  static View *hitTestTooltipFlow(View &v, float x, float y, ClipRect clip) {
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
+      return nullptr;
+    if (!clip.contains(x, y) || !containsPoint(v, x, y))
+      return nullptr;
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+      if (it->style.position == Position::Absolute ||
+          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
+              Display::None)
+        continue;
+      if (View *hit = hitTestTooltipFlow(*it, x, y, childClip))
+        return hit;
+    }
+    if (!v.tooltip.empty() &&
+        !resolveDynamic(v.disabled, v.computed.resolvedDisabled))
+      return &v;
+    return nullptr;
+  }
+
+  View *hitTestTooltip(float x, float y) {
+    if (!hasRoot_)
+      return nullptr;
+    std::vector<AbsoluteEntry> absolutes;
+    collectAbsolutes(root_, absolutes);
+    sortAbsolutes(absolutes);
+    for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
+      if (View *hit = hitTestTooltipFlow(const_cast<View &>(*it->view), x, y,
+                                         ClipRect{}))
+        return hit;
+    return hitTestTooltipFlow(root_, x, y, ClipRect{});
+  }
+
   // Same bubbling shape as hitTestFlow, but matches on onScrollUp/
   // onScrollDown instead of click/press handlers — kept as a separate
   // walk (rather than folding into hasButtonHandler) since scroll
@@ -6282,6 +6332,70 @@ private:
   // button state.
   View *focusedView_ = nullptr;
 
+  TooltipStyle tooltipStyle_;
+  View *tooltipTarget_ = nullptr;
+  int tooltipTimerHandle_ = -1;
+  bool tooltipVisible_ = false;
+  float tooltipPointerX_ = 0, tooltipPointerY_ = 0;
+
+  void requestTooltipRepaint() {
+#if defined(_WIN32)
+    if (hwnd_)
+      InvalidateRect(hwnd_, nullptr, FALSE);
+#else
+    if (eglReady_)
+      redraw();
+#endif
+  }
+
+  void showTooltip() {
+    tooltipVisible_ = true;
+    requestTooltipRepaint();
+  }
+
+  void hideTooltip() {
+    if (tooltipTimerHandle_ >= 0) {
+      removeInterval(tooltipTimerHandle_);
+      tooltipTimerHandle_ = -1;
+    }
+    bool wasVisible = tooltipVisible_;
+    tooltipVisible_ = false;
+    tooltipTarget_ = nullptr;
+    if (wasVisible)
+      requestTooltipRepaint();
+  }
+
+  // Call on every pointer-motion event.
+  void updateTooltipHover(float x, float y) {
+    View *hit = hitTestTooltip(x, y);
+    tooltipPointerX_ = x;
+    tooltipPointerY_ = y;
+    if (hit == tooltipTarget_)
+      return; // same target (or same "nothing") — leave timer/visibility alone
+
+    if (tooltipTimerHandle_ >= 0) {
+      removeInterval(tooltipTimerHandle_);
+      tooltipTimerHandle_ = -1;
+    }
+    bool wasVisible = tooltipVisible_;
+    tooltipVisible_ = false;
+    tooltipTarget_ = hit;
+    if (wasVisible)
+      requestTooltipRepaint();
+
+    if (hit) {
+      tooltipTimerHandle_ = addInterval(tooltipStyle_.delayMs, [this] {
+        showTooltip();
+        // addInterval's timers repeat — cancel the underlying OS timer
+        // now that it's done its one job, or it'd keep firing.
+        int h = tooltipTimerHandle_;
+        tooltipTimerHandle_ = -1;
+        if (h >= 0)
+          removeInterval(h);
+      });
+    }
+  }
+
   // Modifier state, kept current by whichever platform backend is
   // handling raw key events (Win32's GetKeyState polling on each message,
   // or Wayland's xkb_state on every "modifiers" event).
@@ -6315,6 +6429,7 @@ public:
   // can freely flip plain bools/state and have it show up on screen.
   int addInterval(int ms, std::function<void()> fn);
   void removeInterval(int handle);
+  void setTooltipStyle(TooltipStyle s) { tooltipStyle_ = std::move(s); }
   void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
     shortcuts_.push_back({mods, key, std::move(fn)});
   }
@@ -6560,6 +6675,7 @@ private:
         self->renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
         self->paintBoxes(self->renderTarget_);
         self->paintRoot(self->renderTarget_);
+        self->paintTooltip(self->renderTarget_);
         HRESULT hr = self->renderTarget_->EndDraw();
         // D2DERR_RECREATE_TARGET means the underlying device is gone
         // (driver reset, GPU removal, etc.) — drop the target so the next
@@ -6590,6 +6706,7 @@ private:
     // leaves the window before the button is released.
     case WM_LBUTTONDOWN: {
       if (self) {
+        self->hideTooltip();
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (!self->beginScrollPress(x, y))
@@ -6614,6 +6731,7 @@ private:
         if (self->hasRoot_ &&
             LiteUI::updateHover(self->root_, x, y, ClipRect{}))
           changed = true;
+        self->updateTooltipHover(x, y);
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -6641,6 +6759,7 @@ private:
     // press/click path.
     case WM_MBUTTONDOWN: {
       if (self) {
+        self->hideTooltip();
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         self->beginPress(x, y, MouseButton::Middle);
@@ -6664,6 +6783,7 @@ private:
 
     case WM_RBUTTONDOWN: {
       if (self) {
+        self->hideTooltip();
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         self->beginPress(x, y, MouseButton::Right);
@@ -6792,8 +6912,10 @@ private:
     // — blur our own focused view so a background window doesn't keep
     // silently eating keystrokes meant for something else.
     case WM_KILLFOCUS:
-      if (self)
+      if (self) {
         self->setFocus(nullptr);
+        self->hideTooltip();
+      }
       return 0;
 
       // Window was resized (including maximize/restore/snap): update our
@@ -6811,6 +6933,7 @@ private:
         self->relayout();
         if (self->hasRoot_ && self->checkForUpdates(self->root_))
           self->relayout();
+        self->hideTooltip();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
@@ -6858,6 +6981,34 @@ private:
       for (const auto &e : absolutes)
         paintView(rt, *e.view, ClipRect{});
     }
+  }
+
+  void paintTooltip(ID2D1RenderTarget *rt) {
+    if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
+      return;
+    TextStyle ts;
+    ts.fontSize = tooltipStyle_.fontSize;
+    ts.fontFamily = tooltipStyle_.fontFamily;
+    ts.wrap = TextWrap::NoWrap;
+    liteui_text::Measurement m =
+        liteui_text::measure(tooltipTarget_->tooltip, ts, -1);
+    float pad = tooltipStyle_.padding;
+    float boxW = m.width + pad * 2, boxH = m.height + pad * 2;
+    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, width_ - boxW - 2.0f);
+    float by =
+        std::clamp(tooltipPointerY_ + 18.0f, 2.0f, height_ - boxH - 2.0f);
+
+    d2dFillRect(rt, bx, by, boxW, boxH, tooltipStyle_.background);
+    IDWriteTextLayout *layout = liteui_text::makeLayout(
+        tooltipTarget_->tooltip, ts, m.width + 4, m.height + 4);
+    ID2D1SolidColorBrush *brush = nullptr;
+    rt->CreateSolidColorBrush(toD2DColor(tooltipStyle_.textColor), &brush);
+    if (brush) {
+      rt->SetTransform(D2D1::Matrix3x2F::Identity());
+      rt->DrawTextLayout(D2D1::Point2F(bx + pad, by + pad), layout, brush);
+      brush->Release();
+    }
+    layout->Release();
   }
 
   // Draws v's vertical/horizontal scrollbar (whichever are currently
@@ -7448,6 +7599,7 @@ private:
     static_cast<LiteUI *>(data)->currentCursorName_.clear();
   }
   // Called on every pointer movement while over this surface.
+  // Called on every pointer movement while over this surface.
   static void pointerMotion(void *data, wl_pointer *, uint32_t, wl_fixed_t sx,
                             wl_fixed_t sy) {
     // Recover the owning LiteUI.
@@ -7469,6 +7621,13 @@ private:
         LiteUI::updateHover(self->root_, static_cast<float>(self->pointer_x_),
                             static_cast<float>(self->pointer_y_), ClipRect{}))
       changed = true;
+
+    // arms/cancels/re-targets the tooltip timer. Handles its own
+    // repaint scheduling internally (via requestTooltipRepaint), so it
+    // doesn't need to participate in the `changed` flag above.
+    self->updateTooltipHover(static_cast<float>(self->pointer_x_),
+                             static_cast<float>(self->pointer_y_));
+
     if (changed)
       self->redraw();
 
@@ -7567,6 +7726,7 @@ private:
     auto *self = static_cast<LiteUI *>(data);
     self->setFocus(nullptr);
     self->repeatKeycode_ = 0;
+    self->hideTooltip();
   }
 
   static void keyboardKey(void *data, wl_keyboard *, uint32_t, uint32_t,
@@ -7815,6 +7975,7 @@ private:
 
     if (hasRoot_ && checkForUpdates(root_))
       relayout();
+    hideTooltip();
     if (eglReady_)
       redraw();
   }
@@ -8026,6 +8187,90 @@ private:
     drawRectGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(w), static_cast<float>(h),
                static_cast<float>(radius), {r, g, b}, clip);
+  }
+
+  GLuint tooltipTextTexture_ = 0;
+  int tooltipTexW_ = 0, tooltipTexH_ = 0;
+  std::string tooltipTextureBuiltFor_;
+
+  void ensureTooltipTexture(const std::string &text) {
+    if (tooltipTextTexture_ && tooltipTextureBuiltFor_ == text)
+      return;
+    if (tooltipTextTexture_) {
+      glDeleteTextures(1, &tooltipTextTexture_);
+      tooltipTextTexture_ = 0;
+    }
+    TextStyle ts;
+    ts.fontSize = tooltipStyle_.fontSize;
+    ts.fontFamily = tooltipStyle_.fontFamily;
+    ts.wrap = TextWrap::NoWrap;
+    liteui_text::Measurement m = liteui_text::measure(text, ts, -1);
+    int w = std::max(1, (int)std::ceil(m.width)),
+        h = std::max(1, (int)std::ceil(m.height));
+    cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t *cr = cairo_create(surf);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_set_source_rgba(cr, 1, 1, 1, 1);
+    PangoLayout *layout = liteui_text::makeLayout(text, ts, -1, cr);
+    pango_cairo_show_layout(cr, layout);
+    g_object_unref(layout);
+    cairo_surface_flush(surf);
+    unsigned char *data = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    std::vector<unsigned char> alpha((size_t)w * h);
+    for (int row = 0; row < h; ++row)
+      for (int col = 0; col < w; ++col)
+        alpha[row * w + col] = data[row * stride + col * 4 + 3];
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA,
+                 GL_UNSIGNED_BYTE, alpha.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+    tooltipTextTexture_ = tex;
+    tooltipTexW_ = w;
+    tooltipTexH_ = h;
+    tooltipTextureBuiltFor_ = text;
+  }
+
+  void paintTooltip() {
+    if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
+      return;
+    ensureTooltipTexture(tooltipTarget_->tooltip);
+    float pad = tooltipStyle_.padding;
+    float boxW = tooltipTexW_ + pad * 2, boxH = tooltipTexH_ + pad * 2;
+    float bx =
+        std::clamp(tooltipPointerX_ + 12.0f, 2.0f, (float)width_ - boxW - 2.0f);
+    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f,
+                          (float)height_ - boxH - 2.0f);
+
+    drawRectGL(bx, by, boxW, boxH, 4.0f, tooltipStyle_.background, ClipRect{});
+
+    glUseProgram(texProgram_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tooltipTextTexture_);
+    glUniform1i(texUTex_, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
+    glEnableVertexAttribArray(texAPos_);
+    glVertexAttribPointer(texAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glUniform2f(texUPos_, bx + pad, by + pad);
+    glUniform2f(texUSize_, (float)tooltipTexW_, (float)tooltipTexH_);
+    glUniform2f(texUScreen_, (float)width_, (float)height_);
+    Color c = tooltipStyle_.textColor;
+    glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
+                c.a / 255.0f);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
   // Rasterizes v.text under v.textStyle into an alpha-only glyph-coverage
@@ -8500,6 +8745,7 @@ private:
     }
     // Paint the titlebar and its buttons on top of that background.
     drawTitlebar();
+    paintTooltip();
     eglSwapBuffers(eglDisplay_, eglSurface_);
   }
 
@@ -8509,6 +8755,7 @@ private:
   // before — only content-area widget clicks wait for a matching release
   // (see beginPress/endPress).
   void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
+    hideTooltip();
     // Resize/move grabs and the chrome buttons are a left-button-only
     // convention (matching every desktop's own titlebar) — a middle/
     // right click on the resize strip just falls through to whatever's
@@ -8741,6 +8988,8 @@ inline LiteUI::~LiteUI() {
       glDeleteProgram(texProgram_);
     if (canvasProgram_)
       glDeleteProgram(canvasProgram_);
+    if (tooltipTextTexture_)
+      glDeleteTextures(1, &tooltipTextTexture_);
     if (quadVbo_)
       glDeleteBuffers(1, &quadVbo_);
     if (flatVbo_)
