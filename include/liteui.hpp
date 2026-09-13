@@ -6796,10 +6796,10 @@ private:
         self->setFocus(nullptr);
       return 0;
 
-    // Window was resized (including maximize/restore/snap): update our
-    // stored dimensions and re-run layout against the new size. GDI needs
-    // no buffer reallocation (it paints straight into the window's DC), so
-    // this is just relayout + repaint.
+      // Window was resized (including maximize/restore/snap): update our
+      // stored dimensions and re-run layout against the new size. GDI needs
+      // no buffer reallocation (it paints straight into the window's DC), so
+      // this is just relayout + repaint.
     case WM_SIZE: {
       if (self) {
         self->width_ = LOWORD(lp);
@@ -6809,6 +6809,8 @@ private:
               D2D1::SizeU(static_cast<UINT32>(self->width_),
                           static_cast<UINT32>(self->height_)));
         self->relayout();
+        if (self->hasRoot_ && self->checkForUpdates(self->root_))
+          self->relayout();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
@@ -7805,12 +7807,14 @@ private:
   // be resized in place — wl_shm buffers are fixed-size — so this is a full
   // destroy/recreate rather than a realloc.
   void resize(int newWidth, int newHeight) {
-
     width_ = newWidth;
     height_ = newHeight;
     if (eglWindow_)
       wl_egl_window_resize(eglWindow_, width_, height_, 0, 0);
     relayout();
+
+    if (hasRoot_ && checkForUpdates(root_))
+      relayout();
     if (eglReady_)
       redraw();
   }

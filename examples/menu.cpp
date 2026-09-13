@@ -16,9 +16,9 @@ int main() {
   View trigger;
   trigger.style.width = Size::pixel(100);
   trigger.style.height = Size::pixel(36);
-  trigger.style.backgroundColor = {230, 230, 230};
-  trigger.style.hoverColor = {210, 210, 210};
-  trigger.style.borderRadius = 4;
+  trigger.style.backgroundColor = Color{230, 230, 230};
+  trigger.style.hoverColor = Color{210, 210, 210};
+  trigger.style.borderRadius = 4.0f;
   trigger.style.alignItems = Align::Center;
   trigger.style.justifyContent = Justify::Center;
   trigger.onClick = [&]() { menuOpen = !menuOpen; };
@@ -34,17 +34,13 @@ int main() {
   menu.style.direction = FlexDirection::Column;
 
   menu.style.width = Size::pixel(160);
-  menu.style.backgroundColor = {255, 255, 255};
-  menu.style.borderWidth = 1;
-  menu.style.borderColor = {200, 200, 200};
-  menu.style.borderRadius = 6;
+  menu.style.backgroundColor = Color{255, 255, 255};
+  menu.style.borderWidth = 1.0f;
+  menu.style.borderColor = Color{200, 200, 200};
+  menu.style.borderRadius = 6.0f;
   menu.style.zIndex = 200;
-  // Anchor menu's top-left corner to just below the trigger button's
-  // bottom-left corner, expressed relative to backdrop's own origin
-  // (since that's what Absolute positioning here actually resolves
-  // against).
-  menu.positionSource = [&]() { return triggerX - backdropX; };
-  menu.topSource = [&]() {
+  menu.style.left = [&]() { return triggerX - backdropX; };
+  menu.style.top = [&]() {
     constexpr float kGap = 6.0f; // small visual gap under the button
     return (triggerY - backdropY) + triggerH + kGap;
   };
@@ -87,13 +83,15 @@ int main() {
   // unaffected by the nesting; only backdrop's displaySource needs setting.
   View backdrop;
   backdrop.style.position = Position::Absolute;
-  backdrop.style.left = 0;
-  backdrop.style.top = 0;
-  backdrop.style.right = 0;
-  backdrop.style.bottom = 0;
+  backdrop.style.left = 0.0f;
+  backdrop.style.top = 0.0f;
+  backdrop.style.right = 0.0f;
+  backdrop.style.bottom = 0.0f;
   backdrop.style.zIndex = 100;
-  backdrop.style.backgroundColor = {255, 255, 255, 2};
-  backdrop.displaySource = [&]() { return menuOpen; };
+  backdrop.style.backgroundColor = Color{255, 255, 255, 2};
+  backdrop.style.display = [&]() {
+    return menuOpen ? Display::Flex : Display::None;
+  };
   backdrop.onClick = [&]() { menuOpen = false; };
   backdrop.onLayout = [&](float x, float y, float w, float h) {
     backdropX = x;
