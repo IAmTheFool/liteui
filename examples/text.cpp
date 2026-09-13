@@ -12,15 +12,15 @@ static View makeRow(const std::string &caption, Text t) {
   row.style.width = Size::full();
   row.style.padding = EdgeInsets::all(10);
   row.style.gap = 4;
-  row.style.backgroundColor = {255, 255, 255};
-  row.style.borderWidth = 1;
-  row.style.borderColor = {0xE0, 0xE0, 0xE0};
-  row.style.borderRadius = 6;
+  row.style.backgroundColor = Color{255, 255, 255};
+  row.style.borderWidth = 1.0f;
+  row.style.borderColor = Color{0xE0, 0xE0, 0xE0};
+  row.style.borderRadius = 6.0f;
 
   Text label;
   label.label = caption;
   label.fontSize = 12;
-  label.color = {0x88, 0x88, 0x88};
+  label.color = Color{0x88, 0x88, 0x88};
   row.addChild(std::move(label));
 
   row.addChild(std::move(t));
@@ -37,7 +37,7 @@ int main() {
   root.style.padding = EdgeInsets::all(16);
   root.style.gap = 10;
   root.style.overflowY = Overflow::Scroll; // whole window scrolls if content overflows
-  root.style.backgroundColor = {0xF2, 0xF2, 0xF2};
+  root.style.backgroundColor = Color{0xF2, 0xF2, 0xF2};
 
   // ---- Font size ----
   {
@@ -77,7 +77,7 @@ int main() {
     Text t;
     t.label = "Colored text";
     t.fontSize = 18;
-    t.color = {0x21, 0x96, 0xF3};
+    t.color = Color{0x21, 0x96, 0xF3};
     root.addChild(makeRow("color = blue", std::move(t)));
   }
 

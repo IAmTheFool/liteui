@@ -38,7 +38,7 @@ int main() {
   box.onClick = [&]() { checked = !checked; };
 
   Text mark;
-  mark.color = {255, 255, 255};
+  mark.color = Color{255, 255, 255};
   mark.label = [&]() {
     return checked ? std::string("\xE2\x9C\x93") : std::string();
   };

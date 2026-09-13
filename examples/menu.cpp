@@ -27,6 +27,7 @@ int main() {
     triggerY = y;
     triggerH = h;
   };
+  trigger.tooltip = "Open options menu";
   trigger.addChild(triggerLabel);
 
   View menu;
@@ -48,6 +49,7 @@ int main() {
   Text deleteItem;
   deleteItem.label = "Delete";
   deleteItem.style.padding = EdgeInsets::all(10);
+  
 
   View deleteRow;
   deleteRow.style.hoverColor = {245, 245, 245};
@@ -56,6 +58,7 @@ int main() {
     menuOpen = false;
     // ... actual delete logic here ...
   };
+  deleteRow.tooltip = "Permanently delete this item";
   deleteRow.addChild(deleteItem);
 
   Text renameItem;
@@ -112,6 +115,7 @@ int main() {
 
   LiteUI ui(400, 300, "Context Menu");
   ui.setRoot(root);
+  ui.setTooltipStyle({.delayMs = 400});
   ui.run();
   return 0;
 }

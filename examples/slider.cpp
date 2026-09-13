@@ -17,7 +17,7 @@ int main() {
     return std::string(buf);
   };
   valueLabel.fontSize = 14;
-  valueLabel.color = {90, 90, 90};
+  valueLabel.color = Color{90, 90, 90};
 
   // --- track: the clickable strip the thumb rides along ---
   View track;
@@ -57,9 +57,9 @@ int main() {
   thumb.style.top = -6.0f; // (18 - 6) / 2, centers it vertically on the track
   thumb.style.width = Size::pixel(kThumbSize);
   thumb.style.height = Size::pixel(kThumbSize);
-  thumb.style.backgroundColor =Color {255, 255, 255};
+  thumb.style.backgroundColor = Color{255, 255, 255};
   thumb.style.borderWidth = 2.0f;
-  thumb.style.borderColor =Color {60, 120, 235};
+  thumb.style.borderColor = Color{60, 120, 235};
   thumb.style.borderRadius = kThumbSize / 2;
   thumb.style.left = [&]() {
     return sliderValue * trackWidth - kThumbSize / 2;

@@ -11,9 +11,9 @@ int main() {
   View trigger;
   trigger.style.width = Size::pixel(160);
   trigger.style.height = Size::pixel(36);
-  trigger.style.backgroundColor = {230, 230, 230};
-  trigger.style.hoverColor = {210, 210, 210};
-  trigger.style.borderRadius = 4;
+  trigger.style.backgroundColor = Color{230, 230, 230};
+  trigger.style.hoverColor = Color{210, 210, 210};
+  trigger.style.borderRadius = 4.0f;
   trigger.style.alignItems = Align::Center;
   trigger.style.justifyContent = Justify::Center;
   trigger.onClick = [&]() { dialogOpen = true; };
@@ -29,8 +29,8 @@ int main() {
   dialogBox.style.width = Size::pixel(320);
   dialogBox.style.padding = EdgeInsets::all(20);
   dialogBox.style.gap = 16;
-  dialogBox.style.backgroundColor = {255, 255, 255};
-  dialogBox.style.borderRadius = 8;
+  dialogBox.style.backgroundColor = Color{255, 255, 255};
+  dialogBox.style.borderRadius = 8.0f;
   // Swallows any click that lands inside the dialog's own padding/gaps
   // (i.e. not on a specific button below). Without this, such a click
   // would find no onClick on dialogBox or any of its flow descendants
@@ -53,7 +53,7 @@ int main() {
       "data. This action cannot be undone.";
   message.wrap = TextWrap::Wrap;
   message.style.width = Size::full();
-  message.color = {90, 90, 90};
+  message.color = Color{90, 90, 90};
 
   // --- button row ---
   View buttonRow;
@@ -67,9 +67,9 @@ int main() {
   View cancelButton;
   cancelButton.style.width = Size::pixel(80);
   cancelButton.style.height = Size::pixel(34);
-  cancelButton.style.backgroundColor = {240, 240, 240};
-  cancelButton.style.hoverColor = {225, 225, 225};
-  cancelButton.style.borderRadius = 4;
+  cancelButton.style.backgroundColor = Color{240, 240, 240};
+  cancelButton.style.hoverColor = Color{225, 225, 225};
+  cancelButton.style.borderRadius = 4.0f;
   cancelButton.style.alignItems = Align::Center;
   cancelButton.style.justifyContent = Justify::Center;
   cancelButton.onClick = [&]() { dialogOpen = false; };
@@ -77,14 +77,14 @@ int main() {
 
   Text confirmLabel;
   confirmLabel.label = "Delete";
-  confirmLabel.color = {255, 255, 255};
+  confirmLabel.color = Color{255, 255, 255};
 
   View confirmButton;
   confirmButton.style.width = Size::pixel(80);
   confirmButton.style.height = Size::pixel(34);
-  confirmButton.style.backgroundColor = {0xC0, 0x39, 0x2B};
-  confirmButton.style.hoverColor = {0xA8, 0x2F, 0x23};
-  confirmButton.style.borderRadius = 4;
+  confirmButton.style.backgroundColor = Color{0xC0, 0x39, 0x2B};
+  confirmButton.style.hoverColor = Color{0xA8, 0x2F, 0x23};
+  confirmButton.style.borderRadius = 4.0f;
   confirmButton.style.alignItems = Align::Center;
   confirmButton.style.justifyContent = Justify::Center;
   confirmButton.onClick = [&]() {
@@ -104,17 +104,20 @@ int main() {
   // --- backdrop: full-window, dims the page, closes on outside click ---
   View backdrop;
   backdrop.style.position = Position::Absolute;
-  backdrop.style.left = 0;
-  backdrop.style.top = 0;
-  backdrop.style.right = 0;
-  backdrop.style.bottom = 0;
+  backdrop.style.left = 0.0f;
+  backdrop.style.top = 0.0f;
+  backdrop.style.right = 0.0f;
+  backdrop.style.bottom = 0.0f;
   backdrop.style.zIndex = 100;
-  backdrop.style.backgroundColor = {0, 0, 0, 90}; // dimmed, unlike the
-                                                   // near-invisible menu
-                                                   // backdrop
-  backdrop.style.alignItems = Align::Center;      // <-- centers dialogBox
-  backdrop.style.justifyContent = Justify::Center; // <-- vertically & horizontally
-  backdrop.displaySource = [&]() { return dialogOpen; };
+  backdrop.style.backgroundColor = Color{0, 0, 0, 90}; // dimmed, unlike the
+                                                       // near-invisible menu
+                                                       // backdrop
+  backdrop.style.alignItems = Align::Center;           // <-- centers dialogBox
+  backdrop.style.justifyContent =
+      Justify::Center; // <-- vertically & horizontally
+  backdrop.style.display = [&]() {
+    return dialogOpen ? Display::Flex : Display::None;
+  };
   backdrop.onClick = [&]() { dialogOpen = false; }; // click outside -> cancel
   backdrop.addChild(dialogBox);
 
