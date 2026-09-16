@@ -344,18 +344,13 @@ private:
   // every Dynamic<> in the tree reads it live.
   std::shared_ptr<int> activityIndex_ = std::make_shared<int>(0);
 
-  // Explorer state. One directory level at a time rather than a nested
-  // tree: clicking a folder makes it the new root, ".." walks back up.
-  // Flat like this, the keyed list is a plain vector of paths, which is
-  // exactly what keysSource wants.
+  // Explorer state: a real expand/collapse tree rooted at the opened
+  // workspace folder, matching VS Code's explorer. explorerRoot_ is
+  // nullopt until a folder is opened; each FileTreeNode lazily loads its
+  // own children the first time it's expanded (see loadFileTreeChildren,
+  // already used this way by loadFileTreeChildren's own callers).
   std::string workspaceRoot_;
-  std::vector<FileTreeNode> explorerEntries_;
-
-  static std::string parentPath(const std::string &p) {
-    if (p.empty())
-      return {};
-    return std::filesystem::path(p).parent_path().string();
-  }
+  std::optional<FileTreeNode> explorerRoot_;
 
   void setWorkspaceRoot(const std::string &p) {
     if (p.empty())
@@ -363,10 +358,11 @@ private:
     workspaceRoot_ = p;
     FileTreeNode root;
     root.fullPath = p;
+    root.name = editorTitleFromPath(p);
     root.isDir = true;
-    loadFileTreeChildren(
-        root); // scans one level, dirs first (see its own note)
-    explorerEntries_ = std::move(root.children);
+    root.expanded = true; // VS Code opens a freshly-added folder expanded
+    loadFileTreeChildren(root);
+    explorerRoot_ = std::move(root);
   }
 
   void openWorkspaceFolder() {
@@ -375,25 +371,45 @@ private:
       setWorkspaceRoot(*picked);
   }
 
-  // Keys for the explorer's keyed list. ".." is a synthetic key, present
-  // only when there is somewhere above the current root to go.
-  std::vector<std::string> explorerKeys() const {
-    std::vector<std::string> keys;
-    if (workspaceRoot_.empty())
-      return keys;
-    std::string up = parentPath(workspaceRoot_);
-    if (!up.empty() && up != workspaceRoot_)
-      keys.push_back("..");
-    for (const auto &e : explorerEntries_)
-      keys.push_back(e.fullPath);
-    return keys;
+  // DFS by full path from explorerRoot_, reporting the match's depth
+  // (root = 0) via outDepth so buildExplorerRow can indent without
+  // tracking depth itself. Returns a non-owning pointer straight into
+  // explorerRoot_'s tree, so the caller can flip ->expanded on it.
+  static FileTreeNode *findExplorerNodeIn(FileTreeNode &node,
+                                          const std::string &path, int depth,
+                                          int &outDepth) {
+    if (node.fullPath == path) {
+      outDepth = depth;
+      return &node;
+    }
+    for (auto &c : node.children)
+      if (FileTreeNode *hit = findExplorerNodeIn(c, path, depth + 1, outDepth))
+        return hit;
+    return nullptr;
+  }
+  FileTreeNode *findExplorerNode(const std::string &path, int &outDepth) {
+    if (!explorerRoot_)
+      return nullptr;
+    return findExplorerNodeIn(*explorerRoot_, path, 0, outDepth);
   }
 
-  const FileTreeNode *findExplorerEntry(const std::string &fullPath) const {
-    for (const auto &e : explorerEntries_)
-      if (e.fullPath == fullPath)
-        return &e;
-    return nullptr;
+  // Flattens the currently-expanded part of the tree into a list of full
+  // paths, depth-first — this is the explorer's keysSource. Collapsing a
+  // folder simply removes its subtree's paths from this list on the next
+  // poll, so reconcileChildren() frees exactly those rows and nothing
+  // else; expanding one adds them back, freshly built.
+  static void collectExplorerKeys(const FileTreeNode &node,
+                                  std::vector<std::string> &out) {
+    out.push_back(node.fullPath);
+    if (node.isDir && node.expanded)
+      for (const auto &c : node.children)
+        collectExplorerKeys(c, out);
+  }
+  std::vector<std::string> explorerKeys() const {
+    std::vector<std::string> keys;
+    if (explorerRoot_)
+      collectExplorerKeys(*explorerRoot_, keys);
+    return keys;
   }
 
   EditorDocument *activeDoc() {
@@ -419,33 +435,53 @@ private:
       out.push_back(std::string());
   }
 
-  // One row in the explorer list. `key` is either ".." or an entry's full
-  // path. Both handlers read workspaceRoot_ live rather than capturing it,
-  // so a reused ".." row (reconcileChildren keeps it across a navigation,
-  // since its key is unchanged) still walks up from wherever we are now.
+  // One row in the explorer tree. `key` is a node's full path, looked up
+  // fresh on every build (rather than captured by value) so a row that
+  // reconcileChildren reuses across an unrelated expand/collapse
+  // elsewhere in the tree still reflects its own current depth/expanded
+  // state and the active tab's highlight correctly.
   View buildExplorerRow(const std::string &key) {
-    bool isUp = key == "..";
-    const FileTreeNode *node = isUp ? nullptr : findExplorerEntry(key);
-    bool isDir = isUp || (node && node->isDir);
-    std::string name = isUp ? ".." : (node ? node->name : key);
+    int depth = 0;
+    FileTreeNode *node = findExplorerNode(key, depth);
+    bool isDir = node && node->isDir;
+    bool expanded = node && node->expanded;
+    std::string name = node ? node->name : key;
+    const EditorDocument *active = activeDocument();
+    bool isActive = !isDir && active && active->hasPath && active->path == key;
 
     View row;
     row.style.width = Size::full();
     row.style.alignItems = Align::Center;
-    row.style.padding = EdgeInsets{3, 12, 3, 12};
-    row.style.backgroundColor = Color{243, 243, 243};
+    row.style.padding =
+        EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
+    row.style.backgroundColor =
+        isActive ? Color{213, 228, 249} : Color{243, 243, 243};
     row.style.hoverColor = Color{226, 226, 226};
-    row.onClick = [this, key, isDir, isUp] {
-      if (isUp)
-        setWorkspaceRoot(parentPath(workspaceRoot_));
-      else if (isDir)
-        setWorkspaceRoot(key);
-      else
+    row.onClick = [this, key] {
+      int d = 0;
+      FileTreeNode *n = findExplorerNode(key, d);
+      if (!n)
+        return;
+      if (n->isDir) {
+        if (!n->childrenLoaded)
+          loadFileTreeChildren(*n);
+        n->expanded = !n->expanded;
+      } else {
         openFile(key);
+      }
     };
 
+    Text chevron;
+    chevron.label = isDir ? (expanded ? std::string("\xE2\x96\xBE ")  // ▾
+                                      : std::string("\xE2\x96\xB8 ")) // ▸
+                          : std::string("   ");
+    chevron.fontSize = 11;
+    chevron.style.width = Size::pixel(14);
+    chevron.color = Color{110, 110, 110};
+    row.addChild(chevron);
+
     Text label;
-    label.label = isDir && !isUp ? name + "/" : name;
+    label.label = name;
     label.fontSize = 13;
     label.color = isDir ? Color{40, 40, 40} : Color{70, 70, 70};
     row.addChild(label);
@@ -470,12 +506,12 @@ private:
     openBtn.style.alignItems = Align::Center;
     openBtn.style.backgroundColor = Color{243, 243, 243};
     openBtn.style.hoverColor = Color{226, 226, 226};
+    openBtn.style.display = [this]() -> Display {
+      return workspaceRoot_.empty() ? Display::Flex : Display::None;
+    };
     openBtn.onClick = [this] { openWorkspaceFolder(); };
     Text openLabel;
-    openLabel.label = std::function<std::string()>([this]() -> std::string {
-      return workspaceRoot_.empty() ? "Open Folder..."
-                                    : editorTitleFromPath(workspaceRoot_);
-    });
+    openLabel.label = std::string("Open Folder...");
     openLabel.fontSize = 13;
     openLabel.color = Color{40, 40, 40};
     openBtn.addChild(openLabel);
