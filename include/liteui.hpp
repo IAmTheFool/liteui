@@ -888,6 +888,169 @@ saveFilePicker(const std::string &title, const std::string &defaultName,
 
 #endif
 
+// Blocks until the user picks a folder or cancels. Unlike files, folders
+// have no natural "open" vs "save" distinction — saveFolderPicker exists
+// purely to offer a different default title/button framing (e.g. "Select
+// Folder" for a save-destination use case). Returns the chosen path, or
+// std::nullopt on cancel/failure.
+std::optional<std::string>
+openFolderPicker(const std::string &title = "Open Folder");
+
+std::optional<std::string>
+saveFolderPicker(const std::string &title = "Select Folder");
+
+#if defined(_WIN32)
+
+inline std::optional<std::string> openFolderPicker(const std::string &title) {
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileOpenDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS);
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr);
+  if (SUCCEEDED(hr)) {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+// Same as openFolderPicker but via IFileSaveDialog, so the dialog's
+// action button reads "Save"/"Select" rather than "Open" — the only
+// difference; folders have no other save-specific behavior.
+inline std::optional<std::string> saveFolderPicker(const std::string &title) {
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileSaveDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr)) {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS);
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr);
+  if (SUCCEEDED(hr)) {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item))) {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+inline std::optional<std::string> openFolderPicker(const std::string &title) {
+  using namespace liteui_filepicker;
+  std::string cmd;
+  if (commandExists("zenity"))
+    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
+  else if (commandExists("kdialog"))
+    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
+  else
+    return std::nullopt;
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+// zenity/kdialog have no separate "save" mode for directories, so this
+// is identical to openFolderPicker aside from the default title string
+// the caller passes.
+inline std::optional<std::string> saveFolderPicker(const std::string &title) {
+  using namespace liteui_filepicker;
+  std::string cmd;
+  if (commandExists("zenity"))
+    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
+  else if (commandExists("kdialog"))
+    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
+  else
+    return std::nullopt;
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+#endif
+
 namespace liteui_image {
 
 #if defined(_WIN32)
@@ -9519,6 +9682,19 @@ inline void LiteUI::removeInterval(int handle) {
 #endif
 
 inline void LiteUI::setRoot(View view) {
+  // Every one of these is a raw View* into root_'s subtree. root_ is
+  // about to be destroyed (freeTextResources() below, then replaced) —
+  // leaving any of these pointing at it would dangle the moment the old
+  // tree's destructor runs, and the next dispatched event (a keypress
+  // via focusedView_, a scroll via scrollDrag_.target, a tooltip poll
+  // via tooltipTarget_, ...) would then use-after-free.
+  focusedView_ = nullptr;
+  for (int i = 0; i < 3; ++i) {
+    pressedView_[i] = nullptr;
+    dragView_[i] = nullptr;
+  }
+  scrollDrag_ = ScrollDrag{};
+  hideTooltip(); // clears tooltipTarget_ and its timer
   if (hasRoot_)
     root_.freeTextResources();
   root_ = std::move(view);
