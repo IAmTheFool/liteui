@@ -264,7 +264,7 @@ public:
     if (i >= docs_.size() || docs_[i].closed)
       return;
     docs_[i].closed = true;
-   // TODO prompt to save if *docs_[i].modified before closing.
+    // TODO prompt to save if *docs_[i].modified before closing.
     // The editor View for this doc is about to be dropped by
     // reconcileChildren(), which frees it without going through onBlur —
     // so its caret-blink interval would otherwise tick forever against a
@@ -339,6 +339,63 @@ private:
 
   std::shared_ptr<int> openMenuIndex_ = std::make_shared<int>(-1);
 
+  // Which activity-bar item is selected: 0 = Explorer, 1 = Search, -1 =
+  // panel collapsed. shared_ptr for the same reason activeIndex_ is —
+  // every Dynamic<> in the tree reads it live.
+  std::shared_ptr<int> activityIndex_ = std::make_shared<int>(0);
+
+  // Explorer state. One directory level at a time rather than a nested
+  // tree: clicking a folder makes it the new root, ".." walks back up.
+  // Flat like this, the keyed list is a plain vector of paths, which is
+  // exactly what keysSource wants.
+  std::string workspaceRoot_;
+  std::vector<FileTreeNode> explorerEntries_;
+
+  static std::string parentPath(const std::string &p) {
+    if (p.empty())
+      return {};
+    return std::filesystem::path(p).parent_path().string();
+  }
+
+  void setWorkspaceRoot(const std::string &p) {
+    if (p.empty())
+      return;
+    workspaceRoot_ = p;
+    FileTreeNode root;
+    root.fullPath = p;
+    root.isDir = true;
+    loadFileTreeChildren(
+        root); // scans one level, dirs first (see its own note)
+    explorerEntries_ = std::move(root.children);
+  }
+
+  void openWorkspaceFolder() {
+    auto picked = openWorkspaceFolderDialog("Open Folder");
+    if (picked)
+      setWorkspaceRoot(*picked);
+  }
+
+  // Keys for the explorer's keyed list. ".." is a synthetic key, present
+  // only when there is somewhere above the current root to go.
+  std::vector<std::string> explorerKeys() const {
+    std::vector<std::string> keys;
+    if (workspaceRoot_.empty())
+      return keys;
+    std::string up = parentPath(workspaceRoot_);
+    if (!up.empty() && up != workspaceRoot_)
+      keys.push_back("..");
+    for (const auto &e : explorerEntries_)
+      keys.push_back(e.fullPath);
+    return keys;
+  }
+
+  const FileTreeNode *findExplorerEntry(const std::string &fullPath) const {
+    for (const auto &e : explorerEntries_)
+      if (e.fullPath == fullPath)
+        return &e;
+    return nullptr;
+  }
+
   EditorDocument *activeDoc() {
     if (*activeIndex_ < 0 || static_cast<size_t>(*activeIndex_) >= docs_.size())
       return nullptr;
@@ -360,6 +417,186 @@ private:
     out.push_back(cur);
     if (out.empty())
       out.push_back(std::string());
+  }
+
+  // One row in the explorer list. `key` is either ".." or an entry's full
+  // path. Both handlers read workspaceRoot_ live rather than capturing it,
+  // so a reused ".." row (reconcileChildren keeps it across a navigation,
+  // since its key is unchanged) still walks up from wherever we are now.
+  View buildExplorerRow(const std::string &key) {
+    bool isUp = key == "..";
+    const FileTreeNode *node = isUp ? nullptr : findExplorerEntry(key);
+    bool isDir = isUp || (node && node->isDir);
+    std::string name = isUp ? ".." : (node ? node->name : key);
+
+    View row;
+    row.style.width = Size::full();
+    row.style.alignItems = Align::Center;
+    row.style.padding = EdgeInsets{3, 12, 3, 12};
+    row.style.backgroundColor = Color{243, 243, 243};
+    row.style.hoverColor = Color{226, 226, 226};
+    row.onClick = [this, key, isDir, isUp] {
+      if (isUp)
+        setWorkspaceRoot(parentPath(workspaceRoot_));
+      else if (isDir)
+        setWorkspaceRoot(key);
+      else
+        openFile(key);
+    };
+
+    Text label;
+    label.label = isDir && !isUp ? name + "/" : name;
+    label.fontSize = 13;
+    label.color = isDir ? Color{40, 40, 40} : Color{70, 70, 70};
+    row.addChild(label);
+    return row;
+  }
+
+  View buildExplorerPane() {
+    auto act = activityIndex_;
+
+    View pane;
+    pane.style.direction = FlexDirection::Column;
+    pane.style.width = Size::full();
+    pane.style.flexGrow = 1;
+    pane.style.backgroundColor = Color{243, 243, 243};
+    pane.style.display = [act]() -> Display {
+      return *act == 0 ? Display::Flex : Display::None;
+    };
+
+    View openBtn;
+    openBtn.style.width = Size::full();
+    openBtn.style.padding = EdgeInsets{6, 12, 6, 12};
+    openBtn.style.alignItems = Align::Center;
+    openBtn.style.backgroundColor = Color{243, 243, 243};
+    openBtn.style.hoverColor = Color{226, 226, 226};
+    openBtn.onClick = [this] { openWorkspaceFolder(); };
+    Text openLabel;
+    openLabel.label = std::function<std::string()>([this]() -> std::string {
+      return workspaceRoot_.empty() ? "Open Folder..."
+                                    : editorTitleFromPath(workspaceRoot_);
+    });
+    openLabel.fontSize = 13;
+    openLabel.color = Color{40, 40, 40};
+    openBtn.addChild(openLabel);
+    pane.addChild(std::move(openBtn));
+
+    // Keyed the same way the tab strip is: navigating into a folder
+    // changes the key list, and only the rows that actually differ get
+    // built. Scrolls on its own so a big directory doesn't stretch the
+    // panel past the window.
+    View list;
+    list.style.direction = FlexDirection::Column;
+    list.style.width = Size::full();
+    list.style.flexGrow = 1;
+    list.style.backgroundColor = Color{243, 243, 243};
+    list.style.overflowY = Overflow::Auto;
+    list.keysSource = [this] { return explorerKeys(); };
+    list.itemBuilder = [this](const std::string &key) {
+      return buildExplorerRow(key);
+    };
+    pane.addChild(std::move(list));
+    return pane;
+  }
+
+  // Placeholder for now — the per-document Ctrl+F overlay in
+  // liteui_editor_ext.hpp is still where searching actually happens.
+  View buildSearchPane() {
+    auto act = activityIndex_;
+
+    View pane;
+    pane.style.direction = FlexDirection::Column;
+    pane.style.width = Size::full();
+    pane.style.flexGrow = 1;
+    pane.style.padding = EdgeInsets{4, 12, 4, 12};
+    pane.style.backgroundColor = Color{243, 243, 243};
+    pane.style.display = [act]() -> Display {
+      return *act == 1 ? Display::Flex : Display::None;
+    };
+
+    Text hint;
+    hint.label = std::string("Press Ctrl+F in the editor to search the "
+                             "current file.");
+    hint.style.width = Size::full();
+    hint.fontSize = 12;
+    hint.color = Color{110, 110, 110};
+    pane.addChild(hint);
+    return pane;
+  }
+
+  // The expanding half of the sidebar. Hidden entirely (Display::None, so
+  // it reserves no space) while no activity item is selected.
+  View buildSidePanel() {
+    auto act = activityIndex_;
+
+    View panel;
+    panel.style.direction = FlexDirection::Column;
+    panel.style.width = Size::pixel(240);
+    panel.style.height = Size::full();
+    panel.style.backgroundColor = Color{243, 243, 243};
+    panel.style.padding = EdgeInsets{8, 0, 8, 0};
+    panel.style.gap = 2;
+
+    panel.style.display = [act]() -> Display {
+      return *act >= 0 ? Display::Flex : Display::None;
+    };
+
+    Text header;
+    header.label = std::function<std::string()>(
+        [act]() -> std::string { return *act == 1 ? "SEARCH" : "EXPLORER"; });
+    header.style.padding = EdgeInsets{10, 12, 6, 12};
+    header.style.width = Size::full();
+    header.fontSize = 11;
+    header.color = Color{110, 110, 110};
+    panel.addChild(header);
+
+    panel.addChild(buildExplorerPane());
+    panel.addChild(buildSearchPane());
+    return panel;
+  }
+
+  // ---- activity bar: always visible, one row per sidebar view. Text
+  // labels rather than icons for now, so the column is wide enough to
+  // read them. Clicking the selected item again collapses the panel,
+  // matching VS Code.
+  View buildActivityBar() {
+    auto act = activityIndex_;
+
+    View bar;
+    bar.style.direction = FlexDirection::Column;
+    bar.style.width = Size::pixel(44);
+    bar.style.flexShrink = 0;
+    bar.style.height = Size::full();
+    bar.style.backgroundColor = Color{55, 55, 60};
+    bar.style.padding = EdgeInsets{8, 0, 8, 0};
+    bar.style.gap = 2;
+
+    auto addItem = [&](const std::string &title, int idx) {
+      View item;
+      item.style.width = Size::full();
+      item.style.height = Size::pixel(36);
+      item.style.justifyContent = Justify::Center;
+      item.style.alignItems = Align::Center;
+      item.style.hoverColor = Color{75, 75, 80};
+      item.style.backgroundColor = [act, idx]() -> Color {
+        return *act == idx ? Color{40, 40, 45} : Color{55, 55, 60};
+      };
+      item.tooltip = title;
+      item.onClick = [act, idx] { *act = (*act == idx) ? -1 : idx; };
+
+      Text label;
+      label.label = title;
+      label.fontSize = 12;
+      label.color = [act, idx]() -> Color {
+        return *act == idx ? Color{255, 255, 255} : Color{185, 185, 190};
+      };
+      item.addChild(label);
+      bar.addChild(std::move(item));
+    };
+
+    addItem("E", 0);
+    addItem("S", 1);
+    return bar;
   }
 
   // ---- status bar ----
@@ -485,7 +722,8 @@ private:
                        }},
                       {"Open Folder...",
                        [this] {
-
+                         openWorkspaceFolder();
+                         *activityIndex_ = 0; // reveal the Explorer
                        }},
                       {"Save", [this] { saveActive(false); }},
                       {"Save As...", [this] { saveActive(true); }},
@@ -709,6 +947,10 @@ private:
     mainArea.style.direction = FlexDirection::Row;
     mainArea.style.width = Size::full();
     mainArea.style.flexGrow = 1;
+
+    mainArea.addChild(buildActivityBar());
+
+    mainArea.addChild(buildSidePanel());
 
     View editorArea;
     editorArea.style.direction = FlexDirection::Column;
