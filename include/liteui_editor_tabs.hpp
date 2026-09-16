@@ -187,17 +187,25 @@ public:
       : ui_(width, height, windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
     newDocument();
-    rebuild();
+    buildRoot(); // built once; tab strip + editor stack reconcile themselves
+    setupShortcuts();
   }
 
-  void run() { ui_.run(); }
+  // One poll before the loop starts, so any openFile()/newDocument() the
+  // caller made between construction and run() is reconciled into the tree
+  // before the first paint. Once the loop is running, LiteUI's own
+  // pollAndRelayout() (after every dispatched event) handles it. Safe here
+  // precisely because it is NOT inside a handler — see closeTab().
+  void run() {
+    ui_.requestRepaint();
+    ui_.run();
+  }
 
   // Opens a file into a new tab, or focuses it if it's already open.
   void openFile(const std::string &path) {
     for (size_t i = 0; i < docs_.size(); ++i) {
       if (!docs_[i].closed && docs_[i].hasPath && docs_[i].path == path) {
         *activeIndex_ = static_cast<int>(i);
-        rebuild();
         return;
       }
     }
@@ -217,7 +225,6 @@ public:
 
     docs_.push_back(std::move(doc));
     *activeIndex_ = static_cast<int>(docs_.size()) - 1;
-    rebuild();
   }
 
   void newDocument() {
@@ -225,7 +232,6 @@ public:
     doc.title = "untitled-" + std::to_string(++untitledCounter_);
     docs_.push_back(std::move(doc));
     *activeIndex_ = static_cast<int>(docs_.size()) - 1;
-    rebuild();
   }
 
   // forcePickPath=true implements Save As.
@@ -249,14 +255,25 @@ public:
     std::ofstream out(doc->path, std::ios::binary);
     out << joinLines(doc->state->lines);
     *doc->modified = false;
-    rebuild(); // tab label's modified-dot needs to disappear
+    // The tab label is a Dynamic<std::string> reading docs_[idx] live (see
+    // buildTab), so the modified-dot and any Save-As title change appear on
+    // the next poll with no tree rebuild.
   }
 
   void closeTab(size_t i) {
     if (i >= docs_.size() || docs_[i].closed)
       return;
     docs_[i].closed = true;
-    // TODO prompt to save if *docs_[i].modified before closing.
+   // TODO prompt to save if *docs_[i].modified before closing.
+    // The editor View for this doc is about to be dropped by
+    // reconcileChildren(), which frees it without going through onBlur —
+    // so its caret-blink interval would otherwise tick forever against a
+    // state nothing renders.
+    if (docs_[i].state->blinkTimerHandle >= 0) {
+      ui_.removeInterval(docs_[i].state->blinkTimerHandle);
+      docs_[i].state->blinkTimerHandle = -1;
+    }
+    docs_[i].state->focused = false;
 
     if (static_cast<int>(i) == *activeIndex_) {
       int next = -1;
@@ -275,9 +292,7 @@ public:
     }
     if (std::all_of(docs_.begin(), docs_.end(),
                     [](const EditorDocument &d) { return d.closed; }))
-      newDocument(); // newDocument() already calls rebuild()
-    else
-      rebuild();
+      newDocument();
   }
 
   // ---- introspection (status bar, tests, etc.) ----
@@ -311,7 +326,6 @@ public:
     size_t n = open.size();
     pos = (pos + static_cast<size_t>(direction) + n) % n;
     *activeIndex_ = static_cast<int>(open[pos]);
-    rebuild();
   }
 
 private:
@@ -586,11 +600,105 @@ private:
     return bar;
   }
 
-  // Rebuilds the entire tree from docs_/activeIndex_/fileTree_ and hands
-  // it to LiteUI::setRoot(). See the file header for why a full rebuild
-  // (rather than an in-place tree edit) is the right tool for structural
-  // changes here.
-  void rebuild() {
+  // A document's identity for keyed reconciliation. docs_ is append-only
+  // (closing soft-deletes — see EditorDocument::closed), so a document's
+  // index never changes for its whole lifetime, which is exactly the
+  // stability a key needs. Closed documents are simply absent from the
+  // list, and reconcileChildren() frees their rows.
+  std::vector<std::string> documentKeys() const {
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < docs_.size(); ++i)
+      if (!docs_[i].closed)
+        keys.push_back(std::to_string(i));
+    return keys;
+  }
+  static size_t keyToIndex(const std::string &key) {
+    return static_cast<size_t>(std::stoul(key));
+  }
+
+  // One tab in the strip. Built once per document, when its key first
+  // appears; everything that can change afterwards (title, modified dot,
+  // active background) is a Dynamic<> reading docs_/activeIndex_ live.
+  View buildTab(size_t idx) {
+    auto activeIndexPtr = activeIndex_;
+
+    View tab;
+    tab.style.direction = FlexDirection::Row;
+    tab.style.alignItems = Align::Center;
+    tab.style.padding = EdgeInsets{6, 10, 6, 10};
+    tab.style.gap = 8;
+    tab.style.height = Size::full();
+    tab.style.backgroundColor = [activeIndexPtr, idx]() -> Color {
+      return *activeIndexPtr == static_cast<int>(idx) ? Color{255, 255, 255}
+                                                      : Color{225, 225, 225};
+    };
+    tab.style.hoverColor = Color{240, 240, 240};
+    tab.onClick = [activeIndexPtr, idx] {
+      *activeIndexPtr = static_cast<int>(idx);
+    };
+
+    Text label;
+    // Reads docs_[idx] on every poll rather than capturing the title by
+    // value: Save As renames a document in place, and without a rebuild
+    // there is nothing else left to refresh the label.
+    label.label = std::function<std::string()>([this, idx]() -> std::string {
+      if (idx >= docs_.size())
+        return std::string();
+      const EditorDocument &d = docs_[idx];
+      return d.title + (*d.modified ? " *" : "");
+    });
+    label.fontSize = 13;
+    label.color = Color{60, 60, 60};
+    tab.addChild(label);
+
+    View closeBtn;
+    closeBtn.style.width = Size::pixel(16);
+    closeBtn.style.height = Size::pixel(16);
+    closeBtn.style.justifyContent = Justify::Center;
+    closeBtn.style.alignItems = Align::Center;
+    closeBtn.style.borderRadius = 3.0f;
+    closeBtn.style.hoverColor = Color{210, 210, 210};
+    closeBtn.style.backgroundColor = Color{0, 0, 0, 0};
+    closeBtn.onClick = [this, idx] { closeTab(idx); };
+    Text closeLabel;
+    closeLabel.label = std::string("x");
+    closeLabel.fontSize = 12;
+    closeLabel.color = Color{110, 110, 110};
+    closeBtn.addChild(closeLabel);
+    tab.addChild(closeBtn);
+    return tab;
+  }
+
+  // One document's CodeEditor. Hidden rather than destroyed when inactive,
+  // same as before — switching tabs only flips this Dynamic<Display>, so
+  // the keyed list never reconciles on a tab switch at all.
+  View buildEditor(size_t idx) {
+    auto activeIndexPtr = activeIndex_;
+    EditorDocument &doc = docs_[idx];
+
+    CodeEditor ed;
+    ed.style.flexGrow = 1;
+    ed.style.display = [activeIndexPtr, idx]() -> Display {
+      return *activeIndexPtr == static_cast<int>(idx) ? Display::Flex
+                                                      : Display::None;
+    };
+    ed.style.backgroundColor = Color{255, 255, 255};
+    ed.showLineNumbers = true;
+    ed.fontFamily = "Monospace";
+    ed.resetStateFromText = false; // reuse doc.state as-is
+    ed.state = doc.state;
+    std::shared_ptr<bool> modifiedFlag = doc.modified;
+    ed.onChange = [modifiedFlag](const std::string &) { *modifiedFlag = true; };
+    applyHighlighting(ed, doc.highlighter);
+    return toCodeEditorView(std::move(ed));
+  }
+
+  // Builds the tree once. The tab strip and the editor stack are keyed
+  // containers: their children come from keysSource/itemBuilder, and
+  // LiteUI's checkForUpdates() reconciles them after every dispatched
+  // event. Opening or closing a document costs one build, not a
+  // re-rasterization of every tab and every editor in the window.
+  void buildRoot() {
     View root;
     root.style.direction = FlexDirection::Column;
     root.style.width = Size::full();
@@ -617,58 +725,20 @@ private:
     tabBar.style.overflowX = Overflow::Auto;
     tabBar.style.gap = 2;
 
-    auto activeIndexPtr = activeIndex_;
-    for (size_t i = 0; i < docs_.size(); ++i) {
-      if (docs_[i].closed)
-        continue;
-      EditorDocument &doc = docs_[i];
-
-      View tab;
-      tab.style.direction = FlexDirection::Row;
-      tab.style.alignItems = Align::Center;
-      tab.style.padding = EdgeInsets{6, 10, 6, 10};
-      tab.style.gap = 8;
-      tab.style.height = Size::full();
-      size_t idx = i; // by-value capture below, deliberately shadowing loop var
-      tab.style.backgroundColor = [activeIndexPtr, idx]() -> Color {
-        return *activeIndexPtr == static_cast<int>(idx) ? Color{255, 255, 255}
-                                                        : Color{225, 225, 225};
-      };
-      tab.style.hoverColor = Color{240, 240, 240};
-      tab.onClick = [this, idx] {
-        *activeIndex_ = static_cast<int>(idx);
-        rebuild();
-      };
-
-      Text label;
-      std::string title = doc.title;
-      std::shared_ptr<bool> modifiedFlag = doc.modified;
-      label.label = [title, modifiedFlag] {
-        return title + (*modifiedFlag ? " *" : "");
-      };
-      label.fontSize = 13;
-      label.color = Color{60, 60, 60};
-      tab.addChild(label);
-
-      View closeBtn;
-      closeBtn.style.width = Size::pixel(16);
-      closeBtn.style.height = Size::pixel(16);
-      closeBtn.style.justifyContent = Justify::Center;
-      closeBtn.style.alignItems = Align::Center;
-      closeBtn.style.borderRadius = 3.0f;
-      closeBtn.style.hoverColor = Color{210, 210, 210};
-      closeBtn.style.backgroundColor = Color{0, 0, 0, 0};
-      closeBtn.onClick = [this, idx] { closeTab(idx); };
-      Text closeLabel;
-      closeLabel.label = std::string("x");
-      closeLabel.fontSize = 12;
-      closeLabel.color = Color{110, 110, 110};
-      closeBtn.addChild(closeLabel);
-      tab.addChild(closeBtn);
-
-      tabBar.addChild(tab);
-    }
-
+    // The keyed tabs live in their own container rather than directly in
+    // tabBar: reconcileChildren() replaces a node's children wholesale, so
+    // a keyed container can't also hold fixed siblings like the "+" button.
+    View tabList;
+    tabList.style.direction = FlexDirection::Row;
+    tabList.style.alignItems = Align::Center;
+    tabList.style.height = Size::full();
+    tabList.style.gap = 2;
+    tabList.style.backgroundColor = Color{225, 225, 225};
+    tabList.keysSource = [this] { return documentKeys(); };
+    tabList.itemBuilder = [this](const std::string &key) {
+      return buildTab(keyToIndex(key));
+    };
+    tabBar.addChild(std::move(tabList));
     View newTabBtn;
     newTabBtn.style.width = Size::pixel(28);
     newTabBtn.style.height = Size::full();
@@ -686,39 +756,16 @@ private:
 
     editorArea.addChild(tabBar);
 
-    // ---- editor stack: every open document's CodeEditor, all but the
-    // active one hidden via Display::None so switching tabs never touches
-    // the tree shape (just the Dynamic<Display> below, which liteui's own
-    // checkForUpdates()/relayout() picks up on the next dispatch cycle) ----
+    // ---- editor stack: one CodeEditor per open document, keyed the same
+    // way as the tabs, all but the active one hidden via Display::None ----
     View stack;
     stack.style.width = Size::full();
     stack.style.flexGrow = 1;
 
-    for (size_t i = 0; i < docs_.size(); ++i) {
-      if (docs_[i].closed)
-        continue;
-      EditorDocument &doc = docs_[i];
-      size_t idx = i;
-
-      CodeEditor ed;
-      ed.style.flexGrow = 1;
-      ed.style.display = [activeIndexPtr, idx]() -> Display {
-        return *activeIndexPtr == static_cast<int>(idx) ? Display::Flex
-                                                        : Display::None;
-      };
-      ed.style.backgroundColor = Color{255, 255, 255};
-      ed.showLineNumbers = true;
-      ed.fontFamily = "Monospace";
-      ed.resetStateFromText = false; // reuse doc.state as-is
-      ed.state = doc.state;
-      std::shared_ptr<bool> modifiedFlag = doc.modified;
-      ed.onChange = [modifiedFlag](const std::string &) {
-        *modifiedFlag = true;
-      };
-      applyHighlighting(ed, doc.highlighter);
-
-      stack.addChild(toCodeEditorView(std::move(ed)));
-    }
+    stack.keysSource = [this] { return documentKeys(); };
+    stack.itemBuilder = [this](const std::string &key) {
+      return buildEditor(keyToIndex(key));
+    };
     editorArea.addChild(stack);
 
     editorArea.addChild(buildStatusBar());
@@ -727,7 +774,6 @@ private:
     root.addChild(mainArea);
 
     ui_.setRoot(std::move(root));
-    setupShortcuts();
   }
 
   bool shortcutsInstalled_ = false;
