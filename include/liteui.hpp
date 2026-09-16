@@ -2908,6 +2908,23 @@ public:
   Style style;
   std::vector<View> children;
 
+  // Identity within a keyed sibling list. Set automatically by
+  // reconcileChildren from the key that built this node; empty means
+  // "not keyed" — such a child is never matched across a rebuild.
+  std::string key;
+
+  // Keyed children. Instead of filling `children` up front, a view can
+  // declare which keys it should hold and how to build one child per key.
+  // checkForUpdates() polls keysSource after every dispatched event; when
+  // the list differs from what's currently built, reconcileChildren()
+  // matches old children to new keys by `key` and moves survivors over
+  // untouched — cached text texture/layout, canvas surface, scroll offset
+  // and hover state included — so adding or removing one row costs one
+  // build, not a re-rasterization of the whole list.
+  std::function<std::vector<std::string>()> keysSource;
+  std::function<View(const std::string &key)> itemBuilder;
+
+
   // True for a View created via addChild(Text) — a text leaf. isText
   // implies children.empty() always; text/textStyle are meaningless
   // otherwise.
@@ -3066,6 +3083,9 @@ public:
     mutable Color resolvedTextColor{0, 0, 0};
     mutable EdgeInsets resolvedMargin;
     mutable EdgeInsets resolvedPadding;
+    // Key list the current `children` were built for; compared against
+    // keysSource each poll to decide whether to reconcile at all.
+    mutable std::vector<std::string> resolvedKeys;
 
     // Cached platform text backing for isText nodes, rebuilt by the
     // renderer whenever the width it was built for goes stale (a resize
@@ -6229,8 +6249,21 @@ private:
   // after a click is dispatched, since the handler may have mutated the
   // plain variables these sources read from. Returns whether anything
   // changed, so the caller knows whether to relayout/repaint.
-  static bool checkForUpdates(View &v) {
+  bool checkForUpdates(View &v) {
     bool changed = false;
+
+    if (v.keysSource) {
+      std::vector<std::string> keys = v.keysSource();
+      if (keys != v.computed.resolvedKeys) {
+        v.computed.resolvedKeys = keys;
+        if (reconcileChildren(v, keys)) {
+          v.computed.dirty = true;
+          changed = true;
+          structureChanged_ = true;
+        }
+      }
+    }
+
 
     if (auto *fn = std::get_if<std::function<std::string()>>(&v.text)) {
       std::string next = (*fn)();
@@ -6396,6 +6429,84 @@ private:
     return changed;
   }
 
+  // Rebuilds v.children to match `keys`, reusing any existing child whose
+  // `key` matches. Survivors are std::move'd, so their computed cache
+  // carries over; only genuinely new keys are built, and only dropped
+  // children are freed. Returns whether anything actually changed.
+  //
+  // Moved-from entries in `old` keep dangling copies of the survivor's
+  // handles (GL textures, IDWriteTextLayout, cairo surfaces), which is
+  // harmless precisely because View frees nothing in a destructor (see
+  // View::freeTextResources) — we only free the entries we did NOT move
+  // out of.
+  //
+  // Matching is O(new * old). Fine for the list sizes a scroll container
+  // realistically holds; swap in a key->index map if that stops being true.
+  static bool reconcileChildren(View &v, const std::vector<std::string> &keys) {
+    if (!v.itemBuilder)
+      return false;
+    std::vector<View> old = std::move(v.children);
+    v.children.clear();
+    v.children.reserve(keys.size());
+    std::vector<bool> reused(old.size(), false);
+    bool changed = old.size() != keys.size();
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+      size_t match = old.size();
+      for (size_t j = 0; j < old.size(); ++j)
+        if (!reused[j] && old[j].key == keys[i]) {
+          match = j;
+          break;
+        }
+      if (match < old.size()) {
+        reused[match] = true;
+        if (match != i)
+          changed = true; // same node, new position — still needs relayout
+        v.children.push_back(std::move(old[match]));
+      } else {
+        View built = v.itemBuilder(keys[i]);
+        built.key = keys[i];
+        v.children.push_back(std::move(built));
+        changed = true;
+      }
+    }
+    for (size_t j = 0; j < old.size(); ++j)
+      if (!reused[j]) {
+        old[j].freeTextResources();
+        changed = true;
+      }
+    return changed;
+  }
+
+  // Every raw View* we hold points into a children vector that a reconcile
+  // may have just reallocated — or at a row that no longer exists. Drop
+  // them all rather than risk resolving a dangling one on the next
+  // release/motion/key event. focusedView_ is nulled directly rather than
+  // via setFocus(nullptr): the old target may already be freed, so firing
+  // its onBlur would be a use-after-free.
+  void invalidateViewPointers() {
+    for (int i = 0; i < 3; ++i) {
+      pressedView_[i] = nullptr;
+      dragView_[i] = nullptr;
+    }
+    scrollDrag_ = {};
+    focusedView_ = nullptr;
+    hideTooltip(); // clears tooltipTarget_ and cancels its timer
+  }
+
+  // The one place that polls dynamic sources and applies the result.
+  bool pollAndRelayout() {
+    if (!hasRoot_)
+      return false;
+    structureChanged_ = false;
+    if (!checkForUpdates(root_))
+      return false;
+    if (structureChanged_)
+      invalidateViewPointers();
+    relayout();
+    return true;
+  }
+
   // Updates v's (and its descendants') isHovered flag based on (x, y),
   // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
   // view is never marked hovered. Returns whether any flag actually
@@ -6466,8 +6577,7 @@ private:
       if (v->onScrollDown)
         v->onScrollDown();
     }
-    if (checkForUpdates(root_))
-      relayout();
+    pollAndRelayout();
     return true;
   }
 
@@ -6486,6 +6596,11 @@ private:
   // drag can be tracked independently. Cleared on release/capture-loss
   // the same way pressedView_ is. Also indexed by MouseButton.
   View *dragView_[3] = {nullptr, nullptr, nullptr};
+
+  // Set by checkForUpdates whenever reconcileChildren actually rebuilt a
+  // child list; consumed (and cleared) by pollAndRelayout above.
+  bool structureChanged_ = false;
+
 
   static int btnIdx(MouseButton b) { return static_cast<int>(b); }
 
@@ -6610,15 +6725,13 @@ private:
       if (sc.key == e.key && sc.mods == e.mods) {
         if (sc.fn)
           sc.fn();
-        if (hasRoot_ && checkForUpdates(root_))
-          relayout();
+        pollAndRelayout();
         return true;
       }
     }
     if (focusedView_ && focusedView_->onKeyDown) {
       focusedView_->onKeyDown(e);
-      if (hasRoot_ && checkForUpdates(root_))
-        relayout();
+      pollAndRelayout();
       return true;
     }
     return false;
@@ -6627,8 +6740,7 @@ private:
   bool dispatchKeyUp(KeyEvent e) {
     if (focusedView_ && focusedView_->onKeyUp) {
       focusedView_->onKeyUp(e);
-      if (hasRoot_ && checkForUpdates(root_))
-        relayout();
+      pollAndRelayout();
       return true;
     }
     return false;
@@ -6637,8 +6749,7 @@ private:
   bool dispatchTextInput(uint32_t codepoint) {
     if (focusedView_ && focusedView_->onTextInput) {
       focusedView_->onTextInput(codepoint);
-      if (hasRoot_ && checkForUpdates(root_))
-        relayout();
+      pollAndRelayout();
       return true;
     }
     return false;
@@ -6649,11 +6760,25 @@ private:
   void beginPress(float x, float y, MouseButton btn = MouseButton::Left) {
     int i = btnIdx(btn);
     View *hit = hitTest(x, y, btn);
+
+    pressedView_[i] = hit;
+
+    // Decide the drag target and the local coordinates BEFORE invoking any
+    // handler below: onPressAt may mutate app state a keysSource-tracked
+    // list depends on, and once pollAndRelayout() reconciles that list at
+    // the end of this function, `hit` can dangle.
+    bool hasDrag =
+        hit && (btn == MouseButton::Left     ? (bool)hit->onDragTo
+                : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
+                                             : (bool)hit->onRightDragTo);
+    dragView_[i] = hasDrag ? hit : nullptr;
+    float lx = hit ? x - hit->computed.x : 0.0f;
+    float ly = hit ? y - hit->computed.y : 0.0f;
+
     if (btn == MouseButton::Left)
       setFocus((hit && hit->focusable) ? hit : nullptr);
-    pressedView_[i] = hit;
     if (hit) {
-      float lx = x - hit->computed.x, ly = y - hit->computed.y;
+      
       switch (btn) {
       case MouseButton::Left:
         if (hit->onPressAt)
@@ -6669,11 +6794,10 @@ private:
         break;
       }
     }
-    bool hasDrag =
-        hit && (btn == MouseButton::Left     ? (bool)hit->onDragTo
-                : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
-                                             : (bool)hit->onRightDragTo);
-    dragView_[i] = hasDrag ? hit : nullptr;
+    // Reconcile immediately, so a keyed-list mutation the handler just made
+    // nulls pressedView_/dragView_ (via structureChanged_) before the next
+    // motion/release event can dereference a pointer into a freed row.
+    pollAndRelayout();
   }
 
   // Call on every pointer-motion event while a button is held. Advances
@@ -6699,13 +6823,7 @@ private:
       v->onRightDragTo(lx, ly);
       break;
     }
-    if (!hasRoot_)
-      return false;
-    if (checkForUpdates(root_)) {
-      relayout();
-      return true;
-    }
-    return false;
+return pollAndRelayout();
   }
 
   // Advances any of the three buttons' drags at once — motion events
@@ -6730,13 +6848,7 @@ private:
       dispatchClick(released, btn);
     pressedView_[i] = nullptr;
     dragView_[i] = nullptr;
-    if (!hasRoot_)
-      return false;
-    if (checkForUpdates(root_)) {
-      relayout();
-      return true;
-    }
-    return false;
+return pollAndRelayout();
   }
 
 // Windows-only member/method block.
@@ -7094,8 +7206,7 @@ private:
               D2D1::SizeU(static_cast<UINT32>(self->width_),
                           static_cast<UINT32>(self->height_)));
         self->relayout();
-        if (self->hasRoot_ && self->checkForUpdates(self->root_))
-          self->relayout();
+        self->pollAndRelayout();
         self->hideTooltip();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
@@ -8136,8 +8247,7 @@ private:
       wl_egl_window_resize(eglWindow_, width_, height_, 0, 0);
     relayout();
 
-    if (hasRoot_ && checkForUpdates(root_))
-      relayout();
+    pollAndRelayout();
     hideTooltip();
     if (eglReady_)
       redraw();
@@ -9632,8 +9742,7 @@ inline View View::toView(Svg s) {
 }
 
 inline void LiteUI::requestRepaint() {
-  if (checkForUpdates(root_))
-    relayout();
+   pollAndRelayout();
 #if defined(_WIN32)
   if (hwnd_)
     InvalidateRect(hwnd_, nullptr, FALSE);
