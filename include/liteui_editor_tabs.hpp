@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -135,6 +136,12 @@ struct EditorDocument {
   // those indices out from under a callback that's still running: rebuild()
   // simply skips closed documents rather than shrinking the vector.
   bool closed = false;
+
+  // True for the VS-Code-style landing tab (see TabbedEditor::
+  // newWelcomeTab()). Such a document has no real buffer or backing
+  // file — buildEditor() renders it via buildWelcomePane() instead of a
+  // CodeEditor, and saveActive()/the status bar skip it accordingly.
+  bool isWelcome = false;
   std::shared_ptr<CodeEditorState> state = std::make_shared<CodeEditorState>();
   std::shared_ptr<bool> modified = std::make_shared<bool>(false);
   // Always non-null (even for a plain-text/unknown extension, where it
@@ -186,7 +193,7 @@ public:
                const std::string &windowTitle = "liteui code editor")
       : ui_(width, height, windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
-    newDocument();
+    newWelcomeTab();
     buildRoot(); // built once; tab strip + editor stack reconcile themselves
     setupShortcuts();
   }
@@ -234,10 +241,23 @@ public:
     *activeIndex_ = static_cast<int>(docs_.size()) - 1;
   }
 
+  // A VS-Code-style landing tab shown on first launch (and again if every
+  // other tab gets closed — see closeTab()'s all-closed fallback below):
+  // no backing file, just Open File / Open Folder / New File shortcuts.
+  // Rendered by buildWelcomePane() rather than a CodeEditor — see
+  // buildEditor()'s isWelcome branch.
+  void newWelcomeTab() {
+    EditorDocument doc;
+    doc.title = "Welcome";
+    doc.isWelcome = true;
+    docs_.push_back(std::move(doc));
+    *activeIndex_ = static_cast<int>(docs_.size()) - 1;
+  }
+
   // forcePickPath=true implements Save As.
   void saveActive(bool forcePickPath = false) {
     EditorDocument *doc = activeDoc();
-    if (!doc)
+    if (!doc || doc->isWelcome)
       return;
     if (!doc->hasPath || forcePickPath) {
       auto picked =
@@ -292,7 +312,7 @@ public:
     }
     if (std::all_of(docs_.begin(), docs_.end(),
                     [](const EditorDocument &d) { return d.closed; }))
-      newDocument();
+      newWelcomeTab();
   }
 
   // ---- introspection (status bar, tests, etc.) ----
@@ -392,6 +412,53 @@ private:
   // already used this way by loadFileTreeChildren's own callers).
   std::string workspaceRoot_;
   std::optional<FileTreeNode> explorerRoot_;
+  // Currently selected explorer item (a full path — either a file or a
+  // folder). Defaults to the workspace root itself once one is opened,
+  // matching VS Code's "root is selected until you click something
+  // else" behavior. New File/New Folder target this (see
+  // selectedDirectory()) and buildExplorerRow()/buildExplorerHeaderRow()
+  // use it to paint the selection highlight.
+  std::string selectedPath_;
+
+  // Inline create-new-item state: while active, the explorer shows a
+  // TextInput row (see buildPendingCreateRow) inside parentDir instead of
+  // immediately creating a file/folder with a placeholder name. Enter
+  // submits (see submitPendingCreate); clicking anywhere else discards it
+  // (see checkPendingCreateBlur/cancelPendingCreate).
+  struct PendingCreate {
+    bool active = false;
+    bool isDir = false;
+    std::string parentDir;
+  };
+  PendingCreate pendingCreate_;
+  // Whether the input has ever actually received focus since it was
+  // created. Clicking N/F doesn't itself focus the new TextInput (liteui
+  // has no public API to force keyboard focus — see beginPendingCreate),
+  // so the very first "not focused" poll after creation must NOT be
+  // read as a blur, or the row would vanish before anyone could click it.
+  bool pendingCreateEverFocused_ = false;
+  // Rebuilt fresh every time a creation starts or ends (see
+  // resetPendingCreate), so a stale blinking caret or leftover typed text
+  // from a previously discarded input can never bleed into the next one.
+  std::shared_ptr<TextInputState> pendingInputState_ =
+      std::make_shared<TextInputState>();
+  // Sentinel key spliced into explorerKeys() while a creation is active;
+  // chosen so it can never collide with a real filesystem path.
+  static constexpr const char *kPendingCreateKey =
+      "\x01__liteui_pending_create__";
+
+  // Delete-confirmation dialog state. deleteDialogOpen_ is a shared_ptr
+  // for the same reason activeIndex_/activityIndex_ are — the dialog's
+  // own Dynamic<Display>/onClick closures need to read it live across
+  // rebuilds. deleteTargetPath_/deleteTargetIsDir_ are captured once,
+  // when the dialog opens, so the confirm/cancel buttons always act on
+  // whatever was selected at that moment rather than whatever
+  // selectedPath_ has drifted to since (which can't actually change
+  // while the modal backdrop is up, but this keeps the two concerns
+  // separate regardless).
+  std::shared_ptr<bool> deleteDialogOpen_ = std::make_shared<bool>(false);
+  std::string deleteTargetPath_;
+  bool deleteTargetIsDir_ = false;
 
   void setWorkspaceRoot(const std::string &p) {
     if (p.empty())
@@ -404,12 +471,264 @@ private:
     root.expanded = true; // VS Code opens a freshly-added folder expanded
     loadFileTreeChildren(root);
     explorerRoot_ = std::move(root);
+    selectedPath_ = p; // root selected by default
   }
 
   void openWorkspaceFolder() {
     auto picked = openWorkspaceFolderDialog("Open Folder");
     if (picked)
       setWorkspaceRoot(*picked);
+  }
+
+  // Directory New File/New Folder should target: the selected folder
+  // itself, or the parent directory of the selected file — falling back
+  // to the workspace root when nothing is selected. This is what makes
+  // "select a folder, hit N" create inside that folder rather than
+  // always at the root, matching VS Code.
+  std::string selectedDirectory() {
+    if (selectedPath_.empty())
+      return workspaceRoot_;
+    int depth = 0;
+    FileTreeNode *node = findExplorerNode(selectedPath_, depth);
+    if (!node)
+      return workspaceRoot_;
+    if (node->isDir)
+      return node->fullPath;
+    return std::filesystem::path(node->fullPath).parent_path().string();
+  }
+
+  static std::string trimWhitespace(const std::string &s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+      return std::string();
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+  }
+
+  // Row's displayed indent depth for a given full path — same "shift by
+  // one to hide the root row" adjustment buildExplorerRow already does,
+  // factored out so the pending-create row can indent one level deeper
+  // than whatever folder it's being created in.
+  int explorerDepthForPath(const std::string &path) {
+    if (path == workspaceRoot_)
+      return -1; // so a direct child of the root lands at depth 0
+    int depth = 0;
+    FileTreeNode *node = findExplorerNode(path, depth);
+    if (!node)
+      return -1;
+    return std::max(0, depth - 1);
+  }
+
+  // Stops the input's blink timer (if it ever started — mirrors the same
+  // leak-guard closeTab() already applies to a closed CodeEditorState)
+  // and clears all pending-create state, discarding whatever was typed.
+  void resetPendingCreate() {
+    if (pendingInputState_->blinkTimerHandle >= 0) {
+      ui_.removeInterval(pendingInputState_->blinkTimerHandle);
+      pendingInputState_->blinkTimerHandle = -1;
+    }
+    pendingInputState_->focused = false;
+    pendingCreate_.active = false;
+    pendingCreate_.isDir = false;
+    pendingCreate_.parentDir.clear();
+    pendingCreateEverFocused_ = false;
+    pendingInputState_ = std::make_shared<TextInputState>();
+  }
+
+  void cancelPendingCreate() { resetPendingCreate(); }
+
+  // Enter handler: trims the typed name and, if anything's left, creates
+  // the file/folder; a trimmed-empty name is treated as a no-op rather
+  // than an error. Either way the input closes.
+  void submitPendingCreate(const std::string &rawText) {
+    if (!pendingCreate_.active)
+      return;
+    std::string name = trimWhitespace(rawText);
+    bool isDir = pendingCreate_.isDir;
+    std::string dir = pendingCreate_.parentDir;
+    resetPendingCreate(); // close the input either way
+    if (name.empty())
+      return;
+
+    if (isDir) {
+      std::error_code ec;
+      std::filesystem::path newDir = std::filesystem::path(dir) / name;
+      std::filesystem::create_directory(newDir, ec);
+      explorerRefresh();
+      selectedPath_ = newDir.string();
+    } else {
+      std::string path = (std::filesystem::path(dir) / name).string();
+      std::ofstream out(path, std::ios::binary);
+      out.close();
+      explorerRefresh();
+      selectedPath_ = path;
+      openFile(path);
+    }
+  }
+
+  // Polled every dispatched event via buildPendingCreateRow's
+  // style.disabled hook — checkForUpdates() already re-evaluates every
+  // view's Dynamic<bool> disabled field after each click/key, so this
+  // rides that instead of needing its own timer. Always returns false;
+  // the row is never actually disabled, this is purely a polling hook.
+  void checkPendingCreateBlur() {
+    if (!pendingCreate_.active)
+      return;
+    if (pendingInputState_->focused) {
+      pendingCreateEverFocused_ = true;
+      return;
+    }
+    // Hasn't been clicked into yet — nothing to blur from.
+    if (pendingCreateEverFocused_)
+      cancelPendingCreate();
+  }
+
+  void beginPendingCreate(bool isDir) {
+    if (workspaceRoot_.empty())
+      return;
+    std::string dir = selectedDirectory();
+    // Auto-expand the target folder so the new input row is actually
+    // visible where it's being created — matches the old immediate-create
+    // behavior of the new item appearing in an already-open directory.
+    if (dir != workspaceRoot_) {
+      int depth = 0;
+      FileTreeNode *node = findExplorerNode(dir, depth);
+      if (node && node->isDir) {
+        if (!node->childrenLoaded)
+          loadFileTreeChildren(*node);
+        node->expanded = true;
+      }
+    }
+    resetPendingCreate(); // discard any previous unfinished creation first
+    pendingCreate_.active = true;
+    pendingCreate_.isDir = isDir;
+    pendingCreate_.parentDir = dir;
+  }
+
+  void explorerNewFile() { beginPendingCreate(false); }
+  void explorerNewFolder() { beginPendingCreate(true); }
+
+  // Whether `path` is `ancestor` itself or lives somewhere underneath it —
+  // used to find tabs open on files inside a folder that's about to be
+  // deleted, and to tell whether the current selection just got deleted.
+  static bool pathIsUnderOrEqual(const std::string &path,
+                                 const std::string &ancestor) {
+    if (path == ancestor)
+      return true;
+    std::string prefix = ancestor;
+    if (!prefix.empty() && prefix.back() != '/' && prefix.back() != '\\')
+      prefix += static_cast<char>(std::filesystem::path::preferred_separator);
+    return path.size() > prefix.size() &&
+           path.compare(0, prefix.size(), prefix) == 0;
+  }
+
+  // Closes every open tab whose backing file sits at or under `path`,
+  // before the actual filesystem delete runs — otherwise a deleted
+  // document would keep its tab open pointing at a now-missing file.
+  void closeTabsUnderPath(const std::string &path) {
+    for (size_t i = 0; i < docs_.size(); ++i)
+      if (!docs_[i].closed && docs_[i].hasPath &&
+          pathIsUnderOrEqual(docs_[i].path, path))
+        closeTab(i);
+  }
+
+  // Opens the confirmation dialog for whatever's currently selected.
+  // No-op if nothing is selected, the workspace root itself is selected
+  // (deleting the open folder from under itself isn't supported here),
+  // or the dialog is already open.
+  void beginDeleteConfirm() {
+    if (*deleteDialogOpen_ || selectedPath_.empty() ||
+        selectedPath_ == workspaceRoot_)
+      return;
+    int depth = 0;
+    FileTreeNode *node = findExplorerNode(selectedPath_, depth);
+    deleteTargetPath_ = selectedPath_;
+    deleteTargetIsDir_ = node && node->isDir;
+    *deleteDialogOpen_ = true;
+  }
+
+  void cancelDeleteConfirm() {
+    *deleteDialogOpen_ = false;
+    deleteTargetPath_.clear();
+    deleteTargetIsDir_ = false;
+  }
+
+  // Actually deletes deleteTargetPath_ (recursively, if it's a folder),
+  // closing any tabs open under it first and refreshing the tree
+  // afterward. Falls back to selecting the workspace root if the
+  // deleted path was (or contained) the current selection.
+  void confirmDelete() {
+    if (deleteTargetPath_.empty()) {
+      cancelDeleteConfirm();
+      return;
+    }
+    std::string path = deleteTargetPath_;
+    bool isDir = deleteTargetIsDir_;
+    cancelDeleteConfirm();
+
+    closeTabsUnderPath(path);
+
+    std::error_code ec;
+    if (isDir)
+      std::filesystem::remove_all(path, ec);
+    else
+      std::filesystem::remove(path, ec);
+
+    explorerRefresh();
+    if (pathIsUnderOrEqual(selectedPath_, path))
+      selectedPath_ = workspaceRoot_;
+  }
+
+  // Re-scans a directory node from disk, but only if it was already
+  // expanded/loaded — untouched (collapsed, lazy) subtrees are left alone.
+  // Expand state is carried over for children that still exist after the
+  // rescan, so refreshing doesn't visually collapse everything.
+  static void refreshNode(FileTreeNode &node) {
+    if (!node.isDir)
+      return;
+    bool wasLoaded = node.childrenLoaded;
+    bool wasExpanded = node.expanded;
+    std::vector<FileTreeNode> old = std::move(node.children);
+    node.children.clear();
+    node.childrenLoaded = false;
+    if (wasLoaded) {
+      loadFileTreeChildren(node);
+      for (auto &c : node.children)
+        for (auto &o : old)
+          if (o.isDir && c.isDir && o.fullPath == c.fullPath) {
+            c.expanded = o.expanded;
+            c.childrenLoaded = o.childrenLoaded;
+            c.children = std::move(o.children);
+            break;
+          }
+      for (auto &c : node.children)
+        if (c.isDir && c.expanded)
+          refreshNode(c);
+    }
+    node.expanded = wasExpanded;
+  }
+
+  void explorerRefresh() {
+    if (!explorerRoot_)
+      return;
+    refreshNode(*explorerRoot_);
+  }
+
+  static void collapseAllNode(FileTreeNode &node) {
+    if (!node.isDir)
+      return;
+    node.expanded = false;
+    for (auto &c : node.children)
+      collapseAllNode(c);
+  }
+
+  void explorerCollapseAll() {
+    if (!explorerRoot_)
+      return;
+    // Collapse every descendant folder; leave the workspace root itself
+    // expanded, matching VS Code's "Collapse All".
+    for (auto &c : explorerRoot_->children)
+      collapseAllNode(c);
   }
 
   // DFS by full path from explorerRoot_, reporting the match's depth
@@ -434,22 +753,33 @@ private:
     return findExplorerNodeIn(*explorerRoot_, path, 0, outDepth);
   }
 
-  // Flattens the currently-expanded part of the tree into a list of full
-  // paths, depth-first — this is the explorer's keysSource. Collapsing a
-  // folder simply removes its subtree's paths from this list on the next
-  // poll, so reconcileChildren() frees exactly those rows and nothing
-  // else; expanding one adds them back, freshly built.
-  static void collectExplorerKeys(const FileTreeNode &node,
-                                  std::vector<std::string> &out) {
+  // When a creation is pending inside a given folder, kPendingCreateKey is
+  // spliced in as that folder's first "child" key, so the input row always
+  // renders as the top item of the folder it's being created in.
+  // Root-level creations are handled the same way in explorerKeys() below,
+  // since the root itself never gets a collectExplorerKeys() call of its
+  // own.
+  void collectExplorerKeys(const FileTreeNode &node,
+                           std::vector<std::string> &out) const {
     out.push_back(node.fullPath);
-    if (node.isDir && node.expanded)
+    if (node.isDir && node.expanded) {
+      if (pendingCreate_.active && pendingCreate_.parentDir == node.fullPath)
+        out.push_back(kPendingCreateKey);
       for (const auto &c : node.children)
         collectExplorerKeys(c, out);
+    }
   }
   std::vector<std::string> explorerKeys() const {
     std::vector<std::string> keys;
-    if (explorerRoot_)
-      collectExplorerKeys(*explorerRoot_, keys);
+    if (!explorerRoot_)
+      return keys;
+    if (pendingCreate_.active && pendingCreate_.parentDir == workspaceRoot_)
+      keys.push_back(kPendingCreateKey);
+    // The root folder itself is never shown as a row — only its
+    // contents — so start recursion at its children instead of at the
+    // root node.
+    for (const auto &c : explorerRoot_->children)
+      collectExplorerKeys(c, keys);
     return keys;
   }
 
@@ -484,21 +814,38 @@ private:
   View buildExplorerRow(const std::string &key) {
     int depth = 0;
     FileTreeNode *node = findExplorerNode(key, depth);
+    // Root itself is never shown as a row (see explorerKeys), so shift
+    // every visible depth up by one to compensate — a top-level file/
+    // folder should render at indent 0, not 1.
+    depth = std::max(0, depth - 1);
     bool isDir = node && node->isDir;
     bool expanded = node && node->expanded;
     std::string name = node ? node->name : key;
     const EditorDocument *active = activeDocument();
     bool isActive = !isDir && active && active->hasPath && active->path == key;
+    bool isSelected = (key == selectedPath_);
 
     View row;
     row.style.width = Size::full();
     row.style.alignItems = Align::Center;
     row.style.padding =
         EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
-    row.style.backgroundColor =
-        isActive ? Color{213, 228, 249} : Color{243, 243, 243};
+
+    // was: computed once from isSelected/isActive captured at build time.
+    // now: recomputed on every checkForUpdates() poll, so a click that only
+    // changes selectedPath_ (with no key-list change) still repaints this row.
+    row.style.backgroundColor = [this, key, isDir]() -> Color {
+      const EditorDocument *active = activeDocument();
+      bool isActive =
+          !isDir && active && active->hasPath && active->path == key;
+      bool isSelected = (key == selectedPath_);
+      return isSelected ? Color{197, 220, 250}
+             : isActive ? Color{213, 228, 249}
+                        : Color{243, 243, 243};
+    };
     row.style.hoverColor = Color{226, 226, 226};
     row.onClick = [this, key] {
+      selectedPath_ = key;
       int d = 0;
       FileTreeNode *n = findExplorerNode(key, d);
       if (!n)
@@ -526,6 +873,119 @@ private:
     label.fontSize = 13;
     label.color = isDir ? Color{40, 40, 40} : Color{70, 70, 70};
     row.addChild(label);
+    return row;
+  }
+
+  // The inline TextInput row shown while a creation is pending — sits at
+  // whatever depth is one deeper than its parent folder's own rows.
+  View buildPendingCreateRow() {
+    bool isDir = pendingCreate_.isDir;
+    int depth = explorerDepthForPath(pendingCreate_.parentDir) + 1;
+
+    View row;
+    row.style.width = Size::full();
+    row.style.alignItems = Align::Center;
+    row.style.padding =
+        EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
+    row.style.backgroundColor = Color{243, 243, 243};
+    // Piggybacks on the generic Dynamic<bool> polling checkForUpdates()
+    // already does for every view's `disabled` field — re-evaluated
+    // after every dispatched event — purely to detect focus loss on the
+    // TextInput below. The row is never actually disabled; this always
+    // returns false.
+    row.disabled = [this]() -> bool {
+      checkPendingCreateBlur();
+      return false;
+    };
+
+    Text chevron;
+    chevron.label = std::string("   ");
+    chevron.fontSize = 11;
+    chevron.style.width = Size::pixel(14);
+    chevron.color = Color{110, 110, 110};
+    row.addChild(chevron);
+
+    TextInput input;
+    input.style.flexGrow = 1;
+    input.style.height = Size::pixel(20);
+    input.fontSize = 13;
+    input.placeholder = isDir ? "Folder name" : "File name";
+    input.textColor = Color{40, 40, 40};
+    input.borderColor = Color{170, 170, 170};
+    input.focusedBorderColor = Color{80, 140, 230};
+    input.leftPadding = 4.0f;
+    input.onSubmit = [this](const std::string &text) {
+      submitPendingCreate(text);
+    };
+    input.state = pendingInputState_;
+    row.addChild(input);
+    return row;
+  }
+
+  // Row shown just above the file tree, next to the folder name: New File
+  // (N), New Folder (F), Refresh (R), Collapse All (C). Text labels for
+  // now instead of icons. Hidden entirely until a workspace folder is open
+  // (matches openBtn's own visibility condition, just inverted).
+  View buildExplorerHeaderRow() {
+    View row;
+    row.style.direction = FlexDirection::Row;
+    row.style.alignItems = Align::Center;
+    row.style.width = Size::full();
+    row.style.padding = EdgeInsets{4, 8, 4, 12};
+    row.style.gap = 2;
+    // Highlighted the same way a selected child row is, whenever the
+    // root itself is the current selection (its default state).
+    row.style.backgroundColor = [this]() -> Color {
+      return selectedPath_ == workspaceRoot_ ? Color{197, 220, 250}
+                                             : Color{243, 243, 243};
+    };
+    row.style.hoverColor = Color{233, 233, 233};
+    row.onClick = [this] { selectedPath_ = workspaceRoot_; };
+    row.style.display = [this]() -> Display {
+      return workspaceRoot_.empty() ? Display::None : Display::Flex;
+    };
+
+    Text nameLabel;
+    nameLabel.label = std::function<std::string()>([this]() -> std::string {
+      std::string name = editorTitleFromPath(workspaceRoot_);
+      for (auto &c : name)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      return name;
+    });
+    nameLabel.fontSize = 11;
+    nameLabel.fontWeight = FontWeight::SemiBold;
+    nameLabel.color = Color{110, 110, 110};
+    nameLabel.style.flexGrow = 1;
+    row.addChild(nameLabel);
+
+    auto makeActionBtn = [](const std::string &label,
+                            const std::string &tooltip,
+                            std::function<void()> onClick) {
+      View btn;
+      btn.style.width = Size::pixel(20);
+      btn.style.height = Size::pixel(20);
+      btn.style.justifyContent = Justify::Center;
+      btn.style.alignItems = Align::Center;
+      btn.style.borderRadius = 3.0f;
+      btn.style.hoverColor = Color{222, 222, 222};
+      btn.style.backgroundColor = Color{0, 0, 0, 0};
+      btn.tooltip = tooltip;
+      btn.onClick = std::move(onClick);
+      Text t;
+      t.label = label;
+      t.fontSize = 11;
+      t.fontWeight = FontWeight::SemiBold;
+      t.color = Color{90, 90, 90};
+      btn.addChild(t);
+      return btn;
+    };
+
+    row.addChild(makeActionBtn("N", "New File", [this] { explorerNewFile(); }));
+    row.addChild(
+        makeActionBtn("F", "New Folder", [this] { explorerNewFolder(); }));
+    row.addChild(makeActionBtn("R", "Refresh", [this] { explorerRefresh(); }));
+    row.addChild(
+        makeActionBtn("C", "Collapse All", [this] { explorerCollapseAll(); }));
     return row;
   }
 
@@ -557,6 +1017,7 @@ private:
     openLabel.color = Color{40, 40, 40};
     openBtn.addChild(openLabel);
     pane.addChild(std::move(openBtn));
+    pane.addChild(buildExplorerHeaderRow());
 
     // Keyed the same way the tab strip is: navigating into a folder
     // changes the key list, and only the rows that actually differ get
@@ -570,6 +1031,8 @@ private:
     list.style.overflowY = Overflow::Auto;
     list.keysSource = [this] { return explorerKeys(); };
     list.itemBuilder = [this](const std::string &key) {
+      if (key == kPendingCreateKey)
+        return buildPendingCreateRow();
       return buildExplorerRow(key);
     };
     pane.addChild(std::move(list));
@@ -813,7 +1276,7 @@ private:
     Text posLabel;
     posLabel.label = std::function<std::string()>([this]() -> std::string {
       const EditorDocument *doc = activeDocument();
-      if (!doc)
+      if (!doc || doc->isWelcome)
         return "";
       return "Ln " + std::to_string(doc->state->cursor.line + 1) + ", Col " +
              std::to_string(doc->state->cursor.col + 1);
@@ -825,7 +1288,9 @@ private:
     Text langLabel;
     langLabel.label = std::function<std::string()>([this]() -> std::string {
       const EditorDocument *doc = activeDocument();
-      if (!doc || !doc->highlighter || !doc->highlighter->lang)
+      if (!doc || doc->isWelcome)
+        return "";
+      if (!doc->highlighter || !doc->highlighter->lang)
         return "Plain Text";
       return doc->highlighter->lang->name;
     });
@@ -1106,6 +1571,8 @@ private:
   View buildEditor(size_t idx) {
     auto activeIndexPtr = activeIndex_;
     EditorDocument &doc = docs_[idx];
+    if (doc.isWelcome)
+      return buildWelcomePane(idx);
 
     CodeEditor ed;
     ed.style.flexGrow = 1;
@@ -1122,6 +1589,169 @@ private:
     ed.onChange = [modifiedFlag](const std::string &) { *modifiedFlag = true; };
     applyHighlighting(ed, doc.highlighter);
     return toCodeEditorView(std::move(ed));
+  }
+
+  // VS-Code-style landing tab: shown in place of a blank untitled buffer
+  // (see newWelcomeTab()). Lives in the same keyed `stack` container as
+  // every CodeEditor, so it switches tabs the same way — a plain
+  // Dynamic<Display> keyed off activeIndex_, not a rebuild.
+  View buildWelcomePane(size_t idx) {
+    auto activeIndexPtr = activeIndex_;
+
+    View pane;
+    pane.style.direction = FlexDirection::Column;
+    pane.style.flexGrow = 1;
+    pane.style.backgroundColor = Color{255, 255, 255};
+    pane.style.padding = EdgeInsets::all(48.0f);
+    pane.style.gap = 4;
+    pane.style.display = [activeIndexPtr, idx]() -> Display {
+      return *activeIndexPtr == static_cast<int>(idx) ? Display::Flex
+                                                      : Display::None;
+    };
+
+    Text title;
+    title.label = std::string("liteui code editor");
+    title.fontSize = 28;
+    title.fontWeight = FontWeight::SemiBold;
+    title.color = Color{40, 40, 40};
+    pane.addChild(title);
+
+    Text subtitle;
+    subtitle.label = std::string("A lightweight editor.");
+    subtitle.fontSize = 13;
+    subtitle.color = Color{120, 120, 120};
+    subtitle.style.margin = EdgeInsets{4, 0, 24, 0};
+    pane.addChild(subtitle);
+
+    Text startHeader;
+    startHeader.label = std::string("Start");
+    startHeader.fontSize = 12;
+    startHeader.fontWeight = FontWeight::SemiBold;
+    startHeader.color = Color{110, 110, 110};
+    startHeader.style.margin = EdgeInsets{0, 0, 4, 0};
+    pane.addChild(startHeader);
+
+    auto makeLink = [](const std::string &label,
+                       std::function<void()> onClick) {
+      View row;
+      row.style.padding = EdgeInsets{4, 0, 4, 0};
+      row.style.hoverColor = Color{240, 240, 240};
+      row.onClick = std::move(onClick);
+      Text t;
+      t.label = label;
+      t.fontSize = 13;
+      t.color = Color{20, 90, 200};
+      row.addChild(t);
+      return row;
+    };
+
+    pane.addChild(makeLink("New File", [this] { newDocument(); }));
+    pane.addChild(makeLink("Open File...", [this] {
+      auto p = openFilePicker("Open File", {{"All Files", "*"}});
+      if (p)
+        openFile(*p);
+    }));
+    pane.addChild(makeLink("Open Folder...", [this] {
+      openWorkspaceFolder();
+      *activityIndex_ = kExplorerActivityId; // reveal the Explorer
+    }));
+
+    return pane;
+  }
+
+  // Delete-confirmation dialog, built the same way as a standalone
+  // confirm dialog: a dimmed, absolute, full-window backdrop that
+  // centers dialogBox via alignItems/justifyContent, closes on an
+  // outside click, and swallows clicks that land on the dialog itself
+  // so they don't bubble up to that same outside-click handler.
+  View buildDeleteDialog() {
+    auto openPtr = deleteDialogOpen_;
+
+    View dialogBox;
+    dialogBox.style.direction = FlexDirection::Column;
+    dialogBox.style.width = Size::pixel(340);
+    dialogBox.style.padding = EdgeInsets::all(20);
+    dialogBox.style.gap = 16;
+    dialogBox.style.backgroundColor = Color{255, 255, 255};
+    dialogBox.style.borderRadius = 8.0f;
+    dialogBox.onClick = [] {};
+    Text title;
+    title.label = std::function<std::string()>([this]() -> std::string {
+      return deleteTargetIsDir_ ? "Delete Folder?" : "Delete File?";
+    });
+    title.fontSize = 18;
+    title.fontWeight = FontWeight::SemiBold;
+    dialogBox.addChild(title);
+
+    Text message;
+    message.label = std::function<std::string()>([this]() -> std::string {
+      std::string name = deleteTargetPath_.empty()
+                             ? std::string()
+                             : editorTitleFromPath(deleteTargetPath_);
+      if (deleteTargetIsDir_)
+        return "\"" + name +
+               "\" and everything inside it will be permanently deleted. "
+               "This action cannot be undone.";
+      return "\"" + name +
+             "\" will be permanently deleted. This action cannot be undone.";
+    });
+    message.wrap = TextWrap::Wrap;
+    message.style.width = Size::full();
+    message.color = Color{90, 90, 90};
+    dialogBox.addChild(message);
+
+    View buttonRow;
+    buttonRow.style.direction = FlexDirection::Row;
+    buttonRow.style.justifyContent = Justify::End;
+    buttonRow.style.gap = 10;
+
+    Text cancelLabel;
+    cancelLabel.label = std::string("Cancel");
+    View cancelButton;
+    cancelButton.style.width = Size::pixel(80);
+    cancelButton.style.height = Size::pixel(34);
+    cancelButton.style.backgroundColor = Color{240, 240, 240};
+    cancelButton.style.hoverColor = Color{225, 225, 225};
+    cancelButton.style.borderRadius = 4.0f;
+    cancelButton.style.alignItems = Align::Center;
+    cancelButton.style.justifyContent = Justify::Center;
+    cancelButton.onClick = [this] { cancelDeleteConfirm(); };
+    cancelButton.addChild(cancelLabel);
+
+    Text confirmLabel;
+    confirmLabel.label = std::string("Delete");
+    confirmLabel.color = Color{255, 255, 255};
+    View confirmButton;
+    confirmButton.style.width = Size::pixel(80);
+    confirmButton.style.height = Size::pixel(34);
+    confirmButton.style.backgroundColor = Color{0xC0, 0x39, 0x2B};
+    confirmButton.style.hoverColor = Color{0xA8, 0x2F, 0x23};
+    confirmButton.style.borderRadius = 4.0f;
+    confirmButton.style.alignItems = Align::Center;
+    confirmButton.style.justifyContent = Justify::Center;
+    confirmButton.onClick = [this] { confirmDelete(); };
+    confirmButton.addChild(confirmLabel);
+
+    buttonRow.addChild(cancelButton);
+    buttonRow.addChild(confirmButton);
+    dialogBox.addChild(buttonRow);
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    backdrop.style.zIndex = 300; // above the menu dropdowns (200)
+    backdrop.style.backgroundColor = Color{0, 0, 0, 90};
+    backdrop.style.alignItems = Align::Center;
+    backdrop.style.justifyContent = Justify::Center;
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [this] { cancelDeleteConfirm(); };
+    backdrop.addChild(dialogBox);
+    return backdrop;
   }
 
   // Builds the tree once. The tab strip and the editor stack are keyed
@@ -1160,6 +1790,12 @@ private:
     tabBar.style.backgroundColor = Color{225, 225, 225};
     tabBar.style.overflowX = Overflow::Auto;
     tabBar.style.gap = 2;
+    // Defensive: keep the tab strip un-shrinkable, the same way
+    // buildHDivider()/buildTerminalPanel() already protect themselves.
+    // Without this, any sibling whose Fit-sizing balloons (as
+    // buildWelcomePane's did before the fix above) can eat into the
+    // tab bar's height via this file's flex-shrink pool.
+    tabBar.style.flexShrink = 0;
 
     // The keyed tabs live in their own container rather than directly in
     // tabBar: reconcileChildren() replaces a node's children wholesale, so
@@ -1214,6 +1850,7 @@ private:
 
     root.addChild(mainArea);
     root.addChild(buildStatusBar());
+    root.addChild(buildDeleteDialog());
     ui_.setRoot(std::move(root));
   }
 
@@ -1245,6 +1882,23 @@ private:
     ui_.addShortcut(ctrlShift, Key::Tab, [this] { nextTab(-1); });
     ui_.addShortcut(ctrl, Key::PageDown, [this] { nextTab(1); });
     ui_.addShortcut(ctrl, Key::PageUp, [this] { nextTab(-1); });
+
+    // Global shortcuts fire before a focused view's own onKeyDown (see
+    // LiteUI::dispatchKeyDown), so this guards against stealing Delete
+    // away from an in-progress rename (the pending-create TextInput) or
+    // from a CodeEditor that's actually focused and mid-edit — in both
+    // those cases Delete should do its normal "delete the next
+    // character" thing instead of popping this dialog.
+    ui_.addShortcut(KeyModifiers{}, Key::Delete, [this] {
+      if (pendingCreate_.active)
+        return;
+      const EditorDocument *active = activeDocument();
+      if (active && !active->isWelcome && active->state &&
+          active->state->focused)
+        return;
+
+      beginDeleteConfirm();
+    });
   }
 
   bool commandsInstalled_ = false;
