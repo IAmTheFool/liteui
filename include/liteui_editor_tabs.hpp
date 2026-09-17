@@ -344,6 +344,21 @@ private:
   // every Dynamic<> in the tree reads it live.
   std::shared_ptr<int> activityIndex_ = std::make_shared<int>(0);
 
+  // Terminal panel height, resizable via its own horizontal divider — same
+  // shared_ptr/clamp pattern as sidePanelWidth_, just on the vertical axis.
+  std::shared_ptr<float> terminalHeight_ = std::make_shared<float>(180.0f);
+  static constexpr float kMinTerminalHeight = 80.0f;
+  static constexpr float kMaxTerminalHeight = 400.0f;
+  static constexpr float kHDividerHeight = 6.0f;
+
+  // Resizable side panel width, shared with the divider's drag handler and
+  // the panel's own Dynamic<Size> width — same reasoning as activityIndex_:
+  // every closure that reads it needs to survive this tree being rebuilt.
+  std::shared_ptr<float> sidePanelWidth_ = std::make_shared<float>(240.0f);
+  static constexpr float kMinSidePanelWidth = 160.0f;
+  static constexpr float kMaxSidePanelWidth = 480.0f;
+  static constexpr float kSideDividerWidth = 6.0f;
+
   // Explorer state: a real expand/collapse tree rooted at the opened
   // workspace folder, matching VS Code's explorer. explorerRoot_ is
   // nullopt until a folder is opened; each FileTreeNode lazily loads its
@@ -567,7 +582,12 @@ private:
 
     View panel;
     panel.style.direction = FlexDirection::Column;
-    panel.style.width = Size::pixel(240);
+    {
+      auto widthPtr = sidePanelWidth_;
+      panel.style.width = [widthPtr]() -> Size {
+        return Size::pixel(*widthPtr);
+      };
+    }
     panel.style.height = Size::full();
     panel.style.backgroundColor = Color{243, 243, 243};
     panel.style.padding = EdgeInsets{8, 0, 8, 0};
@@ -589,6 +609,107 @@ private:
     panel.addChild(buildExplorerPane());
     panel.addChild(buildSearchPane());
     return panel;
+  }
+
+  // Drag handle between the side panel and the editor area. Collapses to
+  // 0 width alongside the panel itself (same activityIndex_ check) so it's
+  // neither visible nor hit-testable while the panel is closed — matching
+  // vDivider's behavior in the plain liteui example.
+  View buildSideDivider() {
+    auto act = activityIndex_;
+    auto widthPtr = sidePanelWidth_;
+
+    View divider;
+    divider.style.height = Size::full();
+    divider.style.flexShrink = 0;
+    divider.style.backgroundColor = Color{215, 215, 215};
+    divider.style.hoverColor = Color{80, 80, 220};
+
+    divider.style.width = [act]() -> Size {
+      return Size::pixel(*act >= 0 ? kSideDividerWidth : 0.0f);
+    };
+
+    // Same self-centering pattern as main.cpp's updateSidebarWidth: each
+    // onPressAt/onDragTo call reports the pointer's position local to the
+    // divider, and a relayout runs after every one, so nudging the width
+    // by (localX - half the divider's own width) converges to a normal
+    // drag-to-resize even though only local coordinates are available.
+    auto updateWidth = [widthPtr](float localX) {
+      float next = *widthPtr + localX - kSideDividerWidth / 2.0f;
+      *widthPtr = std::clamp(next, kMinSidePanelWidth, kMaxSidePanelWidth);
+    };
+    divider.onPressAt = [updateWidth](float localX, float) {
+      updateWidth(localX);
+    };
+    divider.onDragTo = [updateWidth](float localX, float) {
+      updateWidth(localX);
+    };
+    return divider;
+  }
+  // Drag handle between the editor stack and the terminal panel. Always
+  // visible/draggable (the terminal itself has no open/close toggle here,
+  // matching the plain liteui example's rightColumn layout) — see
+  // buildTerminalPanel() below for the panel it resizes.
+  View buildHDivider() {
+    auto heightPtr = terminalHeight_;
+
+    View divider;
+    divider.style.width = Size::full();
+    divider.style.flexGrow = 0;
+    divider.style.flexShrink = 0;
+    divider.style.height = Size::pixel(kHDividerHeight);
+    divider.style.backgroundColor = Color{210, 210, 210};
+    divider.style.hoverColor = Color{80, 80, 220};
+
+    // Same self-centering drag pattern as buildSideDivider()/main.cpp's
+    // updateTerminalHeight, just on the vertical axis: the terminal grows
+    // upward as the pointer moves down, hence the subtraction.
+    auto updateHeight = [heightPtr](float localY) {
+      float next = *heightPtr - (localY - kHDividerHeight / 2.0f);
+      *heightPtr = std::clamp(next, kMinTerminalHeight, kMaxTerminalHeight);
+    };
+    divider.onPressAt = [updateHeight](float, float localY) {
+      updateHeight(localY);
+    };
+    divider.onDragTo = [updateHeight](float, float localY) {
+      updateHeight(localY);
+    };
+    return divider;
+  }
+
+  // Terminal panel: fixed-looking placeholder content (a title + a bare
+  // prompt), sized by terminalHeight_ via buildHDivider() above. Same
+  // dark palette as the plain liteui example's `terminal` View.
+  View buildTerminalPanel() {
+    auto heightPtr = terminalHeight_;
+
+    View terminal;
+    terminal.style.width = Size::full();
+    terminal.style.flexGrow = 0;
+    terminal.style.flexShrink = 0;
+    terminal.style.direction = FlexDirection::Column;
+    terminal.style.backgroundColor = Color{24, 24, 24};
+    terminal.style.padding = EdgeInsets::all(10.0f);
+    terminal.style.overflowY = Overflow::Hidden;
+    terminal.style.height = [heightPtr]() -> Size {
+      return Size::pixel(*heightPtr);
+    };
+
+    Text title;
+    title.label = std::string("TERMINAL");
+    title.fontSize = 12;
+    title.fontWeight = FontWeight::SemiBold;
+    title.color = Color{180, 180, 180};
+    terminal.addChild(title);
+
+    Text prompt;
+    prompt.label = std::string("$ ");
+    prompt.fontSize = 13;
+    prompt.fontFamily = "monospace";
+    prompt.color = Color{100, 220, 130};
+    prompt.style.margin = EdgeInsets{8, 0, 0, 0};
+    terminal.addChild(prompt);
+    return terminal;
   }
 
   // ---- activity bar: always visible, one row per sidebar view. Text
@@ -653,6 +774,7 @@ private:
     bar.style.backgroundColor = Color{235, 235, 235};
     bar.style.padding = EdgeInsets{0, 12, 0, 12};
     bar.style.gap = 16;
+    bar.style.flexShrink = 0;
 
     Text posLabel;
     posLabel.label = std::function<std::string()>([this]() -> std::string {
@@ -717,10 +839,11 @@ private:
     bar.style.direction = FlexDirection::Row;
     bar.style.alignItems = Align::Center;
     bar.style.width = Size::full();
-    bar.style.height = Size::pixel(48);
+    bar.style.height = Size::pixel(38);
     bar.style.backgroundColor = Color{238, 238, 238};
     bar.style.padding = EdgeInsets{0, 8, 0, 8};
     bar.style.gap = 2;
+    bar.style.flexShrink = 0;
 
     auto openIdx = openMenuIndex_;
     auto backdropX = std::make_shared<float>(0.0f);
@@ -987,6 +1110,7 @@ private:
     mainArea.addChild(buildActivityBar());
 
     mainArea.addChild(buildSidePanel());
+    mainArea.addChild(buildSideDivider());
 
     View editorArea;
     editorArea.style.direction = FlexDirection::Column;
@@ -1034,6 +1158,9 @@ private:
 
     editorArea.addChild(tabBar);
 
+    // ... stack (added below, unchanged) sits between tabBar and the
+    // terminal — see the two new addChild calls right after it.
+
     // ---- editor stack: one CodeEditor per open document, keyed the same
     // way as the tabs, all but the active one hidden via Display::None ----
     View stack;
@@ -1046,11 +1173,13 @@ private:
     };
     editorArea.addChild(stack);
 
-    editorArea.addChild(buildStatusBar());
+    editorArea.addChild(buildHDivider());
+    editorArea.addChild(buildTerminalPanel());
 
     mainArea.addChild(editorArea);
-    root.addChild(mainArea);
 
+    root.addChild(mainArea);
+    root.addChild(buildStatusBar());
     ui_.setRoot(std::move(root));
   }
 
