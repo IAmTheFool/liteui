@@ -447,6 +447,37 @@ private:
   static constexpr const char *kPendingCreateKey =
       "\x01__liteui_pending_create__";
 
+  // Inline rename state — same shape as PendingCreate, but replaces an
+  // *existing* row's rendering instead of adding a new one. explorerKeys()
+  // swaps the target node's own key for a rename-sentinel key (see
+  // collectExplorerKeys) so reconcileChildren actually notices the change
+  // and calls itemBuilder again for that row, rather than reusing the
+  // already-built plain row untouched.
+  struct PendingRename {
+    bool active = false;
+    bool isDir = false;
+    std::string originalPath;
+  };
+  PendingRename pendingRename_;
+  // Same "hasn't been clicked into yet" guard as pendingCreateEverFocused_.
+  bool pendingRenameEverFocused_ = false;
+  std::shared_ptr<TextInputState> pendingRenameInputState_ =
+      std::make_shared<TextInputState>();
+  // Prefix rather than a single fixed sentinel (unlike kPendingCreateKey)
+  // since a rename target is a specific existing path, not a generic
+  // "one pending slot" — the prefix plus path makes each rename key unique
+  // and keeps it out of the way of any real filesystem path.
+  static constexpr const char *kPendingRenameKeyPrefix =
+      "\x02__liteui_pending_rename__:";
+
+  // Right-click context menu for explorer rows (Open/Rename/Delete for a
+  // file, New File/New Folder/Rename/Delete for a folder).
+  std::shared_ptr<bool> explorerMenuOpen_ = std::make_shared<bool>(false);
+  std::string explorerMenuTargetPath_;
+  bool explorerMenuTargetIsDir_ = false;
+  std::shared_ptr<float> explorerMenuX_ = std::make_shared<float>(0.0f);
+  std::shared_ptr<float> explorerMenuY_ = std::make_shared<float>(0.0f);
+
   // Delete-confirmation dialog state. deleteDialogOpen_ is a shared_ptr
   // for the same reason activeIndex_/activityIndex_ are — the dialog's
   // own Dynamic<Display>/onClick closures need to read it live across
@@ -600,6 +631,7 @@ private:
       }
     }
     resetPendingCreate(); // discard any previous unfinished creation first
+    resetPendingRename(); // ...and cancel any in-progress rename too
     pendingCreate_.active = true;
     pendingCreate_.isDir = isDir;
     pendingCreate_.parentDir = dir;
@@ -607,6 +639,128 @@ private:
 
   void explorerNewFile() { beginPendingCreate(false); }
   void explorerNewFolder() { beginPendingCreate(true); }
+
+  // ---- inline rename ----
+
+  void resetPendingRename() {
+    if (pendingRenameInputState_->blinkTimerHandle >= 0) {
+      ui_.removeInterval(pendingRenameInputState_->blinkTimerHandle);
+      pendingRenameInputState_->blinkTimerHandle = -1;
+    }
+    pendingRenameInputState_->focused = false;
+    pendingRename_.active = false;
+    pendingRename_.isDir = false;
+    pendingRename_.originalPath.clear();
+    pendingRenameEverFocused_ = false;
+    pendingRenameInputState_ = std::make_shared<TextInputState>();
+  }
+
+  void cancelPendingRename() { resetPendingRename(); }
+
+  // Same polling trick as checkPendingCreateBlur — piggybacks on the
+  // generic Dynamic<bool> disabled poll so losing focus (clicking
+  // elsewhere) cancels the rename.
+  void checkPendingRenameBlur() {
+    if (!pendingRename_.active)
+      return;
+    if (pendingRenameInputState_->focused) {
+      pendingRenameEverFocused_ = true;
+      return;
+    }
+    if (pendingRenameEverFocused_)
+      cancelPendingRename();
+  }
+
+  void beginPendingRename(const std::string &path, bool isDir) {
+    resetPendingCreate(); // discard any pending N/F creation first
+    resetPendingRename();
+    pendingRename_.active = true;
+    pendingRename_.isDir = isDir;
+    pendingRename_.originalPath = path;
+  }
+
+  // Updates any open tab(s) whose backing path sits at or under oldPath so
+  // a rename doesn't leave a tab silently pointing at a now-missing file —
+  // same reasoning/shape as closeTabsUnderPath's use of pathIsUnderOrEqual.
+  void renamePathInTabs(const std::string &oldPath, const std::string &newPath,
+                        bool isDir) {
+    for (auto &doc : docs_) {
+      if (doc.closed || !doc.hasPath)
+        continue;
+      if (!isDir) {
+        if (doc.path != oldPath)
+          continue;
+        doc.path = newPath;
+      } else {
+        if (!pathIsUnderOrEqual(doc.path, oldPath))
+          continue;
+        doc.path = newPath + doc.path.substr(oldPath.size());
+      }
+      doc.title = editorTitleFromPath(doc.path);
+      doc.highlighter = makeHighlighter(languageForExtension(doc.path));
+    }
+  }
+
+  // Enter handler for the rename TextInput: trims the typed name and, if
+  // anything's left and it actually differs from the current name,
+  // renames on disk, fixes up any open tabs, and refreshes the tree.
+  void submitPendingRename(const std::string &rawText) {
+    if (!pendingRename_.active)
+      return;
+    std::string name = trimWhitespace(rawText);
+    std::string oldPath = pendingRename_.originalPath;
+    bool isDir = pendingRename_.isDir;
+    resetPendingRename(); // close the input either way
+    if (name.empty())
+      return;
+    std::string newPath =
+        (std::filesystem::path(oldPath).parent_path() / name).string();
+    if (newPath == oldPath)
+      return;
+    std::error_code ec;
+    std::filesystem::rename(oldPath, newPath, ec);
+    if (ec)
+      return; // TODO surface a real error dialog/status message
+    renamePathInTabs(oldPath, newPath, isDir);
+    explorerRefresh();
+    selectedPath_ = newPath;
+  }
+
+  // ---- right-click context menu ----
+
+  void openExplorerContextMenu(const std::string &path, bool isDir, float x,
+                               float y) {
+    explorerMenuTargetPath_ = path;
+    explorerMenuTargetIsDir_ = isDir;
+    *explorerMenuX_ = x;
+    *explorerMenuY_ = y;
+    *explorerMenuOpen_ = true;
+  }
+  void closeExplorerContextMenu() { *explorerMenuOpen_ = false; }
+
+  // Each action reuses the same logic the toolbar buttons/keyboard
+  // shortcut already use, just pointed at whatever was right-clicked
+  // (selectedPath_ drives selectedDirectory()/beginDeleteConfirm() already,
+  // so setting it first is enough — no new targeting logic needed).
+  void explorerContextOpen() {
+    if (!explorerMenuTargetIsDir_)
+      openFile(explorerMenuTargetPath_);
+  }
+  void explorerContextRename() {
+    beginPendingRename(explorerMenuTargetPath_, explorerMenuTargetIsDir_);
+  }
+  void explorerContextDelete() {
+    selectedPath_ = explorerMenuTargetPath_;
+    beginDeleteConfirm();
+  }
+  void explorerContextNewFile() {
+    selectedPath_ = explorerMenuTargetPath_;
+    explorerNewFile();
+  }
+  void explorerContextNewFolder() {
+    selectedPath_ = explorerMenuTargetPath_;
+    explorerNewFolder();
+  }
 
   // Whether `path` is `ancestor` itself or lives somewhere underneath it —
   // used to find tabs open on files inside a folder that's about to be
@@ -761,7 +915,11 @@ private:
   // own.
   void collectExplorerKeys(const FileTreeNode &node,
                            std::vector<std::string> &out) const {
-    out.push_back(node.fullPath);
+    bool renamingThis =
+        pendingRename_.active && pendingRename_.originalPath == node.fullPath;
+    out.push_back(renamingThis
+                      ? std::string(kPendingRenameKeyPrefix) + node.fullPath
+                      : node.fullPath);
     if (node.isDir && node.expanded) {
       if (pendingCreate_.active && pendingCreate_.parentDir == node.fullPath)
         out.push_back(kPendingCreateKey);
@@ -859,6 +1017,20 @@ private:
       }
     };
 
+    // Captured via onLayout (same pattern buildMenuBar's own triggers use)
+    // so the right-click handler below can turn a local press point into
+    // a window-absolute position for the context menu.
+    auto rowX = std::make_shared<float>(0.0f);
+    auto rowY = std::make_shared<float>(0.0f);
+    row.onLayout = [rowX, rowY](float x, float y, float, float) {
+      *rowX = x;
+      *rowY = y;
+    };
+    row.onRightPressAt = [this, key, isDir, rowX, rowY](float lx, float ly) {
+      selectedPath_ = key;
+      openExplorerContextMenu(key, isDir, *rowX + lx, *rowY + ly);
+    };
+
     Text chevron;
     chevron.label = isDir ? (expanded ? std::string("\xE2\x96\xBE ")  // ▾
                                       : std::string("\xE2\x96\xB8 ")) // ▸
@@ -918,6 +1090,54 @@ private:
       submitPendingCreate(text);
     };
     input.state = pendingInputState_;
+    row.addChild(input);
+    return row;
+  }
+
+  // Inline rename row: replaces an existing row's content (via the
+  // rename-sentinel key) with a TextInput pre-filled with the item's
+  // current name, at the same indent depth the row already had.
+  View buildPendingRenameRow(const std::string &originalPath) {
+    bool isDir = pendingRename_.isDir;
+    int depth = explorerDepthForPath(originalPath);
+    int d = 0;
+    FileTreeNode *node = findExplorerNode(originalPath, d);
+    bool expanded = node && node->expanded;
+
+    View row;
+    row.style.width = Size::full();
+    row.style.alignItems = Align::Center;
+    row.style.padding =
+        EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
+    row.style.backgroundColor = Color{243, 243, 243};
+    row.disabled = [this]() -> bool {
+      checkPendingRenameBlur();
+      return false;
+    };
+
+    Text chevron;
+    chevron.label = isDir ? (expanded ? std::string("\xE2\x96\xBE ")  // ▾
+                                      : std::string("\xE2\x96\xB8 ")) // ▸
+                          : std::string("   ");
+    chevron.fontSize = 11;
+    chevron.style.width = Size::pixel(14);
+    chevron.color = Color{110, 110, 110};
+    row.addChild(chevron);
+
+    TextInput input;
+    input.style.flexGrow = 1;
+    input.style.height = Size::pixel(20);
+    input.fontSize = 13;
+    input.text =
+        editorTitleFromPath(originalPath); // prefilled with current name
+    input.textColor = Color{40, 40, 40};
+    input.borderColor = Color{170, 170, 170};
+    input.focusedBorderColor = Color{80, 140, 230};
+    input.leftPadding = 4.0f;
+    input.onSubmit = [this](const std::string &text) {
+      submitPendingRename(text);
+    };
+    input.state = pendingRenameInputState_;
     row.addChild(input);
     return row;
   }
@@ -1033,6 +1253,9 @@ private:
     list.itemBuilder = [this](const std::string &key) {
       if (key == kPendingCreateKey)
         return buildPendingCreateRow();
+      if (pendingRename_.active && key == std::string(kPendingRenameKeyPrefix) +
+                                              pendingRename_.originalPath)
+        return buildPendingRenameRow(pendingRename_.originalPath);
       return buildExplorerRow(key);
     };
     pane.addChild(std::move(list));
@@ -1754,6 +1977,88 @@ private:
     return backdrop;
   }
 
+  // Right-click context menu, same backdrop+absolute-menu shape as the
+  // top menu bar's dropdowns. Item visibility toggles per target (file vs
+  // folder) via Dynamic<Display> reading explorerMenuTargetIsDir_, since
+  // the menu itself is built once and never rebuilt.
+  View buildExplorerContextMenu() {
+    auto openPtr = explorerMenuOpen_;
+    auto xPtr = explorerMenuX_;
+    auto yPtr = explorerMenuY_;
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    backdrop.style.zIndex = 250; // above menu-bar dropdowns (200), below
+                                 // the delete-confirmation dialog (300)
+    backdrop.style.backgroundColor = Color{255, 255, 255, 2};
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [openPtr] { *openPtr = false; };
+
+    View menu;
+    menu.style.position = Position::Absolute;
+    menu.style.direction = FlexDirection::Column;
+    menu.style.width = Size::pixel(170);
+    menu.style.backgroundColor = Color{255, 255, 255};
+    menu.style.borderWidth = 1.0f;
+    menu.style.borderColor = Color{200, 200, 200};
+    menu.style.borderRadius = 4.0f;
+    menu.style.zIndex = 260;
+    menu.style.left = [xPtr]() { return *xPtr; };
+    menu.style.top = [yPtr]() { return *yPtr; };
+
+    auto makeItem = [this](const std::string &label,
+                           std::function<void()> action,
+                           std::function<Display()> display = nullptr) {
+      Text t;
+      t.label = label;
+      t.style.padding = EdgeInsets::all(8);
+      t.fontSize = 13;
+      t.color = Color{40, 40, 40};
+
+      View row;
+      row.style.hoverColor = Color{240, 240, 240};
+      if (display)
+        row.style.display = std::move(display);
+      auto openPtr = explorerMenuOpen_;
+      row.onClick = [openPtr, action] {
+        *openPtr = false;
+        if (action)
+          action();
+      };
+      row.addChild(t);
+      return row;
+    };
+
+    auto fileOnly = [this]() -> Display {
+      return explorerMenuTargetIsDir_ ? Display::None : Display::Flex;
+    };
+    auto dirOnly = [this]() -> Display {
+      return explorerMenuTargetIsDir_ ? Display::Flex : Display::None;
+    };
+
+    // Order matches the request for both cases: a file sees
+    // Open/Rename/Delete; a folder sees New Folder/New File/Rename/Delete
+    // (Open simply hides itself for a folder, and New File/New Folder
+    // hide themselves for a file).
+    menu.addChild(
+        makeItem("Open", [this] { explorerContextOpen(); }, fileOnly));
+    menu.addChild(makeItem(
+        "New Folder", [this] { explorerContextNewFolder(); }, dirOnly));
+    menu.addChild(
+        makeItem("New File", [this] { explorerContextNewFile(); }, dirOnly));
+    menu.addChild(makeItem("Rename", [this] { explorerContextRename(); }));
+    menu.addChild(makeItem("Delete", [this] { explorerContextDelete(); }));
+
+    backdrop.addChild(menu);
+    return backdrop;
+  }
+
   // Builds the tree once. The tab strip and the editor stack are keyed
   // containers: their children come from keysSource/itemBuilder, and
   // LiteUI's checkForUpdates() reconciles them after every dispatched
@@ -1851,6 +2156,7 @@ private:
     root.addChild(mainArea);
     root.addChild(buildStatusBar());
     root.addChild(buildDeleteDialog());
+    root.addChild(buildExplorerContextMenu());
     ui_.setRoot(std::move(root));
   }
 
@@ -1890,7 +2196,7 @@ private:
     // those cases Delete should do its normal "delete the next
     // character" thing instead of popping this dialog.
     ui_.addShortcut(KeyModifiers{}, Key::Delete, [this] {
-      if (pendingCreate_.active)
+      if (pendingCreate_.active || pendingRename_.active)
         return;
       const EditorDocument *active = activeDocument();
       if (active && !active->isWelcome && active->state &&
