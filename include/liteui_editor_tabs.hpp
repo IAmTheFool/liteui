@@ -359,6 +359,32 @@ private:
   static constexpr float kMaxSidePanelWidth = 480.0f;
   static constexpr float kSideDividerWidth = 6.0f;
 
+  // Named so the pane-visibility checks in buildExplorerPane()/
+  // buildSearchPane() below can't silently drift out of sync with
+  // activityItems()'s ids if the list is ever reordered or extended.
+  static constexpr int kExplorerActivityId = 0;
+  static constexpr int kSearchActivityId = 1;
+
+  // One entry per sidebar view. Shared by buildActivityBar() (which
+  // renders the icon column) and buildSidePanel() (whose header needs the
+  // matching full name) so the id -> name mapping lives in exactly one
+  // place — previously the panel header had its own hardcoded ternary
+  // that would silently show the wrong name for any activity beyond the
+  // first two.
+  struct ActivityItem {
+    int id;
+    std::string label;   // short glyph shown in the bar
+    std::string tooltip; // full name shown in the bar's tooltip and as
+                         // the side panel's header
+  };
+  static const std::vector<ActivityItem> &activityItems() {
+    static const std::vector<ActivityItem> items = {
+        {kExplorerActivityId, "E", "Explorer"},
+        {kSearchActivityId, "S", "Search"},
+    };
+    return items;
+  }
+
   // Explorer state: a real expand/collapse tree rooted at the opened
   // workspace folder, matching VS Code's explorer. explorerRoot_ is
   // nullopt until a folder is opened; each FileTreeNode lazily loads its
@@ -512,7 +538,7 @@ private:
     pane.style.flexGrow = 1;
     pane.style.backgroundColor = Color{243, 243, 243};
     pane.style.display = [act]() -> Display {
-      return *act == 0 ? Display::Flex : Display::None;
+      return *act == kExplorerActivityId ? Display::Flex : Display::None;
     };
 
     View openBtn;
@@ -562,7 +588,7 @@ private:
     pane.style.padding = EdgeInsets{4, 12, 4, 12};
     pane.style.backgroundColor = Color{243, 243, 243};
     pane.style.display = [act]() -> Display {
-      return *act == 1 ? Display::Flex : Display::None;
+      return *act == kSearchActivityId ? Display::Flex : Display::None;
     };
 
     Text hint;
@@ -598,8 +624,16 @@ private:
     };
 
     Text header;
-    header.label = std::function<std::string()>(
-        [act]() -> std::string { return *act == 1 ? "SEARCH" : "EXPLORER"; });
+    header.label = std::function<std::string()>([act]() -> std::string {
+      for (const auto &activity : activityItems())
+        if (activity.id == *act) {
+          std::string name = activity.tooltip;
+          for (auto &c : name)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+          return name;
+        }
+      return "";
+    });
     header.style.padding = EdgeInsets{10, 12, 6, 12};
     header.style.width = Size::full();
     header.fontSize = 11;
@@ -719,6 +753,8 @@ private:
   View buildActivityBar() {
     auto act = activityIndex_;
 
+    const auto &activities = activityItems();
+
     View bar;
     bar.style.direction = FlexDirection::Column;
     bar.style.width = Size::pixel(44);
@@ -728,31 +764,29 @@ private:
     bar.style.padding = EdgeInsets{8, 0, 8, 0};
     bar.style.gap = 2;
 
-    auto addItem = [&](const std::string &title, int idx) {
-      View item;
-      item.style.width = Size::full();
-      item.style.height = Size::pixel(36);
-      item.style.justifyContent = Justify::Center;
-      item.style.alignItems = Align::Center;
-      item.style.hoverColor = Color{75, 75, 80};
-      item.style.backgroundColor = [act, idx]() -> Color {
+    for (const auto &activity : activities) {
+      int idx = activity.id;
+      View row;
+      row.style.width = Size::full();
+      row.style.height = Size::pixel(36);
+      row.style.justifyContent = Justify::Center;
+      row.style.alignItems = Align::Center;
+      row.style.hoverColor = Color{75, 75, 80};
+      row.style.backgroundColor = [act, idx]() -> Color {
         return *act == idx ? Color{40, 40, 45} : Color{55, 55, 60};
       };
-      item.tooltip = title;
-      item.onClick = [act, idx] { *act = (*act == idx) ? -1 : idx; };
+      row.tooltip = activity.tooltip;
+      row.onClick = [act, idx] { *act = (*act == idx) ? -1 : idx; };
 
       Text label;
-      label.label = title;
+      label.label = activity.label;
       label.fontSize = 12;
       label.color = [act, idx]() -> Color {
         return *act == idx ? Color{255, 255, 255} : Color{185, 185, 190};
       };
-      item.addChild(label);
-      bar.addChild(std::move(item));
-    };
-
-    addItem("E", 0);
-    addItem("S", 1);
+      row.addChild(label);
+      bar.addChild(std::move(row));
+    }
     return bar;
   }
 
