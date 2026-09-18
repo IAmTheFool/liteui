@@ -234,6 +234,26 @@ public:
     *activeIndex_ = static_cast<int>(docs_.size()) - 1;
   }
 
+  // Opens `path` (or focuses its existing tab) and moves the cursor to
+  // `line` (0-based). Used by workspace search results — a plain
+  // openFile() either resets the cursor to (0,0) for a fresh tab or
+  // leaves it untouched for an already-open one, neither of which is
+  // what a "jump to this match" click wants.
+  void openFileAtLine(const std::string &path, size_t line) {
+    openFile(path);
+    for (auto &doc : docs_) {
+      if (doc.closed || !doc.hasPath || doc.path != path)
+        continue;
+      if (line < doc.state->lines.size()) {
+        doc.state->cursor = {line, 0};
+        doc.state->selectionAnchor.reset();
+        doc.state->noteCursorMoved();
+        doc.state->dirty = true;
+      }
+      break;
+    }
+  }
+
   void newDocument() {
     EditorDocument doc;
     doc.title = "untitled-" + std::to_string(++untitledCounter_);
@@ -419,6 +439,278 @@ private:
   // selectedDirectory()) and buildExplorerRow()/buildExplorerHeaderRow()
   // use it to paint the selection highlight.
   std::string selectedPath_;
+
+  // ---- workspace text search (Ctrl+Shift+F pane) ----
+  struct WorkspaceSearchMatch {
+    std::string path;
+    size_t line = 0;      // 0-based
+    std::string lineText; // untrimmed, for the snippet preview
+  };
+  std::string workspaceSearchQuery_;
+  std::vector<WorkspaceSearchMatch> workspaceSearchResults_;
+  std::shared_ptr<TextInputState> searchInputState_ =
+      std::make_shared<TextInputState>();
+
+  std::string workspaceReplaceText_;
+  std::shared_ptr<TextInputState> replaceInputState_ =
+      std::make_shared<TextInputState>();
+  static constexpr size_t kMaxSearchResults = 500;
+  static constexpr uintmax_t kMaxSearchFileBytes = 2 * 1024 * 1024; // 2 MB
+
+  // Directory names never worth descending into for a text search —
+  // typically huge, generated, or binary-heavy.
+  static bool isSearchExcludedDir(const std::string &name) {
+    static const std::unordered_set<std::string> kExcluded = {
+        ".git", "node_modules", "build", "out", ".cache", "dist", ".vs"};
+    return kExcluded.count(name) != 0;
+  }
+
+  // Recursively walks workspaceRoot_, doing a case-insensitive substring
+  // search of `query` across every line of every file it can read as
+  // text. Deliberately simple (phase 1): no regex, no whole-word/case
+  // toggle, no incremental indexing — a linear rescan on every keystroke,
+  // capped by kMaxSearchResults/kMaxSearchFileBytes so a huge or
+  // pathological workspace can't hang the UI.
+  void runWorkspaceSearch(const std::string &query) {
+    workspaceSearchQuery_ = query;
+    workspaceSearchResults_.clear();
+    if (query.empty() || workspaceRoot_.empty())
+      return;
+    std::string needle = asciiLower(query);
+
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(
+        workspaceRoot_,
+        std::filesystem::directory_options::skip_permission_denied, ec);
+    std::filesystem::recursive_directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+      if (workspaceSearchResults_.size() >= kMaxSearchResults)
+        break;
+      const std::filesystem::directory_entry &entry = *it;
+
+      std::error_code typeEc;
+      if (entry.is_directory(typeEc)) {
+        if (isSearchExcludedDir(entry.path().filename().string()))
+          it.disable_recursion_pending();
+        continue;
+      }
+      if (typeEc || !entry.is_regular_file(typeEc))
+        continue;
+
+      std::error_code sizeEc;
+      uintmax_t sz = entry.file_size(sizeEc);
+      if (sizeEc || sz > kMaxSearchFileBytes)
+        continue;
+
+      std::ifstream in(entry.path(), std::ios::binary);
+      if (!in)
+        continue;
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      std::string content = ss.str();
+      // Crude binary-file guard: real text files essentially never
+      // contain a NUL byte.
+      if (content.find('\0') != std::string::npos)
+        continue;
+
+      std::vector<std::string> lines;
+      splitLinesInto(content, lines);
+      std::string path = entry.path().string();
+      for (size_t li = 0; li < lines.size(); ++li) {
+        std::string hay = asciiLower(lines[li]);
+        if (hay.find(needle) == std::string::npos)
+          continue;
+        workspaceSearchResults_.push_back({path, li, lines[li]});
+        if (workspaceSearchResults_.size() >= kMaxSearchResults)
+          break;
+      }
+    }
+  }
+
+  // Replaces every case-insensitive occurrence of `needle` in `line`
+  // with `replacement`, preserving everything else in the line
+  // byte-for-byte. Mirrors the matching logic runWorkspaceSearch already
+  // uses (asciiLower + find), so "what counts as a match" stays
+  // consistent between the search pass and the replace pass.
+  static std::string caseInsensitiveReplaceAll(const std::string &line,
+                                               const std::string &needle,
+                                               const std::string &replacement) {
+    if (needle.empty())
+      return line;
+    std::string hay = asciiLower(line);
+    std::string lneedle = asciiLower(needle);
+    std::string result;
+    size_t pos = 0;
+    while (true) {
+      size_t found = hay.find(lneedle, pos);
+      if (found == std::string::npos) {
+        result += line.substr(pos);
+        break;
+      }
+      result += line.substr(pos, found - pos);
+      result += replacement;
+      pos = found + needle.size();
+    }
+    return result;
+  }
+
+  // Replaces the query text on one specific search-result line, either
+  // through the file's already-open CodeEditorState (so a user with
+  // unsaved edits doesn't get overwritten from under them, and undo
+  // still works via beginEdit) or, if the file isn't open, directly on
+  // disk. Either way the line count can't change (neither the query nor
+  // the replacement text can contain '\n' — TextInput is single-line),
+  // so every other result's stored line number stays valid; only this
+  // line's own content changes. Finishes with a full rescan rather than
+  // patching workspaceSearchResults_ in place — replacing may make this
+  // line stop matching, or start matching a second time, or (if the
+  // replacement text itself contains the query) matter for later
+  // results too, and a rescan is the simplest way to stay correct.
+  void replaceMatch(size_t idx) {
+    if (idx >= workspaceSearchResults_.size() || workspaceSearchQuery_.empty())
+      return;
+    WorkspaceSearchMatch m = workspaceSearchResults_[idx]; // copy: the
+                                                           // vector gets
+                                                           // cleared by
+                                                           // the rescan
+                                                           // below
+    bool handledInOpenDoc = false;
+    for (auto &doc : docs_) {
+      if (doc.closed || !doc.hasPath || doc.path != m.path)
+        continue;
+      if (m.line < doc.state->lines.size()) {
+        std::string replaced = caseInsensitiveReplaceAll(
+            doc.state->lines[m.line], workspaceSearchQuery_,
+            workspaceReplaceText_);
+        if (replaced != doc.state->lines[m.line]) {
+          doc.state->beginEdit(false); // its own undo step, like paste/cut
+          doc.state->lines[m.line] = replaced;
+          doc.state->clampCursor();
+          doc.state->dirty = true;
+        }
+      }
+      std::ofstream out(doc.path, std::ios::binary);
+      out << joinLines(doc.state->lines);
+      *doc.modified = false; // matches saveActive()'s own bookkeeping
+      handledInOpenDoc = true;
+      break;
+    }
+
+    if (!handledInOpenDoc) {
+      std::ifstream in(m.path, std::ios::binary);
+      if (!in)
+        return; // TODO surface a real error dialog/status message
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      std::vector<std::string> lines;
+      splitLinesInto(ss.str(), lines);
+      if (m.line >= lines.size())
+        return;
+      lines[m.line] = caseInsensitiveReplaceAll(
+          lines[m.line], workspaceSearchQuery_, workspaceReplaceText_);
+      std::ofstream out(m.path, std::ios::binary);
+      out << joinLines(lines);
+    }
+
+    runWorkspaceSearch(workspaceSearchQuery_);
+  }
+
+  // One result *slot* (not a keyed row): built once per index, up to
+  // kMaxSearchResults of them, and kept mounted for the life of the pane.
+  // Everything it shows is a Dynamic<> callback reading
+  // workspaceSearchResults_[idx] live, and it hides itself via
+  // Display::None once idx falls outside the current result count.
+  //
+  // Deliberately NOT a keyed list: the previous version rebuilt the
+  // results as a keysSource/itemBuilder list, whose key count changes on
+  // every keystroke. Any keyed-list reconcile anywhere in the tree makes
+  // LiteUI::pollAndRelayout() call invalidateViewPointers() as a safety
+  // measure (see its comment in liteui.hpp) — which unconditionally
+  // nulls focusedView_, since it can't tell which cached View* pointers
+  // are still valid. That silently kicked focus off the search
+  // TextInput after every single character, even though the TextInput's
+  // own View never moved. A fixed, always-mounted pool of slots sidesteps
+  // the problem entirely: nothing structural ever changes while typing.
+  View buildSearchResultSlot(size_t idx) {
+    View row;
+    row.style.direction = FlexDirection::Row;
+    row.style.width = Size::full();
+    row.style.alignItems = Align::Center;
+    row.style.padding = EdgeInsets{5, 12, 5, 12};
+    row.style.gap = 8;
+    row.style.backgroundColor = Color{243, 243, 243};
+    row.style.hoverColor = Color{226, 226, 226};
+    row.style.display = [this, idx]() -> Display {
+      return idx < workspaceSearchResults_.size() ? Display::Flex
+                                                  : Display::None;
+    };
+    row.onClick = [this, idx] {
+      if (idx >= workspaceSearchResults_.size())
+        return;
+      const WorkspaceSearchMatch &m = workspaceSearchResults_[idx];
+      openFileAtLine(m.path, m.line);
+    };
+
+    View textCol;
+    textCol.style.direction = FlexDirection::Column;
+    textCol.style.flexGrow = 1;
+    textCol.style.gap = 2;
+
+    Text top;
+    top.label = std::function<std::string()>([this, idx]() -> std::string {
+      if (idx >= workspaceSearchResults_.size())
+        return std::string();
+      const WorkspaceSearchMatch &m = workspaceSearchResults_[idx];
+      return editorTitleFromPath(m.path) + ":" + std::to_string(m.line + 1);
+    });
+    top.fontSize = 12;
+    top.fontWeight = FontWeight::SemiBold;
+    top.color = Color{40, 40, 40};
+    textCol.addChild(top);
+
+    Text snippetText;
+    snippetText.label =
+        std::function<std::string()>([this, idx]() -> std::string {
+          if (idx >= workspaceSearchResults_.size())
+            return std::string(" ");
+          std::string snippet =
+              trimWhitespace(workspaceSearchResults_[idx].lineText);
+          if (snippet.size() > 140)
+            snippet = snippet.substr(0, 140) + "...";
+          return snippet.empty() ? std::string(" ") : snippet;
+        });
+    snippetText.fontSize = 12;
+    snippetText.color = Color{120, 120, 120};
+    snippetText.overflow = TextOverflow::Ellipsis;
+    snippetText.wrap = TextWrap::NoWrap;
+    textCol.addChild(snippetText);
+
+    row.addChild(std::move(textCol));
+
+    // "R" = replace just this match. Own onClick, so it consumes the
+    // click before it ever reaches row.onClick's "open the file" — same
+    // pattern as buildTab's closeBtn sitting inside a clickable tab.
+    View replaceBtn;
+    replaceBtn.style.width = Size::pixel(22);
+    replaceBtn.style.height = Size::pixel(22);
+    replaceBtn.style.flexShrink = 0;
+    replaceBtn.style.justifyContent = Justify::Center;
+    replaceBtn.style.alignItems = Align::Center;
+    replaceBtn.style.borderRadius = 3.0f;
+    replaceBtn.style.backgroundColor = Color{0, 0, 0, 0};
+    replaceBtn.style.hoverColor = Color{210, 210, 210};
+    replaceBtn.tooltip = "Replace this match";
+    replaceBtn.onClick = [this, idx] { replaceMatch(idx); };
+    Text replaceLabel;
+    replaceLabel.label = std::string("R");
+    replaceLabel.fontSize = 11;
+    replaceLabel.fontWeight = FontWeight::SemiBold;
+    replaceLabel.color = Color{90, 90, 90};
+    replaceBtn.addChild(replaceLabel);
+    row.addChild(std::move(replaceBtn));
+
+    return row;
+  }
 
   // Inline create-new-item state: while active, the explorer shows a
   // TextInput row (see buildPendingCreateRow) inside parentDir instead of
@@ -1262,8 +1554,6 @@ private:
     return pane;
   }
 
-  // Placeholder for now — the per-document Ctrl+F overlay in
-  // liteui_editor_ext.hpp is still where searching actually happens.
   View buildSearchPane() {
     auto act = activityIndex_;
 
@@ -1271,19 +1561,87 @@ private:
     pane.style.direction = FlexDirection::Column;
     pane.style.width = Size::full();
     pane.style.flexGrow = 1;
-    pane.style.padding = EdgeInsets{4, 12, 4, 12};
     pane.style.backgroundColor = Color{243, 243, 243};
     pane.style.display = [act]() -> Display {
       return *act == kSearchActivityId ? Display::Flex : Display::None;
     };
 
-    Text hint;
-    hint.label = std::string("Press Ctrl+F in the editor to search the "
-                             "current file.");
-    hint.style.width = Size::full();
-    hint.fontSize = 12;
-    hint.color = Color{110, 110, 110};
-    pane.addChild(hint);
+    View inputRow;
+    inputRow.style.width = Size::full();
+    inputRow.style.padding = EdgeInsets{8, 12, 4, 12};
+    inputRow.style.flexShrink = 0;
+
+    TextInput input;
+    input.style.width = Size::full();
+    input.style.height = Size::pixel(28);
+    input.style.flexShrink = 0;
+    input.fontSize = 13;
+    input.placeholder = "Search";
+    input.textColor = Color{40, 40, 40};
+    input.borderColor = Color{190, 190, 190};
+    input.focusedBorderColor = Color{80, 140, 230};
+    input.leftPadding = 6.0f;
+    input.state = searchInputState_;
+    input.onChange = [this](const std::string &text) {
+      runWorkspaceSearch(text);
+    };
+    inputRow.addChild(input);
+    pane.addChild(std::move(inputRow));
+
+    View replaceRow;
+    replaceRow.style.width = Size::full();
+    replaceRow.style.padding = EdgeInsets{0, 12, 4, 12};
+    replaceRow.style.flexShrink = 0; // same reasoning as inputRow: never
+                                     // let the panel's shrink math eat this
+
+    TextInput replaceInput;
+    replaceInput.style.width = Size::full();
+    replaceInput.style.height = Size::pixel(28);
+    replaceInput.style.flexShrink = 0;
+    replaceInput.fontSize = 13;
+    replaceInput.placeholder = "Replace";
+    replaceInput.textColor = Color{40, 40, 40};
+    replaceInput.borderColor = Color{190, 190, 190};
+    replaceInput.focusedBorderColor = Color{80, 140, 230};
+    replaceInput.leftPadding = 6.0f;
+    replaceInput.state = replaceInputState_;
+    replaceInput.onChange = [this](const std::string &text) {
+      workspaceReplaceText_ = text;
+    };
+    replaceRow.addChild(replaceInput);
+    pane.addChild(std::move(replaceRow));
+
+    Text hintOrCount;
+    hintOrCount.label = std::function<std::string()>([this]() -> std::string {
+      if (workspaceRoot_.empty())
+        return "Open a folder to search its files.";
+      if (workspaceSearchQuery_.empty())
+        return "";
+      return std::to_string(workspaceSearchResults_.size()) +
+             (workspaceSearchResults_.size() >= kMaxSearchResults
+                  ? "+ results"
+                  : (workspaceSearchResults_.size() == 1 ? " result"
+                                                         : " results"));
+    });
+    hintOrCount.style.padding = EdgeInsets{0, 12, 6, 12};
+    hintOrCount.style.flexShrink = 0;
+    hintOrCount.fontSize = 11;
+    hintOrCount.color = Color{130, 130, 130};
+    pane.addChild(hintOrCount);
+
+    View list;
+    list.style.direction = FlexDirection::Column;
+    list.style.width = Size::full();
+    list.style.flexGrow = 1;
+    list.style.overflowY = Overflow::Auto;
+    list.style.backgroundColor = Color{243, 243, 243};
+    // Fixed pool, not a keyed list — see buildSearchResultSlot's comment
+    // for why. Hidden slots (idx >= current result count) cost nothing:
+    // measureNatural() skips Display::None children entirely, so an
+    // empty or short result set doesn't pay for the unused rows.
+    for (size_t i = 0; i < kMaxSearchResults; ++i)
+      list.addChild(buildSearchResultSlot(i));
+    pane.addChild(std::move(list));
     return pane;
   }
 
@@ -1322,6 +1680,7 @@ private:
     });
     header.style.padding = EdgeInsets{10, 12, 6, 12};
     header.style.width = Size::full();
+    header.style.flexShrink = 0;
     header.fontSize = 11;
     header.color = Color{110, 110, 110};
     panel.addChild(header);

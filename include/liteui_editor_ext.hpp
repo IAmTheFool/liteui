@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
