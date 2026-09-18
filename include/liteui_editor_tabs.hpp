@@ -16,6 +16,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 inline std::string editorTitleFromPath(const std::string &path) {
@@ -609,6 +610,87 @@ private:
       lines[m.line] = caseInsensitiveReplaceAll(
           lines[m.line], workspaceSearchQuery_, workspaceReplaceText_);
       std::ofstream out(m.path, std::ios::binary);
+      out << joinLines(lines);
+    }
+
+    runWorkspaceSearch(workspaceSearchQuery_);
+  }
+
+    // Applies the current query -> replacement across every visible search
+  // result in one pass, grouped by file so each file is read/written (or
+  // its open CodeEditorState edited) exactly once rather than once per
+  // match. Unlike replaceMatch(), this deliberately does NOT call
+  // runWorkspaceSearch() after every single replacement — for a result
+  // set spanning many files that would mean re-walking the entire
+  // workspace once per match. Instead it walks workspaceSearchResults_
+  // once up front to build a path -> line-numbers map, applies each
+  // file's replacements in one shot, and rescans exactly once at the end.
+  void replaceAllMatches() {
+    if (workspaceSearchResults_.empty() || workspaceSearchQuery_.empty())
+      return;
+
+    // path -> the distinct lines within it that matched, in first-seen
+    // order. Each WorkspaceSearchMatch is already one entry per matching
+    // line (runWorkspaceSearch stops scanning a line the moment it finds
+    // one hit — see its inner loop), so no further de-duplication of
+    // line numbers is needed here, only grouping by path.
+    std::vector<std::string> orderedPaths;
+    std::unordered_map<std::string, std::vector<size_t>> linesByPath;
+    for (const auto &m : workspaceSearchResults_) {
+      auto [it, inserted] = linesByPath.try_emplace(m.path);
+      if (inserted)
+        orderedPaths.push_back(m.path);
+      it->second.push_back(m.line);
+    }
+
+    for (const std::string &path : orderedPaths) {
+      const std::vector<size_t> &targetLines = linesByPath[path];
+
+      bool handledInOpenDoc = false;
+      for (auto &doc : docs_) {
+        if (doc.closed || !doc.hasPath || doc.path != path)
+          continue;
+        bool changedAny = false;
+        for (size_t line : targetLines) {
+          if (line >= doc.state->lines.size())
+            continue;
+          std::string replaced = caseInsensitiveReplaceAll(
+              doc.state->lines[line], workspaceSearchQuery_,
+              workspaceReplaceText_);
+          if (replaced != doc.state->lines[line]) {
+            if (!changedAny)
+              doc.state->beginEdit(false); // one undo step per file
+            doc.state->lines[line] = replaced;
+            changedAny = true;
+          }
+        }
+        if (changedAny) {
+          doc.state->clampCursor();
+          doc.state->dirty = true;
+        }
+        std::ofstream out(doc.path, std::ios::binary);
+        out << joinLines(doc.state->lines);
+        *doc.modified = false; // matches saveActive()'s own bookkeeping
+        handledInOpenDoc = true;
+        break;
+      }
+      if (handledInOpenDoc)
+        continue;
+
+      std::ifstream in(path, std::ios::binary);
+      if (!in)
+        continue; // TODO surface a real error dialog/status message
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      std::vector<std::string> lines;
+      splitLinesInto(ss.str(), lines);
+      for (size_t line : targetLines) {
+        if (line >= lines.size())
+          continue;
+        lines[line] = caseInsensitiveReplaceAll(
+            lines[line], workspaceSearchQuery_, workspaceReplaceText_);
+      }
+      std::ofstream out(path, std::ios::binary);
       out << joinLines(lines);
     }
 
@@ -1589,13 +1671,16 @@ private:
     pane.addChild(std::move(inputRow));
 
     View replaceRow;
+    replaceRow.style.direction = FlexDirection::Row;
     replaceRow.style.width = Size::full();
     replaceRow.style.padding = EdgeInsets{0, 12, 4, 12};
     replaceRow.style.flexShrink = 0; // same reasoning as inputRow: never
                                      // let the panel's shrink math eat this
+    replaceRow.style.gap = 6;
+    replaceRow.style.alignItems = Align::Center;
 
     TextInput replaceInput;
-    replaceInput.style.width = Size::full();
+    replaceInput.style.flexGrow = 1;
     replaceInput.style.height = Size::pixel(28);
     replaceInput.style.flexShrink = 0;
     replaceInput.fontSize = 13;
@@ -1608,7 +1693,26 @@ private:
     replaceInput.onChange = [this](const std::string &text) {
       workspaceReplaceText_ = text;
     };
-    replaceRow.addChild(replaceInput);
+    replaceRow.addChild(std::move(replaceInput));
+
+    View replaceAllBtn;
+    replaceAllBtn.style.height = Size::pixel(28);
+    replaceAllBtn.style.flexShrink = 0;
+    replaceAllBtn.style.padding = EdgeInsets{0, 10, 0, 10};
+    replaceAllBtn.style.justifyContent = Justify::Center;
+    replaceAllBtn.style.alignItems = Align::Center;
+    replaceAllBtn.style.borderRadius = 3.0f;
+    replaceAllBtn.style.backgroundColor = Color{225, 225, 225};
+    replaceAllBtn.style.hoverColor = Color{205, 205, 205};
+    replaceAllBtn.tooltip = "Replace all current matches";
+    replaceAllBtn.onClick = [this] { replaceAllMatches(); };
+    Text replaceAllLabel;
+    replaceAllLabel.label = std::string("Replace All");
+    replaceAllLabel.fontSize = 12;
+    replaceAllLabel.color = Color{50, 50, 50};
+    replaceAllBtn.addChild(replaceAllLabel);
+    replaceRow.addChild(std::move(replaceAllBtn));
+
     pane.addChild(std::move(replaceRow));
 
     Text hintOrCount;
