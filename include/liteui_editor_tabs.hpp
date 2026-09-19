@@ -195,16 +195,19 @@ public:
       : ui_(width, height, windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
     newWelcomeTab();
-    // 80x24 is just a starting point — the terminal View's own onLayout
-    // resizes both the PTY and the grid to the real pixel size the
-    // instant buildRoot() below lays out the panel for the first time.
-    terminalState_->spawn(80, 24);
-    ui_.addInterval(33, [state = terminalState_] { state->pollOutput(); });
+    spawnNewTerminal(); // start with one terminal, like VS Code's default
+    ui_.addInterval(33, [this] {
+      for (auto &t : terminals_)
+        t.state->pollOutput();
+    });
     buildRoot(); // built once; tab strip + editor stack reconcile themselves
     setupShortcuts();
   }
 
-  ~TabbedEditor() { terminalState_->shutdown(); }
+  ~TabbedEditor() {
+    for (auto &t : terminals_)
+      t.state->shutdown();
+  }
 
   // One poll before the loop starts, so any openFile()/newDocument() the
   // caller made between construction and run() is reconciled into the tree
@@ -399,11 +402,18 @@ private:
   static constexpr float kMaxTerminalHeight = 400.0f;
   static constexpr float kHDividerHeight = 6.0f;
 
-  // Backing state for the integrated terminal below — a real PTY-backed
-  // shell (see liteui_terminal.hpp), spawned once in the constructor and
-  // kept alive across every rebuild() exactly like docs_/CodeEditorState.
-  std::shared_ptr<liteui_terminal::TerminalState> terminalState_ =
-      std::make_shared<liteui_terminal::TerminalState>();
+  // One terminal instance: its own PTY-backed state (see
+  // liteui_terminal.hpp) plus the label shown in the list on the right.
+  // Index-based keys are fine for now since terminals_ is append-only —
+  // switch to a stable per-tab id (like docs_ does) once close support
+  // lands and entries can actually disappear from the middle.
+  struct TerminalTab {
+    std::shared_ptr<liteui_terminal::TerminalState> state =
+        std::make_shared<liteui_terminal::TerminalState>();
+    std::string label = "powershell"; // default name for now, per spec
+  };
+  std::vector<TerminalTab> terminals_;
+  std::shared_ptr<int> activeTerminalIndex_ = std::make_shared<int>(0);
 
   // Resizable side panel width, shared with the divider's drag handler and
   // the panel's own Dynamic<Size> width — same reasoning as activityIndex_:
@@ -1873,10 +1883,160 @@ private:
     return divider;
   }
 
-  // Terminal panel: a real shell behind a PTY (liteui_terminal.hpp),
-  // sized by terminalHeight_ via buildHDivider() above. The "TERMINAL"
-  // header stays a plain Text; the shell itself is the liteui_terminal
-  // widget filling whatever space is left beneath it.
+  // Spawns a new terminal tab: home directory if no workspace folder is
+  // open, the workspace root otherwise (spawn()'s startDir already
+  // treats an empty string as "use the home directory" — see
+  // liteui_terminal.hpp — so passing workspaceRoot_ straight through
+  // covers both cases without a branch here).
+  void spawnNewTerminal() {
+    TerminalTab tab;
+    tab.state->spawn(80, 24, workspaceRoot_);
+    terminals_.push_back(std::move(tab));
+    *activeTerminalIndex_ = static_cast<int>(terminals_.size()) - 1;
+  }
+
+  std::vector<std::string> terminalKeys() const {
+    std::vector<std::string> keys;
+    keys.reserve(terminals_.size());
+    for (size_t i = 0; i < terminals_.size(); ++i)
+      keys.push_back(std::to_string(i));
+    return keys;
+  }
+  static size_t terminalKeyToIndex(const std::string &key) {
+    return static_cast<size_t>(std::stoul(key));
+  }
+
+  // One terminal's canvas, kept mounted and hidden via Display::None
+  // when it isn't the active one — same pattern as the editor's own
+  // per-document CodeEditor stack, so switching terminals never tears
+  // down or rebuilds a live PTY.
+  View buildTerminalOutput(size_t idx) {
+    auto activeIdx = activeTerminalIndex_;
+    liteui_terminal::Terminal shell;
+    shell.state = terminals_[idx].state;
+    shell.fontSize = 13.0f;
+    shell.style.width = Size::full();
+    shell.style.height = Size::full();
+    shell.style.padding = EdgeInsets{4, 10, 6, 10};
+    shell.style.display = [activeIdx, idx]() -> Display {
+      return static_cast<size_t>(*activeIdx) == idx ? Display::Flex
+                                                     : Display::None;
+    };
+    return liteui_terminal::toTerminalView(std::move(shell));
+  }
+
+  View buildTerminalOutputStack() {
+    View stack;
+    stack.style.width = Size::full();
+    stack.style.flexGrow = 1;
+    stack.keysSource = [this] { return terminalKeys(); };
+    stack.itemBuilder = [this](const std::string &key) {
+      return buildTerminalOutput(terminalKeyToIndex(key));
+    };
+    return stack;
+  }
+
+  // One row in the terminal list: label + a stub close "x". Clicking
+  // the row (anywhere but the x) switches the active terminal.
+  View buildTerminalRow(size_t idx) {
+    auto activeIdx = activeTerminalIndex_;
+
+    View row;
+    row.style.direction = FlexDirection::Row;
+    row.style.alignItems = Align::Center;
+    row.style.width = Size::full();
+    row.style.padding = EdgeInsets{6, 8, 6, 12};
+    row.style.gap = 6;
+    row.style.backgroundColor = [activeIdx, idx]() -> Color {
+      return static_cast<size_t>(*activeIdx) == idx ? Color{55, 55, 55}
+                                                     : Color{30, 30, 30};
+    };
+    row.style.hoverColor = Color{45, 45, 45};
+    row.onClick = [activeIdx, idx] { *activeIdx = static_cast<int>(idx); };
+
+    Text label;
+    label.label = std::function<std::string()>([this, idx]() -> std::string {
+      return idx < terminals_.size() ? terminals_[idx].label : std::string();
+    });
+    label.fontSize = 13;
+    label.color = Color{210, 210, 210};
+    label.style.flexGrow = 1;
+    row.addChild(label);
+
+    View closeBtn;
+    closeBtn.style.width = Size::pixel(18);
+    closeBtn.style.height = Size::pixel(18);
+    closeBtn.style.justifyContent = Justify::Center;
+    closeBtn.style.alignItems = Align::Center;
+    closeBtn.style.borderRadius = 3.0f;
+    closeBtn.style.hoverColor = Color{70, 70, 70};
+    closeBtn.style.backgroundColor = Color{0, 0, 0, 0};
+    // Stub only, as asked — visually present, not wired up. Closing a
+    // running PTY safely (reassigning the active index, tearing down
+    // the shell, deciding what "no terminals left" looks like) is real
+    // behavior for a later pass, not a one-liner here.
+    closeBtn.onClick = [] {};
+    Text closeLabel;
+    closeLabel.label = std::string("x");
+    closeLabel.fontSize = 12;
+    closeLabel.color = Color{150, 150, 150};
+    closeBtn.addChild(closeLabel);
+    row.addChild(closeBtn);
+    return row;
+  }
+
+  // Right-hand column: a "+" header (New Terminal) above the keyed list
+  // of terminal rows — the split VS Code itself uses.
+  View buildTerminalListPanel() {
+    View panel;
+    panel.style.direction = FlexDirection::Column;
+    panel.style.width = Size::pixel(180.0f);
+    panel.style.flexShrink = 0;
+    panel.style.height = Size::full();
+    panel.style.backgroundColor = liteui_terminal::kDefaultBg;
+    panel.style.borderWidth = 1.0f;
+    panel.style.borderColor = Color{50, 50, 50};
+
+    View header;
+    header.style.direction = FlexDirection::Row;
+    header.style.width = Size::full();
+    header.style.height = Size::pixel(30);
+    header.style.alignItems = Align::Center;
+    header.style.justifyContent = Justify::End;
+    header.style.padding = EdgeInsets{0, 8, 0, 8};
+    header.style.flexShrink = 0;
+
+    View addBtn;
+    addBtn.style.width = Size::pixel(22);
+    addBtn.style.height = Size::pixel(22);
+    addBtn.style.justifyContent = Justify::Center;
+    addBtn.style.alignItems = Align::Center;
+    addBtn.style.borderRadius = 3.0f;
+    addBtn.style.hoverColor = Color{60, 60, 60};
+    addBtn.style.backgroundColor = Color{0, 0, 0, 0};
+    addBtn.tooltip = "New Terminal";
+    addBtn.onClick = [this] { spawnNewTerminal(); };
+    Text plus;
+    plus.label = std::string("+");
+    plus.fontSize = 16;
+    plus.color = Color{200, 200, 200};
+    addBtn.addChild(plus);
+    header.addChild(addBtn);
+    panel.addChild(std::move(header));
+
+    View list;
+    list.style.direction = FlexDirection::Column;
+    list.style.width = Size::full();
+    list.style.flexGrow = 1;
+    list.style.overflowY = Overflow::Auto;
+    list.keysSource = [this] { return terminalKeys(); };
+    list.itemBuilder = [this](const std::string &key) {
+      return buildTerminalRow(terminalKeyToIndex(key));
+    };
+    panel.addChild(std::move(list));
+    return panel;
+  }
+
   View buildTerminalPanel() {
     auto heightPtr = terminalHeight_;
 
@@ -1900,13 +2060,15 @@ private:
     title.style.flexShrink = 0;
     terminal.addChild(title);
 
-    liteui_terminal::Terminal shell;
-    shell.state = terminalState_;
-    shell.fontSize = 13.0f;
-    shell.style.flexGrow = 1;
-    shell.style.width = Size::full();
-    shell.style.padding = EdgeInsets{0, 10, 6, 10};
-    terminal.addChild(liteui_terminal::toTerminalView(std::move(shell)));
+    // Active terminal's output on the left, the terminal list (with its
+    // own "+") on the right — the same row-split VS Code itself uses.
+    View body;
+    body.style.direction = FlexDirection::Row;
+    body.style.width = Size::full();
+    body.style.flexGrow = 1;
+    body.addChild(buildTerminalOutputStack());
+    body.addChild(buildTerminalListPanel());
+    terminal.addChild(std::move(body));
     return terminal;
   }
 

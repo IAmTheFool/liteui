@@ -101,6 +101,18 @@ inline Color ansi256(int n) {
 inline constexpr Color kDefaultBg{30, 30, 30, 255};    // VS Code's #1e1e1e
 inline constexpr Color kDefaultFg{204, 204, 204, 255}; // VS Code's #cccccc
 
+// "Monospace" is Pango's generic family name on Linux; DirectWrite on
+// Windows doesn't recognize it and silently substitutes a non-monospace
+// font, which breaks the terminal's fixed cellW grid math (every column
+// is placed by column*cellW, not remeasured per glyph — see onPaint's
+// own per-glyph drawing note for the other half of that fix). Consolas
+// has shipped with Windows since Vista, so it's a safe concrete choice.
+#if defined(_WIN32)
+inline std::string defaultMonospaceFont() { return "Consolas"; }
+#else
+inline std::string defaultMonospaceFont() { return "Monospace"; }
+#endif
+
 // ==================== grid model ====================
 
 // One color slot: either "the theme default" (so it tracks kDefaultFg/Bg
@@ -144,6 +156,30 @@ struct TermPos {
   int row = 0, col = 0;
 };
 
+// ==================== home directory ====================
+//
+// Where the shell starts when no workspace folder is open yet. Reuses
+// liteui.hpp's own toWide() on Windows (already included transitively).
+#if defined(_WIN32)
+inline std::string userHomeDirectory() {
+  wchar_t buf[MAX_PATH];
+  DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH)
+    return std::string();
+  int len =
+      WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+  std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+  if (len > 0)
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, s.data(), len, nullptr, nullptr);
+  return s;
+}
+#else
+inline std::string userHomeDirectory() {
+  const char *home = getenv("HOME");
+  return home && *home ? std::string(home) : std::string("/");
+}
+#endif
+
 // ==================== VT/xterm-subset parser + screen state ====================
 //
 // One instance owns: the PTY (spawn/read-thread/write/resize/shutdown),
@@ -162,21 +198,43 @@ public:
 
   // ---- lifecycle ----
 
-  // Spawns the user's shell behind a PTY of the given initial size. Safe
-  // to call once; a second call is a no-op (the real size arrives soon
-  // after via resize(), once the widget's first layout pass runs).
-  void spawn(int cols, int rows) {
+  // Spawns the user's shell behind a PTY of the given initial size,
+  // starting in `startDir` — or the user's home directory if `startDir`
+  // is empty, which is what "no workspace folder open yet" should look
+  // like. Safe to call once; a second call is a no-op (the real size
+  // arrives soon after via resize(), once the widget's first layout pass
+  // runs).
+  void spawn(int cols, int rows, const std::string &startDir = std::string()) {
     if (spawned_)
       return;
     spawned_ = true;
     resizeGrid(cols, rows);
+    std::string dir = startDir.empty() ? userHomeDirectory() : startDir;
 #if defined(_WIN32)
-    spawnWindows(cols, rows);
+    spawnWindows(cols, rows, dir);
 #else
-    spawnPosix(cols, rows);
+    spawnPosix(cols, rows, dir);
 #endif
     if (ptyLive())
       startReaderThread();
+  }
+
+  // Sends a `cd` to the already-running shell — used when the app's
+  // workspace folder changes after the terminal has already been
+  // spawned. A live process's CWD can't be changed from outside, but a
+  // real terminal user wouldn't expect that either; this sends exactly
+  // what a person would type themselves, after clearing any partial
+  // input on the line so it can't get appended to garbage.
+  void changeDirectory(const std::string &path) {
+    if (path.empty() || !ptyLive())
+      return;
+    std::string cmd = "\x15"; // Ctrl+U: kill the current input line first
+#if defined(_WIN32)
+    cmd += "cd /d \"" + path + "\"\r";
+#else
+    cmd += "cd \"" + path + "\"\r";
+#endif
+    writeInput(cmd);
   }
 
   // Terminates the child and reader thread. Safe to call more than once
@@ -869,7 +927,7 @@ private:
 #if defined(_WIN32)
   // Requires a Windows 10 1809+ SDK for the ConPTY APIs
   // (CreatePseudoConsole/ResizePseudoConsole/ClosePseudoConsole).
-  void spawnWindows(int cols, int rows) {
+  void spawnWindows(int cols, int rows, const std::string &dir) {
     HANDLE inR = nullptr, inW = nullptr, outR = nullptr, outW = nullptr;
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     if (!CreatePipe(&inR, &inW, &sa, 0) || !CreatePipe(&outR, &outW, &sa, 0))
@@ -905,15 +963,22 @@ private:
       wcscpy_s(comspec, L"cmd.exe");
     std::vector<wchar_t> cmdline(comspec, comspec + wcslen(comspec) + 1);
 
+    // toWide() comes from liteui.hpp (included transitively); an empty
+    // dir means "use CreateProcessW's own default", which is fine since
+    // spawn() already resolves an empty startDir to the home directory
+    // before we ever get here.
+    std::wstring wdir = dir.empty() ? std::wstring() : toWide(dir);
+
     CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-                  EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-                  &si.StartupInfo, &process_);
+                  EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                  wdir.empty() ? nullptr : wdir.c_str(), &si.StartupInfo,
+                  &process_);
 
     DeleteProcThreadAttributeList(si.lpAttributeList);
     HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
   }
 #else
-  void spawnPosix(int cols, int rows) {
+  void spawnPosix(int cols, int rows, const std::string &dir) {
     winsize ws{};
     ws.ws_col = static_cast<unsigned short>(cols);
     ws.ws_row = static_cast<unsigned short>(rows);
@@ -924,7 +989,11 @@ private:
     }
     if (pid == 0) {
       // Child: exec the user's shell. setsid/controlling-tty wiring is
-      // already done for us by forkpty().
+      // already done for us by forkpty(). chdir() failing (e.g. a
+      // deleted folder) just leaves us in whatever directory we forked
+      // from — no different from a real terminal in that situation.
+      if (!dir.empty())
+        chdir(dir.c_str());
       const char *shell = getenv("SHELL");
       if (!shell || !*shell)
         shell = "/bin/bash";
@@ -1034,7 +1103,7 @@ inline std::string encodeKey(const KeyEvent &e, bool appCursorKeys) {
 struct Terminal {
   Style style;
   float fontSize = 13.0f;
-  std::string fontFamily = "Monospace"; // matches CodeEditor's own default
+  std::string fontFamily = defaultMonospaceFont();
   Color backgroundColor = kDefaultBg;
   std::shared_ptr<TerminalState> state = std::make_shared<TerminalState>();
 };
@@ -1110,13 +1179,16 @@ inline View toTerminalView(Terminal t) {
           ctx.setFillColor(cellBg);
           ctx.fillRect(runX, r * lineH, runW, lineH);
         }
-        std::string text;
-        for (int i = c; i < runEnd; ++i)
-          text += line.cells[static_cast<size_t>(i)].ch;
         ctx.setFont(ts.fontFamily, ts.fontSize,
                    first.bold ? FontWeight::Bold : FontWeight::Regular);
         ctx.setFillColor(fg);
-        ctx.fillText(text, runX, y);
+        // One fillText per glyph, each pinned to i*cellW, rather than
+        // the whole run as one string — keeps every column exactly on
+        // its grid slot (and therefore in sync with the cursor's own
+        // column*cellW math below) even if the chosen font turns out
+        // not to be perfectly fixed-pitch.
+        for (int i = c; i < runEnd; ++i)
+          ctx.fillText(line.cells[static_cast<size_t>(i)].ch, i * cellW, y);
         if (first.underline)
           ctx.fillRect(runX, r * lineH + lineH - 2.0f, runW, 1.0f);
         c = runEnd;
