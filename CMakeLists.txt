@@ -82,8 +82,9 @@ elseif(UNIX AND NOT APPLE)
         PkgConfig::GLES
         PkgConfig::WAYLAND_EGL
         PkgConfig::XKBCOMMON
-        PkgConfig::PNG 
+        PkgConfig::PNG
         PkgConfig::JPEG
+        util
     )
     add_dependencies(main xdg_shell_protocol)
 

@@ -5,6 +5,7 @@
 #include "liteui.hpp"
 #include "liteui_editor_ext.hpp"
 #include "liteui_syntax.hpp"
+#include "liteui_terminal.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -16,7 +17,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <algorithm>
 #include <vector>
 
 inline std::string editorTitleFromPath(const std::string &path) {
@@ -195,9 +195,16 @@ public:
       : ui_(width, height, windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
     newWelcomeTab();
+    // 80x24 is just a starting point — the terminal View's own onLayout
+    // resizes both the PTY and the grid to the real pixel size the
+    // instant buildRoot() below lays out the panel for the first time.
+    terminalState_->spawn(80, 24);
+    ui_.addInterval(33, [state = terminalState_] { state->pollOutput(); });
     buildRoot(); // built once; tab strip + editor stack reconcile themselves
     setupShortcuts();
   }
+
+  ~TabbedEditor() { terminalState_->shutdown(); }
 
   // One poll before the loop starts, so any openFile()/newDocument() the
   // caller made between construction and run() is reconciled into the tree
@@ -391,6 +398,12 @@ private:
   static constexpr float kMinTerminalHeight = 80.0f;
   static constexpr float kMaxTerminalHeight = 400.0f;
   static constexpr float kHDividerHeight = 6.0f;
+
+  // Backing state for the integrated terminal below — a real PTY-backed
+  // shell (see liteui_terminal.hpp), spawned once in the constructor and
+  // kept alive across every rebuild() exactly like docs_/CodeEditorState.
+  std::shared_ptr<liteui_terminal::TerminalState> terminalState_ =
+      std::make_shared<liteui_terminal::TerminalState>();
 
   // Resizable side panel width, shared with the divider's drag handler and
   // the panel's own Dynamic<Size> width — same reasoning as activityIndex_:
@@ -616,7 +629,7 @@ private:
     runWorkspaceSearch(workspaceSearchQuery_);
   }
 
-    // Applies the current query -> replacement across every visible search
+  // Applies the current query -> replacement across every visible search
   // result in one pass, grouped by file so each file is read/written (or
   // its open CodeEditorState edited) exactly once rather than once per
   // match. Unlike replaceMatch(), this deliberately does NOT call
@@ -1860,9 +1873,10 @@ private:
     return divider;
   }
 
-  // Terminal panel: fixed-looking placeholder content (a title + a bare
-  // prompt), sized by terminalHeight_ via buildHDivider() above. Same
-  // dark palette as the plain liteui example's `terminal` View.
+  // Terminal panel: a real shell behind a PTY (liteui_terminal.hpp),
+  // sized by terminalHeight_ via buildHDivider() above. The "TERMINAL"
+  // header stays a plain Text; the shell itself is the liteui_terminal
+  // widget filling whatever space is left beneath it.
   View buildTerminalPanel() {
     auto heightPtr = terminalHeight_;
 
@@ -1871,8 +1885,7 @@ private:
     terminal.style.flexGrow = 0;
     terminal.style.flexShrink = 0;
     terminal.style.direction = FlexDirection::Column;
-    terminal.style.backgroundColor = Color{24, 24, 24};
-    terminal.style.padding = EdgeInsets::all(10.0f);
+    terminal.style.backgroundColor = liteui_terminal::kDefaultBg;
     terminal.style.overflowY = Overflow::Hidden;
     terminal.style.height = [heightPtr]() -> Size {
       return Size::pixel(*heightPtr);
@@ -1883,15 +1896,17 @@ private:
     title.fontSize = 12;
     title.fontWeight = FontWeight::SemiBold;
     title.color = Color{180, 180, 180};
+    title.style.padding = EdgeInsets{6, 10, 4, 10};
+    title.style.flexShrink = 0;
     terminal.addChild(title);
 
-    Text prompt;
-    prompt.label = std::string("$ ");
-    prompt.fontSize = 13;
-    prompt.fontFamily = "monospace";
-    prompt.color = Color{100, 220, 130};
-    prompt.style.margin = EdgeInsets{8, 0, 0, 0};
-    terminal.addChild(prompt);
+    liteui_terminal::Terminal shell;
+    shell.state = terminalState_;
+    shell.fontSize = 13.0f;
+    shell.style.flexGrow = 1;
+    shell.style.width = Size::full();
+    shell.style.padding = EdgeInsets{0, 10, 6, 10};
+    terminal.addChild(liteui_terminal::toTerminalView(std::move(shell)));
     return terminal;
   }
 
