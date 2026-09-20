@@ -1348,15 +1348,19 @@ private:
                              std::vector<std::string> &out) {
     out.clear();
     std::string cur;
+    auto pushLine = [&] {
+      if (!cur.empty() && cur.back() == '\r')
+        cur.pop_back();
+      out.push_back(cur);
+      cur.clear();
+    };
     for (char c : text) {
-      if (c == '\n') {
-        out.push_back(cur);
-        cur.clear();
-      } else {
+      if (c == '\n')
+        pushLine();
+      else
         cur += c;
-      }
     }
-    out.push_back(cur);
+    pushLine();
     if (out.empty())
       out.push_back(std::string());
   }
@@ -1920,7 +1924,7 @@ private:
     shell.style.padding = EdgeInsets{4, 10, 6, 10};
     shell.style.display = [activeIdx, idx]() -> Display {
       return static_cast<size_t>(*activeIdx) == idx ? Display::Flex
-                                                     : Display::None;
+                                                    : Display::None;
     };
     return liteui_terminal::toTerminalView(std::move(shell));
   }
@@ -1949,7 +1953,7 @@ private:
     row.style.gap = 6;
     row.style.backgroundColor = [activeIdx, idx]() -> Color {
       return static_cast<size_t>(*activeIdx) == idx ? Color{55, 55, 55}
-                                                     : Color{30, 30, 30};
+                                                    : Color{30, 30, 30};
     };
     row.style.hoverColor = Color{45, 45, 45};
     row.onClick = [activeIdx, idx] { *activeIdx = static_cast<int>(idx); };

@@ -367,6 +367,18 @@ struct CodeEditorState {
   float scrollX = 0.0f, scrollY = 0.0f;
   float lastViewW = 0.0f, lastViewH = 0.0f;
 
+  bool manualScroll = false; // true while the user is scrolling via wheel/
+                             // scrollbar rather than moving the caret —
+                             // suppresses onPaint's caret-follow snap
+
+  bool scrollbarDragging = false;
+  float scrollbarDragStartY = 0.0f;
+  float scrollbarDragStartScrollY = 0.0f;
+
+  bool hScrollbarDragging = false;
+  float hScrollbarDragStartX = 0.0f;
+  float hScrollbarDragStartScrollX = 0.0f;
+
   // ---- undo/redo ----
   // Snapshot-based: correct and simple, at the cost of copying the whole
   // buffer per undo step. Fine up to the sizes a text-editing session
@@ -408,6 +420,7 @@ struct CodeEditorState {
   // other edit (paste, cut, newline, backspace/delete, indent) is its own
   // undo step so undo doesn't merge unrelated actions together.
   void beginEdit(bool coalescable) {
+    manualScroll = false;
     redoStack.clear(); // a fresh edit invalidates the redo history
     if (!coalescable) {
       pushUndo();
@@ -424,11 +437,15 @@ struct CodeEditorState {
   // Call after a pure cursor move (arrow keys, click) that isn't itself an
   // edit, so the next keystroke doesn't get coalesced into whatever typing
   // happened before the cursor moved elsewhere.
-  void noteCursorMoved() { lastEdit = LastEdit::None; }
+  void noteCursorMoved() {
+    lastEdit = LastEdit::None;
+    manualScroll = false;
+  }
 
   void undo() {
     if (undoStack.empty())
       return;
+    manualScroll = false;
     redoStack.push_back(snapshot());
     restore(undoStack.back());
     undoStack.pop_back();
@@ -439,6 +456,7 @@ struct CodeEditorState {
   void redo() {
     if (redoStack.empty())
       return;
+    manualScroll = false;
     undoStack.push_back(snapshot());
     restore(redoStack.back());
     redoStack.pop_back();
@@ -502,6 +520,7 @@ struct CodeEditorState {
   }
 
   void selectAll() {
+    manualScroll = false;
     selectionAnchor = EditPos{0, 0};
     cursor = EditPos{lines.size() - 1, lines.back().size()};
   }
@@ -603,6 +622,7 @@ struct CodeEditorState {
   // hood, so it's already rendered by the existing selection-highlight
   // code and already works with Ctrl+C/replace without any special-casing.
   void jumpToMatch(int idx) {
+    manualScroll = false;
     if (idx < 0 || idx >= static_cast<int>(search.matches.size())) {
       search.currentMatch = -1;
       return;
@@ -699,6 +719,12 @@ struct CodeEditor {
   float padding = 8.0f;
   float lineHeight = 0.0f; // 0 = auto (fontSize * 1.4)
   int tabWidthSpaces = 4;
+
+  bool showScrollbar = true;
+  float scrollbarWidth = 10.0f;
+  Color scrollbarTrackColor = Color{0, 0, 0, 20};
+  Color scrollbarThumbColor = Color{0, 0, 0, 90};
+
   std::function<void(const std::string &)> onChange;
 
   std::function<void(const std::vector<std::string> &lines)> beforePaintSync;
@@ -758,6 +784,10 @@ inline View toCodeEditorView(CodeEditor ed) {
   auto onChange = ed.onChange;
   Color borderColor = ed.borderColor;
   Color focusedBorderColor = ed.focusedBorderColor;
+  bool showScrollbar = ed.showScrollbar;
+  float scrollbarWidth = ed.scrollbarWidth;
+  Color scrollbarTrackColor = ed.scrollbarTrackColor;
+  Color scrollbarThumbColor = ed.scrollbarThumbColor;
   auto preKeyDown = ed.preKeyDown;
   auto preTextInput = ed.preTextInput;
   auto postPaint = ed.postPaint;
@@ -775,6 +805,47 @@ inline View toCodeEditorView(CodeEditor ed) {
     bool d = state->dirty;
     state->dirty = false;
     return d;
+  };
+
+  auto vScrollbarGeometry = [](CodeEditorState *state, float lineH, float viewH,
+                               float viewW, float barW) {
+    struct Geo {
+      bool visible;
+      float trackY, trackH, thumbY, thumbH, x;
+    };
+    float contentH = state->lines.size() * lineH;
+    if (contentH <= viewH)
+      return Geo{false, 0, 0, 0, 0, 0};
+    float trackY = 0, trackH = viewH;
+    float thumbH = std::max(20.0f, trackH * (viewH / contentH));
+    float maxScroll = std::max(0.0f, contentH - viewH);
+    float thumbY =
+        maxScroll > 0 ? (state->scrollY / maxScroll) * (trackH - thumbH) : 0;
+    return Geo{true, trackY, trackH, thumbY, thumbH, viewW - barW};
+  };
+
+  auto hScrollbarGeometry = [](CodeEditorState *state, const TextStyle &ts,
+                               float textLeft, float viewW, float viewH,
+                               float barH) {
+    struct Geo {
+      bool visible;
+      float trackX, trackW, thumbX, thumbW, y;
+    };
+    float maxLineW = 0.0f;
+    for (const auto &l : state->lines) {
+      float w = liteui_text::measure(l, ts, -1).width;
+      if (w > maxLineW)
+        maxLineW = w;
+    }
+    float viewportW = std::max(0.0f, viewW - textLeft);
+    if (maxLineW <= viewportW)
+      return Geo{false, 0, 0, 0, 0, 0};
+    float trackX = textLeft, trackW = viewportW;
+    float thumbW = std::max(20.0f, trackW * (viewportW / maxLineW));
+    float maxScroll = std::max(0.0f, maxLineW - viewportW);
+    float thumbX =
+        maxScroll > 0 ? (state->scrollX / maxScroll) * (trackW - thumbW) : 0;
+    return Geo{true, trackX, trackW, thumbX, thumbW, viewH - barH};
   };
 
   auto gutterWidth = [showNums, ts](size_t lineCount) -> float {
@@ -933,21 +1004,32 @@ inline View toCodeEditorView(CodeEditor ed) {
     float availH = std::max(0.0f, ctx.height() - pad * 2.0f);
 
     float caretTop = state->cursor.line * lineH;
-    if (caretTop - state->scrollY < 0)
-      state->scrollY = caretTop;
-    if (caretTop + lineH - state->scrollY > availH)
-      state->scrollY = caretTop + lineH - availH;
+    if (!state->manualScroll) {
+      if (caretTop - state->scrollY < 0)
+        state->scrollY = caretTop;
+      if (caretTop + lineH - state->scrollY > availH)
+        state->scrollY = caretTop + lineH - availH;
+    }
     float maxScrollY = std::max(0.0f, state->lines.size() * lineH - availH);
     state->scrollY = std::clamp(state->scrollY, 0.0f, maxScrollY);
 
     const std::string &curLine = state->lines[state->cursor.line];
     liteui_text::Measurement caretM =
         liteui_text::measure(curLine.substr(0, state->cursor.col), ts, -1);
-    if (caretM.width - state->scrollX > availW)
-      state->scrollX = caretM.width - availW;
-    if (caretM.width - state->scrollX < 0)
-      state->scrollX = caretM.width;
-    state->scrollX = std::max(0.0f, state->scrollX);
+    if (!state->manualScroll) {
+      if (caretM.width - state->scrollX > availW)
+        state->scrollX = caretM.width - availW;
+      if (caretM.width - state->scrollX < 0)
+        state->scrollX = caretM.width;
+    }
+    float maxLineW = 0.0f;
+    for (const auto &l : state->lines) {
+      float w = liteui_text::measure(l, ts, -1).width;
+      if (w > maxLineW)
+        maxLineW = w;
+    }
+    float maxScrollX = std::max(0.0f, maxLineW - availW);
+    state->scrollX = std::clamp(state->scrollX, 0.0f, maxScrollX);
 
     ctx.save();
     ctx.beginPath();
@@ -1157,6 +1239,27 @@ inline View toCodeEditorView(CodeEditor ed) {
       ctx.fillText(hint, bx + 8.0f, ty);
     }
 
+    if (showScrollbar) {
+      auto vGeo = vScrollbarGeometry(state.get(), lineH, ctx.height(),
+                                     ctx.width(), scrollbarWidth);
+      if (vGeo.visible) {
+        ctx.setFillColor(scrollbarTrackColor);
+        ctx.fillRect(vGeo.x, vGeo.trackY, scrollbarWidth, vGeo.trackH);
+        ctx.setFillColor(scrollbarThumbColor);
+        ctx.fillRect(vGeo.x, vGeo.trackY + vGeo.thumbY, scrollbarWidth,
+                     vGeo.thumbH);
+      }
+      auto hGeo = hScrollbarGeometry(state.get(), ts, textLeft, ctx.width(),
+                                     ctx.height(), scrollbarWidth);
+      if (hGeo.visible) {
+        ctx.setFillColor(scrollbarTrackColor);
+        ctx.fillRect(hGeo.trackX, hGeo.y, hGeo.trackW, scrollbarWidth);
+        ctx.setFillColor(scrollbarThumbColor);
+        ctx.fillRect(hGeo.trackX + hGeo.thumbX, hGeo.y, hGeo.thumbW,
+                     scrollbarWidth);
+      }
+    }
+
     if (postPaint)
       postPaint(ctx);
   };
@@ -1172,6 +1275,57 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onPressAt = [=](float lx, float ly) {
+    float textLeft = pad + gutterWidth(state->lines.size());
+    state->scrollbarDragging = false;
+    state->hScrollbarDragging = false;
+    if (showScrollbar) {
+      auto hGeo =
+          hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
+                             state->lastViewH, scrollbarWidth);
+      // Check the horizontal band first: in the bottom-right corner where
+      // both bars could claim the point, the bottom strip visually belongs
+      // to the horizontal bar, so it gets priority.
+      if (hGeo.visible && ly >= hGeo.y) {
+        state->manualScroll = true;
+        state->hScrollbarDragging = true;
+        state->hScrollbarDragStartX = lx;
+        state->hScrollbarDragStartScrollX = state->scrollX;
+        if (lx < hGeo.trackX + hGeo.thumbX ||
+            lx > hGeo.trackX + hGeo.thumbX + hGeo.thumbW) {
+          float maxLineW = 0.0f;
+          for (const auto &l : state->lines) {
+            float w = liteui_text::measure(l, ts, -1).width;
+            if (w > maxLineW)
+              maxLineW = w;
+          }
+          float viewportW = std::max(0.0f, state->lastViewW - textLeft);
+          float maxScroll = std::max(0.0f, maxLineW - viewportW);
+          float frac = (lx - hGeo.trackX - hGeo.thumbW / 2.0f) /
+                       std::max(1.0f, hGeo.trackW - hGeo.thumbW);
+          state->scrollX = std::clamp(frac * maxScroll, 0.0f, maxScroll);
+        }
+        state->dirty = true;
+        return;
+      }
+      auto vGeo = vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                                     state->lastViewW, scrollbarWidth);
+      if (vGeo.visible && lx >= vGeo.x) {
+        state->manualScroll = true;
+        state->scrollbarDragging = true;
+        state->scrollbarDragStartY = ly;
+        state->scrollbarDragStartScrollY = state->scrollY;
+        if (ly < vGeo.trackY + vGeo.thumbY ||
+            ly > vGeo.trackY + vGeo.thumbY + vGeo.thumbH) {
+          float contentH = state->lines.size() * lineH;
+          float maxScroll = std::max(0.0f, contentH - state->lastViewH);
+          float frac = (ly - vGeo.thumbH / 2.0f) /
+                       std::max(1.0f, vGeo.trackH - vGeo.thumbH);
+          state->scrollY = std::clamp(frac * maxScroll, 0.0f, maxScroll);
+        }
+        state->dirty = true;
+        return;
+      }
+    }
     EditPos p = posAtPoint(lx, ly);
     state->cursor = p;
     state->dragAnchor = p;
@@ -1182,10 +1336,42 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onDragTo = [=](float lx, float ly) {
+    float textLeft = pad + gutterWidth(state->lines.size());
+    if (state->hScrollbarDragging) {
+      float maxLineW = 0.0f;
+      for (const auto &l : state->lines) {
+        float w = liteui_text::measure(l, ts, -1).width;
+        if (w > maxLineW)
+          maxLineW = w;
+      }
+      float viewportW = std::max(0.0f, state->lastViewW - textLeft);
+      float maxScroll = std::max(0.0f, maxLineW - viewportW);
+      auto hGeo =
+          hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
+                             state->lastViewH, scrollbarWidth);
+      float range = std::max(1.0f, hGeo.trackW - hGeo.thumbW);
+      float delta = (lx - state->hScrollbarDragStartX) / range * maxScroll;
+      state->scrollX = std::clamp(state->hScrollbarDragStartScrollX + delta,
+                                  0.0f, maxScroll);
+      state->manualScroll = true;
+      state->dirty = true;
+      return;
+    }
+    if (state->scrollbarDragging) {
+      state->manualScroll = true;
+      float contentH = state->lines.size() * lineH;
+      float maxScroll = std::max(0.0f, contentH - state->lastViewH);
+      auto vGeo = vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                                     state->lastViewW, scrollbarWidth);
+      float range = std::max(1.0f, vGeo.trackH - vGeo.thumbH);
+      float delta = (ly - state->scrollbarDragStartY) / range * maxScroll;
+      state->scrollY =
+          std::clamp(state->scrollbarDragStartScrollY + delta, 0.0f, maxScroll);
+      state->dirty = true;
+      return;
+    }
     EditPos p = posAtPoint(lx, ly);
     state->cursor = p;
-    // Only form a selection once the drag has actually moved somewhere
-    // else; dragging back to the exact press point clears it again.
     if (p != state->dragAnchor)
       state->selectionAnchor = state->dragAnchor;
     else
@@ -1216,10 +1402,12 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onScrollUp = [state, lineH] {
+    state->manualScroll = true;
     state->scrollY = std::max(0.0f, state->scrollY - lineH * 3.0f);
     state->dirty = true;
   };
   v.onScrollDown = [state, lineH] {
+    state->manualScroll = true;
     float maxScrollY =
         std::max(0.0f, state->lines.size() * lineH - state->lastViewH);
     state->scrollY = std::min(maxScrollY, state->scrollY + lineH * 3.0f);
