@@ -6,6 +6,8 @@
 #include "liteui_editor_ext.hpp"
 #include "liteui_syntax.hpp"
 #include "liteui_terminal.hpp"
+#include "liteui_theme.hpp"
+namespace th = liteui_theme;
 
 #include <algorithm>
 #include <cctype>
@@ -194,6 +196,8 @@ public:
                const std::string &windowTitle = "liteui code editor")
       : ui_(width, height, windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
+    ui_.setWindowBackground(th::kEditorBg);
+    ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
     newWelcomeTab();
     spawnNewTerminal(); // start with one terminal, like VS Code's default
     ui_.addInterval(33, [this] {
@@ -743,8 +747,8 @@ private:
     row.style.alignItems = Align::Center;
     row.style.padding = EdgeInsets{5, 12, 5, 12};
     row.style.gap = 8;
-    row.style.backgroundColor = Color{243, 243, 243};
-    row.style.hoverColor = Color{226, 226, 226};
+    row.style.backgroundColor = th::kSideBarBg;
+    row.style.hoverColor = th::kHoverBg;
     row.style.display = [this, idx]() -> Display {
       return idx < workspaceSearchResults_.size() ? Display::Flex
                                                   : Display::None;
@@ -757,6 +761,7 @@ private:
     };
 
     View textCol;
+    textCol.style.backgroundColor = th::kTransparent;
     textCol.style.direction = FlexDirection::Column;
     textCol.style.flexGrow = 1;
     textCol.style.gap = 2;
@@ -770,7 +775,7 @@ private:
     });
     top.fontSize = 12;
     top.fontWeight = FontWeight::SemiBold;
-    top.color = Color{40, 40, 40};
+    top.color = th::kText;
     textCol.addChild(top);
 
     Text snippetText;
@@ -785,7 +790,7 @@ private:
           return snippet.empty() ? std::string(" ") : snippet;
         });
     snippetText.fontSize = 12;
-    snippetText.color = Color{120, 120, 120};
+    snippetText.color = th::kTextMuted;
     snippetText.overflow = TextOverflow::Ellipsis;
     snippetText.wrap = TextWrap::NoWrap;
     textCol.addChild(snippetText);
@@ -803,14 +808,14 @@ private:
     replaceBtn.style.alignItems = Align::Center;
     replaceBtn.style.borderRadius = 3.0f;
     replaceBtn.style.backgroundColor = Color{0, 0, 0, 0};
-    replaceBtn.style.hoverColor = Color{210, 210, 210};
+    replaceBtn.style.hoverColor = th::kButtonHoverBg;
     replaceBtn.tooltip = "Replace this match";
     replaceBtn.onClick = [this, idx] { replaceMatch(idx); };
     Text replaceLabel;
     replaceLabel.label = std::string("R");
     replaceLabel.fontSize = 11;
     replaceLabel.fontWeight = FontWeight::SemiBold;
-    replaceLabel.color = Color{90, 90, 90};
+    replaceLabel.color = th::kTextMuted;
     replaceBtn.addChild(replaceLabel);
     row.addChild(std::move(replaceBtn));
 
@@ -1398,11 +1403,11 @@ private:
       bool isActive =
           !isDir && active && active->hasPath && active->path == key;
       bool isSelected = (key == selectedPath_);
-      return isSelected ? Color{197, 220, 250}
-             : isActive ? Color{213, 228, 249}
-                        : Color{243, 243, 243};
+      return isSelected ? th::kSelectedBg
+             : isActive ? th::kActiveItemBg
+                        : th::kSideBarBg;
     };
-    row.style.hoverColor = Color{226, 226, 226};
+    row.style.hoverColor = th::kHoverBg;
     row.onClick = [this, key] {
       selectedPath_ = key;
       int d = 0;
@@ -1438,13 +1443,13 @@ private:
                           : std::string("   ");
     chevron.fontSize = 11;
     chevron.style.width = Size::pixel(14);
-    chevron.color = Color{110, 110, 110};
+    chevron.color = th::kTextDim;
     row.addChild(chevron);
 
     Text label;
     label.label = name;
     label.fontSize = 13;
-    label.color = isDir ? Color{40, 40, 40} : Color{70, 70, 70};
+    label.color = th::kText;
     row.addChild(label);
     return row;
   }
@@ -1460,7 +1465,7 @@ private:
     row.style.alignItems = Align::Center;
     row.style.padding =
         EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
-    row.style.backgroundColor = Color{243, 243, 243};
+    row.style.backgroundColor = th::kSideBarBg;
     // Piggybacks on the generic Dynamic<bool> polling checkForUpdates()
     // already does for every view's `disabled` field — re-evaluated
     // after every dispatched event — purely to detect focus loss on the
@@ -1475,7 +1480,7 @@ private:
     chevron.label = std::string("   ");
     chevron.fontSize = 11;
     chevron.style.width = Size::pixel(14);
-    chevron.color = Color{110, 110, 110};
+    chevron.color = th::kTextDim;
     row.addChild(chevron);
 
     TextInput input;
@@ -1483,9 +1488,13 @@ private:
     input.style.height = Size::pixel(20);
     input.fontSize = 13;
     input.placeholder = isDir ? "Folder name" : "File name";
-    input.textColor = Color{40, 40, 40};
-    input.borderColor = Color{170, 170, 170};
-    input.focusedBorderColor = Color{80, 140, 230};
+    input.textColor = th::kText;
+    input.borderColor = th::kDivider;
+    input.focusedBorderColor = th::kAccent;
+    input.style.backgroundColor = th::kInputBg;
+    input.style.borderWidth = 1.0f;
+    input.placeholderColor = th::kPlaceholder;
+    input.caretColor = th::kCaret;
     input.leftPadding = 4.0f;
     input.onSubmit = [this](const std::string &text) {
       submitPendingCreate(text);
@@ -1510,7 +1519,7 @@ private:
     row.style.alignItems = Align::Center;
     row.style.padding =
         EdgeInsets{3, 12, 3, static_cast<float>(8 + depth * 14)};
-    row.style.backgroundColor = Color{243, 243, 243};
+    row.style.backgroundColor = th::kSideBarBg;
     row.disabled = [this]() -> bool {
       checkPendingRenameBlur();
       return false;
@@ -1522,7 +1531,7 @@ private:
                           : std::string("   ");
     chevron.fontSize = 11;
     chevron.style.width = Size::pixel(14);
-    chevron.color = Color{110, 110, 110};
+    chevron.color = th::kTextDim;
     row.addChild(chevron);
 
     TextInput input;
@@ -1531,9 +1540,13 @@ private:
     input.fontSize = 13;
     input.text =
         editorTitleFromPath(originalPath); // prefilled with current name
-    input.textColor = Color{40, 40, 40};
-    input.borderColor = Color{170, 170, 170};
-    input.focusedBorderColor = Color{80, 140, 230};
+    input.textColor = th::kText;
+    input.borderColor = th::kDivider;
+    input.focusedBorderColor = th::kAccent;
+    input.style.backgroundColor = th::kInputBg;
+    input.style.borderWidth = 1.0f;
+    input.placeholderColor = th::kPlaceholder;
+    input.caretColor = th::kCaret;
     input.leftPadding = 4.0f;
     input.onSubmit = [this](const std::string &text) {
       submitPendingRename(text);
@@ -1557,10 +1570,9 @@ private:
     // Highlighted the same way a selected child row is, whenever the
     // root itself is the current selection (its default state).
     row.style.backgroundColor = [this]() -> Color {
-      return selectedPath_ == workspaceRoot_ ? Color{197, 220, 250}
-                                             : Color{243, 243, 243};
+      return selectedPath_ == workspaceRoot_ ? th::kSelectedBg : th::kSideBarBg;
     };
-    row.style.hoverColor = Color{233, 233, 233};
+    row.style.hoverColor = th::kHoverBg;
     row.onClick = [this] { selectedPath_ = workspaceRoot_; };
     row.style.display = [this]() -> Display {
       return workspaceRoot_.empty() ? Display::None : Display::Flex;
@@ -1575,7 +1587,7 @@ private:
     });
     nameLabel.fontSize = 11;
     nameLabel.fontWeight = FontWeight::SemiBold;
-    nameLabel.color = Color{110, 110, 110};
+    nameLabel.color = th::kTextDim;
     nameLabel.style.flexGrow = 1;
     row.addChild(nameLabel);
 
@@ -1588,7 +1600,7 @@ private:
       btn.style.justifyContent = Justify::Center;
       btn.style.alignItems = Align::Center;
       btn.style.borderRadius = 3.0f;
-      btn.style.hoverColor = Color{222, 222, 222};
+      btn.style.hoverColor = th::kButtonHoverBg;
       btn.style.backgroundColor = Color{0, 0, 0, 0};
       btn.tooltip = tooltip;
       btn.onClick = std::move(onClick);
@@ -1596,7 +1608,7 @@ private:
       t.label = label;
       t.fontSize = 11;
       t.fontWeight = FontWeight::SemiBold;
-      t.color = Color{90, 90, 90};
+      t.color = th::kTextMuted;
       btn.addChild(t);
       return btn;
     };
@@ -1617,7 +1629,7 @@ private:
     pane.style.direction = FlexDirection::Column;
     pane.style.width = Size::full();
     pane.style.flexGrow = 1;
-    pane.style.backgroundColor = Color{243, 243, 243};
+    pane.style.backgroundColor = th::kSideBarBg;
     pane.style.display = [act]() -> Display {
       return *act == kExplorerActivityId ? Display::Flex : Display::None;
     };
@@ -1626,8 +1638,8 @@ private:
     openBtn.style.width = Size::full();
     openBtn.style.padding = EdgeInsets{6, 12, 6, 12};
     openBtn.style.alignItems = Align::Center;
-    openBtn.style.backgroundColor = Color{243, 243, 243};
-    openBtn.style.hoverColor = Color{226, 226, 226};
+    openBtn.style.backgroundColor = th::kSideBarBg;
+    openBtn.style.hoverColor = th::kHoverBg;
     openBtn.style.display = [this]() -> Display {
       return workspaceRoot_.empty() ? Display::Flex : Display::None;
     };
@@ -1635,7 +1647,7 @@ private:
     Text openLabel;
     openLabel.label = std::string("Open Folder...");
     openLabel.fontSize = 13;
-    openLabel.color = Color{40, 40, 40};
+    openLabel.color = th::kText;
     openBtn.addChild(openLabel);
     pane.addChild(std::move(openBtn));
     pane.addChild(buildExplorerHeaderRow());
@@ -1648,7 +1660,7 @@ private:
     list.style.direction = FlexDirection::Column;
     list.style.width = Size::full();
     list.style.flexGrow = 1;
-    list.style.backgroundColor = Color{243, 243, 243};
+    list.style.backgroundColor = th::kSideBarBg;
     list.style.overflowY = Overflow::Auto;
     list.keysSource = [this] { return explorerKeys(); };
     list.itemBuilder = [this](const std::string &key) {
@@ -1670,7 +1682,7 @@ private:
     pane.style.direction = FlexDirection::Column;
     pane.style.width = Size::full();
     pane.style.flexGrow = 1;
-    pane.style.backgroundColor = Color{243, 243, 243};
+    pane.style.backgroundColor = th::kSideBarBg;
     pane.style.display = [act]() -> Display {
       return *act == kSearchActivityId ? Display::Flex : Display::None;
     };
@@ -1679,6 +1691,7 @@ private:
     inputRow.style.width = Size::full();
     inputRow.style.padding = EdgeInsets{8, 12, 4, 12};
     inputRow.style.flexShrink = 0;
+    inputRow.style.backgroundColor = th::kSideBarBg;
 
     TextInput input;
     input.style.width = Size::full();
@@ -1686,9 +1699,13 @@ private:
     input.style.flexShrink = 0;
     input.fontSize = 13;
     input.placeholder = "Search";
-    input.textColor = Color{40, 40, 40};
-    input.borderColor = Color{190, 190, 190};
-    input.focusedBorderColor = Color{80, 140, 230};
+    input.textColor = th::kText;
+    input.borderColor = th::kDivider;
+    input.focusedBorderColor = th::kAccent;
+    input.style.backgroundColor = th::kInputBg;
+    input.style.borderWidth = 1.0f;
+    input.placeholderColor = th::kPlaceholder;
+    input.caretColor = th::kCaret;
     input.leftPadding = 6.0f;
     input.state = searchInputState_;
     input.onChange = [this](const std::string &text) {
@@ -1705,6 +1722,7 @@ private:
                                      // let the panel's shrink math eat this
     replaceRow.style.gap = 6;
     replaceRow.style.alignItems = Align::Center;
+    replaceRow.style.backgroundColor = th::kSideBarBg;
 
     TextInput replaceInput;
     replaceInput.style.flexGrow = 1;
@@ -1712,9 +1730,9 @@ private:
     replaceInput.style.flexShrink = 0;
     replaceInput.fontSize = 13;
     replaceInput.placeholder = "Replace";
-    replaceInput.textColor = Color{40, 40, 40};
-    replaceInput.borderColor = Color{190, 190, 190};
-    replaceInput.focusedBorderColor = Color{80, 140, 230};
+    replaceInput.textColor = th::kText;
+    replaceInput.borderColor = th::kDivider;
+    replaceInput.focusedBorderColor = th::kAccent;
     replaceInput.leftPadding = 6.0f;
     replaceInput.state = replaceInputState_;
     replaceInput.onChange = [this](const std::string &text) {
@@ -1729,14 +1747,15 @@ private:
     replaceAllBtn.style.justifyContent = Justify::Center;
     replaceAllBtn.style.alignItems = Align::Center;
     replaceAllBtn.style.borderRadius = 3.0f;
-    replaceAllBtn.style.backgroundColor = Color{225, 225, 225};
-    replaceAllBtn.style.hoverColor = Color{205, 205, 205};
+    replaceAllBtn.style.backgroundColor = th::kButtonBg;
+    replaceAllBtn.style.hoverColor = th::kButtonHoverBg;
+
     replaceAllBtn.tooltip = "Replace all current matches";
     replaceAllBtn.onClick = [this] { replaceAllMatches(); };
     Text replaceAllLabel;
     replaceAllLabel.label = std::string("Replace All");
     replaceAllLabel.fontSize = 12;
-    replaceAllLabel.color = Color{50, 50, 50};
+    replaceAllLabel.color = th::kText;
     replaceAllBtn.addChild(replaceAllLabel);
     replaceRow.addChild(std::move(replaceAllBtn));
 
@@ -1757,7 +1776,7 @@ private:
     hintOrCount.style.padding = EdgeInsets{0, 12, 6, 12};
     hintOrCount.style.flexShrink = 0;
     hintOrCount.fontSize = 11;
-    hintOrCount.color = Color{130, 130, 130};
+    hintOrCount.color = th::kTextDim;
     pane.addChild(hintOrCount);
 
     View list;
@@ -1765,7 +1784,7 @@ private:
     list.style.width = Size::full();
     list.style.flexGrow = 1;
     list.style.overflowY = Overflow::Auto;
-    list.style.backgroundColor = Color{243, 243, 243};
+    list.style.backgroundColor = th::kSideBarBg;
     // Fixed pool, not a keyed list — see buildSearchResultSlot's comment
     // for why. Hidden slots (idx >= current result count) cost nothing:
     // measureNatural() skips Display::None children entirely, so an
@@ -1790,7 +1809,7 @@ private:
       };
     }
     panel.style.height = Size::full();
-    panel.style.backgroundColor = Color{243, 243, 243};
+    panel.style.backgroundColor = th::kSideBarBg;
     panel.style.padding = EdgeInsets{8, 0, 8, 0};
     panel.style.gap = 2;
 
@@ -1813,7 +1832,7 @@ private:
     header.style.width = Size::full();
     header.style.flexShrink = 0;
     header.fontSize = 11;
-    header.color = Color{110, 110, 110};
+    header.color = th::kTextDim;
     panel.addChild(header);
 
     panel.addChild(buildExplorerPane());
@@ -1832,8 +1851,8 @@ private:
     View divider;
     divider.style.height = Size::full();
     divider.style.flexShrink = 0;
-    divider.style.backgroundColor = Color{215, 215, 215};
-    divider.style.hoverColor = Color{80, 80, 220};
+    divider.style.backgroundColor = th::kDivider;
+    divider.style.hoverColor = th::kAccent;
 
     divider.style.width = [act]() -> Size {
       return Size::pixel(*act >= 0 ? kSideDividerWidth : 0.0f);
@@ -1868,8 +1887,8 @@ private:
     divider.style.flexGrow = 0;
     divider.style.flexShrink = 0;
     divider.style.height = Size::pixel(kHDividerHeight);
-    divider.style.backgroundColor = Color{210, 210, 210};
-    divider.style.hoverColor = Color{80, 80, 220};
+    divider.style.backgroundColor = th::kDivider;
+    divider.style.hoverColor = th::kAccent;
 
     // Same self-centering drag pattern as buildSideDivider()/main.cpp's
     // updateTerminalHeight, just on the vertical axis: the terminal grows
@@ -1933,6 +1952,7 @@ private:
     View stack;
     stack.style.width = Size::full();
     stack.style.flexGrow = 1;
+    stack.style.backgroundColor = liteui_terminal::kDefaultBg;
     stack.keysSource = [this] { return terminalKeys(); };
     stack.itemBuilder = [this](const std::string &key) {
       return buildTerminalOutput(terminalKeyToIndex(key));
@@ -2008,6 +2028,7 @@ private:
     header.style.alignItems = Align::Center;
     header.style.justifyContent = Justify::End;
     header.style.padding = EdgeInsets{0, 8, 0, 8};
+    header.style.backgroundColor = liteui_terminal::kDefaultBg;
     header.style.flexShrink = 0;
 
     View addBtn;
@@ -2033,6 +2054,7 @@ private:
     list.style.width = Size::full();
     list.style.flexGrow = 1;
     list.style.overflowY = Overflow::Auto;
+    list.style.backgroundColor = liteui_terminal::kDefaultBg;
     list.keysSource = [this] { return terminalKeys(); };
     list.itemBuilder = [this](const std::string &key) {
       return buildTerminalRow(terminalKeyToIndex(key));
@@ -2070,6 +2092,7 @@ private:
     body.style.direction = FlexDirection::Row;
     body.style.width = Size::full();
     body.style.flexGrow = 1;
+    body.style.backgroundColor = liteui_terminal::kDefaultBg;
     body.addChild(buildTerminalOutputStack());
     body.addChild(buildTerminalListPanel());
     terminal.addChild(std::move(body));
@@ -2135,7 +2158,7 @@ private:
     bar.style.alignItems = Align::Center;
     bar.style.width = Size::full();
     bar.style.height = Size::pixel(24);
-    bar.style.backgroundColor = Color{235, 235, 235};
+    bar.style.backgroundColor = th::kStatusBarBg;
     bar.style.padding = EdgeInsets{0, 12, 0, 12};
     bar.style.gap = 16;
     bar.style.flexShrink = 0;
@@ -2149,7 +2172,7 @@ private:
              std::to_string(doc->state->cursor.col + 1);
     });
     posLabel.fontSize = 12;
-    posLabel.color = Color{80, 80, 80};
+    posLabel.color = th::kOnAccent;
     bar.addChild(posLabel);
 
     Text langLabel;
@@ -2162,13 +2185,13 @@ private:
       return doc->highlighter->lang->name;
     });
     langLabel.fontSize = 12;
-    langLabel.color = Color{80, 80, 80};
+    langLabel.color = th::kOnAccent;
     bar.addChild(langLabel);
 
     Text encLabel;
     encLabel.label = std::string("UTF-8");
     encLabel.fontSize = 12;
-    encLabel.color = Color{80, 80, 80};
+    encLabel.color = th::kOnAccent;
     bar.addChild(encLabel);
 
     Text countLabel;
@@ -2176,7 +2199,7 @@ private:
       return std::to_string(openDocumentCount()) + " open";
     });
     countLabel.fontSize = 12;
-    countLabel.color = Color{140, 140, 140};
+    countLabel.color = th::kOnAccentDim;
     bar.addChild(countLabel);
 
     return bar;
@@ -2206,7 +2229,7 @@ private:
     bar.style.alignItems = Align::Center;
     bar.style.width = Size::full();
     bar.style.height = Size::pixel(38);
-    bar.style.backgroundColor = Color{238, 238, 238};
+    bar.style.backgroundColor = th::kMenuBarBg;
     bar.style.padding = EdgeInsets{0, 8, 0, 8};
     bar.style.gap = 2;
     bar.style.flexShrink = 0;
@@ -2225,7 +2248,7 @@ private:
     backdrop.style.right = 0.0f;
     backdrop.style.bottom = 0.0f;
     backdrop.style.zIndex = 100;
-    backdrop.style.backgroundColor = Color{255, 255, 255, 2};
+    backdrop.style.backgroundColor = th::kOverlayClear;
     backdrop.style.display = [openIdx]() -> Display {
       return *openIdx >= 0 ? Display::Flex : Display::None;
     };
@@ -2291,10 +2314,10 @@ private:
       trigger.style.padding = EdgeInsets{0, 10, 0, 10};
       trigger.style.alignItems = Align::Center;
       trigger.style.justifyContent = Justify::Center;
-      trigger.style.hoverColor = Color{220, 220, 220};
+      trigger.style.hoverColor = th::kButtonHoverBg;
       trigger.style.backgroundColor = [openIdx, idx]() -> Color {
-        return static_cast<size_t>(*openIdx) == idx ? Color{210, 210, 210}
-                                                    : Color{238, 238, 238};
+        return static_cast<size_t>(*openIdx) == idx ? th::kMenuBarOpenBg
+                                                    : th::kMenuBarBg;
       };
       trigger.onClick = [openIdx, idx] {
         *openIdx =
@@ -2309,7 +2332,7 @@ private:
       Text label;
       label.label = def.title;
       label.fontSize = 13;
-      label.color = Color{50, 50, 50};
+      label.color = th::kText;
       trigger.addChild(label);
       bar.addChild(trigger);
 
@@ -2321,9 +2344,9 @@ private:
       menu.style.position = Position::Absolute;
       menu.style.direction = FlexDirection::Column;
       menu.style.width = Size::pixel(200);
-      menu.style.backgroundColor = Color{255, 255, 255};
+      menu.style.backgroundColor = th::kMenuBg;
       menu.style.borderWidth = 1.0f;
-      menu.style.borderColor = Color{200, 200, 200};
+      menu.style.borderColor = th::kMenuBorder;
       menu.style.borderRadius = 4.0f;
       menu.style.zIndex = 200;
       menu.style.display = [openIdx, idx]() -> Display {
@@ -2342,10 +2365,11 @@ private:
         itemLabel.label = item.label;
         itemLabel.style.padding = EdgeInsets::all(8);
         itemLabel.fontSize = 13;
-        itemLabel.color = Color{40, 40, 40};
+        itemLabel.color = th::kText;
 
         View row;
-        row.style.hoverColor = Color{240, 240, 240};
+        row.style.hoverColor = th::kMenuHoverBg;
+        row.style.backgroundColor = th::kMenuBg;
         auto action = item.action;
         row.onClick = [openIdx, action] {
           *openIdx = -1;
@@ -2392,10 +2416,10 @@ private:
     tab.style.gap = 8;
     tab.style.height = Size::full();
     tab.style.backgroundColor = [activeIndexPtr, idx]() -> Color {
-      return *activeIndexPtr == static_cast<int>(idx) ? Color{255, 255, 255}
-                                                      : Color{225, 225, 225};
+      return *activeIndexPtr == static_cast<int>(idx) ? th::kEditorBg
+                                                      : th::kTabInactiveBg;
     };
-    tab.style.hoverColor = Color{240, 240, 240};
+    tab.style.hoverColor = th::kTabHoverBg;
     tab.onClick = [activeIndexPtr, idx] {
       *activeIndexPtr = static_cast<int>(idx);
     };
@@ -2411,7 +2435,10 @@ private:
       return d.title + (*d.modified ? " *" : "");
     });
     label.fontSize = 13;
-    label.color = Color{60, 60, 60};
+    label.color = std::function<Color()>([activeIndexPtr, idx]() -> Color {
+      return *activeIndexPtr == static_cast<int>(idx) ? th::kTextBright
+                                                      : th::kTextInactive;
+    });
     tab.addChild(label);
 
     View closeBtn;
@@ -2420,13 +2447,13 @@ private:
     closeBtn.style.justifyContent = Justify::Center;
     closeBtn.style.alignItems = Align::Center;
     closeBtn.style.borderRadius = 3.0f;
-    closeBtn.style.hoverColor = Color{210, 210, 210};
+    closeBtn.style.hoverColor = th::kButtonHoverBg;
     closeBtn.style.backgroundColor = Color{0, 0, 0, 0};
     closeBtn.onClick = [this, idx] { closeTab(idx); };
     Text closeLabel;
     closeLabel.label = std::string("x");
     closeLabel.fontSize = 12;
-    closeLabel.color = Color{110, 110, 110};
+    closeLabel.color = th::kTextDim;
     closeBtn.addChild(closeLabel);
     tab.addChild(closeBtn);
     return tab;
@@ -2447,7 +2474,7 @@ private:
       return *activeIndexPtr == static_cast<int>(idx) ? Display::Flex
                                                       : Display::None;
     };
-    ed.style.backgroundColor = Color{255, 255, 255};
+    ed.style.backgroundColor = th::kEditorBg;
     ed.showLineNumbers = true;
     ed.fontFamily = "Monospace";
     ed.resetStateFromText = false; // reuse doc.state as-is
@@ -2468,7 +2495,7 @@ private:
     View pane;
     pane.style.direction = FlexDirection::Column;
     pane.style.flexGrow = 1;
-    pane.style.backgroundColor = Color{255, 255, 255};
+    pane.style.backgroundColor = th::kEditorBg;
     pane.style.padding = EdgeInsets::all(48.0f);
     pane.style.gap = 4;
     pane.style.display = [activeIndexPtr, idx]() -> Display {
@@ -2480,13 +2507,13 @@ private:
     title.label = std::string("liteui code editor");
     title.fontSize = 28;
     title.fontWeight = FontWeight::SemiBold;
-    title.color = Color{40, 40, 40};
+    title.color = th::kText;
     pane.addChild(title);
 
     Text subtitle;
     subtitle.label = std::string("A lightweight editor.");
     subtitle.fontSize = 13;
-    subtitle.color = Color{120, 120, 120};
+    subtitle.color = th::kTextMuted;
     subtitle.style.margin = EdgeInsets{4, 0, 24, 0};
     pane.addChild(subtitle);
 
@@ -2494,7 +2521,7 @@ private:
     startHeader.label = std::string("Start");
     startHeader.fontSize = 12;
     startHeader.fontWeight = FontWeight::SemiBold;
-    startHeader.color = Color{110, 110, 110};
+    startHeader.color = th::kTextDim;
     startHeader.style.margin = EdgeInsets{0, 0, 4, 0};
     pane.addChild(startHeader);
 
@@ -2502,12 +2529,13 @@ private:
                        std::function<void()> onClick) {
       View row;
       row.style.padding = EdgeInsets{4, 0, 4, 0};
-      row.style.hoverColor = Color{240, 240, 240};
+      row.style.hoverColor = th::kHoverBg;
+      row.style.backgroundColor = th::kEditorBg;
       row.onClick = std::move(onClick);
       Text t;
       t.label = label;
       t.fontSize = 13;
-      t.color = Color{20, 90, 200};
+      t.color = th::kLink;
       row.addChild(t);
       return row;
     };
@@ -2539,7 +2567,10 @@ private:
     dialogBox.style.width = Size::pixel(340);
     dialogBox.style.padding = EdgeInsets::all(20);
     dialogBox.style.gap = 16;
-    dialogBox.style.backgroundColor = Color{255, 255, 255};
+
+    dialogBox.style.backgroundColor = th::kSideBarBg;
+    dialogBox.style.borderWidth = 1.0f;
+    dialogBox.style.borderColor = th::kMenuBorder;
     dialogBox.style.borderRadius = 8.0f;
     dialogBox.onClick = [] {};
     Text title;
@@ -2548,6 +2579,7 @@ private:
     });
     title.fontSize = 18;
     title.fontWeight = FontWeight::SemiBold;
+    title.color = th::kTextBright;
     dialogBox.addChild(title);
 
     Text message;
@@ -2564,21 +2596,24 @@ private:
     });
     message.wrap = TextWrap::Wrap;
     message.style.width = Size::full();
-    message.color = Color{90, 90, 90};
+    message.color = th::kTextMuted;
     dialogBox.addChild(message);
 
     View buttonRow;
     buttonRow.style.direction = FlexDirection::Row;
     buttonRow.style.justifyContent = Justify::End;
+    buttonRow.style.backgroundColor = th::kTransparent;
     buttonRow.style.gap = 10;
 
     Text cancelLabel;
     cancelLabel.label = std::string("Cancel");
+    cancelLabel.color = th::kText;
+
     View cancelButton;
     cancelButton.style.width = Size::pixel(80);
     cancelButton.style.height = Size::pixel(34);
-    cancelButton.style.backgroundColor = Color{240, 240, 240};
-    cancelButton.style.hoverColor = Color{225, 225, 225};
+    cancelButton.style.backgroundColor = th::kButtonBg;
+    cancelButton.style.hoverColor = th::kButtonHoverBg;
     cancelButton.style.borderRadius = 4.0f;
     cancelButton.style.alignItems = Align::Center;
     cancelButton.style.justifyContent = Justify::Center;
@@ -2591,11 +2626,11 @@ private:
     View confirmButton;
     confirmButton.style.width = Size::pixel(80);
     confirmButton.style.height = Size::pixel(34);
-    confirmButton.style.backgroundColor = Color{0xC0, 0x39, 0x2B};
-    confirmButton.style.hoverColor = Color{0xA8, 0x2F, 0x23};
     confirmButton.style.borderRadius = 4.0f;
     confirmButton.style.alignItems = Align::Center;
     confirmButton.style.justifyContent = Justify::Center;
+    confirmButton.style.backgroundColor = th::kDanger;
+    confirmButton.style.hoverColor = th::kDangerHover;
     confirmButton.onClick = [this] { confirmDelete(); };
     confirmButton.addChild(confirmLabel);
 
@@ -2610,7 +2645,7 @@ private:
     backdrop.style.right = 0.0f;
     backdrop.style.bottom = 0.0f;
     backdrop.style.zIndex = 300; // above the menu dropdowns (200)
-    backdrop.style.backgroundColor = Color{0, 0, 0, 90};
+    backdrop.style.backgroundColor = th::kOverlay;
     backdrop.style.alignItems = Align::Center;
     backdrop.style.justifyContent = Justify::Center;
     backdrop.style.display = [openPtr]() -> Display {
@@ -2638,7 +2673,7 @@ private:
     backdrop.style.bottom = 0.0f;
     backdrop.style.zIndex = 250; // above menu-bar dropdowns (200), below
                                  // the delete-confirmation dialog (300)
-    backdrop.style.backgroundColor = Color{255, 255, 255, 2};
+    backdrop.style.backgroundColor = th::kOverlayClear;
     backdrop.style.display = [openPtr]() -> Display {
       return *openPtr ? Display::Flex : Display::None;
     };
@@ -2648,9 +2683,9 @@ private:
     menu.style.position = Position::Absolute;
     menu.style.direction = FlexDirection::Column;
     menu.style.width = Size::pixel(170);
-    menu.style.backgroundColor = Color{255, 255, 255};
+    menu.style.backgroundColor = th::kMenuBg;
+    menu.style.borderColor = th::kMenuBorder;
     menu.style.borderWidth = 1.0f;
-    menu.style.borderColor = Color{200, 200, 200};
     menu.style.borderRadius = 4.0f;
     menu.style.zIndex = 260;
     menu.style.left = [xPtr]() { return *xPtr; };
@@ -2663,10 +2698,11 @@ private:
       t.label = label;
       t.style.padding = EdgeInsets::all(8);
       t.fontSize = 13;
-      t.color = Color{40, 40, 40};
+      t.color = th::kText;
 
       View row;
-      row.style.hoverColor = Color{240, 240, 240};
+      row.style.backgroundColor = th::kMenuBg;
+      row.style.hoverColor = th::kMenuHoverBg;
       if (display)
         row.style.display = std::move(display);
       auto openPtr = explorerMenuOpen_;
@@ -2713,12 +2749,13 @@ private:
     root.style.direction = FlexDirection::Column;
     root.style.width = Size::full();
     root.style.height = Size::full();
-    root.style.backgroundColor = Color{250, 250, 250};
+    root.style.backgroundColor = th::kEditorBg;
     root.addChild(buildMenuBar());
     View mainArea;
     mainArea.style.direction = FlexDirection::Row;
     mainArea.style.width = Size::full();
     mainArea.style.flexGrow = 1;
+    mainArea.style.backgroundColor = th::kEditorBg;
 
     mainArea.addChild(buildActivityBar());
 
@@ -2729,6 +2766,7 @@ private:
     editorArea.style.direction = FlexDirection::Column;
     editorArea.style.height = Size::full();
     editorArea.style.flexGrow = 1;
+    editorArea.style.backgroundColor = th::kEditorBg;
 
     // ---- tab strip ----
     View tabBar;
@@ -2736,9 +2774,10 @@ private:
     tabBar.style.alignItems = Align::Center;
     tabBar.style.width = Size::full();
     tabBar.style.height = Size::pixel(34);
-    tabBar.style.backgroundColor = Color{225, 225, 225};
     tabBar.style.overflowX = Overflow::Auto;
     tabBar.style.gap = 2;
+    tabBar.style.backgroundColor = th::kTabBarBg;
+
     // Defensive: keep the tab strip un-shrinkable, the same way
     // buildHDivider()/buildTerminalPanel() already protect themselves.
     // Without this, any sibling whose Fit-sizing balloons (as
@@ -2754,37 +2793,37 @@ private:
     tabList.style.alignItems = Align::Center;
     tabList.style.height = Size::full();
     tabList.style.gap = 2;
-    tabList.style.backgroundColor = Color{225, 225, 225};
+    tabList.style.backgroundColor = th::kTabBarBg;
     tabList.keysSource = [this] { return documentKeys(); };
     tabList.itemBuilder = [this](const std::string &key) {
       return buildTab(keyToIndex(key));
     };
     tabBar.addChild(std::move(tabList));
+
     View newTabBtn;
     newTabBtn.style.width = Size::pixel(28);
     newTabBtn.style.height = Size::full();
     newTabBtn.style.justifyContent = Justify::Center;
     newTabBtn.style.alignItems = Align::Center;
-    newTabBtn.style.hoverColor = Color{210, 210, 210};
-    newTabBtn.style.backgroundColor = Color{225, 225, 225};
+    newTabBtn.style.backgroundColor = th::kTabBarBg;
+    newTabBtn.style.hoverColor = th::kButtonHoverBg;
     newTabBtn.onClick = [this] { newDocument(); };
+
     Text plus;
     plus.label = std::string("+");
     plus.fontSize = 16;
-    plus.color = Color{90, 90, 90};
+    plus.color = th::kTextMuted;
     newTabBtn.addChild(plus);
     tabBar.addChild(newTabBtn);
 
     editorArea.addChild(tabBar);
-
-    // ... stack (added below, unchanged) sits between tabBar and the
-    // terminal — see the two new addChild calls right after it.
 
     // ---- editor stack: one CodeEditor per open document, keyed the same
     // way as the tabs, all but the active one hidden via Display::None ----
     View stack;
     stack.style.width = Size::full();
     stack.style.flexGrow = 1;
+    stack.style.backgroundColor = th::kEditorBg;
 
     stack.keysSource = [this] { return documentKeys(); };
     stack.itemBuilder = [this](const std::string &key) {

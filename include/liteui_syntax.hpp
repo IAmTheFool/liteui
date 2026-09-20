@@ -219,12 +219,12 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
 }
 
 struct SyntaxTheme {
-  Color plainColor = Color{30, 30, 30};
-  Color keywordColor = Color{175, 40, 130};
-  Color commentColor = Color{110, 140, 100};
-  Color stringColor = Color{170, 90, 40};
-  Color numberColor = Color{30, 110, 170};
-  Color preprocessorColor = Color{130, 100, 190};
+  Color plainColor = Color{212, 212, 212};
+  Color keywordColor = Color{86, 156, 214};
+  Color commentColor = Color{106, 153, 85};
+  Color stringColor = Color{206, 145, 120};
+  Color numberColor = Color{181, 206, 168};
+  Color preprocessorColor = Color{197, 134, 192};
 };
 
 inline Color colorForToken(SyntaxTokenType t, const SyntaxTheme &theme) {

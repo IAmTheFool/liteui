@@ -3,6 +3,7 @@
 #pragma once
 
 #include "liteui.hpp"
+#include "liteui_theme.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -706,15 +707,15 @@ struct CodeEditor {
   FontWeight fontWeight = FontWeight::Regular;
   std::string fontFamily = "Monospace"; // code wants a monospace default,
                                         // unlike editor_example.cpp's TextArea
-  Color textColor = Color{20, 20, 20};
-  Color placeholderColor = Color{160, 160, 160};
-  Color caretColor = Color{20, 20, 20};
-  Color selectionColor =
-      Color{51, 153, 255, 90}; // translucent selection highlight
-  Color borderColor = Color{180, 180, 180};
-  Color focusedBorderColor = Color{50, 120, 220};
-  Color lineNumberColor = Color{170, 170, 170};
-  Color lineNumberBackground = Color{245, 245, 245};
+  Color textColor = liteui_theme::kEditorText;
+  Color placeholderColor = liteui_theme::kPlaceholder;
+  Color caretColor = liteui_theme::kCaret;
+  Color selectionColor = Color{38, 79, 120, 220};
+  Color borderColor = liteui_theme::kDivider;
+  Color focusedBorderColor = liteui_theme::kAccent;
+  Color lineNumberColor = Color{133, 133, 133};
+  Color lineNumberBackground = liteui_theme::kEditorBg;
+
   bool showLineNumbers = true;
   float padding = 8.0f;
   float lineHeight = 0.0f; // 0 = auto (fontSize * 1.4)
@@ -722,8 +723,8 @@ struct CodeEditor {
 
   bool showScrollbar = true;
   float scrollbarWidth = 10.0f;
-  Color scrollbarTrackColor = Color{0, 0, 0, 20};
-  Color scrollbarThumbColor = Color{0, 0, 0, 90};
+  Color scrollbarTrackColor = Color{255, 255, 255, 12};
+  Color scrollbarThumbColor = Color{255, 255, 255, 60};
 
   std::function<void(const std::string &)> onChange;
 
@@ -1075,7 +1076,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     // ---- other search matches (the current one is already covered by
     // the selection highlight above, since jumpToMatch() just selects it)
     if (state->search.active && !state->search.matches.empty()) {
-      ctx.setFillColor(Color{255, 230, 90, 130});
+      ctx.setFillColor(Color{234, 192, 0, 90});
       for (size_t mi = 0; mi < state->search.matches.size(); ++mi) {
         if (static_cast<int>(mi) == state->search.currentMatch)
           continue;
@@ -1111,7 +1112,7 @@ inline View toCodeEditorView(CodeEditor ed) {
           float x1 =
               liteui_text::measure(line.substr(0, bp.col + 1), ts, -1).width;
           float y = pad + bp.line * lineH - state->scrollY;
-          ctx.setFillColor(Color{140, 170, 230, 110});
+          ctx.setFillColor(Color{255, 255, 255, 50});
           ctx.fillRect(textLeft - state->scrollX + x0, y,
                        std::max(1.0f, x1 - x0), lineH);
         }
@@ -1201,7 +1202,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       float boxH = rowH * numRows + 10.0f;
       float bx = ctx.width() - boxW - 10.0f;
       float by = 8.0f;
-      ctx.setFillColor(Color{35, 35, 35, 235});
+      ctx.setFillColor(Color{60, 60, 64, 245});
       ctx.fillRect(bx, by, boxW, boxH);
 
       ctx.setFont(ts.fontFamily, 12.5f, FontWeight::Regular);

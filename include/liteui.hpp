@@ -2924,7 +2924,6 @@ public:
   std::function<std::vector<std::string>()> keysSource;
   std::function<View(const std::string &key)> itemBuilder;
 
-
   // True for a View created via addChild(Text) — a text leaf. isText
   // implies children.empty() always; text/textStyle are meaningless
   // otherwise.
@@ -6264,7 +6263,6 @@ private:
       }
     }
 
-
     if (auto *fn = std::get_if<std::function<std::string()>>(&v.text)) {
       std::string next = (*fn)();
       if (next != v.computed.resolvedText) {
@@ -6601,7 +6599,6 @@ private:
   // child list; consumed (and cleared) by pollAndRelayout above.
   bool structureChanged_ = false;
 
-
   static int btnIdx(MouseButton b) { return static_cast<int>(b); }
 
   // The one view currently receiving keyboard events, or nullptr if
@@ -6615,6 +6612,10 @@ private:
   int tooltipTimerHandle_ = -1;
   bool tooltipVisible_ = false;
   float tooltipPointerX_ = 0, tooltipPointerY_ = 0;
+
+  Color windowBg_{255, 255, 255, 255};
+  Color scrollTrack_{0xE0, 0xE0, 0xE0, 255};
+  Color scrollThumb_{0x90, 0x90, 0x90, 255};
 
   void requestTooltipRepaint() {
 #if defined(_WIN32)
@@ -6708,6 +6709,15 @@ public:
   int addInterval(int ms, std::function<void()> fn);
   void removeInterval(int handle);
   void setTooltipStyle(TooltipStyle s) { tooltipStyle_ = std::move(s); }
+  void setWindowBackground(Color c) {
+    windowBg_ = c;
+    requestRepaint();
+  }
+  void setScrollbarColors(Color track, Color thumb) {
+    scrollTrack_ = track;
+    scrollThumb_ = thumb;
+    requestRepaint();
+  }
   void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
     shortcuts_.push_back({mods, key, std::move(fn)});
   }
@@ -6778,7 +6788,7 @@ private:
     if (btn == MouseButton::Left)
       setFocus((hit && hit->focusable) ? hit : nullptr);
     if (hit) {
-      
+
       switch (btn) {
       case MouseButton::Left:
         if (hit->onPressAt)
@@ -6823,7 +6833,7 @@ private:
       v->onRightDragTo(lx, ly);
       break;
     }
-return pollAndRelayout();
+    return pollAndRelayout();
   }
 
   // Advances any of the three buttons' drags at once — motion events
@@ -6848,7 +6858,7 @@ return pollAndRelayout();
       dispatchClick(released, btn);
     pressedView_[i] = nullptr;
     dragView_[i] = nullptr;
-return pollAndRelayout();
+    return pollAndRelayout();
   }
 
 // Windows-only member/method block.
@@ -6943,11 +6953,7 @@ return pollAndRelayout();
       if (self) {
         self->ensureRenderTarget();
         self->renderTarget_->BeginDraw();
-        // Plain white background first — WM_ERASEBKGND below tells
-        // Windows not to do this for us anymore, so we own it, matching
-        // what the Linux/Wayland renderer already does for its content
-        // area.
-        self->renderTarget_->Clear(D2D1::ColorF(D2D1::ColorF::White));
+        self->renderTarget_->Clear(toD2DColor(self->windowBg_));
         self->paintBoxes(self->renderTarget_);
         self->paintRoot(self->renderTarget_);
         self->paintTooltip(self->renderTarget_);
@@ -7292,21 +7298,21 @@ return pollAndRelayout();
   // which is itself already visible or this function wouldn't have been
   // reached).
   void paintScrollbars(ID2D1RenderTarget *rt, const View &v) {
+    auto box = [&](const PixRect &r, Color c) {
+      d2dFillRect(rt, r.x, r.y, r.w, r.h, c);
+    };
     if (wantVBar(v)) {
-      PixRect t = vTrackRect(v), th = vThumbRect(v);
-      d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
-      d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
+      box(vTrackRect(v), scrollTrack_);
+      box(vThumbRect(v), scrollThumb_);
     }
     if (wantHBar(v)) {
-      PixRect t = hTrackRect(v), th = hThumbRect(v);
-      d2dFillRect(rt, t.x, t.y, t.w, t.h, {0xE0, 0xE0, 0xE0});
-      d2dFillRect(rt, th.x, th.y, th.w, th.h, {0x90, 0x90, 0x90});
+      box(hTrackRect(v), scrollTrack_);
+      box(hThumbRect(v), scrollThumb_);
     }
-    // Corner filler where both bars would otherwise leave a gap/overlap.
     if (wantVBar(v) && wantHBar(v))
       d2dFillRect(rt, v.computed.x + v.computed.w - kScrollbarThickness,
                   v.computed.y + v.computed.h - kScrollbarThickness,
-                  kScrollbarThickness, kScrollbarThickness, {0xE0, 0xE0, 0xE0});
+                  kScrollbarThickness, kScrollbarThickness, scrollTrack_);
   }
 
   // Rebuilds v.computed.textLayout if it's missing or was built for a
@@ -8790,30 +8796,22 @@ return pollAndRelayout();
   // scrollbar correctly disappears if v itself has scrolled out of some
   // outer ancestor's viewport, same reasoning as the GDI version.
   void renderScrollbars(const View &v, const ClipRect &clip) {
+    auto box = [&](const PixRect &r, Color c) {
+      drawRectGL(r.x, r.y, r.w, r.h, 0.0f, c, clip);
+    };
     if (wantVBar(v)) {
-      PixRect t = vTrackRect(v), th = vThumbRect(v);
-      fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
-               static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
-               clip);
-      fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
-               static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90, 0x90,
-               clip);
+      box(vTrackRect(v), scrollTrack_);
+      box(vThumbRect(v), scrollThumb_);
     }
     if (wantHBar(v)) {
-      PixRect t = hTrackRect(v), th = hThumbRect(v);
-      fillRect(static_cast<int>(t.x), static_cast<int>(t.y),
-               static_cast<int>(t.w), static_cast<int>(t.h), 0xE0, 0xE0, 0xE0,
-               clip);
-      fillRect(static_cast<int>(th.x), static_cast<int>(th.y),
-               static_cast<int>(th.w), static_cast<int>(th.h), 0x90, 0x90, 0x90,
-               clip);
+      box(hTrackRect(v), scrollTrack_);
+      box(hThumbRect(v), scrollThumb_);
     }
     if (wantVBar(v) && wantHBar(v))
-      fillRect(
-          static_cast<int>(v.computed.x + v.computed.w - kScrollbarThickness),
-          static_cast<int>(v.computed.y + v.computed.h - kScrollbarThickness),
-          static_cast<int>(kScrollbarThickness),
-          static_cast<int>(kScrollbarThickness), 0xE0, 0xE0, 0xE0, clip);
+      drawRectGL(v.computed.x + v.computed.w - kScrollbarThickness,
+                 v.computed.y + v.computed.h - kScrollbarThickness,
+                 kScrollbarThickness, kScrollbarThickness, 0.0f, scrollTrack_,
+                 clip);
   }
 
   // Draws one View (background + border) using its already-computed layout,
@@ -8853,19 +8851,17 @@ return pollAndRelayout();
                    ? *s.hoverColor
                    : resolveDynamic(s.backgroundColor,
                                     v.computed.resolvedBackgroundColor);
+    radius = std::max(0, std::min({radius, w / 2, h / 2}));
     float borderWidthVal =
         resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
     if (borderWidthVal > 0) {
-      Color borderColorVal =
-          resolveDynamic(s.borderColor, v.computed.resolvedBorderColor);
-      fillRoundedRect(x, y, w, h, radius, borderColorVal.r, borderColorVal.g,
-                      borderColorVal.b, clip);
+      Color bc = resolveDynamic(s.borderColor, v.computed.resolvedBorderColor);
       int bw = static_cast<int>(borderWidthVal);
-      fillRoundedRect(x + bw, y + bw, std::max(0, w - 2 * bw),
-                      std::max(0, h - 2 * bw), std::max(0, radius - bw), bg.r,
-                      bg.g, bg.b, clip);
-    } else {
-      fillRoundedRect(x, y, w, h, radius, bg.r, bg.g, bg.b, clip);
+      drawRectGL(x, y, w, h, radius, bc, clip);
+      drawRectGL(x + bw, y + bw, std::max(0, w - 2 * bw),
+                 std::max(0, h - 2 * bw), std::max(0, radius - bw), bg, clip);
+    } else if (bg.a > 0) {
+      drawRectGL(x, y, w, h, radius, bg, clip);
     }
     // A canvas node paints its own Style background/border like any
     // other box (above), then has its cached onPaint texture drawn on
@@ -8990,7 +8986,8 @@ return pollAndRelayout();
       return;
     glViewport(0, 0, width_, height_);
     applyScissor(ClipRect{});
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f); // plain white content-area background
+    glClearColor(windowBg_.r / 255.0f, windowBg_.g / 255.0f,
+                 windowBg_.b / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     // Paint queued boxes on top of the plain background, before the titlebar
     // so it stays on top.
@@ -9742,7 +9739,7 @@ inline View View::toView(Svg s) {
 }
 
 inline void LiteUI::requestRepaint() {
-   pollAndRelayout();
+  pollAndRelayout();
 #if defined(_WIN32)
   if (hwnd_)
     InvalidateRect(hwnd_, nullptr, FALSE);

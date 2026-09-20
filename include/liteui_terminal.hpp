@@ -71,14 +71,14 @@ namespace liteui_terminal {
 // it, chosen to match VS Code's own default dark-theme terminal palette
 // so the widget looks at home next to the editor.
 inline Color ansi16(int idx, bool bright) {
-  static const Color kNormal[8] = {
-      {0, 0, 0, 255},      {205, 49, 49, 255},   {13, 188, 121, 255},
-      {229, 229, 16, 255}, {36, 114, 200, 255},  {188, 63, 188, 255},
-      {17, 168, 205, 255}, {229, 229, 229, 255}};
-  static const Color kBright[8] = {
-      {102, 102, 102, 255}, {241, 76, 76, 255},   {35, 209, 139, 255},
-      {245, 245, 67, 255},  {59, 142, 234, 255},  {214, 112, 214, 255},
-      {41, 184, 219, 255},  {255, 255, 255, 255}};
+  static const Color kNormal[8] = {{0, 0, 0, 255},      {205, 49, 49, 255},
+                                   {13, 188, 121, 255}, {229, 229, 16, 255},
+                                   {36, 114, 200, 255}, {188, 63, 188, 255},
+                                   {17, 168, 205, 255}, {229, 229, 229, 255}};
+  static const Color kBright[8] = {{102, 102, 102, 255}, {241, 76, 76, 255},
+                                   {35, 209, 139, 255},  {245, 245, 67, 255},
+                                   {59, 142, 234, 255},  {214, 112, 214, 255},
+                                   {41, 184, 219, 255},  {255, 255, 255, 255}};
   idx = std::clamp(idx, 0, 7);
   return bright ? kBright[idx] : kNormal[idx];
 }
@@ -95,7 +95,7 @@ inline Color ansi256(int n) {
   }
   int gray = 8 + (n - 232) * 10;
   return Color{static_cast<uint8_t>(gray), static_cast<uint8_t>(gray),
-              static_cast<uint8_t>(gray), 255};
+               static_cast<uint8_t>(gray), 255};
 }
 
 inline constexpr Color kDefaultBg{30, 30, 30, 255};    // VS Code's #1e1e1e
@@ -141,8 +141,7 @@ struct TermCell {
            (fg.isDefault || fg.rgb == o.fg.rgb) &&
            bg.isDefault == o.bg.isDefault &&
            (bg.isDefault || bg.rgb == o.bg.rgb) && bold == o.bold &&
-           faint == o.faint && underline == o.underline &&
-           reverse == o.reverse;
+           faint == o.faint && underline == o.underline && reverse == o.reverse;
   }
 };
 
@@ -180,7 +179,8 @@ inline std::string userHomeDirectory() {
 }
 #endif
 
-// ==================== VT/xterm-subset parser + screen state ====================
+// ==================== VT/xterm-subset parser + screen state
+// ====================
 //
 // One instance owns: the PTY (spawn/read-thread/write/resize/shutdown),
 // the parser state machine, and the resulting character grid — plus a
@@ -667,8 +667,9 @@ private:
       break;
     case 'r':
       scrollTop_ = std::clamp(n(0, 1) - 1, 0, rows_ - 1);
-      scrollBottom_ = std::clamp(
-          params.size() > 1 ? n(1, rows_) - 1 : rows_ - 1, scrollTop_, rows_ - 1);
+      scrollBottom_ =
+          std::clamp(params.size() > 1 ? n(1, rows_) - 1 : rows_ - 1,
+                     scrollTop_, rows_ - 1);
       cursorRow_ = 0;
       cursorCol_ = 0;
       break;
@@ -970,9 +971,9 @@ private:
     std::wstring wdir = dir.empty() ? std::wstring() : toWide(dir);
 
     CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
-                  EXTENDED_STARTUPINFO_PRESENT, nullptr,
-                  wdir.empty() ? nullptr : wdir.c_str(), &si.StartupInfo,
-                  &process_);
+                   EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                   wdir.empty() ? nullptr : wdir.c_str(), &si.StartupInfo,
+                   &process_);
 
     DeleteProcThreadAttributeList(si.lpAttributeList);
     HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -1132,6 +1133,7 @@ inline View toTerminalView(Terminal t) {
 
   View v;
   v.style = std::move(t.style);
+  v.style.backgroundColor = bg;
   v.isCanvas = true;
   v.focusable = true;
 
@@ -1180,7 +1182,7 @@ inline View toTerminalView(Terminal t) {
           ctx.fillRect(runX, r * lineH, runW, lineH);
         }
         ctx.setFont(ts.fontFamily, ts.fontSize,
-                   first.bold ? FontWeight::Bold : FontWeight::Regular);
+                    first.bold ? FontWeight::Bold : FontWeight::Regular);
         ctx.setFillColor(fg);
         // One fillText per glyph, each pinned to i*cellW, rather than
         // the whole run as one string — keeps every column exactly on
