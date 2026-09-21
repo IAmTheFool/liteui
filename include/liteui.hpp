@@ -5957,10 +5957,11 @@ private:
   // through the scrollable range the current offset is.
   static PixRect vThumbRect(const View &v) {
     PixRect track = vTrackRect(v);
+    float minThumb = std::min(kMinThumb, track.h); // never exceeds track
     float thumbH =
         v.computed.contentH > 0
             ? std::clamp(track.h * (v.computed.h / v.computed.contentH),
-                         kMinThumb, track.h)
+                         minThumb, track.h)
             : track.h;
     float maxScroll = v.maxScrollY();
     float pos = maxScroll > 0
@@ -5970,10 +5971,11 @@ private:
   }
   static PixRect hThumbRect(const View &v) {
     PixRect track = hTrackRect(v);
+    float minThumb = std::min(kMinThumb, track.w);
     float thumbW =
         v.computed.contentW > 0
             ? std::clamp(track.w * (v.computed.w / v.computed.contentW),
-                         kMinThumb, track.w)
+                         minThumb, track.w)
             : track.w;
     float maxScroll = v.maxScrollX();
     float pos = maxScroll > 0
@@ -7411,6 +7413,8 @@ private:
       // no buffer reallocation (it paints straight into the window's DC), so
       // this is just relayout + repaint.
     case WM_SIZE: {
+      if (wp == SIZE_MINIMIZED)
+        return 0;
       if (self) {
         self->width_ = LOWORD(lp);
         self->height_ = HIWORD(lp);
@@ -7481,9 +7485,10 @@ private:
         liteui_text::measure(tooltipTarget_->tooltip, ts, -1);
     float pad = tooltipStyle_.padding;
     float boxW = m.width + pad * 2, boxH = m.height + pad * 2;
-    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, width_ - boxW - 2.0f);
-    float by =
-        std::clamp(tooltipPointerY_ + 18.0f, 2.0f, height_ - boxH - 2.0f);
+    float maxX = std::max(2.0f, width_ - boxW - 2.0f);
+    float maxY = std::max(2.0f, height_ - boxH - 2.0f);
+    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, maxX);
+    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f, maxY);
 
     d2dFillRect(rt, bx, by, boxW, boxH, tooltipStyle_.background);
     IDWriteTextLayout *layout = liteui_text::makeLayout(
@@ -8742,10 +8747,10 @@ private:
     ensureTooltipTexture(tooltipTarget_->tooltip);
     float pad = tooltipStyle_.padding;
     float boxW = tooltipTexW_ + pad * 2, boxH = tooltipTexH_ + pad * 2;
-    float bx =
-        std::clamp(tooltipPointerX_ + 12.0f, 2.0f, (float)width_ - boxW - 2.0f);
-    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f,
-                          (float)height_ - boxH - 2.0f);
+    float maxX = std::max(2.0f, (float)width_ - boxW - 2.0f);
+    float maxY = std::max(2.0f, (float)height_ - boxH - 2.0f);
+    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, maxX);
+    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f, maxY);
 
     drawRectGL(bx, by, boxW, boxH, 4.0f, tooltipStyle_.background, ClipRect{});
 

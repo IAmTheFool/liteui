@@ -192,9 +192,9 @@ inline void loadFileTreeChildren(FileTreeNode &node) {
 
 class TabbedEditor {
 public:
-  TabbedEditor(
-               const std::string &windowTitle = "liteui code editor")
-      : ui_(windowTitle), activeIndex_(std::make_shared<int>(-1)) {
+  TabbedEditor(const std::string &windowTitle = "liteui code editor")
+      : ui_(windowTitle, -1, -1, true),
+        activeIndex_(std::make_shared<int>(-1)) {
     ui_.setWindowBackground(th::kEditorBg);
     ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
     newWelcomeTab();
@@ -2120,7 +2120,7 @@ private:
     bar.style.flexShrink = 0;
     bar.style.height = Size::full();
     bar.style.backgroundColor = Color{55, 55, 60};
-    bar.style.padding = EdgeInsets{8, 0, 8, 0};
+    bar.style.padding = EdgeInsets{0, 0, 0, 8};
     bar.style.gap = 2;
 
     for (const auto &activity : activities) {
@@ -2396,6 +2396,42 @@ private:
 
       backdrop.addChild(menu);
     }
+
+    // ---- drag area: takes all free space to the right of the menus ----
+    View dragArea;
+    dragArea.style.height = Size::full();
+    dragArea.style.flexGrow = 1;
+    dragArea.style.backgroundColor = th::kMenuBarBg;
+    dragArea.onPressAt = [this](float, float) { ui_.requestMove(); };
+    bar.addChild(std::move(dragArea));
+
+    // ---- window buttons: minimize / maximize / close ----
+    auto makeWindowBtn = [](const std::string &glyph, Color hover,
+                            std::function<void()> onClick) {
+      View b;
+      b.style.width = Size::pixel(46);
+      b.style.height = Size::full();
+      b.style.flexShrink = 0;
+      b.style.justifyContent = Justify::Center;
+      b.style.alignItems = Align::Center;
+      b.style.backgroundColor = th::kMenuBarBg;
+      b.style.hoverColor = hover;
+      b.onClick = std::move(onClick);
+
+      Text t;
+      t.label = glyph;
+      t.fontSize = 14;
+      t.color = th::kText;
+      b.addChild(t);
+      return b;
+    };
+
+    bar.addChild(makeWindowBtn("\xE2\x80\x93", th::kButtonHoverBg,
+                               [this] { ui_.requestMinimize(); })); 
+    bar.addChild(makeWindowBtn("\xE2\x96\xA1", th::kButtonHoverBg,
+                               [this] { ui_.requestMaximize(); })); 
+    bar.addChild(makeWindowBtn("\xE2\x9C\x95", Color{196, 43, 28},
+                               [this] { ui_.requestClose(); })); 
 
     bar.addChild(backdrop);
     return bar;
