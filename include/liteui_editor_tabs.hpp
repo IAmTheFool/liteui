@@ -427,6 +427,12 @@ private:
   static constexpr float kMaxSidePanelWidth = 580.0f;
   static constexpr float kSideDividerWidth = 6.0f;
 
+  // Right-click menu for the code editor (Cut / Copy / Paste).
+  std::shared_ptr<bool> editorMenuOpen_ = std::make_shared<bool>(false);
+  std::shared_ptr<float> editorMenuX_ = std::make_shared<float>(0.0f);
+  std::shared_ptr<float> editorMenuY_ = std::make_shared<float>(0.0f);
+  size_t editorMenuDocIndex_ = 0;
+
   // Named so the pane-visibility checks in buildExplorerPane()/
   // buildSearchPane() below can't silently drift out of sync with
   // activityItems()'s ids if the list is ever reordered or extended.
@@ -491,6 +497,52 @@ private:
       std::make_shared<TextInputState>();
   static constexpr size_t kMaxSearchResults = 500;
   static constexpr uintmax_t kMaxSearchFileBytes = 2 * 1024 * 1024; // 2 MB
+
+  void openEditorContextMenu(size_t docIdx, float x, float y) {
+    editorMenuDocIndex_ = docIdx;
+    *editorMenuX_ = x;
+    *editorMenuY_ = y;
+    *editorMenuOpen_ = true;
+  }
+
+  bool editorMenuHasSelection() const {
+    return editorMenuDocIndex_ < docs_.size() &&
+           docs_[editorMenuDocIndex_].state->hasSelection();
+  }
+
+  void editorContextCopy() {
+    if (editorMenuDocIndex_ >= docs_.size())
+      return;
+    auto &st = docs_[editorMenuDocIndex_].state;
+    if (st->hasSelection())
+      liteui_clipboard::setTextWithFallback(st->selectedText());
+  }
+
+  void editorContextCut() {
+    if (editorMenuDocIndex_ >= docs_.size())
+      return;
+    EditorDocument &doc = docs_[editorMenuDocIndex_];
+    if (!doc.state->hasSelection())
+      return;
+    liteui_clipboard::setTextWithFallback(doc.state->selectedText());
+    doc.state->beginEdit(false); // its own undo step
+    doc.state->deleteSelectionRaw();
+    doc.state->dirty = true;
+    *doc.modified = true;
+  }
+
+  void editorContextPaste() {
+    if (editorMenuDocIndex_ >= docs_.size())
+      return;
+    EditorDocument &doc = docs_[editorMenuDocIndex_];
+    std::string clip = liteui_clipboard::getTextWithFallback();
+    if (clip.empty())
+      return;
+    doc.state->beginEdit(false);
+    doc.state->insertTextRaw(clip);
+    doc.state->dirty = true;
+    *doc.modified = true;
+  }
 
   // Directory names never worth descending into for a text search —
   // typically huge, generated, or binary-heavy.
@@ -2550,7 +2602,20 @@ private:
     std::shared_ptr<bool> modifiedFlag = doc.modified;
     ed.onChange = [modifiedFlag](const std::string &) { *modifiedFlag = true; };
     applyHighlighting(ed, doc.highlighter);
-    return toCodeEditorView(std::move(ed));
+    View view = toCodeEditorView(std::move(ed));
+
+    // Capture the editor's on-screen origin so the menu can appear at the
+    // click point (onRightPressAt only gives coordinates local to the view).
+    auto edX = std::make_shared<float>(0.0f);
+    auto edY = std::make_shared<float>(0.0f);
+    view.onLayout = [edX, edY](float x, float y, float, float) {
+      *edX = x;
+      *edY = y;
+    };
+    view.onRightPressAt = [this, idx, edX, edY](float lx, float ly) {
+      openEditorContextMenu(idx, *edX + lx, *edY + ly);
+    };
+    return view;
   }
 
   // VS-Code-style landing tab: shown in place of a blank untitled buffer
@@ -2721,6 +2786,72 @@ private:
     };
     backdrop.onClick = [this] { cancelDeleteConfirm(); };
     backdrop.addChild(dialogBox);
+    return backdrop;
+  }
+
+  View buildEditorContextMenu() {
+    auto openPtr = editorMenuOpen_;
+    auto xPtr = editorMenuX_;
+    auto yPtr = editorMenuY_;
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    backdrop.style.zIndex = 250;
+    backdrop.style.backgroundColor = th::kOverlayClear;
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [openPtr] { *openPtr = false; };
+
+    View menu;
+    menu.style.position = Position::Absolute;
+    menu.style.direction = FlexDirection::Column;
+    menu.style.width = Size::pixel(150);
+    menu.style.backgroundColor = th::kMenuBg;
+    menu.style.borderColor = th::kMenuBorder;
+    menu.style.borderWidth = 1.0f;
+    menu.style.borderRadius = 4.0f;
+    menu.style.zIndex = 260;
+    menu.style.left = [xPtr]() { return *xPtr; };
+    menu.style.top = [yPtr]() { return *yPtr; };
+
+    auto makeItem = [openPtr](const std::string &label,
+                              std::function<void()> action,
+                              std::function<bool()> enabled) {
+      Text t;
+      t.label = label;
+      t.style.padding = EdgeInsets::all(8);
+      t.fontSize = 13;
+      t.color = std::function<Color()>([enabled]() -> Color {
+        return enabled() ? th::kText : th::kTextDim;
+      });
+
+      View row;
+      row.style.backgroundColor = th::kMenuBg;
+      row.style.hoverColor = th::kMenuHoverBg;
+      // A disabled row isn't clickable; the click falls through to the
+      // backdrop, which just closes the menu.
+      row.disabled = [enabled]() -> bool { return !enabled(); };
+      row.onClick = [openPtr, action] {
+        *openPtr = false;
+        action();
+      };
+      row.addChild(t);
+      return row;
+    };
+
+    auto hasSel = [this] { return editorMenuHasSelection(); };
+    auto always = [] { return true; };
+
+    menu.addChild(makeItem("Cut", [this] { editorContextCut(); }, hasSel));
+    menu.addChild(makeItem("Copy", [this] { editorContextCopy(); }, hasSel));
+    menu.addChild(makeItem("Paste", [this] { editorContextPaste(); }, always));
+
+    backdrop.addChild(menu);
     return backdrop;
   }
 
@@ -2908,6 +3039,7 @@ private:
     root.addChild(buildStatusBar());
     root.addChild(buildDeleteDialog());
     root.addChild(buildExplorerContextMenu());
+    root.addChild(buildEditorContextMenu());
     ui_.setRoot(std::move(root));
   }
 
