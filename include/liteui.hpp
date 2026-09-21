@@ -5784,7 +5784,7 @@ public:
   // Constructor: explicit prevents accidental implicit conversions from a bare
 
   explicit LiteUI(const std::string &title = "Window", int width = -1,
-                  int height = -1);
+                  int height = -1, bool hideTitlebar = false);
   // Destructor: tears down whatever platform resources were created.
   ~LiteUI();
   // Copying is disabled — a LiteUI owns unique OS handles that can't be
@@ -5804,6 +5804,41 @@ public:
   // and triggers a repaint. Ownership of the tree is copied/moved in.
   void setRoot(View view);
 
+  void requestClose() {
+#if defined(_WIN32)
+    if (hwnd_)
+      PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+#else
+    running_ = false;
+#endif
+  }
+
+  void requestMinimize() {
+#if defined(_WIN32)
+    if (hwnd_)
+      ShowWindow(hwnd_, SW_MINIMIZE);
+#else
+    if (toplevel_)
+      xdg_toplevel_set_minimized(toplevel_);
+#endif
+  }
+
+  // Toggles: maximizes if the window is normal, restores it if it's maximized.
+  void requestMaximize() {
+#if defined(_WIN32)
+    if (hwnd_)
+      ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
+#else
+    if (!toplevel_)
+      return;
+    if (maximized_)
+      xdg_toplevel_unset_maximized(toplevel_);
+    else
+      xdg_toplevel_set_maximized(toplevel_);
+    maximized_ = !maximized_;
+#endif
+  }
+
   // Everything below is internal implementation detail.
 private:
   // Requested window width in pixels, stored so pixel-drawing helpers can
@@ -5812,6 +5847,7 @@ private:
   // Requested window height in pixels, same purpose as width_.
   int height_;
   bool startMaximized_ = false;
+  bool hideTitlebar_ = false;
 
   // Boxes queued for drawing, in the order addBox() was called (paint order).
   std::vector<Box> boxes_;
@@ -5837,7 +5873,7 @@ private:
     // deeper than kTitlebarHeight, so its lower slice (including the
     // text) rendered outside the titlebar's opaque cover instead of
     // safely underneath it.
-    float top = static_cast<float>(kTitlebarHeight);
+    float top = static_cast<float>(titlebarHeight());
     float availH = std::max(0.0f, static_cast<float>(height_) - top);
     liteui_layout::layoutRoot(root_, static_cast<float>(width_), availH, 0.0f,
                               top);
@@ -7318,6 +7354,24 @@ private:
       }
       return 0;
 
+      // Keeps a frameless window from covering the taskbar when maximized.
+    case WM_GETMINMAXINFO: {
+      if (self && self->hideTitlebar_) {
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) {
+          auto *mmi = reinterpret_cast<MINMAXINFO *>(lp);
+          mmi->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+          mmi->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+          mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+          mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+          return 0;
+        }
+      }
+      break; // fall out to DefWindowProcW
+    }
+
       // Window was resized (including maximize/restore/snap): update our
       // stored dimensions and re-run layout against the new size. GDI needs
       // no buffer reallocation (it paints straight into the window's DC), so
@@ -7708,7 +7762,8 @@ private:
 
   static constexpr int kTitlebarHeight =
       32; // Height in pixels reserved at the top of the window for the custom
-          // titlebar.
+  // titlebar.
+  int titlebarHeight() const { return hideTitlebar_ ? 0 : kTitlebarHeight; }
 
   static constexpr int kButtonSize =
       18; // Width/height in pixels of each titlebar button's square hitbox.
@@ -7930,16 +7985,18 @@ private:
 
   // Called when the compositor suggests a new size/state for the toplevel.
   static void toplevelConfigure(void *data, xdg_toplevel *, int32_t width,
-                                int32_t height, wl_array *) {
-    // 0x0 means "you decide the size" — keep whatever we currently have.
-    // The actual resize happens later, in surfaceConfigure, once this
-    // configure is ack'd (that's the point at which the protocol allows us
-    // to attach a differently-sized buffer).
+                                int32_t height, wl_array *states) {
     auto *self = static_cast<LiteUI *>(data);
     if (width > 0 && height > 0) {
       self->pendingWidth_ = width;
       self->pendingHeight_ = height;
     }
+    bool max = false;
+    auto *s = static_cast<uint32_t *>(states->data);
+    for (size_t i = 0; i < states->size / sizeof(uint32_t); ++i)
+      if (s[i] == XDG_TOPLEVEL_STATE_MAXIMIZED)
+        max = true;
+    self->maximized_ = max;
   }
   // Called when the compositor/user requests the window be closed (e.g. via a
   // taskbar close action).
@@ -9144,7 +9201,8 @@ private:
         renderView(*e.view, ClipRect{});
     }
     // Paint the titlebar and its buttons on top of that background.
-    drawTitlebar();
+    if (!hideTitlebar_)
+      drawTitlebar();
     paintTooltip();
     eglSwapBuffers(eglDisplay_, eglSurface_);
   }
@@ -9174,7 +9232,7 @@ private:
     // grab or track click consumes it entirely; anything else falls
     // through to the ordinary pending-click press, resolved later in
     // handleRelease().
-    if (pointer_y_ >= kTitlebarHeight) {
+    if (pointer_y_ >= titlebarHeight()) {
       float x = static_cast<float>(pointer_x_),
             y = static_cast<float>(pointer_y_);
       // Only the left button interacts with scrollbars — a thumb grab
@@ -9194,25 +9252,13 @@ private:
       running_ = false;
       return;
     }
-    // If instead the click landed on the maximize button...
     if (inside(maximizeRect(), pointer_x_, pointer_y_)) {
-      // If we're currently maximized, ask the compositor to restore the normal
-      // size...
-      if (maximized_)
-        xdg_toplevel_unset_maximized(toplevel_);
-      // ...otherwise ask it to maximize the window.
-      else
-        xdg_toplevel_set_maximized(toplevel_);
-      // Flip our local tracking flag to match the new state.
-      maximized_ = !maximized_;
-      // Repaint immediately (icon/behavior may depend on this state later).
+      requestMaximize();
       redraw();
       return;
     }
-    // If instead the click landed on the minimize button...
     if (inside(minimizeRect(), pointer_x_, pointer_y_)) {
-      // ...ask the compositor to minimize the toplevel.
-      xdg_toplevel_set_minimized(toplevel_);
+      requestMinimize();
       return;
     }
 
@@ -9227,7 +9273,7 @@ private:
   // already acted on press — so this only matters for content-area
   // interactions below the titlebar.
   void handleRelease(MouseButton btn = MouseButton::Left) {
-    if (pointer_y_ >= kTitlebarHeight) {
+    if (pointer_y_ >= titlebarHeight()) {
       bool changed = (btn == MouseButton::Left)
                          ? endScrollPress(static_cast<float>(pointer_x_),
                                           static_cast<float>(pointer_y_))
@@ -9250,12 +9296,10 @@ private:
 
 // Out-of-line constructor definition; inline because this is a single-header
 // library.
-inline LiteUI::LiteUI(const std::string &title, int w, int h)
-    // w/h <= 0 (including the -1/-1 defaults) means "no explicit size —
-    // start maximized". width_/height_ still need *some* placeholder
-    // value until the OS/compositor tells us the real size.
+inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
     : width_(w > 0 ? w : 800), height_(h > 0 ? h : 600) {
   startMaximized_ = (w <= 0 || h <= 0);
+  hideTitlebar_ = hideTitlebar;
   activeInstance_ = this;
 // Windows-specific construction path.
 #if defined(_WIN32)
@@ -9282,11 +9326,21 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h)
   // Convert the UTF-8 title into the wide string Win32 expects.
   std::wstring wtitle = toWide(title);
 
-  // Create the actual window, passing `this` as the creation parameter so
-  // WndProc can recover it.
-  hwnd_ = CreateWindowExW(0, className, wtitle.c_str(), WS_OVERLAPPEDWINDOW,
-                          CW_USEDEFAULT, CW_USEDEFAULT, width_, height_,
-                          nullptr, nullptr, hInst, this);
+  DWORD style = WS_OVERLAPPEDWINDOW;
+  int posX = CW_USEDEFAULT, posY = CW_USEDEFAULT;
+  if (hideTitlebar_) {
+    // WS_POPUP = no caption, no border. SYSMENU/MINIMIZEBOX keep the
+    // taskbar button's right-click menu and click-to-minimize working.
+    style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    // CW_USEDEFAULT only means "let Windows pick" for overlapped windows,
+    // so center the window in the work area ourselves.
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    posX = wa.left + ((wa.right - wa.left) - width_) / 2;
+    posY = wa.top + ((wa.bottom - wa.top) - height_) / 2;
+  }
+  hwnd_ = CreateWindowExW(0, className, wtitle.c_str(), style, posX, posY,
+                          width_, height_, nullptr, nullptr, hInst, this);
   // If creation failed, surface it as an exception rather than continuing with
   // a null handle.
   if (!hwnd_) {
@@ -9366,8 +9420,8 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h)
   if (startMaximized_) {
     xdg_toplevel_set_maximized(toplevel_);
     maximized_ = true; // keep our own tracking flag in sync, so the
-                        // titlebar's maximize button correctly offers
-                        // "unmaximize" as its next click
+                       // titlebar's maximize button correctly offers
+                       // "unmaximize" as its next click
   }
 
   // Commit the surface state now, which triggers the compositor's first
