@@ -1,75 +1,80 @@
 #include "liteui.hpp"
-
+#include <iostream>
 int main() {
-  int count = 0;
-  float progress = 1.0f;
-  bool checked = false;
-  Text label;
-  label.label = [&]() { return "Count: " + std::to_string(count); };
-  label.fontSize = 20;
+  // Create the window first so the bar's buttons can talk to it.
+  // 4th argument = hideTitlebar: no default titlebar, we draw our own.
+  LiteUI ui("Custom Bar", 900, 600, true);
 
-  View button;
-  button.style.width = Size::pixel(140);
-  button.style.height = Size::pixel(44);
-  button.style.borderRadius = 6.0f;
-  button.style.backgroundColor = Color{230, 230, 230};
-  button.style.hoverColor = {210, 210, 210};
-  button.style.alignItems = Align::Center;
-  button.style.justifyContent = Justify::Center;
-  button.disabled = [&]() { return checked; };
-  button.onClick = [&]() {
-    count++;
-    progress += 1.0;
+  const Color barBg{32, 32, 36};
+  const Color white{235, 235, 235};
+
+  // One reusable factory for the three square buttons.
+  auto barButton = [&](const std::string &glyph, Color hover,
+                       std::function<void()> onClick) {
+    View b;
+    b.style.width = Size::pixel(46);    // height stretches to the bar's
+    b.style.alignItems = Align::Center; // center the glyph both ways
+    b.style.justifyContent = Justify::Center;
+    b.style.hoverColor = hover;
+    b.onClick = std::move(onClick);
+
+    Text t;
+    t.label = glyph;
+    t.fontSize = 14;
+    t.color = white;
+    b.addChild(t);
+    return b;
   };
 
-  Text buttonLabel;
-  buttonLabel.label = "Increment";
-  button.addChild(buttonLabel);
+  // Left side: the title. It grows to fill the free space and doubles
+  // as the drag handle.
+  Text title;
+  title.label = "Custom Bar";
+  title.fontSize = 13;
+  title.color = white;
 
-  View box;
-  box.style.width = Size::pixel(20);
-  box.style.height = Size::pixel(20);
-  box.style.borderWidth = 2.0f;
-  box.style.borderColor = Color{120, 120, 120};
-  box.style.borderRadius = 4.0f;
-  box.style.backgroundColor = [&]() {
-    return checked ? Color{60, 130, 246} : Color{255, 255, 255};
+  View dragArea;
+  dragArea.style.flexGrow = 1;
+  dragArea.style.alignItems = Align::Center; // vertically center the title
+  dragArea.style.padding = EdgeInsets{0, 0, 0, 12}; // top, right, bottom, left
+  dragArea.onPressAt = [&](float, float) {
+    std::cout << "Moving" << std::endl;
+    ui.requestMove();
   };
-  box.onClick = [&]() { checked = !checked; };
+  dragArea.addChild(title);
 
-  Text mark;
-  mark.color = Color{255, 255, 255};
-  mark.label = [&]() {
-    return checked ? std::string("\xE2\x9C\x93") : std::string();
-  };
-  box.addChild(mark);
+  // The bar itself: title area, then minimize / maximize / close.
+  View bar;
+  bar.style.width = Size::full();
+  bar.style.height = Size::pixel(36);
+  bar.style.backgroundColor = barBg;
+  bar.addChild(dragArea);
+  bar.addChild(barButton("\xE2\x80\x93", Color{70, 70, 76},
+                         [&] { ui.requestMinimize(); }));
+  bar.addChild(barButton("\xE2\x96\xA1", Color{70, 70, 76},
+                         [&] { ui.requestMaximize(); }));
+  bar.addChild(barButton("\xE2\x9C\x95", Color{196, 43, 28},
+                         [&] { ui.requestClose(); }));
 
-  View track;
-  track.style.width = Size::full();
-  track.style.height = Size::pixel(8);
-  track.style.backgroundColor = Color{230, 230, 230};
-  track.style.borderRadius = 4.0f;
+  // Everything below the bar.
+  Text hello;
+  hello.label = "Window content goes here";
+  hello.fontSize = 20;
 
-  View fill;
-  fill.style.height = Size::full();
-  fill.style.backgroundColor = Color{60, 130, 246};
-  fill.style.borderRadius = 4.0f;
-  fill.style.width = [&]() { return Size::pixel(progress); };
-  track.addChild(fill);
+  View content;
+  content.style.flexGrow = 1; // take all the space under the bar
+  content.style.alignItems = Align::Center;
+  content.style.justifyContent = Justify::Center;
+  content.style.backgroundColor = Color{245, 245, 245};
+  content.addChild(hello);
 
   View root;
   root.style.direction = FlexDirection::Column;
-  root.style.alignItems = Align::Center;
-  root.style.justifyContent = Justify::Center;
-  root.style.gap = 16;
   root.style.width = Size::full();
   root.style.height = Size::full();
-  root.addChild(label);
-  root.addChild(button);
-  root.addChild(box);
-  root.addChild(track);
+  root.addChild(bar);
+  root.addChild(content);
 
-  LiteUI ui("Counter",-1,-1,true);
   ui.setRoot(root);
   ui.run();
   return 0;

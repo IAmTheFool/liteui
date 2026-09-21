@@ -69,7 +69,7 @@ int main() {
   root.addChild(box);
   root.addChild(track);
 
-  LiteUI ui(400, 200, "Counter");
+  LiteUI ui("Counter");
   ui.setRoot(root);
   ui.run();
   return 0;

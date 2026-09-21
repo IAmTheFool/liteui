@@ -5839,6 +5839,17 @@ public:
 #endif
   }
 
+  void requestMove() {
+#if defined(_WIN32)
+    // Can't start the move from here: we're still inside WM_LBUTTONDOWN,
+    // which is about to grab the mouse. Leave a note for that handler.
+    moveRequested_ = true;
+#else
+    if (seat_ && toplevel_)
+      xdg_toplevel_move(toplevel_, seat_, lastPressSerial_);
+#endif
+  }
+
   // Everything below is internal implementation detail.
 private:
   // Requested window width in pixels, stored so pixel-drawing helpers can
@@ -7020,6 +7031,7 @@ private:
 #if defined(_WIN32)
   // Native window handle; null until CreateWindowExW succeeds.
   HWND hwnd_ = nullptr;
+  bool moveRequested_ = false;
   std::unordered_map<UINT_PTR, std::function<void()>> timers_;
 
   // Device-independent: created once in the constructor, lives for the
@@ -7132,21 +7144,43 @@ private:
     case WM_ERASEBKGND:
       return 1;
 
-    // Left mouse button pressed: first give scrollbars/scrollable content a
-    // chance to claim the press (beginScrollPress) — a thumb grab or track
-    // click consumes it entirely; a press over plain scrollable content
-    // arms a possible pan but still falls through to the ordinary
-    // beginPress() below, since a small movement should still resolve as a
-    // click (see updateScrollDrag/endScrollPress). Capture the mouse so we
-    // still get the matching WM_MOUSEMOVE/WM_LBUTTONUP even if the cursor
-    // leaves the window before the button is released.
+      // Left mouse button pressed: first give scrollbars/scrollable content a
+      // chance to claim the press (beginScrollPress) — a thumb grab or track
+      // click consumes it entirely; a press over plain scrollable content
+      // arms a possible pan but still falls through to the ordinary
+      // beginPress() below, since a small movement should still resolve as a
+      // click (see updateScrollDrag/endScrollPress). Capture the mouse so we
+      // still get the matching WM_MOUSEMOVE/WM_LBUTTONUP even if the cursor
+      // leaves the window before the button is released.
     case WM_LBUTTONDOWN: {
       if (self) {
         self->hideTooltip();
+        self->moveRequested_ =
+            false; // only honor a request made during THIS press
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (!self->beginScrollPress(x, y))
           self->beginPress(x, y);
+
+        if (self->moveRequested_) {
+          self->moveRequested_ = false;
+          // A press handler asked to drag the window. Hand the mouse to
+          // Windows' own move loop, WITHOUT calling SetCapture first. The
+          // cursor position goes in lParam so the drag starts exactly where
+          // the user pressed. This call blocks until the button is released.
+          POINT pt;
+          GetCursorPos(&pt);
+          SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION,
+                       MAKELPARAM(pt.x, pt.y));
+
+          // The OS loop swallowed the release, so drop our pending press
+          // instead of leaving it dangling.
+          self->pressedView_[btnIdx(MouseButton::Left)] = nullptr;
+          self->dragView_[btnIdx(MouseButton::Left)] = nullptr;
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
+
         SetCapture(hwnd);
         if (self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -7745,6 +7779,7 @@ private:
       0; // Serial from the most recent pointer-enter event;
          // wl_pointer_set_cursor requires one and it's not resent on motion, so
          // we cache it.
+  uint32_t lastPressSerial_ = 0;
   std::string currentCursorName_; // Name of the cursor image currently shown,
                                   // so we don't reissue set_cursor every
                                   // single motion event for no reason.
@@ -9213,6 +9248,7 @@ private:
   // before — only content-area widget clicks wait for a matching release
   // (see beginPress/endPress).
   void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
+    lastPressSerial_ = serial;
     hideTooltip();
     // Resize/move grabs and the chrome buttons are a left-button-only
     // convention (matching every desktop's own titlebar) — a middle/
