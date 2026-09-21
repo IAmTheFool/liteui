@@ -349,10 +349,18 @@ int main() {
     state.markDirty();
   };
   canvas.onDragTo = [](float x, float y) {
-    if (!state.strokes.empty()) {
-      state.strokes.back().pts.push_back({x / state.zoom, y / state.zoom});
-      state.markDirty();
+    if (state.strokes.empty())
+      return;
+    auto &pts = state.strokes.back().pts;
+    float nx = x / state.zoom, ny = y / state.zoom;
+    if (!pts.empty()) {
+      float dx = nx - pts.back().x, dy = ny - pts.back().y;
+      float minDist = 1.5f / state.zoom;
+      if (dx * dx + dy * dy < minDist * minDist)
+        return;
     }
+    pts.push_back({nx, ny});
+    state.markDirty();
   };
   canvas.canvasDirtySource = [] {
     bool d = state.dirty;
