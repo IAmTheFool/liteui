@@ -8,7 +8,7 @@
 #include <filesystem>
 
 int main(int argc, char **argv) {
-  TabbedEditor editor("liteui code editor");
+  TabbedEditor editor("CODE");
   for (int i = 1; i < argc; ++i)
     editor.openFile(argv[i]);
 

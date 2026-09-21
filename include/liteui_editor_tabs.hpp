@@ -192,8 +192,8 @@ inline void loadFileTreeChildren(FileTreeNode &node) {
 
 class TabbedEditor {
 public:
-  TabbedEditor(const std::string &windowTitle = "liteui code editor")
-      : ui_(windowTitle, -1, -1, true),
+  TabbedEditor(const std::string &windowTitle = "CODE")
+      : ui_(windowTitle, -1, -1, true), title_(windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
     ui_.setWindowBackground(th::kEditorBg);
     ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
@@ -384,6 +384,7 @@ public:
 
 private:
   LiteUI ui_;
+  std::string title_;
   std::vector<EditorDocument> docs_;
   std::shared_ptr<int> activeIndex_; // shared so Dynamic<> closures in the
                                      // *current* tree can read it without
@@ -401,7 +402,7 @@ private:
   // Terminal panel height, resizable via its own horizontal divider — same
   // shared_ptr/clamp pattern as sidePanelWidth_, just on the vertical axis.
   std::shared_ptr<float> terminalHeight_ = std::make_shared<float>(180.0f);
-  static constexpr float kMinTerminalHeight = 80.0f;
+  static constexpr float kMinTerminalHeight = 0.0f;
   static constexpr float kMaxTerminalHeight = 400.0f;
   static constexpr float kHDividerHeight = 6.0f;
 
@@ -421,9 +422,9 @@ private:
   // Resizable side panel width, shared with the divider's drag handler and
   // the panel's own Dynamic<Size> width — same reasoning as activityIndex_:
   // every closure that reads it needs to survive this tree being rebuilt.
-  std::shared_ptr<float> sidePanelWidth_ = std::make_shared<float>(240.0f);
-  static constexpr float kMinSidePanelWidth = 160.0f;
-  static constexpr float kMaxSidePanelWidth = 480.0f;
+  std::shared_ptr<float> sidePanelWidth_ = std::make_shared<float>(300.0f);
+  static constexpr float kMinSidePanelWidth = 0.0f;
+  static constexpr float kMaxSidePanelWidth = 580.0f;
   static constexpr float kSideDividerWidth = 6.0f;
 
   // Named so the pane-visibility checks in buildExplorerPane()/
@@ -2244,9 +2245,26 @@ private:
     bar.style.width = Size::full();
     bar.style.height = Size::pixel(38);
     bar.style.backgroundColor = th::kMenuBarBg;
-    bar.style.padding = EdgeInsets{0, 8, 0, 8};
+    bar.style.padding = EdgeInsets{0, 0, 0, 4};
     bar.style.gap = 2;
     bar.style.flexShrink = 0;
+
+    View titleBox;
+    titleBox.style.height = Size::full();
+    titleBox.style.flexShrink = 0;
+    titleBox.style.alignItems = Align::Center;
+    titleBox.style.padding = EdgeInsets{0, 14, 0, 6}; // gap before "File"
+    titleBox.style.backgroundColor = th::kMenuBarBg;
+    titleBox.onPressAt = [this](float, float) { ui_.requestMove(); };
+
+    Text titleText;
+    titleText.label = title_;
+    titleText.fontSize = 14;
+    titleText.fontWeight = FontWeight::Bold;
+    titleText.color = th::kTextMuted;
+    titleText.wrap = TextWrap::NoWrap;
+    titleBox.addChild(titleText);
+    bar.addChild(std::move(titleBox));
 
     auto openIdx = openMenuIndex_;
     auto backdropX = std::make_shared<float>(0.0f);
@@ -2427,11 +2445,11 @@ private:
     };
 
     bar.addChild(makeWindowBtn("\xE2\x80\x93", th::kButtonHoverBg,
-                               [this] { ui_.requestMinimize(); })); 
+                               [this] { ui_.requestMinimize(); }));
     bar.addChild(makeWindowBtn("\xE2\x96\xA1", th::kButtonHoverBg,
-                               [this] { ui_.requestMaximize(); })); 
+                               [this] { ui_.requestMaximize(); }));
     bar.addChild(makeWindowBtn("\xE2\x9C\x95", Color{196, 43, 28},
-                               [this] { ui_.requestClose(); })); 
+                               [this] { ui_.requestClose(); }));
 
     bar.addChild(backdrop);
     return bar;
