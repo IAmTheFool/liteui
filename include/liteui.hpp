@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -1050,6 +1051,220 @@ inline std::optional<std::string> saveFolderPicker(const std::string &title) {
 }
 
 #endif
+
+// ==================== Clipboard ====================
+namespace liteui_clipboard {
+
+// Same-process fallback: only used when NO working OS clipboard mechanism
+// exists (headless container, no wl-copy/xclip/xsel, Windows clipboard
+// permanently locked). It is never consulted when the OS clipboard works,
+// so it can't paste stale text over something the user copied elsewhere.
+inline std::string &internalFallback() {
+  static std::string s;
+  return s;
+}
+
+// Normalizes "\r\n" and lone "\r" to "\n" — the editor splits lines on
+// '\n' only, so any '\r' left in pasted text would end up at the end of
+// every line.
+inline std::string toLF(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '\r') {
+      if (i + 1 < in.size() && in[i + 1] == '\n')
+        continue; // CRLF: drop the CR, the LF is kept on the next iteration
+      out += '\n'; // lone CR (classic Mac line ending)
+      continue;
+    }
+    out += in[i];
+  }
+  return out;
+}
+
+// Converts "\n" to "\r\n" without doubling any that are already CRLF.
+inline std::string toCRLF(const std::string &in) {
+  std::string out;
+  out.reserve(in.size() + in.size() / 16 + 1);
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '\n' && (i == 0 || in[i - 1] != '\r'))
+      out += '\r';
+    out += in[i];
+  }
+  return out;
+}
+
+#if defined(_WIN32)
+
+namespace detail {
+// Another process can briefly hold the clipboard open; a few short
+// retries avoids spurious failures without ever blocking noticeably.
+inline bool openClipboardRetry() {
+  for (int i = 0; i < 5; ++i) {
+    if (OpenClipboard(nullptr))
+      return true;
+    Sleep(10);
+  }
+  return false;
+}
+} // namespace detail
+
+// Returns false if the clipboard couldn't be written.
+inline bool setText(const std::string &utf8) {
+  // Windows apps (Notepad, Word, browsers) expect CRLF line endings.
+  std::string crlf = toCRLF(utf8);
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, nullptr, 0);
+  if (wlen <= 0)
+    return false;
+  if (!detail::openClipboardRetry())
+    return false;
+  EmptyClipboard();
+  HGLOBAL hMem =
+      GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wlen) * sizeof(wchar_t));
+  if (!hMem) {
+    CloseClipboard();
+    return false;
+  }
+  wchar_t *dst = static_cast<wchar_t *>(GlobalLock(hMem));
+  if (!dst) {
+    GlobalFree(hMem);
+    CloseClipboard();
+    return false;
+  }
+  MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, dst, wlen);
+  GlobalUnlock(hMem);
+  if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+    GlobalFree(hMem); // clipboard did NOT take ownership on failure
+    CloseClipboard();
+    return false;
+  }
+  CloseClipboard(); // on success the clipboard owns hMem
+  return true;
+}
+
+// nullopt  = clipboard couldn't be opened (caller may use the fallback)
+// ""       = clipboard opened fine but holds no text (e.g. an image)
+inline std::optional<std::string> getText() {
+  if (!detail::openClipboardRetry())
+    return std::nullopt;
+  std::string result;
+  if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+      const wchar_t *w = static_cast<const wchar_t *>(GlobalLock(h));
+      if (w) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        if (len > 1) {
+          result.assign(static_cast<size_t>(len - 1), '\0');
+          WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(), len, nullptr,
+                              nullptr);
+        }
+        GlobalUnlock(h);
+      }
+    }
+  }
+  CloseClipboard();
+  return result;
+}
+
+#else // Linux: shell out to whatever clipboard tool is usable here.
+
+namespace detail {
+
+inline bool commandExists(const char *name) {
+  std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
+  return std::system(check.c_str()) == 0;
+}
+
+inline bool envSet(const char *name) {
+  const char *v = std::getenv(name);
+  return v && *v;
+}
+
+struct Tools {
+  std::string copyCmd, pasteCmd; // both empty = no usable clipboard tool
+};
+
+// Detected once and cached. A tool only counts if its display server is
+// actually present: wl-copy installed inside a headless container is
+// useless, and treating it as "available" would suppress the fallback.
+inline const Tools &tools() {
+  static const Tools t = [] {
+    Tools r;
+    if (envSet("WAYLAND_DISPLAY") && commandExists("wl-copy") &&
+        commandExists("wl-paste")) {
+      r.copyCmd = "wl-copy";
+      // "--type text" makes wl-paste refuse non-text contents (an image)
+      // instead of dumping binary data into the editor.
+      r.pasteCmd = "wl-paste --no-newline --type text";
+    } else if (envSet("DISPLAY") && commandExists("xclip")) {
+      r.copyCmd = "xclip -selection clipboard";
+      r.pasteCmd = "xclip -selection clipboard -o";
+    } else if (envSet("DISPLAY") && commandExists("xsel")) {
+      r.copyCmd = "xsel --clipboard --input";
+      r.pasteCmd = "xsel --clipboard --output";
+    }
+    return r;
+  }();
+  return t;
+}
+
+} // namespace detail
+
+// Returns false if no clipboard tool is available or it couldn't be run.
+inline bool setText(const std::string &utf8) {
+  const auto &t = detail::tools();
+  if (t.copyCmd.empty())
+    return false;
+  FILE *pipe = popen((t.copyCmd + " 2>/dev/null").c_str(), "w");
+  if (!pipe)
+    return false;
+  if (!utf8.empty())
+    fwrite(utf8.data(), 1, utf8.size(), pipe);
+  pclose(pipe); // wl-copy/xclip/xsel fork and detach to hold ownership,
+                // so this returns promptly
+  return true;
+}
+
+// nullopt  = no usable clipboard tool (caller may use the fallback)
+// ""       = tool ran fine but the clipboard has no text (e.g. an image)
+inline std::optional<std::string> getText() {
+  const auto &t = detail::tools();
+  if (t.pasteCmd.empty())
+    return std::nullopt;
+  FILE *pipe = popen((t.pasteCmd + " 2>/dev/null").c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+    result.append(buf, n);
+  pclose(pipe);
+  return result;
+}
+
+#endif
+
+// What CodeEditor actually calls.
+//
+// Set:  always mirrors into the in-process fallback, then tries the OS.
+// Get:  if the OS clipboard is reachable, its answer is final, even when
+//       that answer is "empty". The fallback is used only when there is
+//       no OS clipboard to ask. Line endings are normalized to '\n'.
+inline void setTextWithFallback(const std::string &s) {
+  internalFallback() = s;
+  setText(s);
+}
+
+inline std::string getTextWithFallback() {
+  if (std::optional<std::string> os = getText())
+    return toLF(*os);
+  return internalFallback();
+}
+
+} // namespace liteui_clipboard
 
 namespace liteui_image {
 
@@ -9704,6 +9919,25 @@ inline View View::toView(TextInput ti) {
       if (onSubmit)
         onSubmit(state->text);
       return; // don't touch blink/dirty for a submit
+    case Key::V: {
+      if (!e.mods.ctrl)
+        return;
+      std::string clip = liteui_clipboard::getTextWithFallback();
+      // single-line field: strip line breaks, and keep ASCII-only to match
+      // this widget's byte-offset cursor (see note below)
+      clip.erase(std::remove_if(clip.begin(), clip.end(),
+                                [](unsigned char c) {
+                                  return c == '\n' || c == '\r' || c >= 0x80;
+                                }),
+                 clip.end());
+      if (clip.empty())
+        return;
+      state->text.insert(state->cursor, clip);
+      state->cursor += clip.size();
+      if (onChange)
+        onChange(state->text);
+      break;
+    }
     default:
       return;
     }

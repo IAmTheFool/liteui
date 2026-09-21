@@ -2,7 +2,7 @@
 #include <string>
 
 int main() {
-  LiteUI ui(480, 320, "Text Field Test");
+  LiteUI ui("Text Field Test", 480, 320);
 
   View root;
   root.style.direction = FlexDirection::Column;
