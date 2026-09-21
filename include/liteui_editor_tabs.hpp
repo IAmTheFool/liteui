@@ -443,17 +443,24 @@ private:
     int id;
     std::string label;   // short glyph shown in the bar
     std::string tooltip; // full name shown in the bar's tooltip and as
-                         // the side panel's header
+    // the side panel's header
+    std::string icons;
   };
   static const std::vector<ActivityItem> &activityItems() {
     static const std::vector<ActivityItem> items = {
-        {kExplorerActivityId, "E", "Explorer"},
-        {kSearchActivityId, "S", "Search"},
+        {kExplorerActivityId, "E", "Explorer",
+         R"(<?xml version="1.0" encoding="utf-8"?><!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
+<svg width="800px" height="800px" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><defs><style>.a{fill:none;stroke:#000000;stroke-linecap:round;stroke-linejoin:round;}</style></defs><path class="a" d="M41.6783,13.0436H24.77c-1.9628-.1072-5.9311-4.2372-8.1881-4.2372H6.6806V8.8046A2.1762,2.1762,0,0,0,4.5,10.9763v7.3063h39V14.8652A1.8217,1.8217,0,0,0,41.6783,13.0436Z"/><path class="a" d="M43.5,18.2826H4.5V37.0165a2.1762,2.1762,0,0,0,2.1735,2.1789H41.3194A2.1762,2.1762,0,0,0,43.5,37.0237V18.2826Z"/></svg>)"},
+        {kSearchActivityId, "S", "Search",
+         R"(<?xml version="1.0" encoding="utf-8"?><!-- Uploaded to: SVG Repo, www.svgrepo.com, Generator: SVG Repo Mixer Tools -->
+<svg fill="#000000" width="800px" height="800px" viewBox="0 0 1920 1920" xmlns="http://www.w3.org/2000/svg">
+    <path d="M790.588 1468.235c-373.722 0-677.647-303.924-677.647-677.647 0-373.722 303.925-677.647 677.647-677.647 373.723 0 677.647 303.925 677.647 677.647 0 373.723-303.924 677.647-677.647 677.647Zm596.781-160.715c120.396-138.692 193.807-319.285 193.807-516.932C1581.176 354.748 1226.428 0 790.588 0S0 354.748 0 790.588s354.748 790.588 790.588 790.588c197.647 0 378.24-73.411 516.932-193.807l516.028 516.142 79.963-79.963-516.142-516.028Z" fill-rule="evenodd"/>
+</svg>)"},
     };
     return items;
   }
 
-  // Explorer state: a real expand/collapse tree rooted at the opened
+    // Explorer state: a real expand/collapse tree rooted at the opened
   // workspace folder, matching VS Code's explorer. explorerRoot_ is
   // nullopt until a folder is opened; each FileTreeNode lazily loads its
   // own children the first time it's expanded (see loadFileTreeChildren,
@@ -2131,11 +2138,19 @@ private:
       row.tooltip = activity.tooltip;
       row.onClick = [act, idx] { *act = (*act == idx) ? -1 : idx; };
 
-      Text label;
-      label.label = activity.label;
-      label.fontSize = 12;
-      label.color = [act, idx]() -> Color {
-        return *act == idx ? Color{255, 255, 255} : Color{185, 185, 190};
+      Svg label;
+      // label.label = activity.label;
+      label.source = activity.icons;
+      // label.fontSize = 12;
+      // label.color = [act, idx]() -> Color {
+      //   return *act == idx ? Color{255, 255, 255} : Color{185, 185, 190};
+      // };
+      label.style.width = Size::pixel(28);
+      label.style.height = Size::pixel(28);
+      label.fit = ObjectFit::Contain; // default anyway for Svg
+      label.onError = [](const std::string &err) {
+        // fires if liteui_svg::parseString() fails
+        fprintf(stderr, "SVG parse error: %s\n", err.c_str());
       };
       row.addChild(label);
       bar.addChild(std::move(row));
