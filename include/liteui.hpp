@@ -3184,7 +3184,7 @@ public:
     mutable std::string resolvedText;
     mutable bool resolvedDisabled = false;
     mutable float resolvedValue = 0.0f;
-    mutable Color resolvedBackgroundColor{0, 0, 0, 0}; 
+    mutable Color resolvedBackgroundColor{0, 0, 0, 0};
     mutable Size resolvedWidth = Size::fit();
     mutable Size resolvedHeight = Size::fit();
     mutable float resolvedBorderWidth = 0.0f;
@@ -5782,9 +5782,9 @@ class LiteUI {
 
 public:
   // Constructor: explicit prevents accidental implicit conversions from a bare
-  // int; defaults give an 800x600 "Window".
-  explicit LiteUI(int width = 800, int height = 600,
-                  const std::string &title = "Window");
+
+  explicit LiteUI(const std::string &title = "Window", int width = -1,
+                  int height = -1);
   // Destructor: tears down whatever platform resources were created.
   ~LiteUI();
   // Copying is disabled — a LiteUI owns unique OS handles that can't be
@@ -5811,6 +5811,7 @@ private:
   int width_;
   // Requested window height in pixels, same purpose as width_.
   int height_;
+  bool startMaximized_ = false;
 
   // Boxes queued for drawing, in the order addBox() was called (paint order).
   std::vector<Box> boxes_;
@@ -9249,8 +9250,12 @@ private:
 
 // Out-of-line constructor definition; inline because this is a single-header
 // library.
-inline LiteUI::LiteUI(int w, int h, const std::string &title)
-    : width_(w), height_(h) {
+inline LiteUI::LiteUI(const std::string &title, int w, int h)
+    // w/h <= 0 (including the -1/-1 defaults) means "no explicit size —
+    // start maximized". width_/height_ still need *some* placeholder
+    // value until the OS/compositor tells us the real size.
+    : width_(w > 0 ? w : 800), height_(h > 0 ? h : 600) {
+  startMaximized_ = (w <= 0 || h <= 0);
   activeInstance_ = this;
 // Windows-specific construction path.
 #if defined(_WIN32)
@@ -9295,8 +9300,12 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
     throw std::runtime_error("D2D1CreateFactory failed");
   ensureRenderTarget();
 
-  // Make the window visible using the platform's default show behavior.
-  ShowWindow(hwnd_, SW_SHOWDEFAULT);
+  // Make the window visible. If no explicit size was given, start it
+  // maximized (title bar/borders intact, user can un-maximize/drag/resize
+  // normally) instead of the platform default show. WM_SIZE fires as a
+  // result and updates width_/height_ + relayout automatically via the
+  // existing handler.
+  ShowWindow(hwnd_, startMaximized_ ? SW_SHOWMAXIMIZED : SW_SHOWDEFAULT);
   // Force an initial paint of the window.
   UpdateWindow(hwnd_);
 
@@ -9348,6 +9357,18 @@ inline LiteUI::LiteUI(int w, int h, const std::string &title)
   xdg_toplevel_add_listener(toplevel_, &toplevelListener, this);
   // Set the window's title as shown in taskbars/window switchers.
   xdg_toplevel_set_title(toplevel_, title.c_str());
+
+  // If no explicit size was given, ask the compositor to start us
+  // maximized (our own CSD titlebar stays intact, unlike fullscreen).
+  // The compositor's first configure event reports the real work-area
+  // size via toplevelConfigure -> pendingWidth_/pendingHeight_, which
+  // surfaceConfigure() then applies via resize().
+  if (startMaximized_) {
+    xdg_toplevel_set_maximized(toplevel_);
+    maximized_ = true; // keep our own tracking flag in sync, so the
+                        // titlebar's maximize button correctly offers
+                        // "unmaximize" as its next click
+  }
 
   // Commit the surface state now, which triggers the compositor's first
   // configure event.

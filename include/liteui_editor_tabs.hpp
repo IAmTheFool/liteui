@@ -192,10 +192,9 @@ inline void loadFileTreeChildren(FileTreeNode &node) {
 
 class TabbedEditor {
 public:
-  TabbedEditor(int width = 1100, int height = 700,
+  TabbedEditor(
                const std::string &windowTitle = "liteui code editor")
-      : ui_(width, height, windowTitle),
-        activeIndex_(std::make_shared<int>(-1)) {
+      : ui_(windowTitle), activeIndex_(std::make_shared<int>(-1)) {
     ui_.setWindowBackground(th::kEditorBg);
     ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
     newWelcomeTab();
@@ -460,7 +459,7 @@ private:
     return items;
   }
 
-    // Explorer state: a real expand/collapse tree rooted at the opened
+  // Explorer state: a real expand/collapse tree rooted at the opened
   // workspace folder, matching VS Code's explorer. explorerRoot_ is
   // nullopt until a folder is opened; each FileTreeNode lazily loads its
   // own children the first time it's expanded (see loadFileTreeChildren,
