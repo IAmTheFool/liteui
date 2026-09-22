@@ -1,0 +1,90 @@
+name: Single-header check
+
+# Proves the "single header" claim: liteui.hpp, copied into an empty
+# scratch directory with nothing but a trivial main(), still compiles
+# on both platforms. This is a compile-only check (no linking, no
+# example code, no CMake) -- it exists purely to catch a header that
+# has quietly started depending on some other file in the repo.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  standalone-compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libwayland-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libxkbcommon-dev \
+            libpng-dev \
+            libjpeg-dev
+
+      - name: Assemble a scratch directory containing only the header
+        shell: bash
+        run: |
+          mkdir -p scratch
+          cp liteui.hpp scratch/
+
+          # liteui.hpp #include's "xdg-shell-client-protocol.h" and
+          # "xdg-decoration-client-protocol.h" by relative name (quoted,
+          # not angle-bracketed) on Linux -- these are the vendored,
+          # generated headers under platform/wayland-protocols/, not
+          # system headers a package manager provides. Only the .h
+          # files are needed here since this check never links.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp platform/wayland-protocols/*.h scratch/
+          fi
+
+          cat > scratch/standalone_check.cpp <<'EOF'
+          // Deliberately does nothing but include the header and define
+          // main(). The point is "does liteui.hpp parse and compile on
+          // its own", not "does a real app link" -- build.yml already
+          // covers real linking via the full example programs.
+          #include "liteui.hpp"
+          int main() { return 0; }
+          EOF
+
+      # libjpeg is intentionally left out of this pkg-config call: it
+      # doesn't reliably ship a .pc file, and libjpeg-dev on Ubuntu
+      # installs jpeglib.h to a default system include path anyway.
+      - name: Compile (Linux)
+        if: runner.os == 'Linux'
+        working-directory: scratch
+        run: |
+          g++ -std=c++23 -c standalone_check.cpp \
+            $(pkg-config --cflags wayland-client wayland-cursor wayland-egl \
+                                  cairo pangocairo egl glesv2 xkbcommon libpng)
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The header's Windows branch pulls in d2d1/dwrite via
+      # #pragma comment(lib, ...), so no explicit /link flags are
+      # needed even for a full build -- here we don't even link, just
+      # compile with /c.
+      - name: Compile (Windows)
+        if: runner.os == 'Windows'
+        working-directory: scratch
+        shell: cmd
+        run: cl /std:c++latest /EHsc /c standalone_check.cpp

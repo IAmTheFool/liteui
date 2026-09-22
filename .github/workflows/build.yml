@@ -1,0 +1,53 @@
+name: Build examples
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # liteui's CMakeLists.txt vendors the Wayland protocol bindings
+      # under platform/wayland-protocols/, so no wayland-scanner /
+      # wayland-protocols package is needed here -- only the runtime
+      # dev packages the header itself #includes.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libwayland-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libxkbcommon-dev \
+            libpng-dev \
+            libjpeg-dev
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      # windows-latest's default generator is a multi-config Visual
+      # Studio generator, hence --config here; on Linux this flag is a
+      # harmless no-op for the single-config Unix Makefiles generator.
+      - name: Build every example
+        run: cmake --build build --config Release --parallel
+
+      - name: List built binaries (sanity check)
+        shell: bash
+        run: |
+          find build -type f \( -iname "*.exe" -o -perm -u+x \) 2>/dev/null \
+            | grep -v -E "CMakeFiles|\.(a|lib|o|obj)$" || true

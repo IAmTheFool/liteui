@@ -16,9 +16,7 @@ int main() {
   button.style.alignItems = Align::Center;
   button.style.justifyContent = Justify::Center;
 
-  button.onClick = [&]() {
-    count++;
-  };
+  button.onClick = [&]() { count++; };
 
   Text buttonLabel;
   buttonLabel.label = "Increment";
@@ -34,7 +32,7 @@ int main() {
   root.addChild(label);
   root.addChild(button);
 
-    LiteUI ui("Counter",400,200);
+  LiteUI ui("Counter", 400, 200);
   ui.setRoot(root);
   ui.run(); // blocks, pumps the platform event loop
   return 0;
