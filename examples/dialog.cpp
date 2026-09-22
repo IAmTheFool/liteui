@@ -131,7 +131,7 @@ int main() {
   root.addChild(trigger);
   root.addChild(backdrop);
 
-  LiteUI ui(400, 300, "Confirm Dialog");
+  LiteUI ui("Confirm Dialog",400, 300);
   ui.setRoot(root);
   ui.run();
   return 0;

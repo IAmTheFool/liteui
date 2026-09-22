@@ -4,7 +4,7 @@
 #include <cstdio>
 
 int main() {
-  LiteUI ui(800, 600, "Scrolling demo");
+  LiteUI ui("Scrolling demo",800, 600);
 
   View root;
   root.style.direction = FlexDirection::Column;

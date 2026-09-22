@@ -28,7 +28,7 @@ static View makeRow(const std::string &caption, Text t) {
 }
 
 int main() {
-  LiteUI ui(480, 600, "Text feature showcase");
+  LiteUI ui("Text feature showcase",480, 600);
 
   View root;
   root.style.direction = FlexDirection::Column;

@@ -392,7 +392,7 @@ inline View toTextAreaView(TextArea ta) {
 }
 
 int main() {
-  LiteUI ui(900, 650, "Simple Text Editor");
+  LiteUI ui("Simple Text Editor",900, 650);
 
   View root;
   root.style.direction = FlexDirection::Column;

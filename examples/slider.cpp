@@ -84,7 +84,7 @@ int main() {
   root.style.height = Size::full();
   root.addChild(sliderRow);
 
-  LiteUI ui(320, 200, "Slider");
+  LiteUI ui("Slider",320, 200);
   ui.setRoot(root);
   ui.run();
   return 0;

@@ -18,7 +18,7 @@ struct Tab {
 };
 
 int main() {
-    LiteUI ui(1000, 650, "VS Code Style Layout");
+    LiteUI ui("VS Code Style Layout",1000, 650);
 
     const std::vector<ActivityItem> activities = {
         {0, "Explorer", "E"},

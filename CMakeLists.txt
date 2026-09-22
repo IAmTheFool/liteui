@@ -10,7 +10,7 @@ if(WIN32)
     add_executable(main
         src/main.cpp
     )
-    target_include_directories(main PRIVATE include)
+    target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(main PRIVATE user32 gdi32 d3d11 dxgi d2d1 dwrite windowscodecs ole32)
 
 elseif(UNIX AND NOT APPLE)
@@ -72,7 +72,7 @@ elseif(UNIX AND NOT APPLE)
         ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c
         ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c
     )
-    target_include_directories(main PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(main PRIVATE
         PkgConfig::WAYLAND
         PkgConfig::WAYLAND_CURSOR

@@ -1,17 +1,41 @@
-// src/main.cpp
-
 #include "liteui.hpp"
-#include "liteui_editor_ext.hpp"
-#include "liteui_editor_tabs.hpp"
-#include "liteui_syntax.hpp"
 
-#include <filesystem>
+int main() {
+  int count = 0;
 
-int main(int argc, char **argv) {
-  TabbedEditor editor("CODE");
-  for (int i = 1; i < argc; ++i)
-    editor.openFile(argv[i]);
+  Text label;
+  label.label = [&]() { return "Count: " + std::to_string(count); };
+  label.fontSize = 20;
 
-  editor.run();
+  View button;
+  button.style.width = Size::pixel(140);
+  button.style.height = Size::pixel(44);
+  button.style.borderRadius = 6.0f;
+  button.style.backgroundColor = Color{230, 230, 230};
+  button.style.hoverColor = {210, 210, 210};
+  button.style.alignItems = Align::Center;
+  button.style.justifyContent = Justify::Center;
+
+  button.onClick = [&]() {
+    count++;
+  };
+
+  Text buttonLabel;
+  buttonLabel.label = "Increment";
+  button.addChild(buttonLabel);
+
+  View root;
+  root.style.direction = FlexDirection::Column;
+  root.style.alignItems = Align::Center;
+  root.style.justifyContent = Justify::Center;
+  root.style.gap = 16;
+  root.style.width = Size::full();
+  root.style.height = Size::full();
+  root.addChild(label);
+  root.addChild(button);
+
+    LiteUI ui("Counter",400,200);
+  ui.setRoot(root);
+  ui.run(); // blocks, pumps the platform event loop
   return 0;
 }

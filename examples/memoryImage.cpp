@@ -48,7 +48,7 @@ struct PreviewState {
 };
 
 int main() {
-  LiteUI ui(800, 600, "Image viewer");
+  LiteUI ui("Image viewer",800, 600);
 
   View root;
   root.style.direction = FlexDirection::Column;

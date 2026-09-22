@@ -32,7 +32,7 @@ static size_t caretIndexForX(const std::string &text, const TextStyle &ts,
 }
 
 int main() {
-  LiteUI ui(480, 320, "Text Field Test");
+  LiteUI ui("Text Field Test",480, 320);
 
   TextFieldState tf;
 

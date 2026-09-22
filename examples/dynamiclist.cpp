@@ -128,7 +128,7 @@ int main() {
   addBtn.addChild(std::move(addLabel));
   root.addChild(std::move(addBtn));
 
-  LiteUI app(360, 480, "Items");
+  LiteUI app("Items",360, 480);
   app.setRoot(std::move(root));
   app.run();
 }

@@ -2,7 +2,7 @@
 #include "liteui.hpp"
 
 int main() {
-  LiteUI ui(900, 650, "Paint");
+  LiteUI ui("Paint",900, 650);
   View root;
   root.style.direction = FlexDirection::Column;
   root.style.alignContent = AlignContent::Center;

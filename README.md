@@ -52,7 +52,7 @@ int main() {
   root.addChild(label);
   root.addChild(button);
 
-  LiteUI ui(400, 200, "Counter");
+    LiteUI ui("Counter",400,200);
   ui.setRoot(root);
   ui.run(); // blocks, pumps the platform event loop
   return 0;

@@ -113,7 +113,7 @@ int main() {
   root.addChild(trigger);
   root.addChild(backdrop);
 
-  LiteUI ui(400, 300, "Context Menu");
+  LiteUI ui("Context Menu",400, 300);
   ui.setRoot(root);
   ui.setTooltipStyle({.delayMs = 400});
   ui.run();

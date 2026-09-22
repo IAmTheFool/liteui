@@ -187,7 +187,7 @@ void rebuild() {
 }
 
 int main() {
-    LiteUI ui(1000, 650, "File Explorer Example");
+    LiteUI ui("File Explorer Example",1000, 650);
     app.ui = &ui;
     ui.setRoot(buildRootView());
     ui.run();
