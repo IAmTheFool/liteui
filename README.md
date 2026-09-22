@@ -111,6 +111,26 @@ On Linux, the Wayland protocol bindings (`xdg-shell`,
 `wayland-scanner` or the `wayland-protocols` package — only the
 runtime libraries in the table above.
 
+#### "vendored Wayland protocol sources not found"
+
+If you see this error, it means you're building from a checkout where
+`platform/wayland-protocols/*.c`/`*.h` haven't been generated yet
+(e.g. a fresh clone before they were committed, or you're building
+liteui itself for the first time rather than just consuming it as a
+dependency). Fix it once:
+
+```bash
+sudo apt install libwayland-bin wayland-protocols   # provides wayland-scanner + the protocol XML
+cmake -B build      # configures with a WARNING instead of failing, once wayland-scanner is found
+cmake --build build --target regen-protocols
+git add platform/wayland-protocols && git commit
+```
+
+After that one-time step, `platform/wayland-protocols/` is populated
+and committed, and every subsequent `cmake -B build` configures
+cleanly without needing `wayland-scanner` or `wayland-protocols`
+installed at all.
+
 ### Without CMake
 
 Add `liteui.hpp` to your include path and link the libraries from the
