@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    # Re-runs the same example build as build.yml on both platforms --
+    # a tag that doesn't build cleanly should never become a Release.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libwayland-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libxkbcommon-dev \
+            libpng-dev \
+            libjpeg-dev
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build every example
+        run: cmake --build build --config Release --parallel
+
+  standalone-check:
+    # Also re-runs the single-header compile check -- a release should
+    # never ship a header that has quietly grown a hidden dependency.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libwayland-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libxkbcommon-dev \
+            libpng-dev \
+            libjpeg-dev
+
+      - name: Assemble a scratch directory containing only the header
+        shell: bash
+        run: |
+          mkdir -p scratch
+          cp liteui.hpp scratch/
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp platform/wayland-protocols/*.h scratch/
+          fi
+          cat > scratch/standalone_check.cpp <<'EOF'
+          #include "liteui.hpp"
+          int main() { return 0; }
+          EOF
+
+      - name: Compile (Linux)
+        if: runner.os == 'Linux'
+        working-directory: scratch
+        run: |
+          g++ -std=c++23 -c standalone_check.cpp \
+            $(pkg-config --cflags wayland-client wayland-cursor wayland-egl \
+                                  cairo pangocairo egl glesv2 xkbcommon libpng)
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile (Windows)
+        if: runner.os == 'Windows'
+        working-directory: scratch
+        shell: cmd
+        run: cl /std:c++latest /EHsc /c standalone_check.cpp
+
+  release:
+    needs: [verify, standalone-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release assets
+        # liteui is meant to be usable as a bare header drop-in, but the
+        # Linux backend needs the vendored Wayland protocol bindings
+        # alongside it. Ship both: the raw header for the common
+        # "just copy this file" case, and a tarball with the header +
+        # platform/ + CMakeLists.txt + examples/ for anyone pulling in
+        # the whole package (e.g. via FetchContent or add_subdirectory).
+        run: |
+          mkdir -p dist
+          cp liteui.hpp dist/liteui.hpp
+
+          pkg="liteui-${{ steps.version.outputs.version }}"
+          mkdir -p "$pkg"
+          cp liteui.hpp "$pkg/"
+          cp -r platform "$pkg/" 2>/dev/null || true
+          cp CMakeLists.txt "$pkg/" 2>/dev/null || true
+          cp -r examples "$pkg/" 2>/dev/null || true
+          cp README.md "$pkg/" 2>/dev/null || true
+          tar -czf "dist/${pkg}.tar.gz" "$pkg"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: liteui ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/liteui.hpp
+            dist/liteui-${{ steps.version.outputs.version }}.tar.gz
