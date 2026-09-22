@@ -44,6 +44,12 @@ int main() {
 }
 ```
 
+## Screenshots
+
+| Code editor | Input widgets | Paint |
+|---|---|---|
+| ![Code editor example](screenshots/code_editor.png) | ![Input widgets example](screenshots/inputs.png) | ![Paint example](screenshots/paint.png) |
+
 ## What's in the header
 
 - A retained `View` tree with a flexbox-subset layout engine — `Size`
