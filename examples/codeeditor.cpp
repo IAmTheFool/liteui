@@ -2954,9 +2954,25 @@ struct LanguageDef {
   char stringQuote = '"';
   bool hasChars = false; // 'x' style char literals, distinct from strings
   char charQuote = '\'';
-  bool hasHashPreprocessor = false; // a line whose first non-space char is
-                                    // '#' is colored as one Preprocessor
-                                    // span for its whole remainder
+  bool hasHashPreprocessor = false;    // a line whose first non-space char is
+                                       // '#' is colored as one Preprocessor
+                                       // span for its whole remainder
+  bool hasRawStrings = false;          // C++ R"delim(...)delim"
+  bool hasTripleQuotedStrings = false; // Python '''...''' / """..."""
+};
+
+struct LineContinuation {
+  bool inBlockComment = false;
+  bool inRawString = false;
+  std::string rawDelim; // the delimiter between R" and ( ... ) and closing "
+  bool inTripleString = false;
+  char tripleQuote = '"'; // which quote char started the triple string
+
+  bool operator==(const LineContinuation &o) const {
+    return inBlockComment == o.inBlockComment && inRawString == o.inRawString &&
+           rawDelim == o.rawDelim && inTripleString == o.inTripleString &&
+           tripleQuote == o.tripleQuote;
+  }
 };
 
 inline bool syntaxIsIdentStart(unsigned char c) {
@@ -2975,35 +2991,56 @@ inline bool syntaxIsIdentCont(unsigned char c) {
 // the previous line (see SyntaxHighlighter for how that's threaded
 // through a whole file); `endInBlockComment` is set to whatever state
 // should carry into the *next* line.
-//
-// Known simplifications single-char string/char delimiters only
-// (no Python triple-quotes, no C++ raw strings); a whole "starts with #"
-// line is one Preprocessor span rather than parsing includes/macros
-// specially; no template/generic-aware bracket matching.
+
 inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
                                              const LanguageDef &lang,
-                                             bool startInBlockComment,
-                                             bool &endInBlockComment) {
+                                             LineContinuation startState,
+                                             LineContinuation &endState) {
   std::vector<SyntaxToken> tokens;
   size_t i = 0, n = line.size();
-  bool inBlockComment = startInBlockComment;
+  LineContinuation state = startState;
   auto push = [&](size_t start, size_t len, SyntaxTokenType t) {
     if (len > 0)
       tokens.push_back(SyntaxToken{start, len, t});
   };
 
-  if (inBlockComment) {
+  // ---- carry an unterminated raw string / triple string / block comment
+  // in from the previous line ----
+  if (state.inRawString) {
+    std::string closer = ")" + state.rawDelim + "\"";
+    size_t end = line.find(closer);
+    if (end == std::string::npos) {
+      push(0, n, SyntaxTokenType::String);
+      endState = state;
+      return tokens;
+    }
+    push(0, end + closer.size(), SyntaxTokenType::String);
+    i = end + closer.size();
+    state.inRawString = false;
+    state.rawDelim.clear();
+  } else if (state.inTripleString) {
+    std::string closer(3, state.tripleQuote);
+    size_t end = line.find(closer);
+    if (end == std::string::npos) {
+      push(0, n, SyntaxTokenType::String);
+      endState = state;
+      return tokens;
+    }
+    push(0, end + 3, SyntaxTokenType::String);
+    i = end + 3;
+    state.inTripleString = false;
+  } else if (state.inBlockComment) {
     size_t end = lang.blockCommentEnd.empty()
                      ? std::string::npos
                      : line.find(lang.blockCommentEnd, 0);
     if (end == std::string::npos) {
       push(0, n, SyntaxTokenType::Comment);
-      endInBlockComment = true;
+      endState = state;
       return tokens;
     }
     push(0, end + lang.blockCommentEnd.size(), SyntaxTokenType::Comment);
     i = end + lang.blockCommentEnd.size();
-    inBlockComment = false;
+    state.inBlockComment = false;
   }
 
   if (lang.hasHashPreprocessor) {
@@ -3012,7 +3049,7 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
       ++j;
     if (j < n && line[j] == '#') {
       push(i, n - i, SyntaxTokenType::Preprocessor);
-      endInBlockComment = false;
+      endState = state;
       return tokens;
     }
   }
@@ -3033,7 +3070,7 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
           line.find(lang.blockCommentEnd, i + lang.blockCommentStart.size());
       if (end == std::string::npos) {
         push(i, n - i, SyntaxTokenType::Comment);
-        inBlockComment = true;
+        state.inBlockComment = true;
         i = n;
         break;
       }
@@ -3041,6 +3078,26 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
       i = end + lang.blockCommentEnd.size();
       continue;
     }
+
+    // Python-style triple-quoted string. Checked before the plain
+    // single-quote case below since both start with the same char.
+    if (lang.hasTripleQuotedStrings && (c == '"' || c == '\'') &&
+        line.compare(i, 3, std::string(3, static_cast<char>(c))) == 0) {
+      std::string closer(3, static_cast<char>(c));
+      size_t start = i;
+      size_t end = line.find(closer, i + 3);
+      if (end == std::string::npos) {
+        push(start, n - start, SyntaxTokenType::String);
+        state.inTripleString = true;
+        state.tripleQuote = static_cast<char>(c);
+        i = n;
+        break;
+      }
+      push(start, end + 3 - start, SyntaxTokenType::String);
+      i = end + 3;
+      continue;
+    }
+
     if (lang.hasStrings && c == static_cast<unsigned char>(lang.stringQuote)) {
       size_t start = i++;
       while (i < n) {
@@ -3073,12 +3130,42 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
       push(start, i - start, SyntaxTokenType::String);
       continue;
     }
+
+    // C++ raw string literal: R"delim(...)delim". Reachable here as a
+    // fresh 'R' because if it were part of a longer identifier, the
+    // identifier branch below would already have consumed it on a prior
+    // iteration.
+    if (lang.hasRawStrings && c == 'R' && i + 1 < n && line[i + 1] == '"') {
+      size_t delimStart = i + 2, j = delimStart;
+      while (j < n && line[j] != '(' && line[j] != '"' &&
+             !std::isspace(static_cast<unsigned char>(line[j])) &&
+             line[j] != '\\' && (j - delimStart) < 16)
+        ++j;
+      if (j < n && line[j] == '(') {
+        std::string delim = line.substr(delimStart, j - delimStart);
+        std::string closer = ")" + delim + "\"";
+        size_t start = i;
+        size_t end = line.find(closer, j + 1);
+        if (end == std::string::npos) {
+          push(start, n - start, SyntaxTokenType::String);
+          state.inRawString = true;
+          state.rawDelim = delim;
+          i = n;
+          break;
+        }
+        push(start, end + closer.size() - start, SyntaxTokenType::String);
+        i = end + closer.size();
+        continue;
+      }
+      // 'R' followed by '"' but not a valid delimiter — falls through
+      // and tokenizes as a plain identifier below, as before.
+    }
+
     if (std::isdigit(c)) {
       size_t start = i++;
       while (i < n && (std::isalnum(static_cast<unsigned char>(line[i])) ||
                        line[i] == '.' || line[i] == '_'))
-        ++i; // crude but covers hex/float/suffix cases well enough to color
-             // a number as a number
+        ++i;
       push(start, i - start, SyntaxTokenType::Number);
       continue;
     }
@@ -3092,9 +3179,6 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
                                      : SyntaxTokenType::Plain);
       continue;
     }
-    // Punctuation/operators/whitespace: coalesce a run of "everything
-    // else" bytes into one Plain span so we're not pushing one token per
-    // character.
     size_t start = i++;
     while (i < n) {
       unsigned char cc = static_cast<unsigned char>(line[i]);
@@ -3116,7 +3200,7 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
     push(start, i - start, SyntaxTokenType::Plain);
   }
 
-  endInBlockComment = inBlockComment;
+  endState = state;
   return tokens;
 }
 
@@ -3148,12 +3232,10 @@ inline Color colorForToken(SyntaxTokenType t, const SyntaxTheme &theme) {
 }
 
 struct LineHighlight {
-  bool valid = false;      // false means "never tokenized" or "explicitly
-                           // invalidated" — distinct from an empty-but-valid
-                           // token list for a blank line
-  std::string sourceText;  // the line text this was computed from
-  bool startState = false; // block-comment state entering this line
-  bool endState = false;   // block-comment state leaving this line
+  bool valid = false;
+  std::string sourceText;
+  LineContinuation startState;
+  LineContinuation endState;
   std::vector<SyntaxToken> tokens;
 };
 
@@ -3184,14 +3266,15 @@ struct SyntaxHighlighter {
     if (cache.size() != lines.size())
       realign(lines);
 
-    bool state = false; // block-comment state entering line 0
+    LineContinuation state; // default-constructed: not in a comment,
+                            // raw string, or triple string entering line 0
     for (size_t i = 0; i < lines.size(); ++i) {
       LineHighlight &lc = cache[i];
       if (lc.valid && lc.sourceText == lines[i] && lc.startState == state) {
         state = lc.endState;
         continue;
       }
-      bool endState = false;
+      LineContinuation endState;
       lc.tokens = tokenizeLine(lines[i], *lang, state, endState);
       lc.sourceText = lines[i];
       lc.startState = state;
@@ -3231,10 +3314,6 @@ private:
       rebuilt[i] = cache[i];
     for (size_t i = 0; i < suffix; ++i)
       rebuilt[newN - 1 - i] = cache[oldN - 1 - i];
-    // Everything strictly between prefix and (newN - suffix) is left
-    // default-constructed (valid = false) and will be picked up by the
-    // main sync() loop above, along with anything after it whose
-    // effective incoming state turns out to have changed.
     cache = std::move(rebuilt);
   }
 };
@@ -3310,6 +3389,7 @@ inline std::shared_ptr<LanguageDef> languageCpp() {
       "xor",           "xor_eq",      "override",
       "final",
   };
+  l->hasRawStrings = true;
   return l;
 }
 
@@ -3333,6 +3413,7 @@ inline std::shared_ptr<LanguageDef> languagePython() {
       "import", "in",     "is",      "lambda",   "nonlocal", "not",    "or",
       "pass",   "raise",  "return",  "try",      "while",    "with",   "yield",
   };
+  l->hasTripleQuotedStrings = true;
   return l;
 }
 
