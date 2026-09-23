@@ -4569,7 +4569,7 @@ private:
     pendingCreate_.active = true;
     pendingCreate_.isDir = isDir;
     pendingCreate_.parentDir = dir;
-    pendingInputState_->requestFocus = true; 
+    pendingInputState_->requestFocus = true;
   }
 
   void explorerNewFile() { beginPendingCreate(false); }
@@ -5208,6 +5208,7 @@ private:
     list.style.flexGrow = 1;
     list.style.backgroundColor = th::kSideBarBg;
     list.style.overflowY = Overflow::Auto;
+    list.onClick = [this] { selectedPath_ = workspaceRoot_; };
     list.keysSource = [this] { return explorerKeys(); };
     list.itemBuilder = [this](const std::string &key) {
       if (key == kPendingCreateKey)
