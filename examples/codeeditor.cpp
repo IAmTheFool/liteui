@@ -3652,41 +3652,111 @@ public:
     *activeIndex_ = static_cast<int>(docs_.size()) - 1;
   }
 
-  // forcePickPath=true implements Save As.
+  // Returns false if the doc needed a path and the picker was cancelled
+  // — lets confirmUnsavedDialog() know not to close the tab in that case.
+  bool saveDocument(size_t idx, bool forcePickPath = false) {
+    if (idx >= docs_.size())
+      return false;
+    EditorDocument &doc = docs_[idx];
+    if (doc.isWelcome)
+      return true;
+    if (!doc.hasPath || forcePickPath) {
+      auto picked =
+          saveFilePicker("Save File", doc.title,
+                         {{"Text", "*.txt"}, {"All Files", "*"}}, "txt");
+      if (!picked)
+        return false;
+      doc.path = *picked;
+      doc.hasPath = true;
+      doc.title = editorTitleFromPath(doc.path);
+      doc.highlighter = makeHighlighter(languageForExtension(doc.path));
+    }
+    std::ofstream out(doc.path, std::ios::binary);
+    out << joinLines(doc.state->lines);
+    *doc.modified = false;
+    return true;
+  }
+
   void saveActive(bool forcePickPath = false) {
+    if (*activeIndex_ >= 0)
+      saveDocument(static_cast<size_t>(*activeIndex_), forcePickPath);
+  }
+
+  // ---- Edit menu actions (act on the active tab, not a right-click target)
+
+  void editUndo() {
     EditorDocument *doc = activeDoc();
     if (!doc || doc->isWelcome)
       return;
-    if (!doc->hasPath || forcePickPath) {
-      auto picked =
-          saveFilePicker("Save File", doc->title,
-                         {{"Text", "*.txt"}, {"All Files", "*"}}, "txt");
-      if (!picked)
-        return;
-      doc->path = *picked;
-      doc->hasPath = true;
-      doc->title = editorTitleFromPath(doc->path);
-      // Save As can turn an untitled buffer into e.g. "foo.py" — pick up
-      // a language for it now rather than leaving it permanently plain.
-      doc->highlighter = makeHighlighter(languageForExtension(doc->path));
-    }
-    std::ofstream out(doc->path, std::ios::binary);
-    out << joinLines(doc->state->lines);
-    *doc->modified = false;
-    // The tab label is a Dynamic<std::string> reading docs_[idx] live (see
-    // buildTab), so the modified-dot and any Save-As title change appear on
-    // the next poll with no tree rebuild.
+    doc->state->undo();
+    doc->state->dirty = true;
+    *doc->modified = true;
+  }
+  void editRedo() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome)
+      return;
+    doc->state->redo();
+    doc->state->dirty = true;
+    *doc->modified = true;
+  }
+  void editCopy() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome || !doc->state->hasSelection())
+      return;
+    liteui_clipboard::setTextWithFallback(doc->state->selectedText());
+  }
+  void editCut() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome || !doc->state->hasSelection())
+      return;
+    liteui_clipboard::setTextWithFallback(doc->state->selectedText());
+    doc->state->beginEdit(false);
+    doc->state->deleteSelectionRaw();
+    doc->state->dirty = true;
+    *doc->modified = true;
+  }
+  void editPaste() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome)
+      return;
+    std::string clip = liteui_clipboard::getTextWithFallback();
+    if (clip.empty())
+      return;
+    doc->state->beginEdit(false);
+    doc->state->insertTextRaw(clip);
+    doc->state->dirty = true;
+    *doc->modified = true;
+  }
+  void editSelectAll() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome)
+      return;
+    doc->state->selectAll();
+    doc->state->noteCursorMoved();
+    doc->state->dirty = true;
   }
 
+  // Public entry point: if the tab has unsaved changes, prompts before
+  // closing instead of closing immediately.
   void closeTab(size_t i) {
     if (i >= docs_.size() || docs_[i].closed)
       return;
+    if (!docs_[i].isWelcome && *docs_[i].modified) {
+      unsavedDialogDocIndex_ = i;
+      *unsavedDialogOpen_ = true;
+      return;
+    }
+    closeTabForce(i);
+  }
+
+  // Unconditional close — this is the old closeTab() body verbatim, now
+  // only reached once the modified-check above is satisfied (or
+  // bypassed via "Don't Save").
+  void closeTabForce(size_t i) {
+    if (i >= docs_.size() || docs_[i].closed)
+      return;
     docs_[i].closed = true;
-    // TODO prompt to save if *docs_[i].modified before closing.
-    // The editor View for this doc is about to be dropped by
-    // reconcileChildren(), which frees it without going through onBlur —
-    // so its caret-blink interval would otherwise tick forever against a
-    // state nothing renders.
     if (docs_[i].state->blinkTimerHandle >= 0) {
       ui_.removeInterval(docs_[i].state->blinkTimerHandle);
       docs_[i].state->blinkTimerHandle = -1;
@@ -3778,7 +3848,8 @@ private:
   struct TerminalTab {
     std::shared_ptr<liteui_terminal::TerminalState> state =
         std::make_shared<liteui_terminal::TerminalState>();
-    std::string label = "powershell"; // default name for now, per spec
+    std::string label = "powershell";
+    bool closed = false;
   };
   std::vector<TerminalTab> terminals_;
   std::shared_ptr<int> activeTerminalIndex_ = std::make_shared<int>(0);
@@ -4315,6 +4386,9 @@ private:
   std::shared_ptr<bool> deleteDialogOpen_ = std::make_shared<bool>(false);
   std::string deleteTargetPath_;
   bool deleteTargetIsDir_ = false;
+
+  std::shared_ptr<bool> unsavedDialogOpen_ = std::make_shared<bool>(false);
+  size_t unsavedDialogDocIndex_ = 0;
 
   void setWorkspaceRoot(const std::string &p) {
     if (p.empty())
@@ -5341,11 +5415,44 @@ private:
     *activeTerminalIndex_ = static_cast<int>(terminals_.size()) - 1;
   }
 
+  // Closes terminal `idx`: shuts down its PTY/reader thread, reassigns
+  // the active index the same way closeTab() reassigns activeIndex_, and
+  // — since this panel always expects at least one terminal, unlike the
+  // editor's welcome-tab fallback being optional — spawns a fresh one if
+  // that was the last one open.
+  void closeTerminal(size_t idx) {
+    if (idx >= terminals_.size() || terminals_[idx].closed)
+      return;
+    terminals_[idx].closed = true;
+    terminals_[idx].state->shutdown();
+
+    if (static_cast<size_t>(*activeTerminalIndex_) == idx) {
+      int next = -1;
+      for (int k = static_cast<int>(idx) - 1; k >= 0; --k)
+        if (!terminals_[static_cast<size_t>(k)].closed) {
+          next = k;
+          break;
+        }
+      if (next < 0)
+        for (size_t k = idx + 1; k < terminals_.size(); ++k)
+          if (!terminals_[k].closed) {
+            next = static_cast<int>(k);
+            break;
+          }
+      *activeTerminalIndex_ = next;
+    }
+    if (std::all_of(terminals_.begin(), terminals_.end(),
+                    [](const TerminalTab &t) { return t.closed; }))
+      spawnNewTerminal(); // keeps the panel non-empty; also fixes up
+                          // activeTerminalIndex_ to the new one
+  }
+
   std::vector<std::string> terminalKeys() const {
     std::vector<std::string> keys;
     keys.reserve(terminals_.size());
     for (size_t i = 0; i < terminals_.size(); ++i)
-      keys.push_back(std::to_string(i));
+      if (!terminals_[i].closed)
+        keys.push_back(std::to_string(i));
     return keys;
   }
   static size_t terminalKeyToIndex(const std::string &key) {
@@ -5383,8 +5490,6 @@ private:
     return stack;
   }
 
-  // One row in the terminal list: label + a stub close "x". Clicking
-  // the row (anywhere but the x) switches the active terminal.
   View buildTerminalRow(size_t idx) {
     auto activeIdx = activeTerminalIndex_;
 
@@ -5418,11 +5523,7 @@ private:
     closeBtn.style.borderRadius = 3.0f;
     closeBtn.style.hoverColor = Color{70, 70, 70};
     closeBtn.style.backgroundColor = Color{0, 0, 0, 0};
-    // Stub only, as asked — visually present, not wired up. Closing a
-    // running PTY safely (reassigning the active index, tearing down
-    // the shell, deciding what "no terminals left" looks like) is real
-    // behavior for a later pass, not a one-liner here.
-    closeBtn.onClick = [] {};
+    closeBtn.onClick = [this, idx] { closeTerminal(idx); };
     Text closeLabel;
     closeLabel.label = std::string("x");
     closeLabel.fontSize = 12;
@@ -5728,13 +5829,13 @@ private:
                            closeTab(static_cast<size_t>(*activeIndex_));
                        }}}});
     menus.push_back({"Edit",
-                     {{"Undo", nullptr},
-                      {"Redo", nullptr},
-                      {"Cut", nullptr},
-                      {"Copy", nullptr},
-                      {"Paste", nullptr}}});
+                     {{"Undo", [this] { editUndo(); }},
+                      {"Redo", [this] { editRedo(); }},
+                      {"Cut", [this] { editCut(); }},
+                      {"Copy", [this] { editCopy(); }},
+                      {"Paste", [this] { editPaste(); }}}});
     menus.push_back({"Selection",
-                     {{"Select All", nullptr},
+                     {{"Select All", [this] { editSelectAll(); }},
                       {"Expand Selection", nullptr},
                       {"Shrink Selection", nullptr}}});
     menus.push_back({"View", {}});
@@ -6097,6 +6198,112 @@ private:
     return pane;
   }
 
+  // Same shape as buildDeleteDialog() — full-window dimmed backdrop,
+  // centered box, click on the box swallowed — with a third button.
+  View buildUnsavedChangesDialog() {
+    auto openPtr = unsavedDialogOpen_;
+
+    View dialogBox;
+    dialogBox.style.direction = FlexDirection::Column;
+    dialogBox.style.width = Size::pixel(360);
+    dialogBox.style.padding = EdgeInsets::all(20);
+    dialogBox.style.gap = 16;
+    dialogBox.style.backgroundColor = th::kSideBarBg;
+    dialogBox.style.borderWidth = 1.0f;
+    dialogBox.style.borderColor = th::kMenuBorder;
+    dialogBox.style.borderRadius = 8.0f;
+    dialogBox.onClick = [] {};
+
+    Text title;
+    title.label = std::function<std::string()>([this]() -> std::string {
+      return "Save changes to \"" +
+             (unsavedDialogDocIndex_ < docs_.size()
+                  ? docs_[unsavedDialogDocIndex_].title
+                  : std::string()) +
+             "\"?";
+    });
+    title.fontSize = 18;
+    title.fontWeight = FontWeight::SemiBold;
+    title.color = th::kTextBright;
+    dialogBox.addChild(title);
+
+    Text message;
+    message.label =
+        std::string("Your changes will be lost if you don't save them.");
+    message.wrap = TextWrap::Wrap;
+    message.style.width = Size::full();
+    message.color = th::kTextMuted;
+    dialogBox.addChild(message);
+
+    View buttonRow;
+    buttonRow.style.direction = FlexDirection::Row;
+    buttonRow.style.justifyContent = Justify::End;
+    buttonRow.style.backgroundColor = th::kTransparent;
+    buttonRow.style.gap = 10;
+
+    auto makeBtn = [](const std::string &label, Color bg, Color hover,
+                      Color textColor, std::function<void()> onClick) {
+      Text t;
+      t.label = label;
+      t.color = textColor;
+      View b;
+      b.style.width = Size::pixel(90);
+      b.style.height = Size::pixel(34);
+      b.style.backgroundColor = bg;
+      b.style.hoverColor = hover;
+      b.style.borderRadius = 4.0f;
+      b.style.alignItems = Align::Center;
+      b.style.justifyContent = Justify::Center;
+      b.onClick = std::move(onClick);
+      b.addChild(t);
+      return b;
+    };
+
+    buttonRow.addChild(makeBtn("Cancel", th::kButtonBg, th::kButtonHoverBg,
+                               th::kText, [this] { cancelUnsavedDialog(); }));
+    buttonRow.addChild(makeBtn("Don't Save", th::kButtonBg, th::kButtonHoverBg,
+                               th::kText,
+                               [this] { confirmUnsavedDialog(false); }));
+    buttonRow.addChild(makeBtn("Save", th::kAccent, th::kMenuHoverBg,
+                               th::kOnAccent,
+                               [this] { confirmUnsavedDialog(true); }));
+    dialogBox.addChild(std::move(buttonRow));
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    backdrop.style.zIndex = 300; // same tier as buildDeleteDialog — the
+                                 // two can never be open together
+    backdrop.style.backgroundColor = th::kOverlay;
+    backdrop.style.alignItems = Align::Center;
+    backdrop.style.justifyContent = Justify::Center;
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [this] { cancelUnsavedDialog(); };
+    backdrop.addChild(dialogBox);
+    return backdrop;
+  }
+
+  void cancelUnsavedDialog() { *unsavedDialogOpen_ = false; }
+
+  // save=true ("Save"): try to save first, and only close if the save
+  // actually went through — a cancelled Save-As picker leaves the tab
+  // open rather than silently discarding the buffer. save=false
+  // ("Don't Save"): close unconditionally.
+  void confirmUnsavedDialog(bool save) {
+    size_t idx = unsavedDialogDocIndex_;
+    *unsavedDialogOpen_ = false;
+    if (idx >= docs_.size())
+      return;
+    if (save && !saveDocument(idx))
+      return;
+    closeTabForce(idx);
+  }
+
   // Delete-confirmation dialog, built the same way as a standalone
   // confirm dialog: a dimmed, absolute, full-window backdrop that
   // centers dialogBox via alignItems/justifyContent, closes on an
@@ -6448,6 +6655,7 @@ private:
     root.addChild(mainArea);
     root.addChild(buildStatusBar());
     root.addChild(buildDeleteDialog());
+    root.addChild(buildUnsavedChangesDialog());
     root.addChild(buildExplorerContextMenu());
     root.addChild(buildEditorContextMenu());
     ui_.setRoot(std::move(root));

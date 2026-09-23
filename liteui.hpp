@@ -409,8 +409,6 @@ struct Style {
   Dynamic<float> top = std::numeric_limits<float>::quiet_NaN();
   Dynamic<float> right = std::numeric_limits<float>::quiet_NaN();
   Dynamic<float> bottom = std::numeric_limits<float>::quiet_NaN();
-  // Stacking order among all Absolute nodes tree-wide (not just siblings).
-  // Ties break by document order — see collectAbsolutes().
   Dynamic<int> zIndex = 0;
 
   // When either axis is non-Visible, this view becomes a scroll container:
@@ -421,15 +419,6 @@ struct Style {
   Overflow overflowX = Overflow::Visible;
   Overflow overflowY = Overflow::Visible;
   bool contentPanEnabled = true;
-  // Same idea as contentPanEnabled, but gates pixel scrolling driven by
-  // the mouse wheel/trackpad axis (see applyWheelScroll) instead of a
-  // click-and-drag pan. Defaults to true. Set to false to stop the wheel
-  // from directly moving this view's scroll position — the view can
-  // still be scrolled via its scrollbar (thumb drag or track click).
-  // onScrollUp/onScrollDown below still fire on every wheel notch
-  // regardless of this flag (they're dispatched independently by
-  // dispatchScroll, never gated), so the app can hook them to implement
-  // its own effect instead.
   bool wheelScrollEnabled = true;
   Dynamic<Display> display = Display::Flex;
   Dynamic<Visibility> visibility = Visibility::Visible;
@@ -533,7 +522,7 @@ struct Text {
 //    the inner-radius stop is approximated there by rescaling stop
 //    offsets rather than drawn exactly.
 //  - Shadows are a simple flat-color, unblurred offset copy (no Gaussian
-//    blur), since neither backend is asked to do a blur pass here.
+//    blur).
 //  - strokeText approximates a stroked glyph outline by drawing the fill
 //    text in the stroke color, nudged in a ring of directions — it is not
 //    a true outline of the glyph contours.
@@ -7381,7 +7370,7 @@ private:
 
         if (self->moveRequested_) {
           self->moveRequested_ = false;
-          // A press handler asked to drag the window. Hand the mouse to
+          // Hand the mouse to
           // Windows' own move loop, WITHOUT calling SetCapture first. The
           // cursor position goes in lParam so the drag starts exactly where
           // the user pressed. This call blocks until the button is released.
