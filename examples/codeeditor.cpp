@@ -3622,6 +3622,48 @@ inline std::shared_ptr<LanguageDef> languageJavaScript() {
   return l;
 }
 
+// Maps a file extension to the shell command that "runs" it, for Run >
+// Run Without Debugging below. Deliberately narrow: this project has no
+// real build-system integration, so this only covers "run this script"
+// and "compile-then-run this single file" — the cases a scratch file in
+// this editor is realistically used for, not a general build system.
+inline std::optional<std::string> runCommandForFile(const std::string &path) {
+  size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos)
+    return std::nullopt;
+  std::string ext = path.substr(dot);
+  for (auto &c : ext)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+#if defined(_WIN32)
+  if (ext == ".py" || ext == ".pyw")
+    return "python \"" + path + "\"";
+  if (ext == ".js" || ext == ".mjs")
+    return "node \"" + path + "\"";
+  if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
+    std::string exe = path + ".exe";
+    return "g++ \"" + path + "\" -o \"" + exe + "\" && \"" + exe + "\"";
+  }
+  return std::nullopt; // no POSIX shell (.sh) assumed present on Windows
+#else
+  if (ext == ".py" || ext == ".pyw")
+    return "python3 \"" + path + "\"";
+  if (ext == ".js" || ext == ".mjs")
+    return "node \"" + path + "\"";
+  if (ext == ".sh")
+    return "bash \"" + path + "\"";
+  if (ext == ".c") {
+    std::string exe = path + ".out";
+    return "gcc \"" + path + "\" -o \"" + exe + "\" && \"" + exe + "\"";
+  }
+  if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
+    std::string exe = path + ".out";
+    return "g++ \"" + path + "\" -o \"" + exe + "\" && \"" + exe + "\"";
+  }
+  return std::nullopt;
+#endif
+}
+
 inline std::shared_ptr<LanguageDef>
 languageForExtension(const std::string &path) {
   size_t dot = path.find_last_of('.');
@@ -3939,6 +3981,37 @@ public:
     out << joinLines(doc.state->lines);
     *doc.modified = false;
     return true;
+  }
+
+  // Backs Run > Run Without Debugging. There's no real build/run system
+  // here — this saves the active file if needed and pipes a plausible
+  // interpreter/compiler invocation into the active terminal, the same
+  // way a developer would type it by hand. Silently does nothing useful
+  // (shows an error dialog) for file types runCommandForFile doesn't
+  // recognize, rather than pretending to support them.
+  void runActiveFile() {
+    EditorDocument *doc = activeDoc();
+    if (!doc || doc->isWelcome)
+      return;
+    if (!doc->hasPath) {
+      if (!saveDocument(static_cast<size_t>(*activeIndex_), true))
+        return; // user cancelled the Save As picker
+    } else if (*doc->modified) {
+      saveDocument(static_cast<size_t>(*activeIndex_));
+    }
+    auto cmd = runCommandForFile(doc->path);
+    if (!cmd) {
+      showErrorDialog("Don't know how to run \"" + doc->title +
+                      "\" — no run command is configured for this file type.");
+      return;
+    }
+    if (terminals_.empty())
+      spawnNewTerminal();
+    if (*terminalHeight_ <= 0.0f)
+      *terminalHeight_ = 180.0f; // reveal the panel if it was collapsed
+    size_t idx = static_cast<size_t>(std::clamp(
+        *activeTerminalIndex_, 0, static_cast<int>(terminals_.size()) - 1));
+    terminals_[idx].state->writeInput(*cmd + "\r");
   }
 
   void saveActive(bool forcePickPath = false) {
@@ -4656,6 +4729,8 @@ private:
 
   std::shared_ptr<bool> errorDialogOpen_ = std::make_shared<bool>(false);
   std::string errorDialogMessage_;
+
+  std::shared_ptr<bool> aboutDialogOpen_ = std::make_shared<bool>(false);
 
   void showErrorDialog(std::string message) {
     errorDialogMessage_ = std::move(message);
@@ -6154,9 +6229,14 @@ private:
                       {"Previous Tab", [this] { nextTab(-1); }}}});
     menus.push_back(
         {"Run",
-         {{"Start Debugging", nullptr}, {"Run Without Debugging", nullptr}}});
-    menus.push_back({"Terminal", {{"New Terminal", nullptr}}});
-    menus.push_back({"Help", {{"About", nullptr}}});
+         {{"Start Debugging", nullptr}, // no debugger backend exists;
+                                        // left as an honest stub rather
+                                        // than a fake one
+          {"Run Without Debugging", [this] { runActiveFile(); }}}});
+    menus.push_back(
+        {"Terminal", {{"New Terminal", [this] { spawnNewTerminal(); }}}});
+    menus.push_back(
+        {"Help", {{"About", [this] { *aboutDialogOpen_ = true; }}}});
 
     for (size_t mi = 0; mi < menus.size(); ++mi) {
       const MenuDef &def = menus[mi];
@@ -6614,6 +6694,74 @@ private:
     closeTabForce(idx);
   }
 
+  View buildAboutDialog() {
+    auto openPtr = aboutDialogOpen_;
+    View dialogBox;
+    dialogBox.style.direction = FlexDirection::Column;
+    dialogBox.style.width = Size::pixel(320);
+    dialogBox.style.padding = EdgeInsets::all(20);
+    dialogBox.style.gap = 12;
+    dialogBox.style.backgroundColor = th::kSideBarBg;
+    dialogBox.style.borderWidth = 1.0f;
+    dialogBox.style.borderColor = th::kMenuBorder;
+    dialogBox.style.borderRadius = 8.0f;
+    dialogBox.onClick = [] {};
+
+    Text title;
+    title.label = title_;
+    title.fontSize = 18;
+    title.fontWeight = FontWeight::SemiBold;
+    title.color = th::kTextBright;
+    dialogBox.addChild(title);
+
+    Text message;
+    message.label = std::string(
+        "A lightweight liteui-based code editor. No version or build "
+        "metadata is tracked yet.");
+    message.wrap = TextWrap::Wrap;
+    message.style.width = Size::full();
+    message.color = th::kTextMuted;
+    dialogBox.addChild(message);
+
+    View buttonRow;
+    buttonRow.style.direction = FlexDirection::Row;
+    buttonRow.style.justifyContent = Justify::End;
+    buttonRow.style.backgroundColor = th::kTransparent;
+
+    Text okLabel;
+    okLabel.label = std::string("OK");
+    okLabel.color = th::kOnAccent;
+    View okButton;
+    okButton.style.width = Size::pixel(80);
+    okButton.style.height = Size::pixel(34);
+    okButton.style.backgroundColor = th::kAccent;
+    okButton.style.hoverColor = th::kMenuHoverBg;
+    okButton.style.borderRadius = 4.0f;
+    okButton.style.alignItems = Align::Center;
+    okButton.style.justifyContent = Justify::Center;
+    okButton.onClick = [openPtr] { *openPtr = false; };
+    okButton.addChild(okLabel);
+    buttonRow.addChild(std::move(okButton));
+    dialogBox.addChild(std::move(buttonRow));
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    backdrop.style.zIndex = 350;
+    backdrop.style.backgroundColor = th::kOverlay;
+    backdrop.style.alignItems = Align::Center;
+    backdrop.style.justifyContent = Justify::Center;
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [openPtr] { *openPtr = false; };
+    backdrop.addChild(dialogBox);
+    return backdrop;
+  }
+
   View buildErrorDialog() {
     auto openPtr = errorDialogOpen_;
 
@@ -7042,6 +7190,7 @@ private:
     root.addChild(buildDeleteDialog());
     root.addChild(buildUnsavedChangesDialog());
     root.addChild(buildErrorDialog());
+    root.addChild(buildAboutDialog());
     root.addChild(buildExplorerContextMenu());
     root.addChild(buildEditorContextMenu());
     ui_.setRoot(std::move(root));
