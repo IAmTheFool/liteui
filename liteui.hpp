@@ -6057,6 +6057,31 @@ public:
 #endif
   }
 
+  // Installs a handler invoked whenever the user asks to close the window
+  // (the system close button, the custom titlebar/menu-bar close button
+  // via requestClose(), Alt+F4, or a window-manager "Close" action) —
+  // instead of the window closing immediately. The handler is fully
+  // responsible for deciding what happens next: call forceClose() right
+  // away if there's nothing to lose, or show a confirmation UI first and
+  // call forceClose() later once the user has responded. With no handler
+  // installed, a close request closes the window immediately (the
+  // previous, unconditional behavior).
+  void setOnCloseRequest(std::function<void()> fn) {
+    onCloseRequest_ = std::move(fn);
+  }
+
+  // Closes the window immediately and unconditionally, bypassing
+  // onCloseRequest — call this from within the onCloseRequest handler
+  // once it's safe to actually close.
+  void forceClose() {
+#if defined(_WIN32)
+    if (hwnd_)
+      DestroyWindow(hwnd_);
+#else
+    running_ = false;
+#endif
+  }
+
   // Everything below is internal implementation detail.
 private:
   // Requested window width in pixels, stored so pixel-drawing helpers can
@@ -6072,6 +6097,14 @@ private:
   View root_;
   bool hasRoot_ = false;
   static inline LiteUI *activeInstance_ = nullptr;
+
+  std::function<void()> onCloseRequest_;
+  void handleCloseRequested() {
+    if (onCloseRequest_)
+      onCloseRequest_();
+    else
+      forceClose();
+  }
 
   // Re-runs the layout algorithm over root_ against the current window size.
   void relayout() {
@@ -6872,20 +6905,20 @@ private:
   }
 
   // The one place that polls dynamic sources and applies the result.
-bool pollAndRelayout() {
-  if (!hasRoot_)
-    return false;
-  structureChanged_ = false;
-  pendingFocusRequest_ = nullptr;
-  if (!checkForUpdates(root_))
-    return false;
-  if (structureChanged_)
-    invalidateViewPointers();
-  if (pendingFocusRequest_)
-    setFocus(pendingFocusRequest_);   
-  relayout();
-  return true;
-}
+  bool pollAndRelayout() {
+    if (!hasRoot_)
+      return false;
+    structureChanged_ = false;
+    pendingFocusRequest_ = nullptr;
+    if (!checkForUpdates(root_))
+      return false;
+    if (structureChanged_)
+      invalidateViewPointers();
+    if (pendingFocusRequest_)
+      setFocus(pendingFocusRequest_);
+    relayout();
+    return true;
+  }
 
   // Updates v's (and its descendants') isHovered flag based on (x, y),
   // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
@@ -7654,6 +7687,10 @@ private:
       }
       return 0;
     }
+    case WM_CLOSE:
+      if (self)
+        self->handleCloseRequested();
+      return 0;
     // When the window is being destroyed...
     case WM_DESTROY:
       // ...tell Windows to post a WM_QUIT message, which ends the GetMessage

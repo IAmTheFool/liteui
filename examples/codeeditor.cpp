@@ -4017,6 +4017,7 @@ public:
     });
     buildRoot(); // built once; tab strip + editor stack reconcile themselves
     setupShortcuts();
+    ui_.setOnCloseRequest([this] { attemptCloseWindow(); });
   }
 
   ~TabbedEditor() {
@@ -4877,6 +4878,8 @@ private:
   std::string errorDialogMessage_;
 
   std::shared_ptr<bool> aboutDialogOpen_ = std::make_shared<bool>(false);
+
+  bool closingWindow_ = false;
 
   void showErrorDialog(std::string message) {
     errorDialogMessage_ = std::move(message);
@@ -6824,20 +6827,47 @@ private:
     return backdrop;
   }
 
-  void cancelUnsavedDialog() { *unsavedDialogOpen_ = false; }
+  void cancelUnsavedDialog() {
+    *unsavedDialogOpen_ = false;
+    // Cancel aborts a whole-window close attempt too, not just the one
+    // tab's dialog — the window stays open with whatever tabs remain.
+    closingWindow_ = false;
+  }
 
-  // save=true ("Save"): try to save first, and only close if the save
-  // actually went through — a cancelled Save-As picker leaves the tab
-  // open rather than silently discarding the buffer. save=false
-  // ("Don't Save"): close unconditionally.
   void confirmUnsavedDialog(bool save) {
     size_t idx = unsavedDialogDocIndex_;
     *unsavedDialogOpen_ = false;
-    if (idx >= docs_.size())
+    bool wasClosingWindow = closingWindow_;
+    if (idx >= docs_.size()) {
+      if (wasClosingWindow)
+        attemptCloseWindow();
       return;
-    if (save && !saveDocument(idx))
+    }
+    if (save && !saveDocument(idx)) {
+      closingWindow_ = false; // Save As was cancelled — abort the close too
       return;
+    }
     closeTabForce(idx);
+    if (wasClosingWindow)
+      attemptCloseWindow(); // move on to the next modified tab, if any
+  }
+
+  // Entry point for the window's close button/Alt+F4/taskbar close. Walks
+  // docs_ for the first modified, non-welcome tab and reuses the ordinary
+  // unsaved-changes dialog on it; confirmUnsavedDialog loops back here
+  // after each one resolves. Once nothing is left modified, actually
+  // closes the window.
+  void attemptCloseWindow() {
+    for (size_t i = 0; i < docs_.size(); ++i) {
+      if (docs_[i].closed || docs_[i].isWelcome || !*docs_[i].modified)
+        continue;
+      unsavedDialogDocIndex_ = i;
+      closingWindow_ = true;
+      *unsavedDialogOpen_ = true;
+      return;
+    }
+    closingWindow_ = false;
+    ui_.forceClose();
   }
 
   View buildAboutDialog() {
