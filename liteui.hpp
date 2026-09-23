@@ -1062,7 +1062,7 @@ inline std::string toLF(const std::string &in) {
   for (size_t i = 0; i < in.size(); ++i) {
     if (in[i] == '\r') {
       if (i + 1 < in.size() && in[i + 1] == '\n')
-        continue; // CRLF: drop the CR, the LF is kept on the next iteration
+        continue;  // CRLF: drop the CR, the LF is kept on the next iteration
       out += '\n'; // lone CR (classic Mac line ending)
       continue;
     }
@@ -3167,6 +3167,7 @@ struct TextInputState {
   bool dirty = true;
   int blinkTimerHandle = -1;
   float scrollOffset = 0.0f;
+  bool requestFocus = false;
 };
 
 // Author-facing single-line text field. addChild(TextInput) flattens this
@@ -3314,6 +3315,8 @@ public:
   // input shows/hides its caret here.
   std::function<void()> onFocus;
   std::function<void()> onBlur;
+
+  std::function<bool()> wantsFocus;
 
   // Fired only while this view is the focused view (see LiteUI::focusedView_).
   // No bubbling in v1 — exactly one view receives these, the one that has
@@ -6794,6 +6797,10 @@ private:
       v.computed.dirty = true;
       changed = true;
     }
+    if (v.wantsFocus && v.wantsFocus()) {
+      pendingFocusRequest_ = &v;
+      changed = true;
+    }
     for (auto &c : v.children)
       changed |= checkForUpdates(c);
     return changed;
@@ -6865,17 +6872,20 @@ private:
   }
 
   // The one place that polls dynamic sources and applies the result.
-  bool pollAndRelayout() {
-    if (!hasRoot_)
-      return false;
-    structureChanged_ = false;
-    if (!checkForUpdates(root_))
-      return false;
-    if (structureChanged_)
-      invalidateViewPointers();
-    relayout();
-    return true;
-  }
+bool pollAndRelayout() {
+  if (!hasRoot_)
+    return false;
+  structureChanged_ = false;
+  pendingFocusRequest_ = nullptr;
+  if (!checkForUpdates(root_))
+    return false;
+  if (structureChanged_)
+    invalidateViewPointers();
+  if (pendingFocusRequest_)
+    setFocus(pendingFocusRequest_);   
+  relayout();
+  return true;
+}
 
   // Updates v's (and its descendants') isHovered flag based on (x, y),
   // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
@@ -6978,6 +6988,7 @@ private:
   // there's exactly one keyboard focus at a time, independent of mouse
   // button state.
   View *focusedView_ = nullptr;
+  View *pendingFocusRequest_ = nullptr;
 
   TooltipStyle tooltipStyle_;
   View *tooltipTarget_ = nullptr;
@@ -9796,6 +9807,13 @@ inline View View::toView(TextInput ti) {
     bool d = state->dirty;
     state->dirty = false;
     return d;
+  };
+
+  v.wantsFocus = [state]() -> bool {
+    if (!state->requestFocus)
+      return false;
+    state->requestFocus = false;
+    return true;
   };
 
   v.onPaint = [state, ts, textColor, placeholderColor, caretColor, leftPad,

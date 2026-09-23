@@ -3595,8 +3595,12 @@ public:
       }
     }
     std::ifstream in(path, std::ios::binary);
-    if (!in)
-      return; // TODO surface a real error dialog/status message
+    if (!in) {
+      showErrorDialog("Couldn't open \"" + editorTitleFromPath(path) +
+                      "\" — it may have been moved, deleted, or you may "
+                      "not have permission to read it.");
+      return;
+    }
     std::ostringstream ss;
     ss << in.rdbuf();
 
@@ -4390,6 +4394,14 @@ private:
   std::shared_ptr<bool> unsavedDialogOpen_ = std::make_shared<bool>(false);
   size_t unsavedDialogDocIndex_ = 0;
 
+  std::shared_ptr<bool> errorDialogOpen_ = std::make_shared<bool>(false);
+  std::string errorDialogMessage_;
+
+  void showErrorDialog(std::string message) {
+    errorDialogMessage_ = std::move(message);
+    *errorDialogOpen_ = true;
+  }
+
   void setWorkspaceRoot(const std::string &p) {
     if (p.empty())
       return;
@@ -4483,14 +4495,37 @@ private:
     if (isDir) {
       std::error_code ec;
       std::filesystem::path newDir = std::filesystem::path(dir) / name;
-      std::filesystem::create_directory(newDir, ec);
+      // create_directory's return value is distinct from ec: it returns
+      // false with no error set when the directory already exists, which
+      // is silently wrong to treat as success here.
+      bool created = std::filesystem::create_directory(newDir, ec);
       explorerRefresh();
+      if (ec) {
+        showErrorDialog("Couldn't create folder \"" + name +
+                        "\": " + ec.message());
+        return;
+      }
+      if (!created) {
+        showErrorDialog("A file or folder named \"" + name +
+                        "\" already exists.");
+        return;
+      }
       selectedPath_ = newDir.string();
     } else {
       std::string path = (std::filesystem::path(dir) / name).string();
+      if (std::filesystem::exists(path)) {
+        showErrorDialog("A file or folder named \"" + name +
+                        "\" already exists.");
+        return;
+      }
       std::ofstream out(path, std::ios::binary);
+      bool ok = static_cast<bool>(out);
       out.close();
       explorerRefresh();
+      if (!ok) {
+        showErrorDialog("Couldn't create file \"" + name + "\".");
+        return;
+      }
       selectedPath_ = path;
       openFile(path);
     }
@@ -4534,6 +4569,7 @@ private:
     pendingCreate_.active = true;
     pendingCreate_.isDir = isDir;
     pendingCreate_.parentDir = dir;
+    pendingInputState_->requestFocus = true; 
   }
 
   void explorerNewFile() { beginPendingCreate(false); }
@@ -4576,6 +4612,7 @@ private:
     pendingRename_.active = true;
     pendingRename_.isDir = isDir;
     pendingRename_.originalPath = path;
+    pendingRenameInputState_->requestFocus = true;
   }
 
   // Updates any open tab(s) whose backing path sits at or under oldPath so
@@ -4616,10 +4653,18 @@ private:
         (std::filesystem::path(oldPath).parent_path() / name).string();
     if (newPath == oldPath)
       return;
+    if (std::filesystem::exists(newPath)) {
+      showErrorDialog("A file or folder named \"" + name +
+                      "\" already exists.");
+      return;
+    }
     std::error_code ec;
     std::filesystem::rename(oldPath, newPath, ec);
-    if (ec)
-      return; // TODO surface a real error dialog/status message
+    if (ec) {
+      showErrorDialog("Couldn't rename \"" + editorTitleFromPath(oldPath) +
+                      "\" to \"" + name + "\": " + ec.message());
+      return;
+    }
     renamePathInTabs(oldPath, newPath, isDir);
     explorerRefresh();
     selectedPath_ = newPath;
@@ -4730,6 +4775,10 @@ private:
     explorerRefresh();
     if (pathIsUnderOrEqual(selectedPath_, path))
       selectedPath_ = workspaceRoot_;
+
+    if (ec)
+      showErrorDialog("Couldn't delete \"" + editorTitleFromPath(path) +
+                      "\": " + ec.message());
   }
 
   // Re-scans a directory node from disk, but only if it was already
@@ -6304,6 +6353,81 @@ private:
     closeTabForce(idx);
   }
 
+  View buildErrorDialog() {
+    auto openPtr = errorDialogOpen_;
+
+    View dialogBox;
+    dialogBox.style.direction = FlexDirection::Column;
+    dialogBox.style.width = Size::pixel(360);
+    dialogBox.style.padding = EdgeInsets::all(20);
+    dialogBox.style.gap = 16;
+    dialogBox.style.backgroundColor = th::kSideBarBg;
+    dialogBox.style.borderWidth = 1.0f;
+    dialogBox.style.borderColor = th::kMenuBorder;
+    dialogBox.style.borderRadius = 8.0f;
+    dialogBox.onClick = [] {};
+
+    Text title;
+    title.label = std::string("Error");
+    title.fontSize = 18;
+    title.fontWeight = FontWeight::SemiBold;
+    title.color = th::kTextBright;
+    dialogBox.addChild(title);
+
+    // Dynamic label: dialogBox is built once and reused, so this must
+    // re-poll errorDialogMessage_ rather than capture it by value —
+    // otherwise a second error would still show the first one's text.
+    Text message;
+    message.label = std::function<std::string()>(
+        [this]() -> std::string { return errorDialogMessage_; });
+    message.wrap = TextWrap::Wrap;
+    message.style.width = Size::full();
+    message.color = th::kTextMuted;
+    dialogBox.addChild(message);
+
+    View buttonRow;
+    buttonRow.style.direction = FlexDirection::Row;
+    buttonRow.style.justifyContent = Justify::End;
+    buttonRow.style.backgroundColor = th::kTransparent;
+
+    Text okLabel;
+    okLabel.label = std::string("OK");
+    okLabel.color = th::kOnAccent;
+
+    View okButton;
+    okButton.style.width = Size::pixel(80);
+    okButton.style.height = Size::pixel(34);
+    okButton.style.backgroundColor = th::kAccent;
+    okButton.style.hoverColor = th::kMenuHoverBg;
+    okButton.style.borderRadius = 4.0f;
+    okButton.style.alignItems = Align::Center;
+    okButton.style.justifyContent = Justify::Center;
+    okButton.onClick = [openPtr] { *openPtr = false; };
+    okButton.addChild(okLabel);
+    buttonRow.addChild(std::move(okButton));
+    dialogBox.addChild(std::move(buttonRow));
+
+    View backdrop;
+    backdrop.style.position = Position::Absolute;
+    backdrop.style.left = 0.0f;
+    backdrop.style.top = 0.0f;
+    backdrop.style.right = 0.0f;
+    backdrop.style.bottom = 0.0f;
+    // Above the delete/unsaved dialogs' 300 — an I/O error dialog should
+    // never end up hidden behind one of those, even though in practice
+    // they can't currently be open at the same time.
+    backdrop.style.zIndex = 350;
+    backdrop.style.backgroundColor = th::kOverlay;
+    backdrop.style.alignItems = Align::Center;
+    backdrop.style.justifyContent = Justify::Center;
+    backdrop.style.display = [openPtr]() -> Display {
+      return *openPtr ? Display::Flex : Display::None;
+    };
+    backdrop.onClick = [openPtr] { *openPtr = false; }; // click outside = OK
+    backdrop.addChild(dialogBox);
+    return backdrop;
+  }
+
   // Delete-confirmation dialog, built the same way as a standalone
   // confirm dialog: a dimmed, absolute, full-window backdrop that
   // centers dialogBox via alignItems/justifyContent, closes on an
@@ -6656,6 +6780,7 @@ private:
     root.addChild(buildStatusBar());
     root.addChild(buildDeleteDialog());
     root.addChild(buildUnsavedChangesDialog());
+    root.addChild(buildErrorDialog());
     root.addChild(buildExplorerContextMenu());
     root.addChild(buildEditorContextMenu());
     ui_.setRoot(std::move(root));
