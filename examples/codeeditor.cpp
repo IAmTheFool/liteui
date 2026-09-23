@@ -114,11 +114,12 @@ namespace th = liteui_theme;
 // drawing), and mouse-wheel scrollback navigation.
 //
 // Known v1 limitations, deliberately not implemented: double-width CJK
-// glyphs (every cell is width 1), mouse reporting, real text
-// selection/copy, tab stops other than every 8 columns, non-default
-// scroll regions beyond simple top/bottom tracking, and a blinking
-// cursor (drawn as a steady translucent block instead).
-//
+// glyphs (every cell is width 1), mouse-reporting escape codes (so
+// full-screen mouse-aware apps like vim/htop can't see clicks — click-
+// drag text selection with clipboard copy works regardless, since it's
+// handled entirely on our side), tab stops other than every 8 columns,
+// non-default scroll regions beyond simple top/bottom tracking, and a
+// blinking cursor (drawn as a steady translucent block instead).
 // Threading: the PTY is read on a dedicated background thread (since the
 // read is blocking) into a mutex-guarded byte queue; the UI thread drains
 // that queue on a timer (see toTerminalView's use of addInterval) and is
@@ -437,12 +438,14 @@ public:
   bool cursorVisible() const { return cursorVisible_; }
   bool appCursorKeys() const { return appCursorKeys_; }
 
-  // Row `i` of the currently visible viewport (0 = top), accounting for
-  // scrollOffset_ into the scrollback.
-  const TermRow &visibleRow(int i) const {
+  // Row at absolute index `idx` into the logical (scrollback ++ grid)
+  // buffer — index 0 is the oldest scrollback line, scrollback_.size()
+  // is the grid's own row 0. Shared by visibleRow() (for painting) and
+  // the selection code, which names rows independently of the current
+  // scrollOffset_ so a selection stays anchored to the same text even
+  // if the view scrolls further mid-drag.
+  const TermRow &rowAtAbsolute(int idx) const {
     int total = static_cast<int>(scrollback_.size());
-    int start = total - scrollOffset_;
-    int idx = start + i;
     if (idx < 0)
       return blankRow_;
     if (idx < total)
@@ -453,16 +456,127 @@ public:
     return blankRow_;
   }
 
+  // Row `i` of the currently visible viewport (0 = top), accounting for
+  // scrollOffset_ into the scrollback.
+  const TermRow &visibleRow(int i) const {
+    return rowAtAbsolute(static_cast<int>(scrollback_.size()) - scrollOffset_ +
+                         i);
+  }
+
+  // Converts a viewport-local row (as a mouse event reports it, 0 = top
+  // of the currently visible screen) into the same absolute indexing
+  // rowAtAbsolute() uses.
+  int absoluteRow(int visibleRow) const {
+    return static_cast<int>(scrollback_.size()) - scrollOffset_ + visibleRow;
+  }
+
   bool consumeDirty() {
     bool d = dirty_;
     dirty_ = false;
     return d;
   }
 
+  // ---- mouse text selection ----
+  //
+  // Deliberately simple: endpoints are stored in absolute (scrollback ++
+  // grid) coordinates, and copy is "start of first line through end of
+  // last line" — xterm's default (non-rectangular) selection — with no
+  // word/line double/triple-click and no mouse-reporting escape codes
+  // for full-screen apps (see the file header).
+
+  void beginSelection(int visibleRow, int col) {
+    selecting_ = true;
+    hasSelection_ = false; // becomes true only once the drag actually moves
+    selAnchor_ = selFocus_ = TermPos{absoluteRow(visibleRow), col};
+    dirty_ = true;
+  }
+
+  void updateSelection(int visibleRow, int col) {
+    if (!selecting_)
+      return;
+    TermPos next{absoluteRow(visibleRow), col};
+    if (next.row == selFocus_.row && next.col == selFocus_.col)
+      return;
+    selFocus_ = next;
+    hasSelection_ =
+        selAnchor_.row != selFocus_.row || selAnchor_.col != selFocus_.col;
+    dirty_ = true;
+  }
+
+  // Called on mouse-up. Leaves the result highlighted (matching xterm,
+  // which keeps a selection visible until the next one starts) rather
+  // than clearing it.
+  void endSelection() { selecting_ = false; }
+
+  void clearSelection() {
+    if (hasSelection_)
+      dirty_ = true;
+    hasSelection_ = false;
+  }
+
+  bool hasSelection() const { return hasSelection_; }
+
+  // Normalizes the anchor/focus pair into (start <= end) reading order.
+  void selectionRange(TermPos &start, TermPos &end) const {
+    if (selAnchor_.row < selFocus_.row ||
+        (selAnchor_.row == selFocus_.row && selAnchor_.col <= selFocus_.col)) {
+      start = selAnchor_;
+      end = selFocus_;
+    } else {
+      start = selFocus_;
+      end = selAnchor_;
+    }
+  }
+
+  // Whether absolute (row, col) falls within the current selection —
+  // used by the paint code's per-cell highlight check.
+  bool isCellSelected(int absRow, int col) const {
+    if (!hasSelection_)
+      return false;
+    TermPos start, end;
+    selectionRange(start, end);
+    if (absRow < start.row || absRow > end.row)
+      return false;
+    if (absRow == start.row && col < start.col)
+      return false;
+    if (absRow == end.row && col >= end.col)
+      return false;
+    return true;
+  }
+
+  // Extracts the selection as plain UTF-8, one buffer line per row, with
+  // trailing padding spaces trimmed from each line (that padding is an
+  // artifact of the fixed-width grid, not something the user typed —
+  // every terminal emulator's copy strips it the same way).
+  std::string selectedText() const {
+    if (!hasSelection_)
+      return {};
+    TermPos start, end;
+    selectionRange(start, end);
+    std::string out;
+    for (int r = start.row; r <= end.row; ++r) {
+      const TermRow &row = rowAtAbsolute(r);
+      int lastCol = static_cast<int>(row.cells.size()) - 1;
+      int from = (r == start.row) ? start.col : 0;
+      int to = (r == end.row) ? end.col - 1 : lastCol;
+      to = std::min(to, lastCol);
+      std::string line;
+      for (int c = std::max(0, from); c <= to; ++c)
+        line += row.cells[static_cast<size_t>(c)].ch;
+      while (!line.empty() && line.back() == ' ')
+        line.pop_back();
+      out += line;
+      if (r != end.row)
+        out += '\n';
+    }
+    return out;
+  }
+
 private:
   // ---- grid/scrollback management ----
 
   void resizeGrid(int cols, int rows) {
+    clearSelection();
     std::vector<TermRow> newGrid(static_cast<size_t>(rows), TermRow(cols));
     for (int r = 0; r < std::min(rows, static_cast<int>(grid_.size())); ++r) {
       int copyCols = std::min(cols, cols_);
@@ -781,6 +895,7 @@ private:
   void setAltScreen(bool on) {
     if (on == usingAltScreen_)
       return;
+    clearSelection();
     usingAltScreen_ = on;
     std::swap(grid_, altGrid_);
     if (on)
@@ -1101,6 +1216,11 @@ private:
   int scrollOffset_ = 0; // 0 = viewing the live tail
   bool dirty_ = true;
 
+  // ---- mouse text selection state ----
+  bool selecting_ = false;
+  bool hasSelection_ = false;
+  TermPos selAnchor_{0, 0}, selFocus_{0, 0};
+
   // ---- PTY / threading ----
   bool spawned_ = false;
   std::atomic<bool> readerRunning_{false};
@@ -1220,6 +1340,25 @@ inline View toTerminalView(Terminal t) {
     for (int r = 0; r < rows; ++r) {
       const TermRow &line = state->visibleRow(r);
       float y = r * lineH + lineH / 2.0f;
+
+      // ---- selection highlight, drawn under this row's glyphs ----
+      if (state->hasSelection()) {
+        int absRow = state->absoluteRow(r);
+        ctx.setFillColor(Color{80, 130, 200, 110});
+        int c0 = 0;
+        while (c0 < cols) {
+          if (!state->isCellSelected(absRow, c0)) {
+            ++c0;
+            continue;
+          }
+          int c1 = c0;
+          while (c1 < cols && state->isCellSelected(absRow, c1))
+            ++c1;
+          ctx.fillRect(c0 * cellW, r * lineH, (c1 - c0) * cellW, lineH);
+          c0 = c1;
+        }
+      }
+
       int c = 0;
       while (c < cols && c < static_cast<int>(line.cells.size())) {
         const TermCell &first = line.cells[static_cast<size_t>(c)];
@@ -1269,12 +1408,52 @@ inline View toTerminalView(Terminal t) {
     }
   };
 
-  // Clicking to type jumps back to the live tail, same as any keystroke.
-  v.onPressAt = [state](float, float) { state->scrollBy(-1000000); };
+  // A press starts (or restarts) a selection instead of snapping the
+  // view back to the live tail — that snap now happens only on actual
+  // keyboard input (see writeInput), so selecting text in the
+  // scrollback no longer fights with reading it.
+  auto cellAt = [state, cellW, lineH](float lx, float ly) {
+    int rows = state->rows(), cols = state->cols();
+    int row =
+        std::clamp(static_cast<int>(ly / lineH), 0, std::max(0, rows - 1));
+    int col = std::clamp(static_cast<int>(lx / cellW), 0, cols);
+    return TermPos{row, col};
+  };
+  v.onPressAt = [state, cellAt](float lx, float ly) {
+    TermPos p = cellAt(lx, ly);
+    state->beginSelection(p.row, p.col);
+  };
+  v.onDragTo = [state, cellAt](float lx, float ly) {
+    TermPos p = cellAt(lx, ly);
+    state->updateSelection(p.row, p.col);
+  };
+  // Mouse-up: finalize, and — matching xterm's default behavior — copy
+  // the result straight to the clipboard without requiring a separate
+  // keystroke. A plain click with no drag leaves hasSelection() false,
+  // so this is a no-op then.
+  v.onClick = [state] {
+    state->endSelection();
+    if (state->hasSelection())
+      liteui_clipboard::setTextWithFallback(state->selectedText());
+  };
   v.onScrollUp = [state] { state->scrollBy(3); };
   v.onScrollDown = [state] { state->scrollBy(-3); };
 
   v.onKeyDown = [state](KeyEvent e) {
+    // Ctrl+Shift+C/V are the conventional terminal copy/paste bindings,
+    // since plain Ctrl+C/Ctrl+V are already spoken for (SIGINT / literal
+    // paste-as-^V) by the shell itself.
+    if (e.mods.ctrl && e.mods.shift && e.key == Key::C) {
+      if (state->hasSelection())
+        liteui_clipboard::setTextWithFallback(state->selectedText());
+      return;
+    }
+    if (e.mods.ctrl && e.mods.shift && e.key == Key::V) {
+      std::string clip = liteui_clipboard::getTextWithFallback();
+      if (!clip.empty())
+        state->writeInput(clip);
+      return;
+    }
     std::string bytes = encodeKey(e, state->appCursorKeys());
     if (!bytes.empty())
       state->writeInput(bytes);
