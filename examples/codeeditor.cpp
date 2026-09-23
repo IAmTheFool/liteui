@@ -1691,6 +1691,8 @@ struct CodeEditorState {
                              // scrollbar rather than moving the caret —
                              // suppresses onPaint's caret-follow snap
 
+  bool minimapDragging = false;
+
   bool scrollbarDragging = false;
   float scrollbarDragStartY = 0.0f;
   float scrollbarDragStartScrollY = 0.0f;
@@ -2045,6 +2047,15 @@ struct CodeEditor {
   Color scrollbarTrackColor = Color{255, 255, 255, 12};
   Color scrollbarThumbColor = Color{255, 255, 255, 60};
 
+  bool showMinimap = true;
+  float minimapWidth = 90.0f;
+  float minimapLineHeight = 3.0f; // px per source line in the minimap
+  float minimapCharWidth = 2.0f;  // px per character column
+  Color minimapBackground = Color{37, 37, 38, 255};
+  Color minimapTextColor =
+      Color{220, 220, 220, 120}; // used when no highlightLine given
+  Color minimapViewportColor = Color{255, 255, 255, 28};
+
   std::function<void(const std::string &)> onChange;
 
   std::function<void(const std::vector<std::string> &lines)> beforePaintSync;
@@ -2112,6 +2123,14 @@ inline View toCodeEditorView(CodeEditor ed) {
   auto preTextInput = ed.preTextInput;
   auto postPaint = ed.postPaint;
 
+  bool showMinimap = ed.showMinimap;
+  float minimapWidth = showMinimap ? ed.minimapWidth : 0.0f;
+  float minimapLineHeight = ed.minimapLineHeight;
+  float minimapCharWidth = ed.minimapCharWidth;
+  Color minimapBackground = ed.minimapBackground;
+  Color minimapTextColor = ed.minimapTextColor;
+  Color minimapViewportColor = ed.minimapViewportColor;
+
   View v;
   v.style = std::move(ed.style);
   v.isCanvas = true;
@@ -2127,8 +2146,22 @@ inline View toCodeEditorView(CodeEditor ed) {
     return d;
   };
 
+  // Maps the main editor's scroll fraction onto the minimap's own scroll
+  // range. If the whole file's minimap fits in the view, this is always 0
+  auto computeMinimapScrollY = [](const CodeEditorState *state, float lineH,
+                                  float minimapLineH, float viewportH,
+                                  float minimapViewH) -> float {
+    float mainMaxScroll =
+        std::max(0.0f, state->lines.size() * lineH - viewportH);
+    float minimapMaxScroll =
+        std::max(0.0f, state->lines.size() * minimapLineH - minimapViewH);
+    if (mainMaxScroll <= 0.0f || minimapMaxScroll <= 0.0f)
+      return 0.0f;
+    return (state->scrollY / mainMaxScroll) * minimapMaxScroll;
+  };
+
   auto vScrollbarGeometry = [](CodeEditorState *state, float lineH, float viewH,
-                               float viewW, float barW) {
+                               float viewW, float barW, float /*minimapW*/) {
     struct Geo {
       bool visible;
       float trackY, trackH, thumbY, thumbH, x;
@@ -2146,7 +2179,7 @@ inline View toCodeEditorView(CodeEditor ed) {
 
   auto hScrollbarGeometry = [](CodeEditorState *state, const TextStyle &ts,
                                float textLeft, float viewW, float viewH,
-                               float barH) {
+                               float barH, float minimapW) {
     struct Geo {
       bool visible;
       float trackX, trackW, thumbX, thumbW, y;
@@ -2157,7 +2190,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       if (w > maxLineW)
         maxLineW = w;
     }
-    float viewportW = std::max(0.0f, viewW - textLeft);
+    float viewportW = std::max(0.0f, viewW - textLeft - minimapW);
     if (maxLineW <= viewportW)
       return Geo{false, 0, 0, 0, 0, 0};
     float trackX = textLeft, trackW = viewportW;
@@ -2320,7 +2353,14 @@ inline View toCodeEditorView(CodeEditor ed) {
     state->lastViewH = ctx.height();
     float gutter = gutterWidth(state->lines.size());
     float textLeft = pad + gutter;
-    float availW = std::max(0.0f, ctx.width() - textLeft - pad);
+
+    auto vGeoForLayout =
+        vScrollbarGeometry(state.get(), lineH, ctx.height(), ctx.width(),
+                           scrollbarWidth, minimapWidth);
+    bool vScrollShowing = showScrollbar && vGeoForLayout.visible;
+    float rightGutter = minimapWidth + (vScrollShowing ? scrollbarWidth : 0.0f);
+
+    float availW = std::max(0.0f, ctx.width() - textLeft - pad - rightGutter);
     float availH = std::max(0.0f, ctx.height() - pad * 2.0f);
 
     float caretTop = state->cursor.line * lineH;
@@ -2511,6 +2551,65 @@ inline View toCodeEditorView(CodeEditor ed) {
 
     ctx.restore();
 
+    if (showMinimap) {
+      float minimapX =
+          ctx.width() - minimapWidth - (vScrollShowing ? scrollbarWidth : 0.0f);
+      float minimapViewH = ctx.height();
+
+      ctx.setFillColor(minimapBackground);
+      ctx.fillRect(minimapX, 0, minimapWidth, minimapViewH);
+
+      float mmScrollY = computeMinimapScrollY(
+          state.get(), lineH, minimapLineHeight, availH, minimapViewH);
+      int firstMM =
+          std::max(0, static_cast<int>(mmScrollY / minimapLineHeight));
+      int lastMM = std::min(
+          static_cast<int>(state->lines.size()) - 1,
+          static_cast<int>((mmScrollY + minimapViewH) / minimapLineHeight) + 1);
+      int maxCols =
+          std::max(0, static_cast<int>(minimapWidth / minimapCharWidth));
+
+      std::vector<HighlightSpan> mmSpans;
+      for (int li = firstMM; li <= lastMM; ++li) {
+        const std::string &lineText = state->lines[static_cast<size_t>(li)];
+        float y = li * minimapLineHeight - mmScrollY;
+        mmSpans.clear();
+        if (highlightLine)
+          highlightLine(static_cast<size_t>(li), lineText, mmSpans);
+
+        int col = 0;
+        for (size_t ci = 0; ci < lineText.size() && col < maxCols;) {
+          char c = lineText[ci];
+          size_t next = liteui_utf8::nextBoundary(lineText, ci);
+          if (c == ' ' || c == '\t') {
+            ci = next;
+            ++col;
+            continue;
+          }
+          Color cellColor = minimapTextColor;
+          for (const auto &sp : mmSpans)
+            if (ci >= sp.start && ci < sp.start + sp.length) {
+              cellColor = sp.color;
+              cellColor.a = 150;
+              break;
+            }
+          ctx.setFillColor(cellColor);
+          ctx.fillRect(minimapX + col * minimapCharWidth, y,
+                       std::max(1.0f, minimapCharWidth - 0.5f),
+                       std::max(1.0f, minimapLineHeight - 1.0f));
+          ci = next;
+          ++col;
+        }
+      }
+
+      float indicatorTop =
+          (state->scrollY / lineH) * minimapLineHeight - mmScrollY;
+      float indicatorH = (availH / lineH) * minimapLineHeight;
+      ctx.setFillColor(minimapViewportColor);
+      ctx.fillRect(minimapX, indicatorTop, minimapWidth,
+                   std::max(2.0f, indicatorH));
+    }
+
     // ---- find/replace overlay: drawn last, unclipped, so it floats over
     // the document regardless of scroll position ----
     if (state->search.active) {
@@ -2560,8 +2659,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     }
 
     if (showScrollbar) {
-      auto vGeo = vScrollbarGeometry(state.get(), lineH, ctx.height(),
-                                     ctx.width(), scrollbarWidth);
+      const auto &vGeo = vGeoForLayout;
       if (vGeo.visible) {
         ctx.setFillColor(scrollbarTrackColor);
         ctx.fillRect(vGeo.x, vGeo.trackY, scrollbarWidth, vGeo.trackH);
@@ -2570,7 +2668,7 @@ inline View toCodeEditorView(CodeEditor ed) {
                      vGeo.thumbH);
       }
       auto hGeo = hScrollbarGeometry(state.get(), ts, textLeft, ctx.width(),
-                                     ctx.height(), scrollbarWidth);
+                                     ctx.height(), scrollbarWidth, rightGutter);
       if (hGeo.visible) {
         ctx.setFillColor(scrollbarTrackColor);
         ctx.fillRect(hGeo.trackX, hGeo.y, hGeo.trackW, scrollbarWidth);
@@ -2598,10 +2696,36 @@ inline View toCodeEditorView(CodeEditor ed) {
     float textLeft = pad + gutterWidth(state->lines.size());
     state->scrollbarDragging = false;
     state->hScrollbarDragging = false;
+    state->minimapDragging = false;
+
+    auto vGeo =
+        vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                           state->lastViewW, scrollbarWidth, minimapWidth);
+    bool vScrollShowingHit = showScrollbar && vGeo.visible;
+    float rightGutter =
+        minimapWidth + (vScrollShowingHit ? scrollbarWidth : 0.0f);
+    float minimapLeftEdge = state->lastViewW - rightGutter;
+    float minimapRightEdge =
+        state->lastViewW - (vScrollShowingHit ? scrollbarWidth : 0.0f);
+
+    if (showMinimap && lx >= minimapLeftEdge && lx < minimapRightEdge) {
+      float availHLocal = std::max(1.0f, state->lastViewH - pad * 2.0f);
+      float mmScrollY = computeMinimapScrollY(
+          state.get(), lineH, minimapLineHeight, availHLocal, state->lastViewH);
+      float clickedLine = (ly + mmScrollY) / minimapLineHeight;
+      float maxScrollY =
+          std::max(0.0f, state->lines.size() * lineH - availHLocal);
+      state->scrollY = std::clamp(clickedLine * lineH - availHLocal / 2.0f,
+                                  0.0f, maxScrollY);
+      state->manualScroll = true;
+      state->minimapDragging = true;
+      state->dirty = true;
+      return;
+    }
     if (showScrollbar) {
       auto hGeo =
           hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
-                             state->lastViewH, scrollbarWidth);
+                             state->lastViewH, scrollbarWidth, rightGutter);
       // Check the horizontal band first: in the bottom-right corner where
       // both bars could claim the point, the bottom strip visually belongs
       // to the horizontal bar, so it gets priority.
@@ -2627,8 +2751,9 @@ inline View toCodeEditorView(CodeEditor ed) {
         state->dirty = true;
         return;
       }
-      auto vGeo = vScrollbarGeometry(state.get(), lineH, state->lastViewH,
-                                     state->lastViewW, scrollbarWidth);
+      auto vGeo =
+          vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                             state->lastViewW, scrollbarWidth, minimapWidth);
       if (vGeo.visible && lx >= vGeo.x) {
         state->manualScroll = true;
         state->scrollbarDragging = true;
@@ -2657,6 +2782,19 @@ inline View toCodeEditorView(CodeEditor ed) {
 
   v.onDragTo = [=](float lx, float ly) {
     float textLeft = pad + gutterWidth(state->lines.size());
+    if (state->minimapDragging) {
+      float availHLocal = std::max(1.0f, state->lastViewH - pad * 2.0f);
+      float mmScrollY = computeMinimapScrollY(
+          state.get(), lineH, minimapLineHeight, availHLocal, state->lastViewH);
+      float draggedLine = (ly + mmScrollY) / minimapLineHeight;
+      float maxScrollY =
+          std::max(0.0f, state->lines.size() * lineH - availHLocal);
+      state->scrollY = std::clamp(draggedLine * lineH - availHLocal / 2.0f,
+                                  0.0f, maxScrollY);
+      state->dirty = true;
+      return;
+    }
+
     if (state->hScrollbarDragging) {
       float maxLineW = 0.0f;
       for (const auto &l : state->lines) {
@@ -2666,9 +2804,16 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
       float viewportW = std::max(0.0f, state->lastViewW - textLeft);
       float maxScroll = std::max(0.0f, maxLineW - viewportW);
+
+      auto vGeoForDrag =
+          vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                             state->lastViewW, scrollbarWidth, minimapWidth);
+      float rightGutter =
+          minimapWidth +
+          ((showScrollbar && vGeoForDrag.visible) ? scrollbarWidth : 0.0f);
       auto hGeo =
           hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
-                             state->lastViewH, scrollbarWidth);
+                             state->lastViewH, scrollbarWidth, rightGutter);
       float range = std::max(1.0f, hGeo.trackW - hGeo.thumbW);
       float delta = (lx - state->hScrollbarDragStartX) / range * maxScroll;
       state->scrollX = std::clamp(state->hScrollbarDragStartScrollX + delta,
@@ -2681,8 +2826,9 @@ inline View toCodeEditorView(CodeEditor ed) {
       state->manualScroll = true;
       float contentH = state->lines.size() * lineH;
       float maxScroll = std::max(0.0f, contentH - state->lastViewH);
-      auto vGeo = vScrollbarGeometry(state.get(), lineH, state->lastViewH,
-                                     state->lastViewW, scrollbarWidth);
+      auto vGeo =
+          vScrollbarGeometry(state.get(), lineH, state->lastViewH,
+                             state->lastViewW, scrollbarWidth, minimapWidth);
       float range = std::max(1.0f, vGeo.trackH - vGeo.thumbH);
       float delta = (ly - state->scrollbarDragStartY) / range * maxScroll;
       state->scrollY =
