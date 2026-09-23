@@ -2013,6 +2013,34 @@ inline std::string joinLines(const std::vector<std::string> &lines) {
   return out;
 }
 
+// Majority-vote detection: counts '\n' preceded by '\r' vs bare '\n', so
+// a file with one stray line ending still round-trips as whichever
+// style actually dominates it.
+inline bool detectsCRLF(const std::string &content) {
+  size_t crlfCount = 0, lfCount = 0;
+  for (size_t i = 0; i < content.size(); ++i) {
+    if (content[i] == '\n') {
+      if (i > 0 && content[i - 1] == '\r')
+        ++crlfCount;
+      else
+        ++lfCount;
+    }
+  }
+  return crlfCount > lfCount;
+}
+
+// joinLines() always emits '\n' (matching splitLinesInto's own
+// normalization on read); re-inject '\r' before writing, iff the
+// source actually used CRLF. Reuses liteui_clipboard::toCRLF, which
+// already does this without doubling an existing \r.
+inline std::string joinLinesForSave(const std::vector<std::string> &lines,
+                                    bool crlf) {
+  std::string out = joinLines(lines);
+  if (crlf)
+    out = liteui_clipboard::toCRLF(out);
+  return out;
+}
+
 // ==================== Author-facing CodeEditor ====================
 
 struct HighlightSpan {
@@ -3944,6 +3972,9 @@ struct EditorDocument {
   std::string title = "untitled";
   std::string path;
   bool hasPath = false;
+  bool crlf = false; // true if the file on disk used \r\n; preserved on
+                     // save so we don't silently rewrite every line
+                     // ending in a Windows-authored file
   // Soft-delete rather than actually erasing from the vector: several
   // Dynamic<> closures captured in the *previous* tree's Views (which may
   // still be mid-callback when a close happens — e.g. a close button's
@@ -4052,13 +4083,15 @@ public:
     }
     std::ostringstream ss;
     ss << in.rdbuf();
+    std::string content = ss.str();
 
     EditorDocument doc;
     doc.path = path;
     doc.hasPath = true;
     doc.title = editorTitleFromPath(path);
+    doc.crlf = detectsCRLF(content);
     doc.highlighter = makeHighlighter(languageForExtension(path));
-    splitLinesInto(ss.str(), doc.state->lines);
+    splitLinesInto(content, doc.state->lines);
     doc.state->cursor = {0, 0};
 
     docs_.push_back(std::move(doc));
@@ -4125,7 +4158,7 @@ public:
       doc.highlighter = makeHighlighter(languageForExtension(doc.path));
     }
     std::ofstream out(doc.path, std::ios::binary);
-    out << joinLines(doc.state->lines);
+    out << joinLinesForSave(doc.state->lines, doc.crlf);
     *doc.modified = false;
     return true;
   }
@@ -4596,8 +4629,8 @@ private:
         }
       }
       std::ofstream out(doc.path, std::ios::binary);
-      out << joinLines(doc.state->lines);
-      *doc.modified = false; // matches saveActive()'s own bookkeeping
+      out << joinLinesForSave(doc.state->lines, doc.crlf);
+      *doc.modified = false;
       handledInOpenDoc = true;
       break;
     }
@@ -4605,17 +4638,19 @@ private:
     if (!handledInOpenDoc) {
       std::ifstream in(m.path, std::ios::binary);
       if (!in)
-        return; // TODO surface a real error dialog/status message
+        return;
       std::ostringstream ss;
       ss << in.rdbuf();
+      std::string content = ss.str();
+      bool crlf = detectsCRLF(content);
       std::vector<std::string> lines;
-      splitLinesInto(ss.str(), lines);
+      splitLinesInto(content, lines);
       if (m.line >= lines.size())
         return;
       lines[m.line] = caseInsensitiveReplaceAll(
           lines[m.line], workspaceSearchQuery_, workspaceReplaceText_);
       std::ofstream out(m.path, std::ios::binary);
-      out << joinLines(lines);
+      out << joinLinesForSave(lines, crlf);
     }
 
     runWorkspaceSearch(workspaceSearchQuery_);
@@ -4674,8 +4709,8 @@ private:
           doc.state->dirty = true;
         }
         std::ofstream out(doc.path, std::ios::binary);
-        out << joinLines(doc.state->lines);
-        *doc.modified = false; // matches saveActive()'s own bookkeeping
+        out << joinLinesForSave(doc.state->lines, doc.crlf);
+        *doc.modified = false;
         handledInOpenDoc = true;
         break;
       }
@@ -4684,11 +4719,13 @@ private:
 
       std::ifstream in(path, std::ios::binary);
       if (!in)
-        continue; // TODO surface a real error dialog/status message
+        continue;
       std::ostringstream ss;
       ss << in.rdbuf();
+      std::string content = ss.str();
+      bool crlf = detectsCRLF(content);
       std::vector<std::string> lines;
-      splitLinesInto(ss.str(), lines);
+      splitLinesInto(content, lines);
       for (size_t line : targetLines) {
         if (line >= lines.size())
           continue;
@@ -4696,7 +4733,7 @@ private:
             lines[line], workspaceSearchQuery_, workspaceReplaceText_);
       }
       std::ofstream out(path, std::ios::binary);
-      out << joinLines(lines);
+      out << joinLinesForSave(lines, crlf);
     }
 
     runWorkspaceSearch(workspaceSearchQuery_);
@@ -6259,6 +6296,18 @@ private:
     encLabel.fontSize = 12;
     encLabel.color = th::kOnAccent;
     bar.addChild(encLabel);
+
+    Text lineEndingLabel;
+    lineEndingLabel.label =
+        std::function<std::string()>([this]() -> std::string {
+          const EditorDocument *doc = activeDocument();
+          if (!doc || doc->isWelcome)
+            return "";
+          return doc->crlf ? "CRLF" : "LF";
+        });
+    lineEndingLabel.fontSize = 12;
+    lineEndingLabel.color = th::kOnAccent;
+    bar.addChild(lineEndingLabel);
 
     Text countLabel;
     countLabel.label = std::function<std::string()>([this]() -> std::string {
