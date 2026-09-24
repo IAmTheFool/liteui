@@ -2029,6 +2029,15 @@ inline bool detectsCRLF(const std::string &content) {
   return crlfCount > lfCount;
 }
 
+inline bool looksBinary(const std::string &content) {
+  // A NUL byte essentially never appears in real text — every format this
+  // editor cares about (source, config, markdown, ...) is NUL-free, and
+  // there's no reasonable way to render most binary formats as text
+  // anyway. Shared with runWorkspaceSearch's own scan so "what counts as
+  // binary" can't drift between the two call sites.
+  return content.find('\0') != std::string::npos;
+}
+
 // joinLines() always emits '\n' (matching splitLinesInto's own
 // normalization on read); re-inject '\r' before writing, iff the
 // source actually used CRLF. Reuses liteui_clipboard::toCRLF, which
@@ -4085,6 +4094,13 @@ public:
     ss << in.rdbuf();
     std::string content = ss.str();
 
+    if (looksBinary(content)) {
+      showErrorDialog("\"" + editorTitleFromPath(path) +
+                      "\" looks like a binary file and can't be opened in "
+                      "the editor.");
+      return;
+    }
+
     EditorDocument doc;
     doc.path = path;
     doc.hasPath = true;
@@ -4547,9 +4563,7 @@ private:
       std::ostringstream ss;
       ss << in.rdbuf();
       std::string content = ss.str();
-      // Crude binary-file guard: real text files essentially never
-      // contain a NUL byte.
-      if (content.find('\0') != std::string::npos)
+      if (looksBinary(content))
         continue;
 
       std::vector<std::string> lines;
