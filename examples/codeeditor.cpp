@@ -1661,6 +1661,74 @@ inline std::string asciiLower(const std::string &s) {
   return out;
 }
 
+// Byte offset where each visual row of `line` starts (always begins with 0).
+// Breaks after whitespace when possible, mid-word only if one word is wider
+// than the row. Trailing spaces hang past the edge instead of starting a row.
+inline std::vector<size_t> computeWrapStarts(const std::string &line,
+                                             const TextStyle &ts, float width) {
+  std::vector<size_t> starts{0};
+  if (line.empty() || width < 1.0f)
+    return starts;
+  auto fits = [&](size_t from, size_t to) {
+    return liteui_text::measure(line.substr(from, to - from), ts, -1).width <=
+           width;
+  };
+  auto isWs = [&](size_t i) { return line[i] == ' ' || line[i] == '\t'; };
+
+  size_t start = 0;
+  while (start < line.size()) {
+    size_t lo = liteui_utf8::nextBoundary(line, start); // forced: always 1 char
+    size_t hi = line.size();                            // known not to fit
+    bool remainderFits = false;
+    for (size_t span = 64;; span *= 2) {
+      size_t probe = start + span;
+      if (probe >= line.size()) {
+        remainderFits = fits(start, line.size());
+        break;
+      }
+      probe = liteui_utf8::snapToBoundary(line, probe);
+      if (probe <= lo)
+        continue;
+      if (fits(start, probe))
+        lo = probe;
+      else {
+        hi = probe;
+        break;
+      }
+    }
+    if (remainderFits)
+      break;
+
+    while (true) { // largest `lo` such that [start, lo) fits
+      size_t mid = liteui_utf8::snapToBoundary(line, lo + (hi - lo) / 2);
+      if (mid <= lo)
+        mid = liteui_utf8::nextBoundary(line, lo);
+      if (mid >= hi)
+        break;
+      if (fits(start, mid))
+        lo = mid;
+      else
+        hi = mid;
+    }
+
+    size_t brk = lo;
+    if (brk < line.size() && !isWs(brk)) { // mid-word: back up to whitespace
+      size_t p = brk;
+      while (p > start && !isWs(p - 1))
+        --p;
+      if (p > start)
+        brk = p;
+    }
+    while (brk < line.size() && isWs(brk))
+      ++brk;
+    if (brk >= line.size())
+      break;
+    starts.push_back(brk);
+    start = brk;
+  }
+  return starts;
+}
+
 struct CodeEditorState {
   std::vector<std::string> lines{std::string()}; // always >= 1 entry
   EditPos cursor;
@@ -1883,6 +1951,157 @@ struct CodeEditorState {
 
   SearchState search;
 
+  // ---- word wrap ----
+  bool wordWrap = false;
+  float lastLineH = 20.0f;  // set by onPaint so setWordWrap() can think in rows
+  long pendingTopLine = -1; // applied by the next paint, once layout is rebuilt
+
+  struct WrapLine {
+    bool valid = false;
+    std::string text;         // source text this entry was built from
+    float natural = 0.0f;     // unwrapped width (independent of view width)
+    float builtWidth = -1.0f; // wrap width `starts` was computed for
+    std::vector<size_t> starts{0}; // byte offset where each visual row begins
+  };
+  std::vector<WrapLine> wrapCache;  // parallel to `lines` while wrapping
+  std::vector<size_t> wrapRowStart; // first visual row per line, +1 = total
+
+  bool wrapActive() const {
+    return wordWrap && wrapCache.size() == lines.size() &&
+           wrapRowStart.size() == lines.size() + 1;
+  }
+  size_t totalRows() const {
+    return wrapActive() ? wrapRowStart.back() : lines.size();
+  }
+  size_t firstRowOf(size_t li) const {
+    return wrapActive() ? wrapRowStart[std::min(li, lines.size())] : li;
+  }
+  size_t rowCount(size_t li) const {
+    return (wrapActive() && li < lines.size()) ? wrapCache[li].starts.size()
+                                               : 1;
+  }
+  size_t rowStartByte(size_t li, size_t r) const {
+    if (!wrapActive() || li >= lines.size())
+      return 0;
+    const auto &st = wrapCache[li].starts;
+    return std::min(st[std::min(r, st.size() - 1)], lines[li].size());
+  }
+  size_t rowEndByte(size_t li, size_t r) const {
+    if (li >= lines.size())
+      return 0;
+    if (!wrapActive())
+      return lines[li].size();
+    const auto &st = wrapCache[li].starts;
+    return r + 1 < st.size() ? std::min(st[r + 1], lines[li].size())
+                             : lines[li].size();
+  }
+  size_t rowInLine(size_t li, size_t col) const {
+    if (!wrapActive() || li >= lines.size())
+      return 0;
+    const auto &st = wrapCache[li].starts;
+    size_t idx = static_cast<size_t>(
+        std::upper_bound(st.begin(), st.end(), col) - st.begin());
+    return idx == 0 ? 0 : idx - 1;
+  }
+  size_t lineOfRow(size_t row) const {
+    if (lines.empty())
+      return 0;
+    if (!wrapActive())
+      return std::min(row, lines.size() - 1);
+    size_t idx = static_cast<size_t>(
+        std::upper_bound(wrapRowStart.begin(), wrapRowStart.end(), row) -
+        wrapRowStart.begin());
+    return std::min(idx == 0 ? 0 : idx - 1, lines.size() - 1);
+  }
+  // Fractional conversions, used by the minimap (which stays one line per row).
+  float rowToLineF(float rowF) const {
+    if (!wrapActive() || rowF <= 0.0f)
+      return rowF;
+    size_t li = lineOfRow(static_cast<size_t>(rowF));
+    float frac = (rowF - static_cast<float>(wrapRowStart[li])) /
+                 static_cast<float>(rowCount(li));
+    return static_cast<float>(li) + std::clamp(frac, 0.0f, 1.0f);
+  }
+  float lineToRowF(float lineF) const {
+    if (!wrapActive() || lineF <= 0.0f)
+      return lineF;
+    size_t li = static_cast<size_t>(lineF);
+    if (li >= lines.size())
+      return static_cast<float>(wrapRowStart.back());
+    return static_cast<float>(wrapRowStart[li]) +
+           (lineF - static_cast<float>(li)) * static_cast<float>(rowCount(li));
+  }
+
+  void setWordWrap(bool on) {
+    if (on == wordWrap)
+      return;
+    // Remember the top visible logical line so the view doesn't jump when
+    // the row geometry changes underneath it.
+    float rowF = std::max(0.0f, scrollY) / std::max(1.0f, lastLineH);
+    pendingTopLine = static_cast<long>(lineOfRow(static_cast<size_t>(rowF)));
+    wordWrap = on;
+    wrapCache.clear();
+    wrapRowStart.clear();
+    scrollX = 0.0f;
+    dirty = true;
+  }
+
+  // Rebuilds only what's stale: a line is re-measured when its text changed,
+  // and re-broken when the wrap width changed AND it's wider than the view.
+  void syncWrap(const TextStyle &ts, float width) {
+    if (!wordWrap) {
+      if (!wrapCache.empty()) {
+        wrapCache.clear();
+        wrapRowStart.clear();
+      }
+      return;
+    }
+    if (wrapCache.size() != lines.size())
+      realignWrapCache();
+    wrapRowStart.assign(lines.size() + 1, 0);
+    size_t rows = 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      WrapLine &w = wrapCache[i];
+      if (!w.valid || w.text != lines[i]) {
+        w.text = lines[i];
+        w.natural = lines[i].empty()
+                        ? 0.0f
+                        : liteui_text::measure(lines[i], ts, -1).width;
+        w.valid = true;
+        w.builtWidth = -1.0f;
+      }
+      if (w.builtWidth != width) {
+        w.starts = w.natural <= width ? std::vector<size_t>{0}
+                                      : computeWrapStarts(lines[i], ts, width);
+        w.builtWidth = width;
+      }
+      wrapRowStart[i] = rows;
+      rows += w.starts.size();
+    }
+    wrapRowStart[lines.size()] = rows;
+  }
+
+  // Same prefix/suffix trick as SyntaxHighlighter::realign, so Enter or a
+  // multi-line paste only recomputes the touched region.
+  void realignWrapCache() {
+    size_t oldN = wrapCache.size(), newN = lines.size();
+    size_t prefix = 0;
+    while (prefix < oldN && prefix < newN && wrapCache[prefix].valid &&
+           wrapCache[prefix].text == lines[prefix])
+      ++prefix;
+    size_t maxSuffix = std::min(oldN - prefix, newN - prefix);
+    size_t suffix = 0;
+    while (suffix < maxSuffix && wrapCache[oldN - 1 - suffix].valid &&
+           wrapCache[oldN - 1 - suffix].text == lines[newN - 1 - suffix])
+      ++suffix;
+    std::vector<WrapLine> rebuilt(newN);
+    for (size_t i = 0; i < prefix; ++i)
+      rebuilt[i] = std::move(wrapCache[i]);
+    for (size_t i = 0; i < suffix; ++i)
+      rebuilt[newN - 1 - i] = std::move(wrapCache[oldN - 1 - i]);
+    wrapCache = std::move(rebuilt);
+  }
+
   void enterSearch(bool replaceMode) {
     search.active = true;
     search.replaceMode = replaceMode;
@@ -2074,6 +2293,8 @@ struct CodeEditor {
   Color lineNumberColor = Color{133, 133, 133};
   Color lineNumberBackground = liteui_theme::kEditorBg;
 
+  bool wordWrap = false;
+
   bool showLineNumbers = true;
   float padding = 8.0f;
   float lineHeight = 0.0f; // 0 = auto (fontSize * 1.4)
@@ -2110,6 +2331,7 @@ struct CodeEditor {
 
 inline View toCodeEditorView(CodeEditor ed) {
   auto state = ed.state;
+  state->wordWrap = ed.wordWrap;
 
   if (ed.resetStateFromText) {
     state->lines.clear();
@@ -2189,7 +2411,7 @@ inline View toCodeEditorView(CodeEditor ed) {
                                   float minimapLineH, float viewportH,
                                   float minimapViewH) -> float {
     float mainMaxScroll =
-        std::max(0.0f, state->lines.size() * lineH - viewportH);
+        std::max(0.0f, state->totalRows() * lineH - viewportH);
     float minimapMaxScroll =
         std::max(0.0f, state->lines.size() * minimapLineH - minimapViewH);
     if (mainMaxScroll <= 0.0f || minimapMaxScroll <= 0.0f)
@@ -2203,7 +2425,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       bool visible;
       float trackY, trackH, thumbY, thumbH, x;
     };
-    float contentH = state->lines.size() * lineH;
+    float contentH = state->totalRows() * lineH;
     if (contentH <= viewH)
       return Geo{false, 0, 0, 0, 0, 0};
     float trackY = 0, trackH = viewH;
@@ -2221,6 +2443,8 @@ inline View toCodeEditorView(CodeEditor ed) {
       bool visible;
       float trackX, trackW, thumbX, thumbW, y;
     };
+    if (state->wordWrap)
+      return Geo{false, 0, 0, 0, 0, 0};
     float maxLineW = 0.0f;
     for (const auto &l : state->lines) {
       float w = liteui_text::measure(l, ts, -1).width;
@@ -2250,6 +2474,23 @@ inline View toCodeEditorView(CodeEditor ed) {
     liteui_text::Measurement m =
         liteui_text::measure(std::string(digits + 1, '0'), ts, -1);
     return m.width + 12.0f;
+  };
+
+
+  auto wrapWidthFor = [=](bool reserveVBar) -> float {
+    float textLeft = pad + gutterWidth(state->lines.size());
+    float rightGutter = minimapWidth + (reserveVBar ? scrollbarWidth : 0.0f);
+    return std::max(0.0f, state->lastViewW - textLeft - pad - rightGutter);
+  };
+
+  auto syncLayout = [=] {
+    state->syncWrap(ts, wrapWidthFor(false));
+    if (!state->wordWrap || !showScrollbar)
+      return;
+    float availH = std::max(0.0f, state->lastViewH - pad * 2.0f);
+    bool vBarNeeded = state->totalRows() * lineH > availH + 0.5f;
+    if (vBarNeeded)
+      state->syncWrap(ts, wrapWidthFor(true));
   };
 
   auto notifyChange = [state, onChange] {
@@ -2299,30 +2540,51 @@ inline View toCodeEditorView(CodeEditor ed) {
   // rather than the byte offset, so moving through lines with different
   // multi-byte content still keeps the cursor visually aligned.
   auto pixelColOf = [state, ts](const EditPos &p) {
-    return liteui_text::measure(state->lines[p.line].substr(0, p.col), ts, -1)
+    size_t rs = std::min(
+        state->rowStartByte(p.line, state->rowInLine(p.line, p.col)), p.col);
+    return liteui_text::measure(state->lines[p.line].substr(rs, p.col - rs), ts,
+                                -1)
         .width;
   };
-  auto colAtPixel = [state, ts](size_t line, float px) {
-    return liteui_utf8::snapToBoundary(
-        state->lines[line], liteui_text::caretIndexForX(state->lines[line], ts,
-                                                        std::max(0.0f, px)));
+  auto colAtPixel = [state, ts](size_t line, size_t row, float px) -> size_t {
+    size_t rs = state->rowStartByte(line, row);
+    size_t re = state->rowEndByte(line, row);
+    std::string seg = state->lines[line].substr(rs, re > rs ? re - rs : 0);
+    size_t c = liteui_utf8::snapToBoundary(
+        seg, liteui_text::caretIndexForX(seg, ts, std::max(0.0f, px)));
+    // The end of a non-final row is the same byte offset as the start of the
+    // next row and would be drawn there, so keep the caret on this row.
+    if (row + 1 < state->rowCount(line) && !seg.empty() && c >= seg.size())
+      c = liteui_utf8::prevBoundary(seg, seg.size());
+    return rs + c;
   };
   auto moveUp = [state, pixelColOf, colAtPixel] {
     EditPos &c = state->cursor;
+    size_t r = state->rowInLine(c.line, c.col);
+    float px = pixelColOf(c);
+    if (r > 0) {
+      c.col = colAtPixel(c.line, r - 1, px);
+      return;
+    }
     if (c.line == 0)
       return;
-    float px = pixelColOf(c);
     --c.line;
-    c.col = colAtPixel(c.line, px);
+    c.col = colAtPixel(c.line, state->rowCount(c.line) - 1, px);
   };
   auto moveDown = [state, pixelColOf, colAtPixel] {
     EditPos &c = state->cursor;
+    size_t r = state->rowInLine(c.line, c.col);
+    float px = pixelColOf(c);
+    if (r + 1 < state->rowCount(c.line)) {
+      c.col = colAtPixel(c.line, r + 1, px);
+      return;
+    }
     if (c.line + 1 >= state->lines.size())
       return;
-    float px = pixelColOf(c);
     ++c.line;
-    c.col = colAtPixel(c.line, px);
+    c.col = colAtPixel(c.line, 0, px);
   };
+
   auto moveHome = [state] { state->cursor.col = 0; };
   auto moveEnd = [state] {
     state->cursor.col = state->lines[state->cursor.line].size();
@@ -2388,8 +2650,16 @@ inline View toCodeEditorView(CodeEditor ed) {
   v.onPaint = [=](CanvasContext &ctx) {
     state->lastViewW = ctx.width();
     state->lastViewH = ctx.height();
+    state->lastLineH = lineH;
     float gutter = gutterWidth(state->lines.size());
     float textLeft = pad + gutter;
+    syncLayout();
+    if (state->pendingTopLine >= 0) {
+      state->scrollY =
+          state->firstRowOf(static_cast<size_t>(state->pendingTopLine)) * lineH;
+      state->pendingTopLine = -1;
+      state->manualScroll = true;
+    }
 
     auto vGeoForLayout =
         vScrollbarGeometry(state.get(), lineH, ctx.height(), ctx.width(),
@@ -2400,33 +2670,40 @@ inline View toCodeEditorView(CodeEditor ed) {
     float availW = std::max(0.0f, ctx.width() - textLeft - pad - rightGutter);
     float availH = std::max(0.0f, ctx.height() - pad * 2.0f);
 
-    float caretTop = state->cursor.line * lineH;
+    float caretTop = (state->firstRowOf(state->cursor.line) +
+                      state->rowInLine(state->cursor.line, state->cursor.col)) *
+                     lineH;
     if (!state->manualScroll) {
       if (caretTop - state->scrollY < 0)
         state->scrollY = caretTop;
       if (caretTop + lineH - state->scrollY > availH)
         state->scrollY = caretTop + lineH - availH;
     }
-    float maxScrollY = std::max(0.0f, state->lines.size() * lineH - availH);
+
+    float maxScrollY = std::max(0.0f, state->totalRows() * lineH - availH);
     state->scrollY = std::clamp(state->scrollY, 0.0f, maxScrollY);
 
-    const std::string &curLine = state->lines[state->cursor.line];
-    liteui_text::Measurement caretM =
-        liteui_text::measure(curLine.substr(0, state->cursor.col), ts, -1);
-    if (!state->manualScroll) {
-      if (caretM.width - state->scrollX > availW)
-        state->scrollX = caretM.width - availW;
-      if (caretM.width - state->scrollX < 0)
-        state->scrollX = caretM.width;
+    if (state->wordWrap) {
+      state->scrollX = 0.0f;
+    } else {
+      const std::string &curLine = state->lines[state->cursor.line];
+      liteui_text::Measurement caretM =
+          liteui_text::measure(curLine.substr(0, state->cursor.col), ts, -1);
+      if (!state->manualScroll) {
+        if (caretM.width - state->scrollX > availW)
+          state->scrollX = caretM.width - availW;
+        if (caretM.width - state->scrollX < 0)
+          state->scrollX = caretM.width;
+      }
+      float maxLineW = 0.0f;
+      for (const auto &l : state->lines) {
+        float w = liteui_text::measure(l, ts, -1).width;
+        if (w > maxLineW)
+          maxLineW = w;
+      }
+      float maxScrollX = std::max(0.0f, maxLineW - availW);
+      state->scrollX = std::clamp(state->scrollX, 0.0f, maxScrollX);
     }
-    float maxLineW = 0.0f;
-    for (const auto &l : state->lines) {
-      float w = liteui_text::measure(l, ts, -1).width;
-      if (w > maxLineW)
-        maxLineW = w;
-    }
-    float maxScrollX = std::max(0.0f, maxLineW - availW);
-    state->scrollX = std::clamp(state->scrollX, 0.0f, maxScrollX);
 
     ctx.save();
     ctx.beginPath();
@@ -2438,10 +2715,28 @@ inline View toCodeEditorView(CodeEditor ed) {
       ctx.fillRect(0, 0, gutter + pad, ctx.height());
     }
 
-    int firstLine = std::max(0, static_cast<int>(state->scrollY / lineH));
-    int lastLine =
-        std::min(static_cast<int>(state->lines.size()) - 1,
-                 static_cast<int>((state->scrollY + availH) / lineH) + 1);
+    int firstRow = std::max(0, static_cast<int>(state->scrollY / lineH));
+    int lastRow = static_cast<int>((state->scrollY + availH) / lineH) + 1;
+    int firstLine = static_cast<int>(state->lineOfRow(firstRow));
+    int lastLine = static_cast<int>(state->lineOfRow(std::max(0, lastRow)));
+
+    auto fillByteRange = [&](size_t li, size_t from, size_t to, bool pastEnd) {
+      const std::string &line = state->lines[li];
+      size_t rows = state->rowCount(li), firstRow = state->firstRowOf(li);
+      for (size_t r = 0; r < rows; ++r) {
+        size_t rs = state->rowStartByte(li, r), re = state->rowEndByte(li, r);
+        bool stub = pastEnd && r + 1 == rows; // "selected newline" nub
+        size_t a = std::max(from, rs), b = std::min(to, re);
+        if (a > b || (a == b && !stub))
+          continue;
+        float x0 = liteui_text::measure(line.substr(rs, a - rs), ts, -1).width;
+        float x1 = liteui_text::measure(line.substr(rs, b - rs), ts, -1).width +
+                   (stub ? ts.fontSize * 0.5f : 0.0f);
+        float y = pad + (firstRow + r) * lineH - state->scrollY;
+        ctx.fillRect(textLeft - state->scrollX + x0, y, std::max(1.0f, x1 - x0),
+                     lineH);
+      }
+    };
 
     // ---- selection highlight, drawn under the text ----
     if (state->hasSelection()) {
@@ -2450,27 +2745,14 @@ inline View toCodeEditorView(CodeEditor ed) {
       ctx.setFillColor(selectionColor);
       for (int i = std::max(firstLine, static_cast<int>(s.line));
            i <= std::min(lastLine, static_cast<int>(e.line)); ++i) {
-        const std::string &line = state->lines[static_cast<size_t>(i)];
-        size_t from = (static_cast<size_t>(i) == s.line) ? s.col : 0;
-        size_t to = (static_cast<size_t>(i) == e.line) ? e.col : line.size();
-        float x0 = liteui_text::measure(line.substr(0, from), ts, -1).width;
-        // A selection spanning past this line's own text (i.e. every line
-        // except the last) visually extends to a fixed width past the
-        // line's own end, matching how most editors show a selected
-        // newline rather than stopping the highlight dead at the last
-        // glyph.
-        float x1 =
-            (static_cast<size_t>(i) == e.line)
-                ? liteui_text::measure(line.substr(0, to), ts, -1).width
-                : liteui_text::measure(line, ts, -1).width + ts.fontSize * 0.5f;
-        float y = pad + i * lineH - state->scrollY;
-        ctx.fillRect(textLeft - state->scrollX + x0, y, std::max(1.0f, x1 - x0),
-                     lineH);
+        size_t li = static_cast<size_t>(i);
+        size_t from = (li == s.line) ? s.col : 0;
+        size_t to = (li == e.line) ? e.col : state->lines[li].size();
+        // pastEnd: every line except the last also "selects" its newline
+        fillByteRange(li, from, to, li != e.line);
       }
     }
 
-    // ---- other search matches (the current one is already covered by
-    // the selection highlight above, since jumpToMatch() just selects it)
     if (state->search.active && !state->search.matches.empty()) {
       ctx.setFillColor(Color{234, 192, 0, 90});
       for (size_t mi = 0; mi < state->search.matches.size(); ++mi) {
@@ -2480,18 +2762,9 @@ inline View toCodeEditorView(CodeEditor ed) {
         if (static_cast<int>(m.line) < firstLine ||
             static_cast<int>(m.line) > lastLine)
           continue;
-        const std::string &line = state->lines[m.line];
-        float x0 = liteui_text::measure(line.substr(0, m.col), ts, -1).width;
-        float x1 =
-            liteui_text::measure(
-                line.substr(0, m.col + state->search.query.size()), ts, -1)
-                .width;
-        float y = pad + m.line * lineH - state->scrollY;
-        ctx.fillRect(textLeft - state->scrollX + x0, y, std::max(1.0f, x1 - x0),
-                     lineH);
+        fillByteRange(m.line, m.col, m.col + state->search.query.size(), false);
       }
     }
-
     // ---- matching-bracket highlight: when the cursor sits immediately
     // before or after a bracket, outline both it and its pair ----
     if (!state->hasSelection()) {
@@ -2503,14 +2776,8 @@ inline View toCodeEditorView(CodeEditor ed) {
           if (static_cast<int>(bp.line) < firstLine ||
               static_cast<int>(bp.line) > lastLine)
             continue;
-          const std::string &line = state->lines[bp.line];
-          float x0 = liteui_text::measure(line.substr(0, bp.col), ts, -1).width;
-          float x1 =
-              liteui_text::measure(line.substr(0, bp.col + 1), ts, -1).width;
-          float y = pad + bp.line * lineH - state->scrollY;
           ctx.setFillColor(Color{255, 255, 255, 50});
-          ctx.fillRect(textLeft - state->scrollX + x0, y,
-                       std::max(1.0f, x1 - x0), lineH);
+          fillByteRange(bp.line, bp.col, bp.col + 1, false);
         }
       };
       const std::string &curLineText = state->lines[state->cursor.line];
@@ -2536,51 +2803,65 @@ inline View toCodeEditorView(CodeEditor ed) {
       ctx.setFillColor(placeholderColor);
       ctx.fillText(placeholder, textLeft, pad + lineH / 2.0f);
     } else {
-      std::vector<HighlightSpan>
-          spans; // reused per line; cleared each iteration
+      std::vector<HighlightSpan> spans;
       for (int i = firstLine; i <= lastLine; ++i) {
-        float y = pad + i * lineH - state->scrollY + lineH / 2.0f;
-        if (gutter > 0) {
-          ctx.setFillColor(lineNumColor);
-          ctx.setTextAlign(TextAlign::End);
-          ctx.fillText(std::to_string(i + 1), textLeft - 8.0f, y);
-          ctx.setTextAlign(TextAlign::Start);
-        }
-        const std::string &lineText = state->lines[static_cast<size_t>(i)];
+        size_t li = static_cast<size_t>(i);
+        const std::string &lineText = state->lines[li];
+        size_t rows = state->rowCount(li), firstRow = state->firstRowOf(li);
         if (highlightLine) {
           spans.clear();
-          highlightLine(static_cast<size_t>(i), lineText, spans);
+          highlightLine(li, lineText, spans);
+        }
+        for (size_t r = 0; r < rows; ++r) {
+          float y =
+              pad + (firstRow + r) * lineH - state->scrollY + lineH / 2.0f;
+          if (r == 0 && gutter > 0) { // line number only on a line's first row
+            ctx.setFillColor(lineNumColor);
+            ctx.setTextAlign(TextAlign::End);
+            ctx.fillText(std::to_string(i + 1), textLeft - 8.0f, y);
+            ctx.setTextAlign(TextAlign::Start);
+          }
+          size_t rs = state->rowStartByte(li, r), re = state->rowEndByte(li, r);
           float x = textLeft - state->scrollX;
-          size_t pos = 0;
+          if (!highlightLine) {
+            ctx.setFillColor(textColor);
+            ctx.fillText(lineText.substr(rs, re - rs), x, y);
+            continue;
+          }
+          size_t pos = rs;
           for (const auto &sp : spans) {
-            if (sp.start > pos) {
-              std::string gap = lineText.substr(pos, sp.start - pos);
+            size_t s0 = std::max(sp.start, rs);
+            size_t s1 = std::min(sp.start + sp.length, re);
+            if (s0 >= s1)
+              continue; // token isn't on this row
+            if (s0 > pos) {
+              std::string gap = lineText.substr(pos, s0 - pos);
               ctx.setFillColor(textColor);
               ctx.fillText(gap, x, y);
               x += liteui_text::measure(gap, ts, -1).width;
             }
-            std::string tok = lineText.substr(sp.start, sp.length);
+            std::string tok = lineText.substr(s0, s1 - s0);
             ctx.setFillColor(sp.color);
             ctx.fillText(tok, x, y);
             x += liteui_text::measure(tok, ts, -1).width;
-            pos = sp.start + sp.length;
+            pos = s1;
           }
-          if (pos < lineText.size()) {
+          if (pos < re) {
             ctx.setFillColor(textColor);
-            ctx.fillText(lineText.substr(pos), x, y);
+            ctx.fillText(lineText.substr(pos, re - pos), x, y);
           }
-        } else {
-          ctx.setFillColor(textColor);
-          ctx.fillText(lineText, textLeft - state->scrollX, y);
         }
       }
     }
 
     if (state->focused && state->blinkOn) {
-      float cy = pad + state->cursor.line * lineH - state->scrollY;
+      const EditPos &cc = state->cursor;
+      size_t cr = state->rowInLine(cc.line, cc.col);
+      size_t rs = std::min(state->rowStartByte(cc.line, cr), cc.col);
+      float cy =
+          pad + (state->firstRowOf(cc.line) + cr) * lineH - state->scrollY;
       liteui_text::Measurement cm = liteui_text::measure(
-          state->lines[state->cursor.line].substr(0, state->cursor.col), ts,
-          -1);
+          state->lines[cc.line].substr(rs, cc.col - rs), ts, -1);
       ctx.setFillColor(caretColor);
       ctx.fillRect(textLeft - state->scrollX + cm.width, cy + 2.0f, 1.5f,
                    std::max(0.0f, lineH - 4.0f));
@@ -2639,9 +2920,12 @@ inline View toCodeEditorView(CodeEditor ed) {
         }
       }
 
+      float topRowF = state->scrollY / lineH;
       float indicatorTop =
-          (state->scrollY / lineH) * minimapLineHeight - mmScrollY;
-      float indicatorH = (availH / lineH) * minimapLineHeight;
+          state->rowToLineF(topRowF) * minimapLineHeight - mmScrollY;
+      float indicatorH = (state->rowToLineF(topRowF + availH / lineH) -
+                          state->rowToLineF(topRowF)) *
+                         minimapLineHeight;
       ctx.setFillColor(minimapViewportColor);
       ctx.fillRect(minimapX, indicatorTop, minimapWidth,
                    std::max(2.0f, indicatorH));
@@ -2720,16 +3004,18 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   auto posAtPoint = [=](float lx, float ly) -> EditPos {
-    float gutter = gutterWidth(state->lines.size());
-    float textLeft = pad + gutter;
-    int line = static_cast<int>((ly - pad + state->scrollY) / lineH);
-    line = std::clamp(line, 0, static_cast<int>(state->lines.size()) - 1);
+    syncLayout();
+    float textLeft = pad + gutterWidth(state->lines.size());
+    int rowIdx = static_cast<int>((ly - pad + state->scrollY) / lineH);
+    rowIdx = std::clamp(rowIdx, 0, static_cast<int>(state->totalRows()) - 1);
+    size_t line = state->lineOfRow(static_cast<size_t>(rowIdx));
+    size_t row = static_cast<size_t>(rowIdx) - state->firstRowOf(line);
     float localX = lx - textLeft + state->scrollX;
-    size_t col = colAtPixel(static_cast<size_t>(line), localX);
-    return {static_cast<size_t>(line), col};
+    return {line, colAtPixel(line, row, localX)};
   };
 
   v.onPressAt = [=](float lx, float ly) {
+    syncLayout();
     float textLeft = pad + gutterWidth(state->lines.size());
     state->scrollbarDragging = false;
     state->hScrollbarDragging = false;
@@ -2751,8 +3037,9 @@ inline View toCodeEditorView(CodeEditor ed) {
           state.get(), lineH, minimapLineHeight, availHLocal, state->lastViewH);
       float clickedLine = (ly + mmScrollY) / minimapLineHeight;
       float maxScrollY =
-          std::max(0.0f, state->lines.size() * lineH - availHLocal);
-      state->scrollY = std::clamp(clickedLine * lineH - availHLocal / 2.0f,
+          std::max(0.0f, state->totalRows() * lineH - availHLocal);
+      state->scrollY = std::clamp(state->lineToRowF(clickedLine) * lineH -
+                                      availHLocal / 2.0f,
                                   0.0f, maxScrollY);
       state->manualScroll = true;
       state->minimapDragging = true;
@@ -2798,7 +3085,7 @@ inline View toCodeEditorView(CodeEditor ed) {
         state->scrollbarDragStartScrollY = state->scrollY;
         if (ly < vGeo.trackY + vGeo.thumbY ||
             ly > vGeo.trackY + vGeo.thumbY + vGeo.thumbH) {
-          float contentH = state->lines.size() * lineH;
+          float contentH = state->totalRows() * lineH;
           float maxScroll = std::max(0.0f, contentH - state->lastViewH);
           float frac = (ly - vGeo.thumbH / 2.0f) /
                        std::max(1.0f, vGeo.trackH - vGeo.thumbH);
@@ -2818,6 +3105,7 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onDragTo = [=](float lx, float ly) {
+    syncLayout();
     float textLeft = pad + gutterWidth(state->lines.size());
     if (state->minimapDragging) {
       float availHLocal = std::max(1.0f, state->lastViewH - pad * 2.0f);
@@ -2825,8 +3113,9 @@ inline View toCodeEditorView(CodeEditor ed) {
           state.get(), lineH, minimapLineHeight, availHLocal, state->lastViewH);
       float draggedLine = (ly + mmScrollY) / minimapLineHeight;
       float maxScrollY =
-          std::max(0.0f, state->lines.size() * lineH - availHLocal);
-      state->scrollY = std::clamp(draggedLine * lineH - availHLocal / 2.0f,
+          std::max(0.0f, state->totalRows() * lineH - availHLocal);
+      state->scrollY = std::clamp(state->lineToRowF(draggedLine) * lineH -
+                                      availHLocal / 2.0f,
                                   0.0f, maxScrollY);
       state->dirty = true;
       return;
@@ -2861,7 +3150,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     }
     if (state->scrollbarDragging) {
       state->manualScroll = true;
-      float contentH = state->lines.size() * lineH;
+      float contentH = state->totalRows() * lineH;
       float maxScroll = std::max(0.0f, contentH - state->lastViewH);
       auto vGeo =
           vScrollbarGeometry(state.get(), lineH, state->lastViewH,
@@ -2912,7 +3201,7 @@ inline View toCodeEditorView(CodeEditor ed) {
   v.onScrollDown = [state, lineH] {
     state->manualScroll = true;
     float maxScrollY =
-        std::max(0.0f, state->lines.size() * lineH - state->lastViewH);
+        std::max(0.0f, state->totalRows() * lineH - state->lastViewH);
     state->scrollY = std::min(maxScrollY, state->scrollY + lineH * 3.0f);
     state->dirty = true;
   };
@@ -2923,6 +3212,8 @@ inline View toCodeEditorView(CodeEditor ed) {
       state->dirty = true;
       return;
     }
+
+    syncLayout();
 
     EditPos &cur = state->cursor;
     bool shift = e.mods.shift;
@@ -3020,9 +3311,15 @@ inline View toCodeEditorView(CodeEditor ed) {
       float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
       int step = std::max(1, static_cast<int>(availH / lineH));
       move([&] {
-        cur.line =
-            static_cast<size_t>(std::max(0, static_cast<int>(cur.line) - step));
-        cur.col = std::min(cur.col, state->lines[cur.line].size());
+        if (state->wordWrap) {
+          // "step" is in visual rows, so walk that many rows.
+          for (int k = 0; k < step; ++k)
+            moveUp();
+        } else {
+          cur.line = static_cast<size_t>(
+              std::max(0, static_cast<int>(cur.line) - step));
+          cur.col = std::min(cur.col, state->lines[cur.line].size());
+        }
       });
       break;
     }
@@ -3030,9 +3327,14 @@ inline View toCodeEditorView(CodeEditor ed) {
       float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
       int step = std::max(1, static_cast<int>(availH / lineH));
       move([&] {
-        cur.line = std::min(state->lines.size() - 1,
-                            cur.line + static_cast<size_t>(step));
-        cur.col = std::min(cur.col, state->lines[cur.line].size());
+        if (state->wordWrap) {
+          for (int k = 0; k < step; ++k)
+            moveDown();
+        } else {
+          cur.line = std::min(state->lines.size() - 1,
+                              cur.line + static_cast<size_t>(step));
+          cur.col = std::min(cur.col, state->lines[cur.line].size());
+        }
       });
       break;
     }
@@ -3321,6 +3623,7 @@ struct LanguageDef {
                                        // span for its whole remainder
   bool hasRawStrings = false;          // C++ R"delim(...)delim"
   bool hasTripleQuotedStrings = false; // Python '''...''' / """..."""
+  bool hasTemplateStrings = false;     // `...` may span lines
 };
 
 struct LineContinuation {
@@ -3329,11 +3632,12 @@ struct LineContinuation {
   std::string rawDelim; // the delimiter between R" and ( ... ) and closing "
   bool inTripleString = false;
   char tripleQuote = '"'; // which quote char started the triple string
+  bool inTemplate = false;
 
   bool operator==(const LineContinuation &o) const {
     return inBlockComment == o.inBlockComment && inRawString == o.inRawString &&
            rawDelim == o.rawDelim && inTripleString == o.inTripleString &&
-           tripleQuote == o.tripleQuote;
+           tripleQuote == o.tripleQuote && inTemplate == o.inTemplate;
   }
 };
 
@@ -3391,6 +3695,28 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
     push(0, end + 3, SyntaxTokenType::String);
     i = end + 3;
     state.inTripleString = false;
+  } else if (state.inTemplate) {
+    size_t j = 0;
+    bool closed = false;
+    while (j < n) {
+      if (line[j] == '\\' && j + 1 < n) {
+        j += 2;
+        continue;
+      }
+      if (line[j] == '`') {
+        ++j;
+        closed = true;
+        break;
+      }
+      ++j;
+    }
+    push(0, j, SyntaxTokenType::String);
+    if (!closed) {
+      endState = state;
+      return tokens;
+    }
+    i = j;
+    state.inTemplate = false;
   } else if (state.inBlockComment) {
     size_t end = lang.blockCommentEnd.empty()
                      ? std::string::npos
@@ -3476,6 +3802,26 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
       push(start, i - start, SyntaxTokenType::String);
       continue;
     }
+    if (lang.hasTemplateStrings && c == '`') {
+      size_t start = i++;
+      bool closed = false;
+      while (i < n) {
+        if (line[i] == '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (line[i] == '`') {
+          ++i;
+          closed = true;
+          break;
+        }
+        ++i;
+      }
+      push(start, i - start, SyntaxTokenType::String);
+      if (!closed)
+        state.inTemplate = true;
+      continue;
+    }
     if (lang.hasChars && c == static_cast<unsigned char>(lang.charQuote)) {
       size_t start = i++;
       while (i < n) {
@@ -3549,6 +3895,8 @@ inline std::vector<SyntaxToken> tokenizeLine(const std::string &line,
       if (lang.hasStrings && cc == static_cast<unsigned char>(lang.stringQuote))
         break;
       if (lang.hasChars && cc == static_cast<unsigned char>(lang.charQuote))
+        break;
+      if (lang.hasTemplateStrings && cc == '`')
         break;
       if (!lang.lineComment.empty() &&
           line.compare(i, lang.lineComment.size(), lang.lineComment) == 0)
@@ -3782,26 +4130,39 @@ inline std::shared_ptr<LanguageDef> languagePython() {
 inline std::shared_ptr<LanguageDef> languageJavaScript() {
   auto l = std::make_shared<LanguageDef>();
   l->name = "JavaScript";
-  l->extensions = {".js", ".jsx", ".mjs", ".ts", ".tsx"};
+  l->extensions = {".js", ".jsx", ".mjs", ".cjs"};
   l->lineComment = "//";
   l->blockCommentStart = "/*";
   l->blockCommentEnd = "*/";
   l->hasStrings = true;
   l->stringQuote = '"';
-  l->hasChars = false;
-  l->hasHashPreprocessor = false;
+  l->hasChars = true;
+  l->charQuote = '\'';
+  l->hasTemplateStrings = true;
   l->keywords = {
-      "break",     "case",     "catch",   "class",      "const",
-      "continue",  "debugger", "default", "delete",     "do",
-      "else",      "export",   "extends", "finally",    "for",
-      "function",  "if",       "import",  "in",         "instanceof",
-      "new",       "return",   "super",   "switch",     "this",
-      "throw",     "try",      "typeof",  "var",        "let",
-      "void",      "while",    "with",    "yield",      "async",
-      "await",     "static",   "get",     "set",        "of",
-      "interface", "type",     "enum",    "implements", "namespace",
-      "as",        "from",
+      "break",    "case",       "catch",  "class",    "const",     "continue",
+      "debugger", "default",    "delete", "do",       "else",      "export",
+      "extends",  "finally",    "for",    "function", "if",        "import",
+      "in",       "instanceof", "new",    "return",   "super",     "switch",
+      "this",     "throw",      "try",    "typeof",   "var",       "let",
+      "void",     "while",      "with",   "yield",    "async",     "await",
+      "static",   "true",       "false",  "null",     "undefined",
   };
+  return l;
+}
+
+inline std::shared_ptr<LanguageDef> languageTypeScript() {
+  auto l = languageJavaScript();
+  l->name = "TypeScript";
+  l->extensions = {".ts", ".tsx", ".mts", ".cts"};
+  for (const char *k :
+       {"interface", "type",      "enum",     "implements", "namespace",
+        "abstract",  "declare",   "readonly", "keyof",      "infer",
+        "is",        "satisfies", "as",       "private",    "protected",
+        "public",    "override",  "any",      "unknown",    "never",
+        "string",    "number",    "boolean",  "symbol",     "bigint",
+        "object",    "from",      "of",       "get",        "set"})
+    l->keywords.insert(k);
   return l;
 }
 
@@ -3860,6 +4221,7 @@ languageForExtension(const std::string &path) {
       languageCpp(),
       languagePython(),
       languageJavaScript(),
+      languageTypeScript(),
   };
   for (const auto &lang : kLanguages)
     for (const auto &e : lang->extensions)
@@ -4931,6 +5293,14 @@ private:
   std::shared_ptr<bool> aboutDialogOpen_ = std::make_shared<bool>(false);
 
   bool closingWindow_ = false;
+
+  bool wordWrap_ = false;
+
+  void toggleWordWrap() {
+    wordWrap_ = !wordWrap_;
+    for (auto &doc : docs_)
+      doc.state->setWordWrap(wordWrap_);
+  }
 
   void showErrorDialog(std::string message) {
     errorDialogMessage_ = std::move(message);
@@ -6435,7 +6805,8 @@ private:
                      {{"Select All", [this] { editSelectAll(); }},
                       {"Expand Selection", nullptr},
                       {"Shrink Selection", nullptr}}});
-    menus.push_back({"View", {}});
+    menus.push_back(
+        {"View", {{"Toggle Word Wrap", [this] { toggleWordWrap(); }}}});
     menus.push_back({"Go",
                      {{"Next Tab", [this] { nextTab(1); }},
                       {"Previous Tab", [this] { nextTab(-1); }}}});
@@ -6710,6 +7081,7 @@ private:
     ed.style.backgroundColor = th::kEditorBg;
     ed.showLineNumbers = true;
     ed.fontFamily = "Monospace";
+    ed.wordWrap = wordWrap_;
     ed.resetStateFromText = false; // reuse doc.state as-is
     ed.state = doc.state;
     std::shared_ptr<bool> modifiedFlag = doc.modified;
@@ -7446,6 +7818,10 @@ private:
     KeyModifiers ctrlShift;
     ctrlShift.ctrl = true;
     ctrlShift.shift = true;
+
+    KeyModifiers alt;
+    alt.alt = true;
+    ui_.addShortcut(alt, Key::Z, [this] { toggleWordWrap(); });
 
     ui_.addShortcut(ctrl, Key::T, [this] { newDocument(); });
     ui_.addShortcut(ctrl, Key::W, [this] {

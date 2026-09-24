@@ -8493,7 +8493,7 @@ private:
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
       changed = self->dispatchKeyDown(e);
       uint32_t cp = xkb_state_key_get_utf32(self->xkbState_, xkbCode);
-      if (cp >= 0x20 || cp == '\t')
+      if ((cp >= 0x20 || cp == '\t') && !self->modState_.alt)
         changed |= self->dispatchTextInput(cp);
       // Arm repeat for this key if the compositor wants repeat and this
       // key actually produces repeatable input (xkb flags this).
@@ -8568,7 +8568,7 @@ private:
     KeyEvent e{xkbKeysymToKey(sym), modState_};
     bool changed = dispatchKeyDown(e);
     uint32_t cp = xkb_state_key_get_utf32(xkbState_, xkbCode);
-    if (cp >= 0x20 || cp == '\t')
+    if ((cp >= 0x20 || cp == '\t') && !modState_.alt)
       changed |= dispatchTextInput(cp);
     if (changed)
       redraw();
