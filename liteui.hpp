@@ -6082,6 +6082,14 @@ public:
 #endif
   }
 
+  KeyModifiers modifiers() const {
+#if defined(_WIN32)
+    return currentModifiers();
+#else
+    return modState_;
+#endif
+  }
+
   // Everything below is internal implementation detail.
 private:
   // Requested window width in pixels, stored so pixel-drawing helpers can

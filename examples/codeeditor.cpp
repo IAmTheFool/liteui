@@ -1729,6 +1729,35 @@ inline std::vector<size_t> computeWrapStarts(const std::string &line,
   return starts;
 }
 
+inline void replaceRangeRaw(std::vector<std::string> &lines, EditPos s,
+                            EditPos e, const std::string &text) {
+  std::string head = lines[s.line].substr(0, s.col);
+  std::string tail = lines[e.line].substr(e.col);
+  std::vector<std::string> pieces;
+  for (size_t st = 0;;) {
+    size_t nl = text.find('\n', st);
+    pieces.push_back(
+        text.substr(st, nl == std::string::npos ? std::string::npos : nl - st));
+    if (nl == std::string::npos)
+      break;
+    st = nl + 1;
+  }
+  pieces.front() = head + pieces.front();
+  pieces.back() += tail;
+  lines.erase(lines.begin() + static_cast<long>(s.line),
+              lines.begin() + static_cast<long>(e.line) + 1);
+  lines.insert(lines.begin() + static_cast<long>(s.line), pieces.begin(),
+               pieces.end());
+}
+
+inline EditPos advancePos(EditPos p, const std::string &t) {
+  size_t nl = t.rfind('\n');
+  if (nl == std::string::npos)
+    return {p.line, p.col + t.size()};
+  return {p.line + static_cast<size_t>(std::count(t.begin(), t.end(), '\n')),
+          t.size() - nl - 1};
+}
+
 struct CodeEditorState {
   std::vector<std::string> lines{std::string()}; // always >= 1 entry
   EditPos cursor;
@@ -1747,6 +1776,30 @@ struct CodeEditorState {
   // unequal again — i.e. a selection appearing out of a stale anchor with
   // no drag ever having happened.
   EditPos dragAnchor;
+
+  // ---- multi-cursor ----
+  // `cursor`/`selectionAnchor` above stay the PRIMARY caret, untouched —
+  // every existing single-cursor method (hasSelection, insertTextRaw,
+  // deleteSelectionRaw, ...) keeps working exactly as before. Secondary
+  // carets live here; empty means today's single-cursor behavior, at
+  // zero extra cost.
+  struct Caret {
+    EditPos cursor;
+    std::optional<EditPos> selectionAnchor;
+  };
+  std::vector<Caret> extraCarets;
+  bool hasMultipleCarets() const { return !extraCarets.empty(); }
+
+  // Snapshots primary + extras into one list, primary first.
+  std::vector<Caret> allCarets() const {
+    std::vector<Caret> all;
+    all.reserve(1 + extraCarets.size());
+    all.push_back({cursor, selectionAnchor});
+    all.insert(all.end(), extraCarets.begin(), extraCarets.end());
+    return all;
+  }
+
+  void collapseToPrimaryCaret() { extraCarets.clear(); }
 
   bool focused = false;
   bool blinkOn = true;
@@ -1784,6 +1837,7 @@ struct CodeEditorState {
   CodeEditorSnapshot snapshot() const { return {lines, cursor}; }
 
   void restore(const CodeEditorSnapshot &s) {
+    extraCarets.clear();
     lines = s.lines;
     if (lines.empty())
       lines.push_back(std::string());
@@ -1809,8 +1863,9 @@ struct CodeEditorState {
   // plain single-character typing (onTextInput with no selection) — every
   // other edit (paste, cut, newline, backspace/delete, indent) is its own
   // undo step so undo doesn't merge unrelated actions together.
-  void beginEdit(bool coalescable) {
-    manualScroll = false;
+  void beginEdit(bool coalescable, bool keepCarets = false) {
+    if (!keepCarets)
+      extraCarets.clear();
     redoStack.clear(); // a fresh edit invalidates the redo history
     if (!coalescable) {
       pushUndo();
@@ -1910,6 +1965,7 @@ struct CodeEditorState {
   }
 
   void selectAll() {
+    extraCarets.clear();
     manualScroll = false;
     selectionAnchor = EditPos{0, 0};
     cursor = EditPos{lines.size() - 1, lines.back().size()};
@@ -2103,6 +2159,7 @@ struct CodeEditorState {
   }
 
   void enterSearch(bool replaceMode) {
+    collapseToPrimaryCaret();
     search.active = true;
     search.replaceMode = replaceMode;
     search.fieldFocus = 0;
@@ -2219,6 +2276,280 @@ struct CodeEditorState {
     clampCursor();
     search.matches.clear();
     search.currentMatch = -1;
+  }
+
+  bool columnSelecting = false;
+  float columnAnchorX = 0.0f;
+
+  void setAllCarets(std::vector<Caret> all) {
+    if (all.empty())
+      return;
+    Caret primary = all[0]; // primary STAYS primary
+    std::vector<Caret> extras(all.begin() + 1, all.end());
+    std::sort(extras.begin(), extras.end(), [](const Caret &a, const Caret &b) {
+      return a.cursor < b.cursor;
+    });
+    std::vector<Caret> kept;
+    for (auto &c : extras) {
+      if (c.cursor == primary.cursor)
+        continue;
+      if (!kept.empty() && kept.back().cursor == c.cursor)
+        continue;
+      kept.push_back(c);
+    }
+    cursor = primary.cursor;
+    selectionAnchor = primary.selectionAnchor;
+    extraCarets = std::move(kept);
+  }
+
+  // newest caret becomes primary so the view follows it
+  void addCaretAt(EditPos pos) {
+    auto all = allCarets();
+    all.insert(all.begin(), Caret{pos, std::nullopt});
+    setAllCarets(std::move(all));
+  }
+
+  void clampPos(EditPos &p) const {
+    if (p.line >= lines.size())
+      p.line = lines.size() - 1;
+    p.col = liteui_utf8::snapToBoundary(lines[p.line],
+                                        std::min(p.col, lines[p.line].size()));
+  }
+  void clampAllCarets() {
+    clampCursor();
+    if (selectionAnchor)
+      clampPos(*selectionAnchor);
+    for (auto &c : extraCarets) {
+      clampPos(c.cursor);
+      if (c.selectionAnchor)
+        clampPos(*c.selectionAnchor);
+    }
+  }
+
+  struct Replacement {
+    EditPos start, end;
+    std::string text;
+  };
+
+  static EditPos selLo(const Caret &c) {
+    return (c.selectionAnchor && *c.selectionAnchor < c.cursor)
+               ? *c.selectionAnchor
+               : c.cursor;
+  }
+  static EditPos selHi(const Caret &c) {
+    return (c.selectionAnchor && *c.selectionAnchor < c.cursor) ? c.cursor
+           : c.selectionAnchor ? *c.selectionAnchor
+                               : c.cursor;
+  }
+
+  // reps[i] belongs to caret all[i]
+  void applyReplacements(std::vector<Caret> all,
+                         std::vector<Replacement> reps) {
+    size_t n = reps.size();
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i)
+      order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return reps[a].start < reps[b].start;
+    });
+
+    EditPos floorPos{0, 0}; // guard against overlapping ranges
+    for (size_t i : order) {
+      if (reps[i].start < floorPos)
+        reps[i].start = floorPos;
+      if (reps[i].end < reps[i].start)
+        reps[i].end = reps[i].start;
+      floorPos = reps[i].end;
+    }
+    for (size_t k = n; k-- > 0;) { // bottom-to-top on the buffer
+      auto &r = reps[order[k]];
+      replaceRangeRaw(lines, r.start, r.end, r.text);
+    }
+
+    long lineShift = 0, colShift = 0; // top-to-bottom for caret positions
+    size_t colLine = static_cast<size_t>(-1);
+    for (size_t k = 0; k < n; ++k) {
+      auto &r = reps[order[k]];
+      EditPos ns{
+          static_cast<size_t>(static_cast<long>(r.start.line) + lineShift),
+          static_cast<size_t>(static_cast<long>(r.start.col) +
+                              (r.start.line == colLine ? colShift : 0))};
+      EditPos ne = advancePos(ns, r.text);
+      all[order[k]].cursor = ne;
+      all[order[k]].selectionAnchor.reset();
+      lineShift = static_cast<long>(ne.line) - static_cast<long>(r.end.line);
+      colShift = static_cast<long>(ne.col) - static_cast<long>(r.end.col);
+      colLine = r.end.line;
+    }
+    setAllCarets(std::move(all)); // merges carets that now coincide
+  }
+
+  void multiReplace(bool coalescable,
+                    const std::function<Replacement(const Caret &)> &make) {
+    beginEdit(coalescable, /*keepCarets=*/true);
+    auto all = allCarets();
+    std::vector<Replacement> reps;
+    for (auto &c : all)
+      reps.push_back(make(c));
+    applyReplacements(std::move(all), std::move(reps));
+  }
+
+  void multiTypeText(const std::string &t, bool coalescable) {
+    multiReplace(coalescable, [&](const Caret &c) {
+      return Replacement{selLo(c), selHi(c), t};
+    });
+  }
+  void multiBackspace() {
+    multiReplace(false, [&](const Caret &c) -> Replacement {
+      EditPos s = selLo(c), e = selHi(c);
+      if (s != e)
+        return {s, e, ""};
+      if (c.cursor.col > 0)
+        return {{c.cursor.line,
+                 liteui_utf8::prevBoundary(lines[c.cursor.line], c.cursor.col)},
+                c.cursor,
+                ""};
+      if (c.cursor.line > 0)
+        return {
+            {c.cursor.line - 1, lines[c.cursor.line - 1].size()}, c.cursor, ""};
+      return {c.cursor, c.cursor, ""};
+    });
+  }
+  void multiDelete() {
+    multiReplace(false, [&](const Caret &c) -> Replacement {
+      EditPos s = selLo(c), e = selHi(c);
+      if (s != e)
+        return {s, e, ""};
+      if (c.cursor.col < lines[c.cursor.line].size())
+        return {c.cursor,
+                {c.cursor.line,
+                 liteui_utf8::nextBoundary(lines[c.cursor.line], c.cursor.col)},
+                ""};
+      if (c.cursor.line + 1 < lines.size())
+        return {c.cursor, {c.cursor.line + 1, 0}, ""};
+      return {c.cursor, c.cursor, ""};
+    });
+  }
+  void multiNewline(const std::string &tabStr) {
+    multiReplace(false, [&](const Caret &c) -> Replacement {
+      EditPos s = selLo(c), e = selHi(c);
+      const std::string &line = lines[s.line];
+      size_t n = 0;
+      while (n < line.size() && (line[n] == ' ' || line[n] == '\t'))
+        ++n;
+      bool afterOpen = s.col > 0 && isOpenBracket(line[s.col - 1]);
+      return {s, e,
+              "\n" + line.substr(0, n) + (afterOpen ? tabStr : std::string())};
+    });
+  }
+
+  // ---- Ctrl+D: add next occurrence ----
+
+  static bool isWordCh(unsigned char c) { return std::isalnum(c) || c == '_'; }
+
+  // The word (alnum/underscore run) touching `p` — either the run p.col
+  // sits inside, or, if the cursor is resting just past a word (the
+  // common case after a double-click or a plain caret placement), the
+  // run immediately to its left. nullopt if neither side is a word char.
+  std::optional<std::pair<EditPos, EditPos>> wordRangeAt(EditPos p) const {
+    const std::string &line = lines[p.line];
+    if (p.col >= line.size() ||
+        !isWordCh(static_cast<unsigned char>(line[p.col]))) {
+      if (p.col > 0 && isWordCh(static_cast<unsigned char>(line[p.col - 1])))
+        --p.col;
+      else
+        return std::nullopt;
+    }
+    size_t s = p.col, e = p.col;
+    while (s > 0 && isWordCh(static_cast<unsigned char>(line[s - 1])))
+      --s;
+    while (e < line.size() && isWordCh(static_cast<unsigned char>(line[e])))
+      ++e;
+    return std::make_pair(EditPos{p.line, s}, EditPos{p.line, e});
+  }
+
+  // "Add Selection To Next Find Match": with no selection,
+  // selects the word under the primary caret (first press only, no new
+  // caret). With a selection, finds the next literal occurrence of that
+  // exact text — searching forward from whichever existing caret sits
+  // furthest along in the document, wrapping around, and skipping any
+  // occurrence a caret already has selected — and adds it as a new
+  // caret. The new caret becomes primary, so the view scrolls to follow
+  // it, matching addCaretAt's own convention.
+  void addNextOccurrence() {
+    std::string needle;
+    if (hasSelection()) {
+      needle = selectedText();
+      if (needle.find('\n') != std::string::npos)
+        return; // multi-line selections aren't matched literally like this
+    } else {
+      auto wr = wordRangeAt(cursor);
+      if (!wr)
+        return;
+      selectionAnchor = wr->first;
+      cursor = wr->second;
+      return; // first press only selects the word; no caret added yet
+    }
+    if (needle.empty())
+      return;
+
+    auto all = allCarets();
+    auto rangesEqual = [](const Caret &c, EditPos s, EditPos e) {
+      if (!c.selectionAnchor)
+        return false;
+      EditPos cs = *c.selectionAnchor, ce = c.cursor;
+      if (ce < cs)
+        std::swap(cs, ce);
+      return cs == s && ce == e;
+    };
+
+    // Every occurrence of `needle` in the document, in reading order.
+    std::vector<EditPos> matches;
+    for (size_t li = 0; li < lines.size(); ++li) {
+      const std::string &line = lines[li];
+      size_t pos = 0;
+      while (true) {
+        size_t hit = line.find(needle, pos);
+        if (hit == std::string::npos)
+          break;
+        matches.push_back({li, hit});
+        pos = hit + needle.size();
+      }
+    }
+    if (matches.empty())
+      return;
+
+    EditPos searchFrom = all[0].cursor;
+    for (auto &c : all)
+      if (searchFrom < c.cursor)
+        searchFrom = c.cursor;
+
+    auto notAlreadySelected = [&](EditPos m) {
+      EditPos e{m.line, m.col + needle.size()};
+      for (auto &c : all)
+        if (rangesEqual(c, m, e))
+          return false;
+      return true;
+    };
+
+    std::optional<EditPos> pick;
+    for (auto &m : matches)
+      if (searchFrom < m && notAlreadySelected(m)) {
+        pick = m;
+        break;
+      }
+    if (!pick)
+      for (auto &m : matches)
+        if (notAlreadySelected(m)) {
+          pick = m;
+          break;
+        }
+    if (!pick)
+      return; // every occurrence in the file is already selected
+
+    EditPos e{pick->line, pick->col + needle.size()};
+    all.insert(all.begin(), Caret{e, *pick}); // newest caret is primary
+    setAllCarets(std::move(all));
   }
 };
 
@@ -2476,7 +2807,6 @@ inline View toCodeEditorView(CodeEditor ed) {
     return m.width + 12.0f;
   };
 
-
   auto wrapWidthFor = [=](bool reserveVBar) -> float {
     float textLeft = pad + gutterWidth(state->lines.size());
     float rightGutter = minimapWidth + (reserveVBar ? scrollbarWidth : 0.0f);
@@ -2518,8 +2848,7 @@ inline View toCodeEditorView(CodeEditor ed) {
 
   // ---- cursor motion (UTF-8 aware) ----
 
-  auto moveLeft = [state] {
-    EditPos &c = state->cursor;
+  auto moveLeft = [state](EditPos &c) {
     if (c.col > 0) {
       c.col = liteui_utf8::prevBoundary(state->lines[c.line], c.col);
     } else if (c.line > 0) {
@@ -2527,8 +2856,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       c.col = state->lines[c.line].size();
     }
   };
-  auto moveRight = [state] {
-    EditPos &c = state->cursor;
+  auto moveRight = [state](EditPos &c) {
     if (c.col < state->lines[c.line].size()) {
       c.col = liteui_utf8::nextBoundary(state->lines[c.line], c.col);
     } else if (c.line + 1 < state->lines.size()) {
@@ -2558,8 +2886,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       c = liteui_utf8::prevBoundary(seg, seg.size());
     return rs + c;
   };
-  auto moveUp = [state, pixelColOf, colAtPixel] {
-    EditPos &c = state->cursor;
+  auto moveUp = [state, pixelColOf, colAtPixel](EditPos &c) {
     size_t r = state->rowInLine(c.line, c.col);
     float px = pixelColOf(c);
     if (r > 0) {
@@ -2571,8 +2898,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     --c.line;
     c.col = colAtPixel(c.line, state->rowCount(c.line) - 1, px);
   };
-  auto moveDown = [state, pixelColOf, colAtPixel] {
-    EditPos &c = state->cursor;
+  auto moveDown = [state, pixelColOf, colAtPixel](EditPos &c) {
     size_t r = state->rowInLine(c.line, c.col);
     float px = pixelColOf(c);
     if (r + 1 < state->rowCount(c.line)) {
@@ -2584,11 +2910,8 @@ inline View toCodeEditorView(CodeEditor ed) {
     ++c.line;
     c.col = colAtPixel(c.line, 0, px);
   };
-
-  auto moveHome = [state] { state->cursor.col = 0; };
-  auto moveEnd = [state] {
-    state->cursor.col = state->lines[state->cursor.line].size();
-  };
+  auto moveHome = [state](EditPos &c) { c.col = 0; };
+  auto moveEnd = [state](EditPos &c) { c.col = state->lines[c.line].size(); };
 
   // Ctrl+Left/Right word jump: skip any run of whitespace, then a run of
   // "word" characters (alnum/underscore) or, failing that, one run of
@@ -2602,8 +2925,7 @@ inline View toCodeEditorView(CodeEditor ed) {
                                                      // doesn't fragment
                                                      // mid-codepoint
   };
-  auto moveWordLeft = [state, isWordByte] {
-    EditPos &c = state->cursor;
+  auto moveWordLeft = [state, isWordByte](EditPos &c) {
     if (c.col == 0) {
       if (c.line > 0) {
         --c.line;
@@ -2624,8 +2946,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     }
     c.col = i;
   };
-  auto moveWordRight = [state, isWordByte] {
-    EditPos &c = state->cursor;
+  auto moveWordRight = [state, isWordByte](EditPos &c) {
     const std::string &s = state->lines[c.line];
     if (c.col >= s.size()) {
       if (c.line + 1 < state->lines.size()) {
@@ -2648,6 +2969,7 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onPaint = [=](CanvasContext &ctx) {
+    state->clampAllCarets();
     state->lastViewW = ctx.width();
     state->lastViewH = ctx.height();
     state->lastLineH = lineH;
@@ -2753,6 +3075,23 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
     }
 
+    // Extra carets' own selections, same fillByteRange as the primary's.
+    for (const auto &ec : state->extraCarets) {
+      if (!ec.selectionAnchor || *ec.selectionAnchor == ec.cursor)
+        continue;
+      EditPos s = *ec.selectionAnchor, e2 = ec.cursor;
+      if (e2 < s)
+        std::swap(s, e2);
+      ctx.setFillColor(selectionColor);
+      for (int i = std::max(firstLine, static_cast<int>(s.line));
+           i <= std::min(lastLine, static_cast<int>(e2.line)); ++i) {
+        size_t li = static_cast<size_t>(i);
+        size_t from = (li == s.line) ? s.col : 0;
+        size_t to = (li == e2.line) ? e2.col : state->lines[li].size();
+        fillByteRange(li, from, to, li != e2.line);
+      }
+    }
+
     if (state->search.active && !state->search.matches.empty()) {
       ctx.setFillColor(Color{234, 192, 0, 90});
       for (size_t mi = 0; mi < state->search.matches.size(); ++mi) {
@@ -2855,16 +3194,20 @@ inline View toCodeEditorView(CodeEditor ed) {
     }
 
     if (state->focused && state->blinkOn) {
-      const EditPos &cc = state->cursor;
-      size_t cr = state->rowInLine(cc.line, cc.col);
-      size_t rs = std::min(state->rowStartByte(cc.line, cr), cc.col);
-      float cy =
-          pad + (state->firstRowOf(cc.line) + cr) * lineH - state->scrollY;
-      liteui_text::Measurement cm = liteui_text::measure(
-          state->lines[cc.line].substr(rs, cc.col - rs), ts, -1);
-      ctx.setFillColor(caretColor);
-      ctx.fillRect(textLeft - state->scrollX + cm.width, cy + 2.0f, 1.5f,
-                   std::max(0.0f, lineH - 4.0f));
+      auto drawCaretAt = [&](const EditPos &cc) {
+        size_t cr = state->rowInLine(cc.line, cc.col);
+        size_t rs = std::min(state->rowStartByte(cc.line, cr), cc.col);
+        float cy =
+            pad + (state->firstRowOf(cc.line) + cr) * lineH - state->scrollY;
+        liteui_text::Measurement cm = liteui_text::measure(
+            state->lines[cc.line].substr(rs, cc.col - rs), ts, -1);
+        ctx.setFillColor(caretColor);
+        ctx.fillRect(textLeft - state->scrollX + cm.width, cy + 2.0f, 1.5f,
+                     std::max(0.0f, lineH - 4.0f));
+      };
+      drawCaretAt(state->cursor);
+      for (const auto &ec : state->extraCarets)
+        drawCaretAt(ec.cursor);
     }
 
     ctx.restore();
@@ -3096,6 +3439,18 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
     }
     EditPos p = posAtPoint(lx, ly);
+    KeyModifiers mods =
+        LiteUI::current() ? LiteUI::current()->modifiers() : KeyModifiers{};
+    state->columnSelecting = false;
+    if (mods.alt && mods.shift && !state->wordWrap) { // box select
+      state->collapseToPrimaryCaret();
+      state->columnSelecting = true;
+      state->columnAnchorX = lx - textLeft + state->scrollX;
+    } else if (mods.alt) { // add caret
+      state->addCaretAt(p);
+    } else {
+      state->collapseToPrimaryCaret(); // plain click
+    }
     state->cursor = p;
     state->dragAnchor = p;
     state->selectionAnchor.reset();
@@ -3162,6 +3517,30 @@ inline View toCodeEditorView(CodeEditor ed) {
       state->dirty = true;
       return;
     }
+
+    if (state->columnSelecting) {
+      EditPos p = posAtPoint(lx, ly);
+      float x1 = lx - textLeft + state->scrollX;
+      size_t l0 = std::min(state->dragAnchor.line, p.line);
+      size_t l1 = std::max(state->dragAnchor.line, p.line);
+      std::vector<CodeEditorState::Caret> all;
+      for (size_t l = l0; l <= l1; ++l) {
+        size_t a = colAtPixel(l, 0, state->columnAnchorX),
+               c = colAtPixel(l, 0, x1);
+        CodeEditorState::Caret cc;
+        cc.cursor = {l, c};
+        if (a != c)
+          cc.selectionAnchor = EditPos{l, a};
+        all.push_back(cc);
+      }
+      std::swap(all.front(), all[p.line - l0]); // pointer's line is primary
+      state->setAllCarets(std::move(all));
+      state->noteCursorMoved();
+      state->blinkOn = true;
+      state->dirty = true;
+      return;
+    }
+
     EditPos p = posAtPoint(lx, ly);
     state->cursor = p;
     if (p != state->dragAnchor)
@@ -3207,6 +3586,7 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onKeyDown = [=](KeyEvent e) {
+    state->clampAllCarets();
     if (preKeyDown && preKeyDown(e)) {
       state->blinkOn = true;
       state->dirty = true;
@@ -3232,6 +3612,7 @@ inline View toCodeEditorView(CodeEditor ed) {
           search.fieldFocus = 1 - search.fieldFocus;
         break;
       case Key::Backspace: {
+
         std::string &field =
             search.fieldFocus == 0 ? search.query : search.replacement;
         if (!field.empty())
@@ -3274,32 +3655,63 @@ inline View toCodeEditorView(CodeEditor ed) {
     // Wraps a pure-motion key: applies shift-extends-selection semantics
     // uniformly, since every arrow/Home/End/PageUp/PageDown key follows
     // the same rule (start an anchor if shift is newly held, drop it
-    // otherwise).
-    auto move = [&](std::function<void()> fn) {
-      if (shift) {
-        if (!state->selectionAnchor)
-          state->selectionAnchor = cur;
-      } else {
-        state->selectionAnchor.reset();
+    // otherwise) — now applied to every caret, not just the primary one.
+    auto move = [&](std::function<void(EditPos &)> fn) {
+      auto all = state->allCarets();
+      for (auto &c : all) {
+        if (shift) {
+          if (!c.selectionAnchor)
+            c.selectionAnchor = c.cursor;
+        } else {
+          c.selectionAnchor.reset();
+        }
+        fn(c.cursor);
       }
-      fn();
+      state->setAllCarets(std::move(all));
+      state->noteCursorMoved();
+    };
+
+    auto addCaretVertical = [&](bool down) {
+      auto all = state->allCarets();
+      auto cmp = [](const CodeEditorState::Caret &a,
+                    const CodeEditorState::Caret &b) {
+        return a.cursor < b.cursor;
+      };
+      auto it = down ? std::max_element(all.begin(), all.end(), cmp)
+                     : std::min_element(all.begin(), all.end(), cmp);
+      CodeEditorState::Caret n = *it;
+      n.selectionAnchor.reset();
+      if (down)
+        moveDown(n.cursor);
+      else
+        moveUp(n.cursor);
+      all.insert(all.begin(), n);
+      state->setAllCarets(std::move(all));
       state->noteCursorMoved();
     };
 
     switch (e.key) {
     case Key::Left:
-      move(ctrl ? std::function<void()>(moveWordLeft)
-                : std::function<void()>(moveLeft));
+      move(ctrl ? std::function<void(EditPos &)>(moveWordLeft)
+                : std::function<void(EditPos &)>(moveLeft));
       break;
     case Key::Right:
-      move(ctrl ? std::function<void()>(moveWordRight)
-                : std::function<void()>(moveRight));
+      move(ctrl ? std::function<void(EditPos &)>(moveWordRight)
+                : std::function<void(EditPos &)>(moveRight));
       break;
     case Key::Up:
-      move(moveUp);
+      if (ctrl && e.mods.alt) {
+        addCaretVertical(false);
+      } else {
+        move(moveUp);
+      }
       break;
     case Key::Down:
-      move(moveDown);
+      if (ctrl && e.mods.alt) {
+        addCaretVertical(true);
+      } else {
+        move(moveDown);
+      }
       break;
     case Key::Home:
       move(moveHome);
@@ -3310,15 +3722,15 @@ inline View toCodeEditorView(CodeEditor ed) {
     case Key::PageUp: {
       float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
       int step = std::max(1, static_cast<int>(availH / lineH));
-      move([&] {
+      move([&](EditPos &c) {
         if (state->wordWrap) {
           // "step" is in visual rows, so walk that many rows.
           for (int k = 0; k < step; ++k)
-            moveUp();
+            moveUp(c);
         } else {
-          cur.line = static_cast<size_t>(
-              std::max(0, static_cast<int>(cur.line) - step));
-          cur.col = std::min(cur.col, state->lines[cur.line].size());
+          c.line =
+              static_cast<size_t>(std::max(0, static_cast<int>(c.line) - step));
+          c.col = std::min(c.col, state->lines[c.line].size());
         }
       });
       break;
@@ -3326,14 +3738,14 @@ inline View toCodeEditorView(CodeEditor ed) {
     case Key::PageDown: {
       float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
       int step = std::max(1, static_cast<int>(availH / lineH));
-      move([&] {
+      move([&](EditPos &c) {
         if (state->wordWrap) {
           for (int k = 0; k < step; ++k)
-            moveDown();
+            moveDown(c);
         } else {
-          cur.line = std::min(state->lines.size() - 1,
-                              cur.line + static_cast<size_t>(step));
-          cur.col = std::min(cur.col, state->lines[cur.line].size());
+          c.line = std::min(state->lines.size() - 1,
+                            c.line + static_cast<size_t>(step));
+          c.col = std::min(c.col, state->lines[c.line].size());
         }
       });
       break;
@@ -3352,6 +3764,13 @@ inline View toCodeEditorView(CodeEditor ed) {
       else
         handled = false;
       break;
+    case Key::D:
+      if (ctrl) {
+        state->addNextOccurrence();
+        state->noteCursorMoved();
+      } else
+        handled = false;
+      break;
     case Key::X:
       if (ctrl) {
         if (state->hasSelection()) {
@@ -3367,8 +3786,12 @@ inline View toCodeEditorView(CodeEditor ed) {
       if (ctrl) {
         std::string clip = liteui_clipboard::getTextWithFallback();
         if (!clip.empty()) {
-          state->beginEdit(false);
-          insertTextRaw(clip);
+          if (state->hasMultipleCarets()) {
+            state->multiTypeText(clip, false);
+          } else {
+            state->beginEdit(false);
+            insertTextRaw(clip);
+          }
           notifyChange();
         }
       } else
@@ -3393,6 +3816,11 @@ inline View toCodeEditorView(CodeEditor ed) {
       break;
 
     case Key::Backspace:
+      if (state->hasMultipleCarets()) {
+        state->multiBackspace();
+        notifyChange();
+        break;
+      }
       if (state->hasSelection()) {
         state->beginEdit(false);
         state->deleteSelectionRaw();
@@ -3427,6 +3855,11 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
       break;
     case Key::Delete:
+      if (state->hasMultipleCarets()) {
+        state->multiDelete();
+        notifyChange();
+        break;
+      }
       if (state->hasSelection()) {
         state->beginEdit(false);
         state->deleteSelectionRaw();
@@ -3445,6 +3878,11 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
       break;
     case Key::Enter: {
+      if (state->hasMultipleCarets()) {
+        state->multiNewline(std::string(static_cast<size_t>(tabSpaces), ' '));
+        notifyChange();
+        break;
+      }
       state->beginEdit(false);
       // Auto-indent: carry the current line's leading whitespace onto the
       // new line, plus one extra indent level if the line ends with an
@@ -3476,9 +3914,23 @@ inline View toCodeEditorView(CodeEditor ed) {
       break;
     }
     case Key::Tab:
+      if (state->hasMultipleCarets()) {
+        state->multiTypeText(std::string(static_cast<size_t>(tabSpaces), ' '),
+                             false);
+        notifyChange();
+        break;
+      }
       state->beginEdit(false);
       insertTextRaw(std::string(static_cast<size_t>(tabSpaces), ' '));
       notifyChange();
+      break;
+    case Key::Escape:
+      if (state->hasMultipleCarets()) {
+        state->collapseToPrimaryCaret();
+        state->noteCursorMoved();
+      } else {
+        handled = false;
+      }
       break;
     default:
       handled = false;
@@ -3491,6 +3943,7 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   v.onTextInput = [=](uint32_t cp) {
+    state->clampAllCarets();
     if (preTextInput && preTextInput(cp)) {
       state->blinkOn = true;
       state->dirty = true;
@@ -3550,6 +4003,18 @@ inline View toCodeEditorView(CodeEditor ed) {
         if (!afterWordChar)
           autoClose = c;
       }
+
+      if (state->hasMultipleCarets()) {
+        bool anySel = state->hasSelection();
+        for (auto &c : state->extraCarets)
+          anySel |= c.selectionAnchor && *c.selectionAnchor != c.cursor;
+        state->multiTypeText(encoded, !anySel);
+        state->blinkOn = true;
+        state->dirty = true;
+        notifyChange();
+        return;
+      }
+
       if (autoClose != '\0') {
         state->beginEdit(false); // auto-close pair insertion is its own
                                  // undo step, not coalesced with plain typing
