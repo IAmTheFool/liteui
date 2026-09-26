@@ -1,5 +1,6 @@
-// src/main.cpp
+
 #include "liteui.hpp"
+#include <array>
 #include <memory>
 #include <vector>
 #include <string>
@@ -16,6 +17,93 @@ struct Tab {
     int id;
     std::string title;
 };
+
+
+enum class Theme { Dark, Light, Sepia };
+constexpr int kThemeCount = 3; // keep in sync with kPalettes.size() and Theme
+
+struct ThemePalette {
+    const char *name;
+
+    Color toolbarBg, toolbarText;
+    Color toggleBtnBg, toggleBtnBorder;
+
+    Color activityBarBg, activityActiveBg, activityInactiveBg, activityIconColor;
+
+    Color sidebarBg, sidebarTitleColor, fileRowTextColor, placeholderColor;
+
+    Color dividerBg;
+
+    Color tabBarBg, tabActiveBg, tabInactiveBg;
+    Color tabActiveText, tabInactiveText, glyphColor;
+
+    Color editorBg, editorLabelColor;
+
+    Color terminalBg, terminalTitleColor, terminalPromptColor;
+};
+
+inline const ThemePalette &paletteFor(Theme t) {
+    static const std::array<ThemePalette, kThemeCount> kPalettes = {{
+        // -- Dark --------------------------------------------------
+        ThemePalette{
+            .name = "Dark mode",
+            .toolbarBg = Color{51, 51, 55, 255}, .toolbarText = Color{220, 220, 220, 255},
+            .toggleBtnBg = Color{60, 60, 64, 255}, .toggleBtnBorder = Color{80, 80, 85, 255},
+            .activityBarBg = Color{45, 45, 48, 255},
+            .activityActiveBg = Color{60, 60, 64, 255}, .activityInactiveBg = Color{45, 45, 48, 255},
+            .activityIconColor = Color{220, 220, 220, 255},
+            .sidebarBg = Color{37, 37, 38, 255}, .sidebarTitleColor = Color{180, 180, 180, 255},
+            .fileRowTextColor = Color{204, 204, 204, 255}, .placeholderColor = Color{150, 150, 150, 255},
+            .dividerBg = Color{30, 30, 30, 255},
+            .tabBarBg = Color{37, 37, 38, 255},
+            .tabActiveBg = Color{30, 30, 30, 255}, .tabInactiveBg = Color{37, 37, 38, 255},
+            .tabActiveText = Color{255, 255, 255, 255}, .tabInactiveText = Color{170, 170, 170, 255},
+            .glyphColor = Color{170, 170, 170, 255},
+            .editorBg = Color{30, 30, 30, 255}, .editorLabelColor = Color{150, 150, 150, 255},
+            .terminalBg = Color{24, 24, 24, 255}, .terminalTitleColor = Color{180, 180, 180, 255},
+            .terminalPromptColor = Color{100, 220, 130, 255},
+        },
+        // -- Light -------------------------------------------------
+        ThemePalette{
+            .name = "Light mode",
+            .toolbarBg = Color{243, 243, 243, 255}, .toolbarText = Color{30, 30, 30, 255},
+            .toggleBtnBg = Color{230, 230, 230, 255}, .toggleBtnBorder = Color{200, 200, 200, 255},
+            .activityBarBg = Color{236, 236, 236, 255},
+            .activityActiveBg = Color{208, 208, 208, 255}, .activityInactiveBg = Color{236, 236, 236, 255},
+            .activityIconColor = Color{40, 40, 40, 255},
+            .sidebarBg = Color{245, 245, 245, 255}, .sidebarTitleColor = Color{90, 90, 90, 255},
+            .fileRowTextColor = Color{50, 50, 50, 255}, .placeholderColor = Color{120, 120, 120, 255},
+            .dividerBg = Color{225, 225, 225, 255},
+            .tabBarBg = Color{236, 236, 236, 255},
+            .tabActiveBg = Color{255, 255, 255, 255}, .tabInactiveBg = Color{236, 236, 236, 255},
+            .tabActiveText = Color{30, 30, 30, 255}, .tabInactiveText = Color{110, 110, 110, 255},
+            .glyphColor = Color{110, 110, 110, 255},
+            .editorBg = Color{255, 255, 255, 255}, .editorLabelColor = Color{160, 160, 160, 255},
+            .terminalBg = Color{250, 250, 250, 255}, .terminalTitleColor = Color{90, 90, 90, 255},
+            .terminalPromptColor = Color{20, 140, 70, 255},
+        },
+        // -- Sepia (new third theme) --------------------------------
+        ThemePalette{
+            .name = "Sepia mode",
+            .toolbarBg = Color{224, 202, 168, 255}, .toolbarText = Color{75, 55, 35, 255},
+            .toggleBtnBg = Color{214, 190, 152, 255}, .toggleBtnBorder = Color{194, 168, 128, 255},
+            .activityBarBg = Color{214, 190, 152, 255},
+            .activityActiveBg = Color{194, 168, 128, 255}, .activityInactiveBg = Color{214, 190, 152, 255},
+            .activityIconColor = Color{75, 55, 35, 255},
+            .sidebarBg = Color{240, 224, 194, 255}, .sidebarTitleColor = Color{110, 85, 55, 255},
+            .fileRowTextColor = Color{75, 55, 35, 255}, .placeholderColor = Color{140, 110, 80, 255},
+            .dividerBg = Color{194, 168, 128, 255},
+            .tabBarBg = Color{232, 212, 178, 255},
+            .tabActiveBg = Color{245, 232, 208, 255}, .tabInactiveBg = Color{232, 212, 178, 255},
+            .tabActiveText = Color{75, 55, 35, 255}, .tabInactiveText = Color{120, 95, 65, 255},
+            .glyphColor = Color{120, 95, 65, 255},
+            .editorBg = Color{245, 232, 208, 255}, .editorLabelColor = Color{140, 110, 80, 255},
+            .terminalBg = Color{232, 212, 178, 255}, .terminalTitleColor = Color{110, 85, 55, 255},
+            .terminalPromptColor = Color{90, 120, 60, 255},
+        },
+    }};
+    return kPalettes[static_cast<size_t>(t)];
+}
 
 int main() {
     LiteUI ui("VS Code Style Layout",1000, 650);
@@ -42,12 +130,7 @@ int main() {
     const float statusBarHeight = 24.0f;
     const float tabBarHeight = 36.0f;
 
-    // ---------------------------------------------------------------
-    // Tab state: an open-tabs list plus which one is active. Both live
-    // in shared_ptrs since the tab bar's keysSource/itemBuilder, the
-    // "+" button, each tab's own close button, and the editor content
-    // area all need to read/mutate the same data.
-    // ---------------------------------------------------------------
+
     auto tabs = std::make_shared<std::vector<Tab>>(std::vector<Tab>{
         {0, "main.cpp"},
         {1, "liteui.hpp"},
@@ -55,34 +138,66 @@ int main() {
     auto activeTab = std::make_shared<int>(0); // -1 = no tabs open
     auto nextTabId = std::make_shared<int>(2); // next id to hand out
 
+
+    auto theme = std::make_shared<Theme>(Theme::Dark);
+
+    auto themeName = [theme]() {
+        return std::string(paletteFor(*theme).name);
+    };
+
+    auto themeColor = [theme](Color ThemePalette::*field) {
+        return std::function<Color()>([theme, field]() {
+            return paletteFor(*theme).*field;
+        });
+    };
+
     View root;
     root.style.direction = FlexDirection::Column;
     root.style.width = Size::full();
     root.style.height = Size::full();
 
-    // ---------------------------------------------------------------
-    // Top Toolbar
-    // ---------------------------------------------------------------
+
     View toolbar;
     toolbar.style.width = Size::full();
     toolbar.style.height = Size::pixel(toolbarHeight);
     toolbar.style.flexGrow = 0;
     toolbar.style.flexShrink = 0;
-    toolbar.style.backgroundColor = Color{51, 51, 55, 255};
+    toolbar.style.backgroundColor = themeColor(&ThemePalette::toolbarBg);
     toolbar.style.direction = FlexDirection::Row;
     toolbar.style.alignItems = Align::Center;
+    toolbar.style.justifyContent = Justify::SpaceBetween;
     toolbar.style.padding = EdgeInsets{0, 16, 0, 16};
 
     Text toolbarTitle;
     toolbarTitle.label = std::string("My Project");
     toolbarTitle.fontSize = 13.0f;
     toolbarTitle.fontWeight = FontWeight::Medium;
-    toolbarTitle.color = Color{220, 220, 220, 255};
+    toolbarTitle.color = themeColor(&ThemePalette::toolbarText);
     toolbar.addChild(toolbarTitle);
 
-    // ---------------------------------------------------------------
-    // Workspace row
-    // ---------------------------------------------------------------
+
+    Text themeToggleLabel;
+    themeToggleLabel.label = std::function<std::string()>(themeName);
+    themeToggleLabel.fontSize = 12.0f;
+    themeToggleLabel.color = themeColor(&ThemePalette::toolbarText);
+
+    View themeToggleBtn;
+    themeToggleBtn.style.height = Size::pixel(24);
+    themeToggleBtn.style.borderRadius = 4.0f;
+    themeToggleBtn.style.borderWidth = 1.0f;
+    themeToggleBtn.style.borderColor = themeColor(&ThemePalette::toggleBtnBorder);
+    themeToggleBtn.style.backgroundColor = themeColor(&ThemePalette::toggleBtnBg);
+    themeToggleBtn.style.direction = FlexDirection::Row;
+    themeToggleBtn.style.alignItems = Align::Center;
+    themeToggleBtn.style.justifyContent = Justify::Center;
+    themeToggleBtn.style.padding = EdgeInsets{0, 10, 0, 10};
+    themeToggleBtn.onClick = [theme]() {
+        *theme = static_cast<Theme>((static_cast<int>(*theme) + 1) % kThemeCount);
+    };
+    themeToggleBtn.addChild(themeToggleLabel);
+    toolbar.addChild(themeToggleBtn);
+
+
     View workspace;
     workspace.style.direction = FlexDirection::Row;
     workspace.style.width = Size::full();
@@ -96,7 +211,7 @@ int main() {
     activityBar.style.flexShrink = 0;
     activityBar.style.direction = FlexDirection::Column;
     activityBar.style.alignItems = Align::Center;
-    activityBar.style.backgroundColor = Color{45, 45, 48, 255};
+    activityBar.style.backgroundColor = themeColor(&ThemePalette::activityBarBg);
     activityBar.style.padding = EdgeInsets::all(6.0f);
     activityBar.style.gap = 12.0f;
 
@@ -112,9 +227,9 @@ int main() {
 
         int id = item.id;
         button.style.backgroundColor = std::function<Color()>(
-            [activeActivity, id]() {
-                return *activeActivity == id ? Color{60, 60, 64, 255}
-                                             : Color{45, 45, 48, 255};
+            [activeActivity, id, theme]() {
+                const ThemePalette &p = paletteFor(*theme);
+                return *activeActivity == id ? p.activityActiveBg : p.activityInactiveBg;
             });
 
         button.onClick = [activeActivity, id]() {
@@ -125,7 +240,7 @@ int main() {
         icon.label = item.icon;
         icon.fontSize = 16.0f;
         icon.fontWeight = FontWeight::SemiBold;
-        icon.color = Color{220, 220, 220, 255};
+        icon.color = themeColor(&ThemePalette::activityIconColor);
         button.addChild(icon);
 
         activityBar.addChild(button);
@@ -137,7 +252,7 @@ int main() {
     sidebar.style.flexGrow = 0;
     sidebar.style.flexShrink = 0;
     sidebar.style.direction = FlexDirection::Column;
-    sidebar.style.backgroundColor = Color{37, 37, 38, 255};
+    sidebar.style.backgroundColor = themeColor(&ThemePalette::sidebarBg);
     sidebar.style.padding = EdgeInsets::all(12.0f);
     sidebar.style.overflowX = Overflow::Hidden;
 
@@ -155,13 +270,12 @@ int main() {
         });
     sidebarTitle.fontSize = 12.0f;
     sidebarTitle.fontWeight = FontWeight::SemiBold;
-    sidebarTitle.color = Color{180, 180, 180, 255};
+    sidebarTitle.color = themeColor(&ThemePalette::sidebarTitleColor);
     sidebar.addChild(sidebarTitle);
 
-    // File rows now open a tab when clicked (Explorer -> editor tie-in).
+
     auto openTab = [tabs, activeTab, nextTabId](const std::string &title) {
-        // If a tab with this title is already open, just activate it
-        // instead of opening a duplicate.
+
         for (const auto &t : *tabs) {
             if (t.title == title) {
                 *activeTab = t.id;
@@ -173,7 +287,7 @@ int main() {
         *activeTab = id;
     };
 
-    auto makeFileRow = [openTab](const std::string &name) {
+    auto makeFileRow = [openTab, themeColor](const std::string &name) {
         View row;
         row.style.height = Size::pixel(24);
         row.style.width = Size::full();
@@ -183,7 +297,7 @@ int main() {
         Text label;
         label.label = name;
         label.fontSize = 13.0f;
-        label.color = Color{204, 204, 204, 255};
+        label.color = themeColor(&ThemePalette::fileRowTextColor);
         row.addChild(label);
         return row;
     };
@@ -211,7 +325,7 @@ int main() {
             Text placeholder;
             placeholder.label = item.title + " view goes here";
             placeholder.fontSize = 13.0f;
-            placeholder.color = Color{150, 150, 150, 255};
+            placeholder.color = themeColor(&ThemePalette::placeholderColor);
             pane.addChild(placeholder);
         }
 
@@ -224,7 +338,7 @@ int main() {
     vDivider.style.height = Size::full();
     vDivider.style.flexGrow = 0;
     vDivider.style.flexShrink = 0;
-    vDivider.style.backgroundColor = Color{30, 30, 30, 255};
+    vDivider.style.backgroundColor = themeColor(&ThemePalette::dividerBg);
     vDivider.style.hoverColor = Color{80, 80, 220, 255};
 
     vDivider.style.width = std::function<Size()>([activeActivity, dividerWidth] {
@@ -259,15 +373,10 @@ int main() {
     tabBarContainer.style.height = Size::pixel(tabBarHeight);
     tabBarContainer.style.flexGrow = 0;
     tabBarContainer.style.flexShrink = 0;
-    tabBarContainer.style.backgroundColor = Color{37, 37, 38, 255};
+    tabBarContainer.style.backgroundColor = themeColor(&ThemePalette::tabBarBg);
     tabBarContainer.style.alignItems = Align::Stretch;
 
-    // The keyed tab strip itself. keysSource returns one string key per
-    // open tab (its id, stringified); itemBuilder constructs the View
-    // for a given key. LiteUI's reconcileChildren matches surviving keys
-    // across rebuilds, so tabs don't get needlessly torn down/rebuilt
-    // when e.g. just the active one changes — only when the actual set
-    // of open tabs changes.
+
     View tabStrip;
     tabStrip.style.direction = FlexDirection::Row;
     tabStrip.style.height = Size::full();
@@ -281,11 +390,9 @@ int main() {
         return keys;
     };
 
-    tabStrip.itemBuilder = [tabs, activeTab](const std::string &key) -> View {
+    tabStrip.itemBuilder = [tabs, activeTab, theme, themeColor](const std::string &key) -> View {
         int id = std::stoi(key);
 
-        // Look up this tab's current title fresh every rebuild (cheap
-        // at this scale; a map would be worth it with many more tabs).
         std::string title;
         for (const auto &t : *tabs)
             if (t.id == id) { title = t.title; break; }
@@ -299,30 +406,26 @@ int main() {
         tab.style.borderWidth = 0.0f;
         tab.style.hoverColor = Color{45, 45, 48, 255};
 
-        // Highlighted background + a bottom accent border when active —
-        // both re-polled every dispatch cycle off the shared activeTab.
+
         tab.style.backgroundColor = std::function<Color()>(
-            [activeTab, id]() {
-                return *activeTab == id ? Color{30, 30, 30, 255}
-                                       : Color{37, 37, 38, 255};
+            [activeTab, id, theme]() {
+                const ThemePalette &p = paletteFor(*theme);
+                return *activeTab == id ? p.tabActiveBg : p.tabInactiveBg;
             });
 
-        // Clicking anywhere on the tab (other than the close button,
-        // which hit-tests to itself first) activates it.
+
         tab.onClick = [activeTab, id]() { *activeTab = id; };
 
         Text label;
         label.label = title;
         label.fontSize = 13.0f;
-        label.color = std::function<Color()>([activeTab, id]() {
-            return *activeTab == id ? Color{255, 255, 255, 255}
-                                   : Color{170, 170, 170, 255};
+        label.color = std::function<Color()>([activeTab, id, theme]() {
+            const ThemePalette &p = paletteFor(*theme);
+            return *activeTab == id ? p.tabActiveText : p.tabInactiveText;
         });
         tab.addChild(label);
 
-        // Close button: its own onClick means hitTest resolves to this
-        // view specifically when clicked, not the parent tab, so closing
-        // never also triggers the "activate" click above.
+
         View closeBtn;
         closeBtn.style.width = Size::pixel(16);
         closeBtn.style.height = Size::pixel(16);
@@ -355,7 +458,7 @@ int main() {
         Text closeGlyph;
         closeGlyph.label = std::string("\u00D7"); // ×
         closeGlyph.fontSize = 13.0f;
-        closeGlyph.color = Color{170, 170, 170, 255};
+        closeGlyph.color = themeColor(&ThemePalette::glyphColor);
         closeBtn.addChild(closeGlyph);
 
         tab.addChild(closeBtn);
@@ -381,7 +484,7 @@ int main() {
     Text newTabGlyph;
     newTabGlyph.label = std::string("+");
     newTabGlyph.fontSize = 16.0f;
-    newTabGlyph.color = Color{170, 170, 170, 255};
+    newTabGlyph.color = themeColor(&ThemePalette::glyphColor);
     newTabBtn.addChild(newTabGlyph);
 
     tabBarContainer.addChild(tabStrip);
@@ -392,7 +495,7 @@ int main() {
     View editorArea;
     editorArea.style.flexGrow = 1;
     editorArea.style.width = Size::full();
-    editorArea.style.backgroundColor = Color{30, 30, 30, 255};
+    editorArea.style.backgroundColor = themeColor(&ThemePalette::editorBg);
     editorArea.style.direction = FlexDirection::Column;
     editorArea.style.justifyContent = Justify::Center;
     editorArea.style.alignItems = Align::Center;
@@ -406,7 +509,7 @@ int main() {
             return "No tabs open";
         });
     editorLabel.fontSize = 20.0f;
-    editorLabel.color = Color{150, 150, 150, 255};
+    editorLabel.color = themeColor(&ThemePalette::editorLabelColor);
     editorArea.addChild(editorLabel);
 
     // ---- Horizontal divider — editor <-> terminal ----
@@ -415,7 +518,7 @@ int main() {
     hDivider.style.flexGrow = 0;
     hDivider.style.flexShrink = 0;
     hDivider.style.height = Size::pixel(hDividerHeight);
-    hDivider.style.backgroundColor = Color{30, 30, 30, 255};
+    hDivider.style.backgroundColor = themeColor(&ThemePalette::dividerBg);
     hDivider.style.hoverColor = Color{80, 80, 220, 255};
 
     auto updateTerminalHeight = [terminalHeight, hDividerHeight,
@@ -436,7 +539,7 @@ int main() {
     terminal.style.flexGrow = 0;
     terminal.style.flexShrink = 0;
     terminal.style.direction = FlexDirection::Column;
-    terminal.style.backgroundColor = Color{24, 24, 24, 255};
+    terminal.style.backgroundColor = themeColor(&ThemePalette::terminalBg);
     terminal.style.padding = EdgeInsets::all(10.0f);
     terminal.style.overflowY = Overflow::Hidden;
 
@@ -448,14 +551,14 @@ int main() {
     terminalTitle.label = std::string("TERMINAL");
     terminalTitle.fontSize = 12.0f;
     terminalTitle.fontWeight = FontWeight::SemiBold;
-    terminalTitle.color = Color{180, 180, 180, 255};
+    terminalTitle.color = themeColor(&ThemePalette::terminalTitleColor);
     terminal.addChild(terminalTitle);
 
     Text terminalPrompt;
     terminalPrompt.label = std::string("$ ");
     terminalPrompt.fontSize = 13.0f;
     terminalPrompt.fontFamily = "monospace";
-    terminalPrompt.color = Color{100, 220, 130, 255};
+    terminalPrompt.color = themeColor(&ThemePalette::terminalPromptColor);
     terminalPrompt.style.margin = EdgeInsets{8, 0, 0, 0};
     terminal.addChild(terminalPrompt);
 

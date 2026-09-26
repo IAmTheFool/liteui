@@ -8,12 +8,149 @@
 
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-// Mutable state for a TextArea, held by shared_ptr so every copy of the
-// View a TextArea flattens into (addChild copies Views, same reasoning
-// as TextInputState) still shares one live document/cursor/scroll state.
+namespace theme {
+
+enum class Theme { Dark, Light, Monokai };
+
+struct Palette {
+  Color appBg, topBarBg, titleText, statusText;
+  Color editorBg, textColor, placeholderColor, caretColor;
+  Color borderColor, focusedBorderColor, lineNumberColor, lineNumberBg;
+};
+
+inline const Palette &lightPalette() {
+  static const Palette p{
+      .appBg = {250, 250, 250},
+      .topBarBg = {235, 235, 235},
+      .titleText = {90, 90, 90},
+      .statusText = {130, 130, 130},
+      .editorBg = {255, 255, 255},
+      .textColor = {20, 20, 20},
+      .placeholderColor = {160, 160, 160},
+      .caretColor = {20, 20, 20},
+      .borderColor = {180, 180, 180},
+      .focusedBorderColor = {50, 120, 220},
+      .lineNumberColor = {170, 170, 170},
+      .lineNumberBg = {245, 245, 245},
+  };
+  return p;
+}
+
+inline const Palette &darkPalette() {
+  static const Palette p{
+      .appBg = {30, 30, 30},
+      .topBarBg = {45, 45, 45},
+      .titleText = {200, 200, 200},
+      .statusText = {150, 150, 150},
+      .editorBg = {30, 30, 30},
+      .textColor = {212, 212, 212},
+      .placeholderColor = {120, 120, 120},
+      .caretColor = {220, 220, 220},
+      .borderColor = {70, 70, 70},
+      .focusedBorderColor = {0, 122, 204},
+      .lineNumberColor = {110, 110, 110},
+      .lineNumberBg = {37, 37, 38},
+  };
+  return p;
+}
+
+inline const Palette &monokaiPalette() {
+  static const Palette p{
+      .appBg = {39, 40, 34},
+      .topBarBg = {50, 51, 44},
+      .titleText = {248, 248, 242},
+      .statusText = {160, 160, 150},
+      .editorBg = {39, 40, 34},
+      .textColor = {248, 248, 242},
+      .placeholderColor = {117, 113, 94},
+      .caretColor = {248, 248, 242},
+      .borderColor = {70, 71, 62},
+      .focusedBorderColor = {249, 38, 114},
+      .lineNumberColor = {117, 113, 94},
+      .lineNumberBg = {45, 46, 40},
+  };
+  return p;
+}
+
+inline const Palette &paletteFor(Theme t) {
+  switch (t) {
+  case Theme::Dark:
+    return darkPalette();
+  case Theme::Monokai:
+    return monokaiPalette();
+  case Theme::Light:
+  default:
+    return lightPalette();
+  }
+}
+
+inline const char *name(Theme t) {
+  switch (t) {
+  case Theme::Dark:
+    return "Dark";
+  case Theme::Monokai:
+    return "Monokai";
+  case Theme::Light:
+  default:
+    return "Light";
+  }
+}
+
+inline Color appBg = lightPalette().appBg;
+inline Color topBarBg = lightPalette().topBarBg;
+inline Color titleText = lightPalette().titleText;
+inline Color statusText = lightPalette().statusText;
+inline Color editorBg = lightPalette().editorBg;
+inline Color textColor = lightPalette().textColor;
+inline Color placeholderColor = lightPalette().placeholderColor;
+inline Color caretColor = lightPalette().caretColor;
+inline Color borderColor = lightPalette().borderColor;
+inline Color focusedBorderColor = lightPalette().focusedBorderColor;
+inline Color lineNumberColor = lightPalette().lineNumberColor;
+inline Color lineNumberBg = lightPalette().lineNumberBg;
+
+inline Theme &current() {
+  static Theme t = Theme::Light;
+  return t;
+}
+
+inline void setTheme(Theme t) {
+  current() = t;
+  const Palette &p = paletteFor(t);
+  appBg = p.appBg;
+  topBarBg = p.topBarBg;
+  titleText = p.titleText;
+  statusText = p.statusText;
+  editorBg = p.editorBg;
+  textColor = p.textColor;
+  placeholderColor = p.placeholderColor;
+  caretColor = p.caretColor;
+  borderColor = p.borderColor;
+  focusedBorderColor = p.focusedBorderColor;
+  lineNumberColor = p.lineNumberColor;
+  lineNumberBg = p.lineNumberBg;
+}
+
+inline void cycleTheme() {
+  switch (current()) {
+  case Theme::Light:
+    setTheme(Theme::Dark);
+    break;
+  case Theme::Dark:
+    setTheme(Theme::Monokai);
+    break;
+  case Theme::Monokai:
+    setTheme(Theme::Light);
+    break;
+  }
+}
+
+} // namespace theme
+
 struct TextAreaState {
   std::vector<std::string> lines{std::string()}; // always >= 1 entry
   size_t cursorLine = 0;
@@ -24,15 +161,10 @@ struct TextAreaState {
   int blinkTimerHandle = -1;
   float scrollX = 0.0f; // pixels, applied uniformly to every visible line
   float scrollY = 0.0f; // pixels
-  // Cached from the most recent onPaint call, so onKeyDown/onScrollUp/
-  // onScrollDown (which have no CanvasContext of their own) can still
-  // clamp scrolling and compute page-up/page-down step sizes.
   float lastViewW = 0.0f, lastViewH = 0.0f;
+  float fontSize = 15.0f;
 };
 
-// Joins state->lines back into the single '\n'-separated string shape
-// TextArea::onChange (and any app code reading the current contents)
-// wants.
 inline std::string textAreaJoin(const TextAreaState &s) {
   std::string out;
   for (size_t i = 0; i < s.lines.size(); ++i) {
@@ -43,26 +175,20 @@ inline std::string textAreaJoin(const TextAreaState &s) {
   return out;
 }
 
-// Author-facing struct. addChild-style usage: pass to toTextAreaView()
-// and add the resulting View, e.g. `parent.addChild(toTextAreaView(ta));`
-// — TextArea isn't wired into View::addChild overloads directly (this
-// header ships separately from liteui.hpp), so call toTextAreaView()
-// explicitly instead of the addChild(Text)/addChild(Canvas) shorthand.
 struct TextArea {
   Style style;
   std::string text; // initial content; split on '\n'
   std::string placeholder;
   float fontSize = 15.0f;
   FontWeight fontWeight = FontWeight::Regular;
-  std::string fontFamily; // empty = platform default; set e.g. "Consolas"
-                          // or "Monospace" for a code-editor feel
-  Color textColor = Color{20, 20, 20};
-  Color placeholderColor = Color{160, 160, 160};
-  Color caretColor = Color{20, 20, 20};
-  Color borderColor = Color{180, 180, 180};
-  Color focusedBorderColor = Color{50, 120, 220};
-  Color lineNumberColor = Color{170, 170, 170};
-  Color lineNumberBackground = Color{245, 245, 245};
+  std::string fontFamily;
+  std::optional<Color> textColor;
+  std::optional<Color> placeholderColor;
+  std::optional<Color> caretColor;
+  std::optional<Color> borderColor;
+  std::optional<Color> focusedBorderColor;
+  std::optional<Color> lineNumberColor;
+  std::optional<Color> lineNumberBackground;
   bool showLineNumbers = true;
   float padding = 8.0f;
   float lineHeight = 0.0f; // 0 = auto (fontSize * 1.4)
@@ -93,33 +219,42 @@ inline View toTextAreaView(TextArea ta) {
   state->cursorCol = state->lines.back().size();
 
   TextStyle ts;
-  ts.fontSize = ta.fontSize;
-  ts.fontWeight = ta.fontWeight;
   ts.fontFamily = ta.fontFamily;
   ts.wrap = TextWrap::NoWrap;
+  state->fontSize = ta.fontSize;
+  FontWeight resolvedFontWeight = ta.fontWeight;
+  FontStyle resolvedFontStyle =
+      FontStyle::Normal; // not yet exposed on TextArea
 
-  float lineH = ta.lineHeight > 0 ? ta.lineHeight : ta.fontSize * 1.4f;
+  float lineHeightOverride = ta.lineHeight;
+  auto lineH = [state, lineHeightOverride]() -> float {
+    return lineHeightOverride > 0.0f ? lineHeightOverride
+                                     : state->fontSize * 1.4f;
+  };
   float pad = ta.padding;
   bool showNums = ta.showLineNumbers;
   int tabSpaces = std::max(1, ta.tabWidthSpaces);
-  Color textColor = ta.textColor;
-  Color placeholderColor = ta.placeholderColor;
-  Color caretColor = ta.caretColor;
-  Color lineNumColor = ta.lineNumberColor;
-  Color lineNumBg = ta.lineNumberBackground;
+  std::optional<Color> textColorOverride = ta.textColor;
+  std::optional<Color> placeholderColorOverride = ta.placeholderColor;
+  std::optional<Color> caretColorOverride = ta.caretColor;
+  std::optional<Color> lineNumColorOverride = ta.lineNumberColor;
+  std::optional<Color> lineNumBgOverride = ta.lineNumberBackground;
   std::string placeholder = ta.placeholder;
   auto onChange = ta.onChange;
-  Color borderColor = ta.borderColor;
-  Color focusedBorderColor = ta.focusedBorderColor;
+  std::optional<Color> borderColorOverride = ta.borderColor;
+  std::optional<Color> focusedBorderColorOverride = ta.focusedBorderColor;
 
   View v;
   v.style = std::move(ta.style);
   v.isCanvas = true;
   v.focusable = true;
 
-  // Border color reflects focus automatically, same idiom TextInput uses.
-  v.style.borderColor = [state, borderColor, focusedBorderColor] {
-    return state->focused ? focusedBorderColor : borderColor;
+
+  v.style.borderColor = [state, borderColorOverride,
+                         focusedBorderColorOverride] {
+    if (state->focused)
+      return focusedBorderColorOverride.value_or(theme::focusedBorderColor);
+    return borderColorOverride.value_or(theme::borderColor);
   };
 
   v.canvasDirtySource = [state] {
@@ -128,9 +263,9 @@ inline View toTextAreaView(TextArea ta) {
     return d;
   };
 
-  // Width of the line-number gutter, given how many lines currently
-  // exist — grows as the document gets longer ("9" -> "10" -> "100").
-  auto gutterWidth = [showNums, ts](size_t lineCount) -> float {
+
+  auto gutterWidth = [showNums, ts, state, resolvedFontWeight,
+                      resolvedFontStyle](size_t lineCount) -> float {
     if (!showNums)
       return 0.0f;
     int digits = 1;
@@ -140,7 +275,8 @@ inline View toTextAreaView(TextArea ta) {
       ++digits;
     }
     liteui_text::Measurement m =
-        liteui_text::measure(std::string(digits + 1, '0'), ts, -1);
+        liteui_text::measure(std::string(digits + 1, '0'), ts, state->fontSize,
+                             resolvedFontWeight, resolvedFontStyle, -1);
     return m.width + 12.0f; // a little breathing room on each side
   };
 
@@ -150,6 +286,14 @@ inline View toTextAreaView(TextArea ta) {
   };
 
   v.onPaint = [=](CanvasContext &ctx) {
+
+    Color textColor = textColorOverride.value_or(theme::textColor);
+    Color placeholderColor =
+        placeholderColorOverride.value_or(theme::placeholderColor);
+    Color caretColor = caretColorOverride.value_or(theme::caretColor);
+    Color lineNumColor = lineNumColorOverride.value_or(theme::lineNumberColor);
+    Color lineNumBg = lineNumBgOverride.value_or(theme::lineNumberBg);
+
     state->lastViewW = ctx.width();
     state->lastViewH = ctx.height();
     float gutter = gutterWidth(state->lines.size());
@@ -157,21 +301,20 @@ inline View toTextAreaView(TextArea ta) {
     float availW = std::max(0.0f, ctx.width() - textLeft - pad);
     float availH = std::max(0.0f, ctx.height() - pad * 2.0f);
 
-    // Keep the caret's line vertically in view.
-    float caretTop = state->cursorLine * lineH;
+
+    float caretTop = state->cursorLine * lineH();
     if (caretTop - state->scrollY < 0)
       state->scrollY = caretTop;
-    if (caretTop + lineH - state->scrollY > availH)
-      state->scrollY = caretTop + lineH - availH;
-    float maxScrollY = std::max(0.0f, state->lines.size() * lineH - availH);
+    if (caretTop + lineH() - state->scrollY > availH)
+      state->scrollY = caretTop + lineH() - availH;
+    float maxScrollY = std::max(0.0f, state->lines.size() * lineH() - availH);
     state->scrollY = std::clamp(state->scrollY, 0.0f, maxScrollY);
 
-    // Keep the caret's column horizontally in view. scrollX is applied
-    // uniformly to every visible line (see the file-level limitations
-    // note) — only the current line's caret position drives it.
+
     const std::string &curLine = state->lines[state->cursorLine];
-    liteui_text::Measurement caretM =
-        liteui_text::measure(curLine.substr(0, state->cursorCol), ts, -1);
+    liteui_text::Measurement caretM = liteui_text::measure(
+        curLine.substr(0, state->cursorCol), ts, state->fontSize,
+        resolvedFontWeight, resolvedFontStyle, -1);
     if (caretM.width - state->scrollX > availW)
       state->scrollX = caretM.width - availW;
     if (caretM.width - state->scrollX < 0)
@@ -188,22 +331,23 @@ inline View toTextAreaView(TextArea ta) {
       ctx.fillRect(0, 0, gutter + pad, ctx.height());
     }
 
-    ctx.setFont(ts.fontFamily, ts.fontSize, ts.fontWeight, ts.fontStyle);
+    ctx.setFont(ts.fontFamily, state->fontSize, resolvedFontWeight,
+                resolvedFontStyle);
     ctx.setTextBaseline(TextBaseline::Middle);
     ctx.setTextAlign(TextAlign::Start);
 
-    int firstLine = std::max(0, static_cast<int>(state->scrollY / lineH));
+    int firstLine = std::max(0, static_cast<int>(state->scrollY / lineH()));
     int lastLine =
         std::min(static_cast<int>(state->lines.size()) - 1,
-                 static_cast<int>((state->scrollY + availH) / lineH) + 1);
+                 static_cast<int>((state->scrollY + availH) / lineH()) + 1);
 
     bool empty = state->lines.size() == 1 && state->lines[0].empty();
     if (empty && !state->focused && !placeholder.empty()) {
       ctx.setFillColor(placeholderColor);
-      ctx.fillText(placeholder, textLeft, pad + lineH / 2.0f);
+      ctx.fillText(placeholder, textLeft, pad + lineH() / 2.0f);
     } else {
       for (int i = firstLine; i <= lastLine; ++i) {
-        float y = pad + i * lineH - state->scrollY + lineH / 2.0f;
+        float y = pad + i * lineH() - state->scrollY + lineH() / 2.0f;
         if (gutter > 0) {
           ctx.setFillColor(lineNumColor);
           ctx.setTextAlign(TextAlign::End);
@@ -217,10 +361,10 @@ inline View toTextAreaView(TextArea ta) {
     }
 
     if (state->focused && state->blinkOn) {
-      float cy = pad + state->cursorLine * lineH - state->scrollY;
+      float cy = pad + state->cursorLine * lineH() - state->scrollY;
       ctx.setFillColor(caretColor);
       ctx.fillRect(textLeft - state->scrollX + caretM.width, cy + 2.0f, 1.5f,
-                   std::max(0.0f, lineH - 4.0f));
+                   std::max(0.0f, lineH() - 4.0f));
     }
 
     ctx.restore();
@@ -229,12 +373,13 @@ inline View toTextAreaView(TextArea ta) {
   v.onPressAt = [=](float lx, float ly) {
     float gutter = gutterWidth(state->lines.size());
     float textLeft = pad + gutter;
-    int line = static_cast<int>((ly - pad + state->scrollY) / lineH);
+    int line = static_cast<int>((ly - pad + state->scrollY) / lineH());
     line = std::clamp(line, 0, static_cast<int>(state->lines.size()) - 1);
     state->cursorLine = static_cast<size_t>(line);
     float localX = lx - textLeft + state->scrollX;
     state->cursorCol = liteui_text::caretIndexForX(
-        state->lines[state->cursorLine], ts, std::max(0.0f, localX));
+        state->lines[state->cursorLine], ts, state->fontSize,
+        resolvedFontWeight, resolvedFontStyle, std::max(0.0f, localX));
     state->blinkOn = true;
     state->dirty = true;
   };
@@ -259,17 +404,15 @@ inline View toTextAreaView(TextArea ta) {
     }
   };
 
-  // Discrete wheel notches scroll a fixed number of lines — see the
-  // file-level note on why this Canvas node doesn't get the library's
-  // pixel-based wheel scrolling automatically.
+
   v.onScrollUp = [state, lineH] {
-    state->scrollY = std::max(0.0f, state->scrollY - lineH * 3.0f);
+    state->scrollY = std::max(0.0f, state->scrollY - lineH() * 3.0f);
     state->dirty = true;
   };
   v.onScrollDown = [state, lineH] {
     float maxScrollY =
-        std::max(0.0f, state->lines.size() * lineH - state->lastViewH);
-    state->scrollY = std::min(maxScrollY, state->scrollY + lineH * 3.0f);
+        std::max(0.0f, state->lines.size() * lineH() - state->lastViewH);
+    state->scrollY = std::min(maxScrollY, state->scrollY + lineH() * 3.0f);
     state->dirty = true;
   };
 
@@ -314,15 +457,15 @@ inline View toTextAreaView(TextArea ta) {
       col = lines[ln].size();
       break;
     case Key::PageUp: {
-      float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
-      int step = std::max(1, static_cast<int>(availH / lineH));
+      float availH = std::max(lineH(), state->lastViewH - pad * 2.0f);
+      int step = std::max(1, static_cast<int>(availH / lineH()));
       ln = static_cast<size_t>(std::max(0, static_cast<int>(ln) - step));
       col = std::min(col, lines[ln].size());
       break;
     }
     case Key::PageDown: {
-      float availH = std::max(lineH, state->lastViewH - pad * 2.0f);
-      int step = std::max(1, static_cast<int>(availH / lineH));
+      float availH = std::max(lineH(), state->lastViewH - pad * 2.0f);
+      int step = std::max(1, static_cast<int>(availH / lineH()));
       ln = std::min(lines.size() - 1, ln + static_cast<size_t>(step));
       col = std::min(col, lines[ln].size());
       break;
@@ -392,15 +535,37 @@ inline View toTextAreaView(TextArea ta) {
 }
 
 int main() {
-  LiteUI ui("Simple Text Editor",900, 650);
+  LiteUI ui("Simple Text Editor", 900, 650);
 
   View root;
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
   root.style.height = Size::full();
-  root.style.backgroundColor = Color{250, 250, 250};
+  root.style.backgroundColor = [] { return theme::appBg; };
 
-  // ---- top bar: filename on the left, live char count on the right ----
+  // ---- editor: built first so editorState exists before themeBtn's
+  // onClick (further down) needs to capture it ----
+  TextArea editor;
+  editor.style.flexGrow = 1;
+  editor.style.backgroundColor = [] { return theme::editorBg; };
+  editor.placeholder = "Start typing...";
+  editor.fontSize = 15;
+  editor.fontFamily = ""; // set e.g. "Consolas" (Win) / "Monospace" (Linux)
+                          // for a code-editor look
+  editor.showLineNumbers = true;
+
+  auto statusLabel = std::make_shared<std::string>("0 chars");
+  editor.onChange = [statusLabel](const std::string &text) {
+    *statusLabel = std::to_string(text.size()) + " chars";
+  };
+
+  // Keep a handle to the shared editing state so the Ctrl+S shortcut
+  // and the theme toggle below can both use it after `editor` itself is
+  // consumed by toTextAreaView() — editor.state is a shared_ptr, so this
+  // alias stays valid regardless.
+  auto editorState = editor.state;
+
+  // ---- top bar: filename, live char count, theme toggle ----
   View topBar;
   topBar.style.direction = FlexDirection::Row;
   topBar.style.alignItems = Align::Center;
@@ -408,45 +573,98 @@ int main() {
   topBar.style.padding = EdgeInsets{8, 12, 8, 12};
   topBar.style.width = Size::full();
   topBar.style.height = Size::pixel(36);
-  topBar.style.backgroundColor = Color{235, 235, 235};
+  topBar.style.backgroundColor = [] { return theme::topBarBg; };
 
   Text title;
   title.label = std::string("untitled.txt");
   title.fontSize = 13;
-  title.color = Color{90, 90, 90};
+  title.color = [] { return theme::titleText; };
   topBar.addChild(title);
 
   // A plain shared string the status Text polls every dispatch cycle
   // (click/key/timer) via its Dynamic<std::string> label — same idiom
   // TextInput/TextArea use for their own dynamic fields.
-  auto statusLabel = std::make_shared<std::string>("0 chars");
   Text statusText;
   statusText.label = [statusLabel] { return *statusLabel; };
   statusText.fontSize = 12;
-  statusText.color = Color{130, 130, 130};
+  statusText.color = [] { return theme::statusText; };
   topBar.addChild(statusText);
 
-  root.addChild(topBar);
+  // ---- font size controls: click to shrink/grow the editor's text ----
+  // editorState->fontSize is read fresh by onPaint/onPressAt/onKeyDown
+  // (see toTextAreaView) rather than captured once, so just mutating it
+  // and flagging dirty is enough to make the change show up — no need
+  // to rebuild the TextArea's View.
+  constexpr float kFontSizeStep = 1.0f;
+  constexpr float kMinFontSize = 8.0f;
+  constexpr float kMaxFontSize = 48.0f;
 
-  // ---- editor: fills all remaining vertical space ----
-  TextArea editor;
+  Text decreaseFontText;
+  decreaseFontText.label = std::string("A-");
+  decreaseFontText.fontSize = 12;
+  decreaseFontText.color = [] { return theme::statusText; };
 
-  editor.style.flexGrow = 1;
-  editor.style.backgroundColor = Color{255, 255, 255};
-  editor.placeholder = "Start typing...";
-  editor.fontSize = 15;
-  editor.fontFamily = ""; // set e.g. "Consolas" (Win) / "Monospace" (Linux)
-                          // for a code-editor look
-  editor.showLineNumbers = true;
-  editor.onChange = [statusLabel](const std::string &text) {
-    *statusLabel = std::to_string(text.size()) + " chars";
+  View decreaseFontBtn;
+  decreaseFontBtn.style.padding = EdgeInsets{2, 8, 2, 8};
+  decreaseFontBtn.style.borderRadius = 4.0f;
+  decreaseFontBtn.style.hoverColor = theme::topBarBg;
+  decreaseFontBtn.addChild(decreaseFontText);
+  decreaseFontBtn.onClick = [editorState, kMinFontSize, kFontSizeStep] {
+    editorState->fontSize =
+        std::max(kMinFontSize, editorState->fontSize - kFontSizeStep);
+    editorState->dirty = true;
   };
+  topBar.addChild(decreaseFontBtn);
 
-  // Keep a handle to the shared editing state so the Ctrl+S shortcut
-  // below can read the document's current contents — editor.state is a
-  // shared_ptr, so this alias stays valid regardless of what happens to
-  // the (now-consumed) `editor` value passed into toTextAreaView.
-  auto editorState = editor.state;
+  // Live label showing the current size — polled every dispatch cycle
+  // via Text's Dynamic<std::string> label, same idiom as statusText.
+  Text fontSizeLabel;
+  fontSizeLabel.label = [editorState] {
+    return std::to_string(static_cast<int>(editorState->fontSize)) + "px";
+  };
+  fontSizeLabel.fontSize = 12;
+  fontSizeLabel.color = [] { return theme::statusText; };
+  topBar.addChild(fontSizeLabel);
+
+  Text increaseFontText;
+  increaseFontText.label = std::string("A+");
+  increaseFontText.fontSize = 12;
+  increaseFontText.color = [] { return theme::statusText; };
+
+  View increaseFontBtn;
+  increaseFontBtn.style.padding = EdgeInsets{2, 8, 2, 8};
+  increaseFontBtn.style.borderRadius = 4.0f;
+  increaseFontBtn.style.hoverColor = theme::topBarBg;
+  increaseFontBtn.addChild(increaseFontText);
+  increaseFontBtn.onClick = [editorState, kMaxFontSize, kFontSizeStep] {
+    editorState->fontSize =
+        std::min(kMaxFontSize, editorState->fontSize + kFontSizeStep);
+    editorState->dirty = true;
+  };
+  topBar.addChild(increaseFontBtn);
+
+  // ---- theme toggle: click to cycle Light -> Dark -> Monokai -> ... ----
+  auto themeLabel =
+      std::make_shared<std::string>(theme::name(theme::current()));
+  Text themeText;
+  themeText.label = [themeLabel] { return "Theme: " + *themeLabel; };
+  themeText.fontSize = 12;
+  themeText.color = [] { return theme::statusText; };
+
+  View themeBtn;
+  themeBtn.style.padding = EdgeInsets{2, 8, 2, 8};
+  themeBtn.style.borderRadius = 4.0f;
+  themeBtn.style.hoverColor = theme::topBarBg;
+  themeBtn.addChild(themeText);
+
+  themeBtn.onClick = [themeLabel, editorState] {
+    theme::cycleTheme();
+    *themeLabel = theme::name(theme::current());
+    editorState->dirty = true;
+  };
+  topBar.addChild(themeBtn);
+
+  root.addChild(topBar);
 
   View editorWrap;
   editorWrap.style.width = Size::full();

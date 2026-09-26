@@ -288,6 +288,16 @@ inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache) {
   return cache;
 }
 
+// For a Dynamic<> field built from a source that's inherently never a
+// callback (Canvas::setFont's plain params, a TextInput's/TooltipStyle's
+// plain fields, ...) — no polled cache exists or is needed for these, so
+// there's nothing to fall back to. Throws (via std::get) if that
+// assumption is ever violated, rather than silently resolving to a wrong
+// default.
+template <class T> inline const T &resolveStatic(const Dynamic<T> &field) {
+  return std::get<T>(field);
+}
+
 // ---------------- Layout engine: Size / Style / View ----------------
 
 // A size along one axis. Fixed/Percentage are self-explanatory; Fit sizes
@@ -445,9 +455,9 @@ enum class TextWrap { Wrap, NoWrap };
 // flattens into (see View::toView below). Kept as its own struct so View
 // doesn't have to duplicate every Text field under a different name.
 struct TextStyle {
-  float fontSize = 16.0f;
-  FontWeight fontWeight = FontWeight::Regular;
-  FontStyle fontStyle = FontStyle::Normal;
+  Dynamic<float> fontSize = 16.0f;
+  Dynamic<FontWeight> fontWeight = FontWeight::Regular;
+  Dynamic<FontStyle> fontStyle = FontStyle::Normal;
   std::string fontFamily; // empty = platform default UI font
   Dynamic<Color> color = Color{0, 0, 0};
   TextAlign align = TextAlign::Start;
@@ -3405,6 +3415,9 @@ public:
     mutable Visibility resolvedVisibility = Visibility::Visible;
     mutable int resolvedZIndex = 0;
     mutable Color resolvedTextColor{0, 0, 0};
+    mutable float resolvedFontSize = 16.0f;
+    mutable FontWeight resolvedFontWeight = FontWeight::Regular;
+    mutable FontStyle resolvedFontStyle = FontStyle::Normal;
     mutable EdgeInsets resolvedMargin;
     mutable EdgeInsets resolvedPadding;
     // Key list the current `children` were built for; compared against
@@ -3424,6 +3437,12 @@ public:
     mutable IDWriteTextLayout *textLayout = nullptr;
     mutable float textLayoutBuiltForWidth = -1.0f;
     mutable std::string textLayoutBuiltForText;
+    // Font values the layout above was built for — a Dynamic<> fontSize/
+    // fontWeight/fontStyle can change without the text or the box width
+    // changing, and that alone must still invalidate the cached layout.
+    mutable float textLayoutBuiltForFontSize = -1.0f;
+    mutable FontWeight textLayoutBuiltForFontWeight = FontWeight::Regular;
+    mutable FontStyle textLayoutBuiltForFontStyle = FontStyle::Normal;
     // A GPU-backed offscreen render target the size of this canvas node's
     // inner (padding-excluded) content box, drawn into by onPaint and
     // then blitted into the window's own render target every paint pass
@@ -3436,6 +3455,11 @@ public:
     mutable int textTexW = 0, textTexH = 0;
     mutable float textTextureBuiltForWidth = -1.0f;
     mutable std::string textTextureBuiltForText;
+    // See textLayoutBuiltForFontSize/Weight/Style above — same reasoning,
+    // Linux/Cairo side.
+    mutable float textTextureBuiltForFontSize = -1.0f;
+    mutable FontWeight textTextureBuiltForFontWeight = FontWeight::Regular;
+    mutable FontStyle textTextureBuiltForFontStyle = FontStyle::Normal;
     // A CPU-side Cairo image surface the size of this canvas node's inner
     // content box, drawn into by onPaint, then converted+uploaded as an
     // RGBA GL texture for actual display (see
@@ -3607,15 +3631,17 @@ inline DWRITE_FONT_STYLE toDWriteStyle(FontStyle s) {
 // measuring a Fit-width node's intrinsic single-line size). Caller owns
 // the returned pointer.
 inline IDWriteTextLayout *makeLayout(const std::string &text,
-                                     const TextStyle &style, float availWidth,
+                                     const TextStyle &style, float fontSize,
+                                     FontWeight fontWeight,
+                                     FontStyle fontStyleVal, float availWidth,
                                      float availHeight) {
   std::wstring wfam =
       style.fontFamily.empty() ? L"Segoe UI" : toWide(style.fontFamily);
   IDWriteTextFormat *format = nullptr;
   factory()->CreateTextFormat(
-      wfam.c_str(), nullptr, toDWriteWeight(style.fontWeight),
-      toDWriteStyle(style.fontStyle), DWRITE_FONT_STRETCH_NORMAL,
-      style.fontSize, L"", &format);
+      wfam.c_str(), nullptr, toDWriteWeight(fontWeight),
+      toDWriteStyle(fontStyleVal), DWRITE_FONT_STRETCH_NORMAL,
+      fontSize, L"", &format);
   if (!format)
     throw std::runtime_error("CreateTextFormat failed");
   format->SetWordWrapping(style.wrap == TextWrap::Wrap
@@ -3677,11 +3703,13 @@ inline IDWriteTextLayout *makeLayout(const std::string &text,
 // metrics back. The renderer's own cached layout (built per-paint, see
 // LiteUI::ensureTextLayout) is what's actually drawn.
 inline Measurement measure(const std::string &text, const TextStyle &style,
-                           float availWidth) {
+                           float fontSize, FontWeight fontWeight,
+                           FontStyle fontStyleVal, float availWidth) {
   float w =
       availWidth >= 0 ? availWidth : std::numeric_limits<float>::max() / 4;
   float h = std::numeric_limits<float>::max() / 4;
-  IDWriteTextLayout *layout = makeLayout(text, style, w, h);
+  IDWriteTextLayout *layout =
+      makeLayout(text, style, fontSize, fontWeight, fontStyleVal, w, h);
   DWRITE_TEXT_METRICS m;
   layout->GetMetrics(&m);
   float outH = m.height;
@@ -3701,11 +3729,13 @@ inline Measurement measure(const std::string &text, const TextStyle &style,
 // (clickX measured from the text's own left edge). O(n) — fine for
 // typical single-line field text.
 inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
-                             float clickX) {
+                             float fontSize, FontWeight fontWeight,
+                             FontStyle fontStyleVal, float clickX) {
   float best = 1e9f;
   size_t bestIdx = 0;
   for (size_t i = 0; i <= text.size(); ++i) {
-    Measurement m = measure(text.substr(0, i), style, -1);
+    Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
+                            fontStyleVal, -1);
     float d = std::abs(m.width - clickX);
     if (d < best) {
       best = d;
@@ -3717,18 +3747,21 @@ inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
 
 #else // Linux — Pango/Cairo
 
-inline PangoFontDescription *makeFontDescription(const TextStyle &style) {
+inline PangoFontDescription *makeFontDescription(const TextStyle &style,
+                                                  float fontSize,
+                                                  FontWeight fontWeight,
+                                                  FontStyle fontStyleVal) {
   PangoFontDescription *desc = pango_font_description_new();
   pango_font_description_set_family(
       desc, style.fontFamily.empty() ? "Sans" : style.fontFamily.c_str());
   pango_font_description_set_weight(
-      desc, static_cast<PangoWeight>(static_cast<int>(style.fontWeight)));
-  pango_font_description_set_style(desc, style.fontStyle == FontStyle::Italic
+      desc, static_cast<PangoWeight>(static_cast<int>(fontWeight)));
+  pango_font_description_set_style(desc, fontStyleVal == FontStyle::Italic
                                              ? PANGO_STYLE_ITALIC
                                              : PANGO_STYLE_NORMAL);
   // Absolute pixel size sidesteps a DPI round-trip — everything else in
   // this file (layout, GL) already works in plain screen pixels.
-  pango_font_description_set_absolute_size(desc, style.fontSize * PANGO_SCALE);
+  pango_font_description_set_absolute_size(desc, fontSize * PANGO_SCALE);
   return desc;
 }
 
@@ -3743,10 +3776,13 @@ inline cairo_t *measureCr() {
 }
 
 inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
-                               float availWidth, cairo_t *cr) {
+                               float fontSize, FontWeight fontWeight,
+                               FontStyle fontStyleVal, float availWidth,
+                               cairo_t *cr) {
   PangoLayout *layout = pango_cairo_create_layout(cr);
   pango_layout_set_text(layout, text.c_str(), -1);
-  PangoFontDescription *desc = makeFontDescription(style);
+  PangoFontDescription *desc =
+      makeFontDescription(style, fontSize, fontWeight, fontStyleVal);
   pango_layout_set_font_description(layout, desc);
   pango_font_description_free(desc);
   pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
@@ -3809,8 +3845,10 @@ inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
 }
 
 inline Measurement measure(const std::string &text, const TextStyle &style,
-                           float availWidth) {
-  PangoLayout *layout = makeLayout(text, style, availWidth, measureCr());
+                           float fontSize, FontWeight fontWeight,
+                           FontStyle fontStyleVal, float availWidth) {
+  PangoLayout *layout = makeLayout(text, style, fontSize, fontWeight,
+                                   fontStyleVal, availWidth, measureCr());
   int w, h;
   pango_layout_get_pixel_size(layout, &w, &h);
   Measurement result{static_cast<float>(w), static_cast<float>(h)};
@@ -3824,11 +3862,13 @@ inline Measurement measure(const std::string &text, const TextStyle &style,
 // implementation above; only depends on measure(), so the logic is
 // identical on both platforms.
 inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
-                             float clickX) {
+                             float fontSize, FontWeight fontWeight,
+                             FontStyle fontStyleVal, float clickX) {
   float best = 1e9f;
   size_t bestIdx = 0;
   for (size_t i = 0; i <= text.size(); ++i) {
-    Measurement m = measure(text.substr(0, i), style, -1);
+    Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
+                            fontStyleVal, -1);
     float d = std::abs(m.width - clickX);
     if (d < best) {
       best = d;
@@ -4186,7 +4226,9 @@ public:
   };
   TextMetricsResult measureText(const std::string &text) {
     TextStyle ts = fontToTextStyle();
-    liteui_text::Measurement m = liteui_text::measure(text, ts, -1);
+    liteui_text::Measurement m = liteui_text::measure(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1);
     return {m.width};
   }
   void fillText(const std::string &text, float x, float y,
@@ -4554,8 +4596,9 @@ private:
   void drawTextImpl(const std::string &text, float x, float y, float,
                     bool stroked) {
     TextStyle ts = fontToTextStyle();
-    IDWriteTextLayout *layout =
-        liteui_text::makeLayout(text, ts, 1.0e6f, 1.0e6f);
+    IDWriteTextLayout *layout = liteui_text::makeLayout(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), 1.0e6f, 1.0e6f);
     DWRITE_TEXT_METRICS m;
     layout->GetMetrics(&m);
     float drawX = x, drawY = y;
@@ -4952,7 +4995,9 @@ public:
   };
   TextMetricsResult measureText(const std::string &text) {
     TextStyle ts = fontToTextStyle();
-    PangoLayout *layout = liteui_text::makeLayout(text, ts, -1, cr_);
+    PangoLayout *layout = liteui_text::makeLayout(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1, cr_);
     int w = 0, h = 0;
     pango_layout_get_pixel_size(layout, &w, &h);
     g_object_unref(layout);
@@ -5219,7 +5264,9 @@ private:
   void drawTextImpl(const std::string &text, float x, float y, float,
                     bool stroked) {
     TextStyle ts = fontToTextStyle();
-    PangoLayout *layout = liteui_text::makeLayout(text, ts, -1, cr_);
+    PangoLayout *layout = liteui_text::makeLayout(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1, cr_);
     int pw = 0, ph = 0;
     pango_layout_get_pixel_size(layout, &pw, &ph);
     PangoLayoutIter *iter = pango_layout_get_iter(layout);
@@ -5384,6 +5431,11 @@ inline Natural measureNatural(View &node, float availW, float availH,
                              : std::max(0.0f, outerW - pad.left - pad.right);
     liteui_text::Measurement m = liteui_text::measure(
         resolveDynamic(node.text, node.computed.resolvedText), node.textStyle,
+        resolveDynamic(node.textStyle.fontSize, node.computed.resolvedFontSize),
+        resolveDynamic(node.textStyle.fontWeight,
+                       node.computed.resolvedFontWeight),
+        resolveDynamic(node.textStyle.fontStyle,
+                       node.computed.resolvedFontStyle),
         measureWidth);
     float w = (widthIsFit || widthIndefinitePercentage)
                   ? clampSize(m.width + pad.left + pad.right,
@@ -6697,6 +6749,32 @@ private:
         changed = true;
       }
     }
+    if (auto *fn = std::get_if<std::function<float()>>(&v.textStyle.fontSize)) {
+      float next = (*fn)();
+      if (next != v.computed.resolvedFontSize) {
+        v.computed.resolvedFontSize = next;
+        v.computed.dirty = true;
+        changed = true; // affects text measurement — relayout() picked up by caller
+      }
+    }
+    if (auto *fn =
+            std::get_if<std::function<FontWeight()>>(&v.textStyle.fontWeight)) {
+      FontWeight next = (*fn)();
+      if (next != v.computed.resolvedFontWeight) {
+        v.computed.resolvedFontWeight = next;
+        v.computed.dirty = true;
+        changed = true; // affects text measurement — relayout() picked up by caller
+      }
+    }
+    if (auto *fn =
+            std::get_if<std::function<FontStyle()>>(&v.textStyle.fontStyle)) {
+      FontStyle next = (*fn)();
+      if (next != v.computed.resolvedFontStyle) {
+        v.computed.resolvedFontStyle = next;
+        v.computed.dirty = true;
+        changed = true; // affects text measurement — relayout() picked up by caller
+      }
+    }
     if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled)) {
       bool next = (*fn)();
       if (next != v.computed.resolvedDisabled) {
@@ -7741,8 +7819,9 @@ private:
     ts.fontSize = tooltipStyle_.fontSize;
     ts.fontFamily = tooltipStyle_.fontFamily;
     ts.wrap = TextWrap::NoWrap;
-    liteui_text::Measurement m =
-        liteui_text::measure(tooltipTarget_->tooltip, ts, -1);
+    liteui_text::Measurement m = liteui_text::measure(
+        tooltipTarget_->tooltip, ts, resolveStatic(ts.fontSize),
+        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle), -1);
     float pad = tooltipStyle_.padding;
     float boxW = m.width + pad * 2, boxH = m.height + pad * 2;
     float maxX = std::max(2.0f, width_ - boxW - 2.0f);
@@ -7752,7 +7831,9 @@ private:
 
     d2dFillRect(rt, bx, by, boxW, boxH, tooltipStyle_.background);
     IDWriteTextLayout *layout = liteui_text::makeLayout(
-        tooltipTarget_->tooltip, ts, m.width + 4, m.height + 4);
+        tooltipTarget_->tooltip, ts, resolveStatic(ts.fontSize),
+        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle),
+        m.width + 4, m.height + 4);
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(tooltipStyle_.textColor), &brush);
     if (brush) {
@@ -7793,9 +7874,18 @@ private:
   // from paintView), which is exactly why the cache fields are mutable.
   static void ensureTextLayout(const View &v) {
     const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
+    float fontSize =
+        resolveDynamic(v.textStyle.fontSize, v.computed.resolvedFontSize);
+    FontWeight fontWeight = resolveDynamic(v.textStyle.fontWeight,
+                                           v.computed.resolvedFontWeight);
+    FontStyle fontStyleVal = resolveDynamic(v.textStyle.fontStyle,
+                                            v.computed.resolvedFontStyle);
     if (v.computed.textLayout &&
         v.computed.textLayoutBuiltForWidth == v.computed.w &&
-        v.computed.textLayoutBuiltForText == text)
+        v.computed.textLayoutBuiltForText == text &&
+        v.computed.textLayoutBuiltForFontSize == fontSize &&
+        v.computed.textLayoutBuiltForFontWeight == fontWeight &&
+        v.computed.textLayoutBuiltForFontStyle == fontStyleVal)
       return;
     if (v.computed.textLayout) {
       v.computed.textLayout->Release();
@@ -7805,10 +7895,13 @@ private:
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float innerW = std::max(0.0f, v.computed.w - pad.left - pad.right);
     float innerH = std::max(0.0f, v.computed.h - pad.top - pad.bottom);
-    v.computed.textLayout =
-        liteui_text::makeLayout(text, v.textStyle, innerW, innerH);
+    v.computed.textLayout = liteui_text::makeLayout(
+        text, v.textStyle, fontSize, fontWeight, fontStyleVal, innerW, innerH);
     v.computed.textLayoutBuiltForWidth = v.computed.w;
     v.computed.textLayoutBuiltForText = text;
+    v.computed.textLayoutBuiltForFontSize = fontSize;
+    v.computed.textLayoutBuiltForFontWeight = fontWeight;
+    v.computed.textLayoutBuiltForFontStyle = fontStyleVal;
   }
 
   void paintText(ID2D1RenderTarget *rt, const View &v) {
@@ -8961,7 +9054,9 @@ private:
     ts.fontSize = tooltipStyle_.fontSize;
     ts.fontFamily = tooltipStyle_.fontFamily;
     ts.wrap = TextWrap::NoWrap;
-    liteui_text::Measurement m = liteui_text::measure(text, ts, -1);
+    liteui_text::Measurement m = liteui_text::measure(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1);
     int w = std::max(1, (int)std::ceil(m.width)),
         h = std::max(1, (int)std::ceil(m.height));
     cairo_surface_t *surf =
@@ -8972,7 +9067,9 @@ private:
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_set_source_rgba(cr, 1, 1, 1, 1);
-    PangoLayout *layout = liteui_text::makeLayout(text, ts, -1, cr);
+    PangoLayout *layout = liteui_text::makeLayout(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1, cr);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
     cairo_surface_flush(surf);
@@ -9042,9 +9139,18 @@ private:
   // otherwise require.
   static void ensureTextTexture(const View &v) {
     const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
+    float fontSize =
+        resolveDynamic(v.textStyle.fontSize, v.computed.resolvedFontSize);
+    FontWeight fontWeight = resolveDynamic(v.textStyle.fontWeight,
+                                           v.computed.resolvedFontWeight);
+    FontStyle fontStyleVal = resolveDynamic(v.textStyle.fontStyle,
+                                            v.computed.resolvedFontStyle);
     if (v.computed.textTexture &&
         v.computed.textTextureBuiltForWidth == v.computed.w &&
-        v.computed.textTextureBuiltForText == text)
+        v.computed.textTextureBuiltForText == text &&
+        v.computed.textTextureBuiltForFontSize == fontSize &&
+        v.computed.textTextureBuiltForFontWeight == fontWeight &&
+        v.computed.textTextureBuiltForFontStyle == fontStyleVal)
       return;
     if (v.computed.textTexture) {
       glDeleteTextures(1, &v.computed.textTexture);
@@ -9067,8 +9173,9 @@ private:
     cairo_set_source_rgba(
         cr, 1, 1, 1,
         1); // color is applied later via u_color; only alpha matters
-    PangoLayout *layout = liteui_text::makeLayout(
-        text, v.textStyle, static_cast<float>(innerW), cr);
+    PangoLayout *layout =
+        liteui_text::makeLayout(text, v.textStyle, fontSize, fontWeight,
+                                fontStyleVal, static_cast<float>(innerW), cr);
     pango_cairo_update_layout(cr, layout);
     pango_cairo_show_layout(cr, layout);
     g_object_unref(layout);
@@ -9122,6 +9229,9 @@ private:
     v.computed.textTexH = innerH;
     v.computed.textTextureBuiltForWidth = v.computed.w;
     v.computed.textTextureBuiltForText = text;
+    v.computed.textTextureBuiltForFontSize = fontSize;
+    v.computed.textTextureBuiltForFontWeight = fontWeight;
+    v.computed.textTextureBuiltForFontStyle = fontStyleVal;
   }
 
   void drawTextTexture(const View &v, const ClipRect &clip) {
@@ -9867,8 +9977,9 @@ inline View View::toView(TextInput ti) {
 
     // Keep the caret in view: scroll right if it's past the visible edge,
     // scroll left if it's before the start of the visible window.
-    liteui_text::Measurement cursorM =
-        liteui_text::measure(state->text.substr(0, state->cursor), ts, -1);
+    liteui_text::Measurement cursorM = liteui_text::measure(
+        state->text.substr(0, state->cursor), ts, resolveStatic(ts.fontSize),
+        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle), -1);
     float cursorX = cursorM.width;
     if (cursorX - state->scrollOffset > availW)
       state->scrollOffset = cursorX - availW;
@@ -9876,7 +9987,9 @@ inline View View::toView(TextInput ti) {
       state->scrollOffset = cursorX;
 
     // Never scroll past the end of the text (e.g. after deleting chars).
-    liteui_text::Measurement fullM = liteui_text::measure(state->text, ts, -1);
+    liteui_text::Measurement fullM = liteui_text::measure(
+        state->text, ts, resolveStatic(ts.fontSize),
+        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle), -1);
     float maxScroll = std::max(0.0f, fullM.width - availW);
     state->scrollOffset = std::clamp(state->scrollOffset, 0.0f, maxScroll);
 
@@ -9887,7 +10000,8 @@ inline View View::toView(TextInput ti) {
     ctx.rect(0, 0, ctx.width(), ctx.height());
     ctx.clip();
 
-    ctx.setFont(ts.fontFamily, ts.fontSize, ts.fontWeight, ts.fontStyle);
+    ctx.setFont(ts.fontFamily, resolveStatic(ts.fontSize),
+               resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle));
     ctx.setTextBaseline(TextBaseline::Middle);
     ctx.setTextAlign(TextAlign::Start);
 
@@ -9911,7 +10025,9 @@ inline View View::toView(TextInput ti) {
 
   v.onPressAt = [state, ts, leftPad](float lx, float) {
     state->cursor = liteui_text::caretIndexForX(
-        state->text, ts, lx - leftPad + state->scrollOffset);
+        state->text, ts, resolveStatic(ts.fontSize),
+        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle),
+        lx - leftPad + state->scrollOffset);
     state->blinkOn = true;
     state->dirty = true;
   };

@@ -36,69 +36,148 @@
 #include <unistd.h>
 #endif
 
-namespace liteui_text {
-inline Measurement measureCompat(const std::string &text, const TextStyle &ts,
-                                 float fontSize, FontWeight fontWeight,
-                                 FontStyle fontStyleVal, float availWidth) {
-  return measure(text, ts, fontSize, fontWeight, fontStyleVal, availWidth);
-}
-inline size_t caretIndexForXCompat(const std::string &text, const TextStyle &ts,
-                                   float fontSize, FontWeight fontWeight,
-                                   FontStyle fontStyleVal, float clickX) {
-  return caretIndexForX(text, ts, fontSize, fontWeight, fontStyleVal, clickX);
-}
-} // namespace liteui_text
-
 //=====================Theme =============================
 
 namespace liteui_theme {
 
+// Two finalized palettes, one field-for-field replacement of the other.
+// Every existing `th::kX` call site across the file keeps working
+// unchanged — apply() below overwrites these in place, so the *names*
+// stay compile-time constants but the *values* are runtime-swappable.
+// (Not constexpr any more, since apply() mutates them.)
+
 // surfaces
-inline constexpr Color kEditorBg{30, 30, 30, 255};
-inline constexpr Color kSideBarBg{37, 37, 38, 255};
-inline constexpr Color kTabBarBg{37, 37, 38, 255};
-inline constexpr Color kTabInactiveBg{45, 45, 45, 255};
-inline constexpr Color kMenuBarBg{60, 60, 60, 255};
-inline constexpr Color kMenuBarOpenBg{95, 95, 95, 255};
-inline constexpr Color kStatusBarBg{0, 122, 204, 255};
-inline constexpr Color kMenuBg{37, 37, 38, 255};
-inline constexpr Color kMenuBorder{69, 69, 69, 255};
-inline constexpr Color kInputBg{60, 60, 60, 255};
-inline constexpr Color kButtonBg{60, 60, 60, 255};
-inline constexpr Color kButtonHoverBg{78, 78, 78, 255};
-inline constexpr Color kDivider{60, 60, 60, 255};
+inline Color kEditorBg{30, 30, 30, 255};
+inline Color kSideBarBg{37, 37, 38, 255};
+inline Color kTabBarBg{37, 37, 38, 255};
+inline Color kTabInactiveBg{45, 45, 45, 255};
+inline Color kMenuBarBg{60, 60, 60, 255};
+inline Color kMenuBarOpenBg{95, 95, 95, 255};
+inline Color kStatusBarBg{0, 122, 204, 255};
+inline Color kMenuBg{37, 37, 38, 255};
+inline Color kMenuBorder{69, 69, 69, 255};
+inline Color kInputBg{60, 60, 60, 255};
+inline Color kButtonBg{60, 60, 60, 255};
+inline Color kButtonHoverBg{78, 78, 78, 255};
+inline Color kDivider{60, 60, 60, 255};
 
 // interaction states
-inline constexpr Color kHoverBg{42, 45, 46, 255};
-inline constexpr Color kMenuHoverBg{9, 71, 113, 255};
-inline constexpr Color kSelectedBg{4, 57, 94, 255};
-inline constexpr Color kActiveItemBg{55, 55, 61, 255};
-inline constexpr Color kTabHoverBg{55, 55, 55, 255};
-inline constexpr Color kAccent{0, 122, 204, 255};
-inline constexpr Color kDanger{0xC0, 0x39, 0x2B, 255};
-inline constexpr Color kDangerHover{0xA8, 0x2F, 0x23, 255};
+inline Color kHoverBg{42, 45, 46, 255};
+inline Color kMenuHoverBg{9, 71, 113, 255};
+inline Color kSelectedBg{4, 57, 94, 255};
+inline Color kActiveItemBg{55, 55, 61, 255};
+inline Color kTabHoverBg{55, 55, 55, 255};
+inline Color kAccent{0, 122, 204, 255};
+inline Color kDanger{0xC0, 0x39, 0x2B, 255};
+inline Color kDangerHover{0xA8, 0x2F, 0x23, 255};
 
 // text
-inline constexpr Color kText{204, 204, 204, 255};
-inline constexpr Color kTextMuted{157, 157, 157, 255};
-inline constexpr Color kTextDim{128, 128, 128, 255};
-inline constexpr Color kTextBright{255, 255, 255, 255};
-inline constexpr Color kTextInactive{150, 150, 150, 255};
-inline constexpr Color kLink{55, 148, 255, 255};
-inline constexpr Color kOnAccent{255, 255, 255, 255};
-inline constexpr Color kOnAccentDim{190, 220, 245, 255};
+inline Color kText{204, 204, 204, 255};
+inline Color kTextMuted{157, 157, 157, 255};
+inline Color kTextDim{128, 128, 128, 255};
+inline Color kTextBright{255, 255, 255, 255};
+inline Color kTextInactive{150, 150, 150, 255};
+inline Color kLink{55, 148, 255, 255};
+inline Color kOnAccent{255, 255, 255, 255};
+inline Color kOnAccentDim{190, 220, 245, 255};
 
-// editor text
-inline constexpr Color kEditorText{212, 212, 212, 255};
-inline constexpr Color kPlaceholder{130, 130, 130, 255};
-inline constexpr Color kCaret{174, 175, 173, 255};
+// editor text — fallback defaults for CodeEditor's own struct members;
+// the app overrides these per-tab from EditorColorScheme (see
+// buildEditor()), but they're kept in step here too for consistency.
+inline Color kEditorText{212, 212, 212, 255};
+inline Color kPlaceholder{130, 130, 130, 255};
+inline Color kCaret{174, 175, 173, 255};
 
 // misc
-inline constexpr Color kTransparent{0, 0, 0, 0};
-inline constexpr Color kOverlay{0, 0, 0, 120};    // modal dimmer
-inline constexpr Color kOverlayClear{0, 0, 0, 2}; // click-away catcher
-inline constexpr Color kScrollTrack{37, 37, 38, 255};
-inline constexpr Color kScrollThumb{90, 90, 90, 255};
+inline Color kTransparent{0, 0, 0, 0};
+inline Color kOverlay{0, 0, 0, 120};    // modal dimmer
+inline Color kOverlayClear{0, 0, 0, 2}; // click-away catcher
+inline Color kScrollTrack{37, 37, 38, 255};
+inline Color kScrollThumb{90, 90, 90, 255};
+
+// Overwrites every kX above in place. Called from
+// editorColorSchemeForTheme() — the one place settings_.theme turns into
+// actual colors — so the chrome palette and the editor palette can never
+// drift out of sync with each other.
+inline void apply(bool light) {
+  if (light) {
+    kEditorBg = {255, 255, 255, 255};
+    kSideBarBg = {243, 243, 243, 255};
+    kTabBarBg = {243, 243, 243, 255};
+    kTabInactiveBg = {236, 236, 236, 255};
+    kMenuBarBg = {243, 243, 243, 255};
+    kMenuBarOpenBg = {224, 224, 224, 255};
+    kStatusBarBg = {0, 122, 204, 255};
+    kMenuBg = {255, 255, 255, 255};
+    kMenuBorder = {220, 220, 220, 255};
+    kInputBg = {230, 230, 230, 255};
+    kButtonBg = {230, 230, 230, 255};
+    kButtonHoverBg = {217, 217, 217, 255};
+    kDivider = {225, 225, 225, 255};
+    kHoverBg = {232, 232, 232, 255};
+    kMenuHoverBg = {229, 241, 251, 255};
+    kSelectedBg = {198, 225, 246, 255};
+    kActiveItemBg = {229, 229, 229, 255};
+    kTabHoverBg = {232, 232, 232, 255};
+    kAccent = {0, 122, 204, 255};
+    kDanger = {0xC0, 0x39, 0x2B, 255};
+    kDangerHover = {0xA8, 0x2F, 0x23, 255};
+    kText = {30, 30, 30, 255};
+    kTextMuted = {100, 100, 100, 255};
+    kTextDim = {130, 130, 130, 255};
+    kTextBright = {0, 0, 0, 255};
+    kTextInactive = {120, 120, 120, 255};
+    kLink = {0, 90, 200, 255};
+    kOnAccent = {255, 255, 255, 255};
+    kOnAccentDim = {190, 220, 245, 255};
+    kEditorText = {30, 30, 30, 255};
+    kPlaceholder = {150, 150, 150, 255};
+    kCaret = {20, 20, 20, 255};
+    kTransparent = {0, 0, 0, 0};
+    kOverlay = {0, 0, 0, 120};
+    kOverlayClear = {0, 0, 0, 2};
+    kScrollTrack = {243, 243, 243, 255};
+    kScrollThumb = {190, 190, 190, 255};
+  } else {
+    kEditorBg = {30, 30, 30, 255};
+    kSideBarBg = {37, 37, 38, 255};
+    kTabBarBg = {37, 37, 38, 255};
+    kTabInactiveBg = {45, 45, 45, 255};
+    kMenuBarBg = {60, 60, 60, 255};
+    kMenuBarOpenBg = {95, 95, 95, 255};
+    kStatusBarBg = {0, 122, 204, 255};
+    kMenuBg = {37, 37, 38, 255};
+    kMenuBorder = {69, 69, 69, 255};
+    kInputBg = {60, 60, 60, 255};
+    kButtonBg = {60, 60, 60, 255};
+    kButtonHoverBg = {78, 78, 78, 255};
+    kDivider = {60, 60, 60, 255};
+    kHoverBg = {42, 45, 46, 255};
+    kMenuHoverBg = {9, 71, 113, 255};
+    kSelectedBg = {4, 57, 94, 255};
+    kActiveItemBg = {55, 55, 61, 255};
+    kTabHoverBg = {55, 55, 55, 255};
+    kAccent = {0, 122, 204, 255};
+    kDanger = {0xC0, 0x39, 0x2B, 255};
+    kDangerHover = {0xA8, 0x2F, 0x23, 255};
+    kText = {204, 204, 204, 255};
+    kTextMuted = {157, 157, 157, 255};
+    kTextDim = {128, 128, 128, 255};
+    kTextBright = {255, 255, 255, 255};
+    kTextInactive = {150, 150, 150, 255};
+    kLink = {55, 148, 255, 255};
+    kOnAccent = {255, 255, 255, 255};
+    kOnAccentDim = {190, 220, 245, 255};
+    kEditorText = {212, 212, 212, 255};
+    kPlaceholder = {130, 130, 130, 255};
+    kCaret = {174, 175, 173, 255};
+    kTransparent = {0, 0, 0, 0};
+    kOverlay = {0, 0, 0, 120};
+    kOverlayClear = {0, 0, 0, 2};
+    kScrollTrack = {37, 37, 38, 255};
+    kScrollThumb = {90, 90, 90, 255};
+  }
+}
 
 } // namespace liteui_theme
 
@@ -1305,22 +1384,13 @@ struct Terminal {
 
 inline View toTerminalView(Terminal t) {
   auto state = t.state;
-  // Same reasoning as CodeEditor above: ts only carries fontFamily/wrap;
-  // fontSize is captured by value once here rather than round-tripped
-  // through ts's Dynamic<float>. Terminal doesn't expose weight/style as
-  // adjustable, so those are just the TextStyle defaults (Regular/Normal)
-  // — per-cell bold is handled separately, below, via each cell's own
-  // `first.bold` flag rather than through ts at all.
   TextStyle ts;
+  ts.fontSize = t.fontSize;
   ts.fontFamily = t.fontFamily;
   ts.wrap = TextWrap::NoWrap;
-  float resolvedFontSize = t.fontSize;
-  constexpr FontWeight kBaseWeight = FontWeight::Regular;
-  constexpr FontStyle kBaseStyle = FontStyle::Normal;
 
   // Monospace assumption: every glyph advances the same width as "M".
-  liteui_text::Measurement cellM = liteui_text::measureCompat(
-      "M", ts, resolvedFontSize, kBaseWeight, kBaseStyle, -1);
+  liteui_text::Measurement cellM = liteui_text::measure("M", ts, -1);
   float cellW = std::max(1.0f, cellM.width);
   float lineH = t.fontSize * 1.4f;
   Color bg = t.backgroundColor;
@@ -1350,8 +1420,7 @@ inline View toTerminalView(Terminal t) {
     state->resize(cols, rows);
   };
 
-  v.onPaint = [state, ts, cellW, lineH, bg,
-               resolvedFontSize](CanvasContext &ctx) {
+  v.onPaint = [state, ts, cellW, lineH, bg](CanvasContext &ctx) {
     ctx.setFillColor(bg);
     ctx.fillRect(0, 0, ctx.width(), ctx.height());
     ctx.setTextBaseline(TextBaseline::Middle);
@@ -1404,7 +1473,7 @@ inline View toTerminalView(Terminal t) {
           ctx.setFillColor(cellBg);
           ctx.fillRect(runX, r * lineH, runW, lineH);
         }
-        ctx.setFont(ts.fontFamily, resolvedFontSize,
+        ctx.setFont(ts.fontFamily, ts.fontSize,
                     first.bold ? FontWeight::Bold : FontWeight::Regular);
         ctx.setFillColor(fg);
         // One fillText per glyph, each pinned to i*cellW, rather than
@@ -1685,16 +1754,14 @@ inline std::string asciiLower(const std::string &s) {
 // Byte offset where each visual row of `line` starts (always begins with 0).
 // Breaks after whitespace when possible, mid-word only if one word is wider
 // than the row. Trailing spaces hang past the edge instead of starting a row.
-inline std::vector<size_t>
-computeWrapStarts(const std::string &line, const TextStyle &ts, float fontSize,
-                  FontWeight fontWeight, FontStyle fontStyleVal, float width) {
+inline std::vector<size_t> computeWrapStarts(const std::string &line,
+                                             const TextStyle &ts, float width) {
   std::vector<size_t> starts{0};
   if (line.empty() || width < 1.0f)
     return starts;
   auto fits = [&](size_t from, size_t to) {
-    return liteui_text::measureCompat(line.substr(from, to - from), ts,
-                                      fontSize, fontWeight, fontStyleVal, -1)
-               .width <= width;
+    return liteui_text::measure(line.substr(from, to - from), ts, -1).width <=
+           width;
   };
   auto isWs = [&](size_t i) { return line[i] == ' ' || line[i] == '\t'; };
 
@@ -2127,8 +2194,7 @@ struct CodeEditorState {
 
   // Rebuilds only what's stale: a line is re-measured when its text changed,
   // and re-broken when the wrap width changed AND it's wider than the view.
-  void syncWrap(const TextStyle &ts, float fontSize, FontWeight fontWeight,
-                FontStyle fontStyleVal, float width) {
+  void syncWrap(const TextStyle &ts, float width) {
     if (!wordWrap) {
       if (!wrapCache.empty()) {
         wrapCache.clear();
@@ -2144,20 +2210,15 @@ struct CodeEditorState {
       WrapLine &w = wrapCache[i];
       if (!w.valid || w.text != lines[i]) {
         w.text = lines[i];
-        w.natural =
-            lines[i].empty()
-                ? 0.0f
-                : liteui_text::measureCompat(lines[i], ts, fontSize, fontWeight,
-                                             fontStyleVal, -1)
-                      .width;
+        w.natural = lines[i].empty()
+                        ? 0.0f
+                        : liteui_text::measure(lines[i], ts, -1).width;
         w.valid = true;
         w.builtWidth = -1.0f;
       }
       if (w.builtWidth != width) {
-        w.starts = w.natural <= width
-                       ? std::vector<size_t>{0}
-                       : computeWrapStarts(lines[i], ts, fontSize, fontWeight,
-                                           fontStyleVal, width);
+        w.starts = w.natural <= width ? std::vector<size_t>{0}
+                                      : computeWrapStarts(lines[i], ts, width);
         w.builtWidth = width;
       }
       wrapRowStart[i] = rows;
@@ -2714,14 +2775,11 @@ inline View toCodeEditorView(CodeEditor ed) {
                           // a since-shortened buffer
   }
 
-
   TextStyle ts;
+  ts.fontSize = ed.fontSize;
+  ts.fontWeight = ed.fontWeight;
   ts.fontFamily = ed.fontFamily;
   ts.wrap = TextWrap::NoWrap;
-  float resolvedFontSize = ed.fontSize;
-  FontWeight resolvedFontWeight = ed.fontWeight;
-  FontStyle resolvedFontStyle =
-      FontStyle::Normal; // not yet exposed on CodeEditor
 
   float lineH = ed.lineHeight > 0 ? ed.lineHeight : ed.fontSize * 1.4f;
   float pad = ed.padding;
@@ -2800,10 +2858,8 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   auto hScrollbarGeometry = [](CodeEditorState *state, const TextStyle &ts,
-                               float fontSize, FontWeight fontWeight,
-                               FontStyle fontStyleVal, float textLeft,
-                               float viewW, float viewH, float barH,
-                               float minimapW) {
+                               float textLeft, float viewW, float viewH,
+                               float barH, float minimapW) {
     struct Geo {
       bool visible;
       float trackX, trackW, thumbX, thumbW, y;
@@ -2812,9 +2868,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       return Geo{false, 0, 0, 0, 0, 0};
     float maxLineW = 0.0f;
     for (const auto &l : state->lines) {
-      float w = liteui_text::measureCompat(l, ts, fontSize, fontWeight,
-                                           fontStyleVal, -1)
-                    .width;
+      float w = liteui_text::measure(l, ts, -1).width;
       if (w > maxLineW)
         maxLineW = w;
     }
@@ -2829,8 +2883,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     return Geo{true, trackX, trackW, thumbX, thumbW, viewH - barH};
   };
 
-  auto gutterWidth = [showNums, ts, resolvedFontSize, resolvedFontWeight,
-                      resolvedFontStyle](size_t lineCount) -> float {
+  auto gutterWidth = [showNums, ts](size_t lineCount) -> float {
     if (!showNums)
       return 0.0f;
     int digits = 1;
@@ -2839,9 +2892,8 @@ inline View toCodeEditorView(CodeEditor ed) {
       n /= 10;
       ++digits;
     }
-    liteui_text::Measurement m = liteui_text::measureCompat(
-        std::string(digits + 1, '0'), ts, resolvedFontSize, resolvedFontWeight,
-        resolvedFontStyle, -1);
+    liteui_text::Measurement m =
+        liteui_text::measure(std::string(digits + 1, '0'), ts, -1);
     return m.width + 12.0f;
   };
 
@@ -2852,15 +2904,13 @@ inline View toCodeEditorView(CodeEditor ed) {
   };
 
   auto syncLayout = [=] {
-    state->syncWrap(ts, resolvedFontSize, resolvedFontWeight, resolvedFontStyle,
-                    wrapWidthFor(false));
+    state->syncWrap(ts, wrapWidthFor(false));
     if (!state->wordWrap || !showScrollbar)
       return;
     float availH = std::max(0.0f, state->lastViewH - pad * 2.0f);
     bool vBarNeeded = state->totalRows() * lineH > availH + 0.5f;
     if (vBarNeeded)
-      state->syncWrap(ts, resolvedFontSize, resolvedFontWeight,
-                      resolvedFontStyle, wrapWidthFor(true));
+      state->syncWrap(ts, wrapWidthFor(true));
   };
 
   auto notifyChange = [state, onChange] {
@@ -2907,25 +2957,19 @@ inline View toCodeEditorView(CodeEditor ed) {
   // Column tracking across Up/Down uses the on-screen pixel x position
   // rather than the byte offset, so moving through lines with different
   // multi-byte content still keeps the cursor visually aligned.
-  auto pixelColOf = [state, ts, resolvedFontSize, resolvedFontWeight,
-                     resolvedFontStyle](const EditPos &p) {
+  auto pixelColOf = [state, ts](const EditPos &p) {
     size_t rs = std::min(
         state->rowStartByte(p.line, state->rowInLine(p.line, p.col)), p.col);
-    return liteui_text::measureCompat(
-               state->lines[p.line].substr(rs, p.col - rs), ts,
-               resolvedFontSize, resolvedFontWeight, resolvedFontStyle, -1)
+    return liteui_text::measure(state->lines[p.line].substr(rs, p.col - rs), ts,
+                                -1)
         .width;
   };
-  auto colAtPixel = [state, ts, resolvedFontSize, resolvedFontWeight,
-                     resolvedFontStyle](size_t line, size_t row,
-                                        float px) -> size_t {
+  auto colAtPixel = [state, ts](size_t line, size_t row, float px) -> size_t {
     size_t rs = state->rowStartByte(line, row);
     size_t re = state->rowEndByte(line, row);
     std::string seg = state->lines[line].substr(rs, re > rs ? re - rs : 0);
     size_t c = liteui_utf8::snapToBoundary(
-        seg, liteui_text::caretIndexForXCompat(
-                 seg, ts, resolvedFontSize, resolvedFontWeight,
-                 resolvedFontStyle, std::max(0.0f, px)));
+        seg, liteui_text::caretIndexForX(seg, ts, std::max(0.0f, px)));
     // The end of a non-final row is the same byte offset as the start of the
     // next row and would be drawn there, so keep the caret on this row.
     if (row + 1 < state->rowCount(line) && !seg.empty() && c >= seg.size())
@@ -3055,9 +3099,8 @@ inline View toCodeEditorView(CodeEditor ed) {
       state->scrollX = 0.0f;
     } else {
       const std::string &curLine = state->lines[state->cursor.line];
-      liteui_text::Measurement caretM = liteui_text::measureCompat(
-          curLine.substr(0, state->cursor.col), ts, resolvedFontSize,
-          resolvedFontWeight, resolvedFontStyle, -1);
+      liteui_text::Measurement caretM =
+          liteui_text::measure(curLine.substr(0, state->cursor.col), ts, -1);
       if (!state->manualScroll) {
         if (caretM.width - state->scrollX > availW)
           state->scrollX = caretM.width - availW;
@@ -3066,10 +3109,7 @@ inline View toCodeEditorView(CodeEditor ed) {
       }
       float maxLineW = 0.0f;
       for (const auto &l : state->lines) {
-        float w = liteui_text::measureCompat(l, ts, resolvedFontSize,
-                                             resolvedFontWeight,
-                                             resolvedFontStyle, -1)
-                      .width;
+        float w = liteui_text::measure(l, ts, -1).width;
         if (w > maxLineW)
           maxLineW = w;
       }
@@ -3101,15 +3141,9 @@ inline View toCodeEditorView(CodeEditor ed) {
         size_t a = std::max(from, rs), b = std::min(to, re);
         if (a > b || (a == b && !stub))
           continue;
-        float x0 = liteui_text::measureCompat(
-                       line.substr(rs, a - rs), ts, resolvedFontSize,
-                       resolvedFontWeight, resolvedFontStyle, -1)
-                       .width;
-        float x1 = liteui_text::measureCompat(
-                       line.substr(rs, b - rs), ts, resolvedFontSize,
-                       resolvedFontWeight, resolvedFontStyle, -1)
-                       .width +
-                   (stub ? resolvedFontSize * 0.5f : 0.0f);
+        float x0 = liteui_text::measure(line.substr(rs, a - rs), ts, -1).width;
+        float x1 = liteui_text::measure(line.substr(rs, b - rs), ts, -1).width +
+                   (stub ? ts.fontSize * 0.5f : 0.0f);
         float y = pad + (firstRow + r) * lineH - state->scrollY;
         ctx.fillRect(textLeft - state->scrollX + x0, y, std::max(1.0f, x1 - x0),
                      lineH);
@@ -3186,7 +3220,7 @@ inline View toCodeEditorView(CodeEditor ed) {
         highlightBracketAt(EditPos{state->cursor.line, state->cursor.col - 1});
     }
 
-    ctx.setFont(ts.fontFamily, resolvedFontSize, resolvedFontWeight);
+    ctx.setFont(ts.fontFamily, ts.fontSize, ts.fontWeight);
     ctx.setTextBaseline(TextBaseline::Middle);
     ctx.setTextAlign(TextAlign::Start);
 
@@ -3233,18 +3267,12 @@ inline View toCodeEditorView(CodeEditor ed) {
               std::string gap = lineText.substr(pos, s0 - pos);
               ctx.setFillColor(textColor);
               ctx.fillText(gap, x, y);
-              x += liteui_text::measureCompat(gap, ts, resolvedFontSize,
-                                              resolvedFontWeight,
-                                              resolvedFontStyle, -1)
-                       .width;
+              x += liteui_text::measure(gap, ts, -1).width;
             }
             std::string tok = lineText.substr(s0, s1 - s0);
             ctx.setFillColor(sp.color);
             ctx.fillText(tok, x, y);
-            x += liteui_text::measureCompat(tok, ts, resolvedFontSize,
-                                            resolvedFontWeight,
-                                            resolvedFontStyle, -1)
-                     .width;
+            x += liteui_text::measure(tok, ts, -1).width;
             pos = s1;
           }
           if (pos < re) {
@@ -3261,9 +3289,8 @@ inline View toCodeEditorView(CodeEditor ed) {
         size_t rs = std::min(state->rowStartByte(cc.line, cr), cc.col);
         float cy =
             pad + (state->firstRowOf(cc.line) + cr) * lineH - state->scrollY;
-        liteui_text::Measurement cm = liteui_text::measureCompat(
-            state->lines[cc.line].substr(rs, cc.col - rs), ts, resolvedFontSize,
-            resolvedFontWeight, resolvedFontStyle, -1);
+        liteui_text::Measurement cm = liteui_text::measure(
+            state->lines[cc.line].substr(rs, cc.col - rs), ts, -1);
         ctx.setFillColor(caretColor);
         ctx.fillRect(textLeft - state->scrollX + cm.width, cy + 2.0f, 1.5f,
                      std::max(0.0f, lineH - 4.0f));
@@ -3394,10 +3421,8 @@ inline View toCodeEditorView(CodeEditor ed) {
         ctx.fillRect(vGeo.x, vGeo.trackY + vGeo.thumbY, scrollbarWidth,
                      vGeo.thumbH);
       }
-      auto hGeo = hScrollbarGeometry(state.get(), ts, resolvedFontSize,
-                                     resolvedFontWeight, resolvedFontStyle,
-                                     textLeft, ctx.width(), ctx.height(),
-                                     scrollbarWidth, rightGutter);
+      auto hGeo = hScrollbarGeometry(state.get(), ts, textLeft, ctx.width(),
+                                     ctx.height(), scrollbarWidth, rightGutter);
       if (hGeo.visible) {
         ctx.setFillColor(scrollbarTrackColor);
         ctx.fillRect(hGeo.trackX, hGeo.y, hGeo.trackW, scrollbarWidth);
@@ -3455,10 +3480,9 @@ inline View toCodeEditorView(CodeEditor ed) {
       return;
     }
     if (showScrollbar) {
-      auto hGeo = hScrollbarGeometry(
-          state.get(), ts, resolvedFontSize, resolvedFontWeight,
-          resolvedFontStyle, textLeft, state->lastViewW, state->lastViewH,
-          scrollbarWidth, rightGutter);
+      auto hGeo =
+          hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
+                             state->lastViewH, scrollbarWidth, rightGutter);
       // Check the horizontal band first: in the bottom-right corner where
       // both bars could claim the point, the bottom strip visually belongs
       // to the horizontal bar, so it gets priority.
@@ -3471,10 +3495,7 @@ inline View toCodeEditorView(CodeEditor ed) {
             lx > hGeo.trackX + hGeo.thumbX + hGeo.thumbW) {
           float maxLineW = 0.0f;
           for (const auto &l : state->lines) {
-            float w = liteui_text::measureCompat(l, ts, resolvedFontSize,
-                                                 resolvedFontWeight,
-                                                 resolvedFontStyle, -1)
-                          .width;
+            float w = liteui_text::measure(l, ts, -1).width;
             if (w > maxLineW)
               maxLineW = w;
           }
@@ -3548,10 +3569,7 @@ inline View toCodeEditorView(CodeEditor ed) {
     if (state->hScrollbarDragging) {
       float maxLineW = 0.0f;
       for (const auto &l : state->lines) {
-        float w = liteui_text::measureCompat(l, ts, resolvedFontSize,
-                                             resolvedFontWeight,
-                                             resolvedFontStyle, -1)
-                      .width;
+        float w = liteui_text::measure(l, ts, -1).width;
         if (w > maxLineW)
           maxLineW = w;
       }
@@ -3564,10 +3582,9 @@ inline View toCodeEditorView(CodeEditor ed) {
       float rightGutter =
           minimapWidth +
           ((showScrollbar && vGeoForDrag.visible) ? scrollbarWidth : 0.0f);
-      auto hGeo = hScrollbarGeometry(
-          state.get(), ts, resolvedFontSize, resolvedFontWeight,
-          resolvedFontStyle, textLeft, state->lastViewW, state->lastViewH,
-          scrollbarWidth, rightGutter);
+      auto hGeo =
+          hScrollbarGeometry(state.get(), ts, textLeft, state->lastViewW,
+                             state->lastViewH, scrollbarWidth, rightGutter);
       float range = std::max(1.0f, hGeo.trackW - hGeo.thumbW);
       float delta = (lx - state->hScrollbarDragStartX) / range * maxScroll;
       state->scrollX = std::clamp(state->hScrollbarDragStartScrollX + delta,
@@ -4768,6 +4785,505 @@ languageForExtension(const std::string &path) {
   return nullptr;
 }
 
+//================Settings / Preferences =========================
+//
+// Font size, tab width, theme and word wrap used to be compile-time
+// constants baked into CodeEditor/TabbedEditor. This adds a tiny,
+// dependency-free JSON reader/writer and an EditorSettings struct loaded
+// once at startup (see EditorSettings::defaultPath()), editable by hand
+// or via the new "Preferences" menu. Word wrap is the one setting
+// CodeEditorState already supports changing live (setWordWrap), so it's
+// the one exception that also updates already-open tabs; everything
+// else applies to newly created tabs/terminals going forward.
+
+namespace liteui_json {
+
+// A minimal, generic JSON value — enough to round-trip a small settings
+// file (nested objects, strings, numbers, bools). Not spec-complete (no
+// \uXXXX escapes) — plenty for hand-edited config.
+struct Value {
+  enum class Type {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object
+  } type = Type::Null;
+  bool b = false;
+  double num = 0;
+  std::string str;
+  std::vector<Value> arr;
+  std::vector<std::pair<std::string, Value>> obj; // insertion order
+
+  static Value makeObject() {
+    Value v;
+    v.type = Type::Object;
+    return v;
+  }
+  static Value makeString(std::string s) {
+    Value v;
+    v.type = Type::String;
+    v.str = std::move(s);
+    return v;
+  }
+  static Value makeNumber(double n) {
+    Value v;
+    v.type = Type::Number;
+    v.num = n;
+    return v;
+  }
+  static Value makeBool(bool bv) {
+    Value v;
+    v.type = Type::Bool;
+    v.b = bv;
+    return v;
+  }
+
+  const Value *find(const std::string &key) const {
+    if (type != Type::Object)
+      return nullptr;
+    for (auto &kv : obj)
+      if (kv.first == key)
+        return &kv.second;
+    return nullptr;
+  }
+  void set(const std::string &key, Value v) {
+    for (auto &kv : obj)
+      if (kv.first == key) {
+        kv.second = std::move(v);
+        return;
+      }
+    obj.push_back({key, std::move(v)});
+  }
+
+  bool asBool(bool def) const { return type == Type::Bool ? b : def; }
+  double asNumber(double def) const { return type == Type::Number ? num : def; }
+  std::string asString(const std::string &def) const {
+    return type == Type::String ? str : def;
+  }
+};
+
+class Parser {
+public:
+  explicit Parser(const std::string &s) : s_(s) {}
+  std::optional<Value> parse() {
+    skipWs();
+    Value v;
+    if (!parseValue(v))
+      return std::nullopt;
+    return v;
+  }
+
+private:
+  const std::string &s_;
+  size_t i_ = 0;
+  void skipWs() {
+    while (i_ < s_.size() && static_cast<unsigned char>(s_[i_]) <= ' ')
+      ++i_;
+  }
+  bool parseValue(Value &out) {
+    skipWs();
+    if (i_ >= s_.size())
+      return false;
+    char c = s_[i_];
+    if (c == '{')
+      return parseObject(out);
+    if (c == '[')
+      return parseArray(out);
+    if (c == '"')
+      return parseString(out);
+    if (c == 't' || c == 'f')
+      return parseBool(out);
+    if (c == 'n') {
+      if (s_.compare(i_, 4, "null") == 0) {
+        i_ += 4;
+        out.type = Value::Type::Null;
+        return true;
+      }
+      return false;
+    }
+    return parseNumber(out);
+  }
+  bool parseObject(Value &out) {
+    out = Value::makeObject();
+    ++i_;
+    skipWs();
+    if (i_ < s_.size() && s_[i_] == '}') {
+      ++i_;
+      return true;
+    }
+    while (true) {
+      skipWs();
+      Value keyVal;
+      if (i_ >= s_.size() || s_[i_] != '"' || !parseString(keyVal))
+        return false;
+      skipWs();
+      if (i_ >= s_.size() || s_[i_] != ':')
+        return false;
+      ++i_;
+      Value val;
+      if (!parseValue(val))
+        return false;
+      out.obj.push_back({keyVal.str, std::move(val)});
+      skipWs();
+      if (i_ < s_.size() && s_[i_] == ',') {
+        ++i_;
+        continue;
+      }
+      if (i_ < s_.size() && s_[i_] == '}') {
+        ++i_;
+        break;
+      }
+      return false;
+    }
+    return true;
+  }
+  bool parseArray(Value &out) {
+    out.type = Value::Type::Array;
+    ++i_;
+    skipWs();
+    if (i_ < s_.size() && s_[i_] == ']') {
+      ++i_;
+      return true;
+    }
+    while (true) {
+      Value val;
+      if (!parseValue(val))
+        return false;
+      out.arr.push_back(std::move(val));
+      skipWs();
+      if (i_ < s_.size() && s_[i_] == ',') {
+        ++i_;
+        continue;
+      }
+      if (i_ < s_.size() && s_[i_] == ']') {
+        ++i_;
+        break;
+      }
+      return false;
+    }
+    return true;
+  }
+  bool parseString(Value &out) {
+    out.type = Value::Type::String;
+    ++i_;
+    std::string result;
+    while (i_ < s_.size() && s_[i_] != '"') {
+      char c = s_[i_];
+      if (c == '\\' && i_ + 1 < s_.size()) {
+        char n = s_[i_ + 1];
+        switch (n) {
+        case 'n':
+          result += '\n';
+          break;
+        case 't':
+          result += '\t';
+          break;
+        case 'r':
+          result += '\r';
+          break;
+        default:
+          result += n;
+          break; // handles \" \\ \/ verbatim
+        }
+        i_ += 2;
+      } else {
+        result += c;
+        ++i_;
+      }
+    }
+    if (i_ >= s_.size())
+      return false;
+    ++i_;
+    out.str = std::move(result);
+    return true;
+  }
+  bool parseBool(Value &out) {
+    if (s_.compare(i_, 4, "true") == 0) {
+      out.type = Value::Type::Bool;
+      out.b = true;
+      i_ += 4;
+      return true;
+    }
+    if (s_.compare(i_, 5, "false") == 0) {
+      out.type = Value::Type::Bool;
+      out.b = false;
+      i_ += 5;
+      return true;
+    }
+    return false;
+  }
+  bool parseNumber(Value &out) {
+    size_t start = i_;
+    if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+'))
+      ++i_;
+    bool any = false;
+    while (i_ < s_.size() && isdigit(static_cast<unsigned char>(s_[i_]))) {
+      ++i_;
+      any = true;
+    }
+    if (i_ < s_.size() && s_[i_] == '.') {
+      ++i_;
+      while (i_ < s_.size() && isdigit(static_cast<unsigned char>(s_[i_]))) {
+        ++i_;
+        any = true;
+      }
+    }
+    if (i_ < s_.size() && (s_[i_] == 'e' || s_[i_] == 'E')) {
+      size_t save = i_;
+      ++i_;
+      if (i_ < s_.size() && (s_[i_] == '+' || s_[i_] == '-'))
+        ++i_;
+      bool expDigits = false;
+      while (i_ < s_.size() && isdigit(static_cast<unsigned char>(s_[i_]))) {
+        ++i_;
+        expDigits = true;
+      }
+      if (!expDigits)
+        i_ = save;
+    }
+    if (!any)
+      return false;
+    out.type = Value::Type::Number;
+    out.num = std::strtod(s_.c_str() + start, nullptr);
+    return true;
+  }
+};
+
+inline std::optional<Value> parse(const std::string &text) {
+  Parser p(text);
+  return p.parse();
+}
+
+inline void escapeInto(std::string &out, const std::string &s) {
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    default:
+      out += c;
+    }
+  }
+}
+
+inline void serialize(const Value &v, std::string &out, int indent) {
+  auto pad = [&](int n) { out.append(static_cast<size_t>(n) * 2, ' '); };
+  switch (v.type) {
+  case Value::Type::Null:
+    out += "null";
+    break;
+  case Value::Type::Bool:
+    out += v.b ? "true" : "false";
+    break;
+  case Value::Type::Number: {
+    double d = v.num;
+    if (d == static_cast<double>(static_cast<long long>(d)))
+      out += std::to_string(static_cast<long long>(d));
+    else
+      out += std::to_string(d);
+    break;
+  }
+  case Value::Type::String:
+    out += '"';
+    escapeInto(out, v.str);
+    out += '"';
+    break;
+  case Value::Type::Array:
+    out += "[\n";
+    for (size_t i = 0; i < v.arr.size(); ++i) {
+      pad(indent + 1);
+      serialize(v.arr[i], out, indent + 1);
+      if (i + 1 < v.arr.size())
+        out += ",";
+      out += "\n";
+    }
+    pad(indent);
+    out += "]";
+    break;
+  case Value::Type::Object:
+    out += "{\n";
+    for (size_t i = 0; i < v.obj.size(); ++i) {
+      pad(indent + 1);
+      out += '"';
+      escapeInto(out, v.obj[i].first);
+      out += "\": ";
+      serialize(v.obj[i].second, out, indent + 1);
+      if (i + 1 < v.obj.size())
+        out += ",";
+      out += "\n";
+    }
+    pad(indent);
+    out += "}";
+    break;
+  }
+}
+
+inline std::string dump(const Value &v) {
+  std::string out;
+  serialize(v, out, 0);
+  return out;
+}
+
+} // namespace liteui_json
+
+// Where the settings file lives — a "liteui-editor" folder next to the
+// usual per-user config location. Created on first save if missing.
+inline std::string settingsDirectory() {
+  std::string home = liteui_terminal::userHomeDirectory();
+#if defined(_WIN32)
+  return home.empty() ? std::string("liteui-editor") : home + "\\liteui-editor";
+#else
+  return home.empty() ? std::string(".liteui-editor")
+                      : home + "/.config/liteui-editor";
+#endif
+}
+inline std::string settingsFilePath() {
+#if defined(_WIN32)
+  return settingsDirectory() + "\\settings.json";
+#else
+  return settingsDirectory() + "/settings.json";
+#endif
+}
+
+// Everything that used to be a compile-time constant on CodeEditor/
+// TabbedEditor. Loaded once at startup and persisted back out whenever
+// the user changes something via the Preferences menu.
+struct EditorSettings {
+  float fontSize = 14.0f;
+  int tabWidthSpaces = 4;
+  bool wordWrap = false;
+  bool showLineNumbers = true;
+  bool showMinimap = true;
+  std::string theme = "dark"; // "dark" | "light"
+  float terminalFontSize = 13.0f;
+
+  static std::string defaultPath() { return settingsFilePath(); }
+
+  static EditorSettings load(const std::string &path) {
+    EditorSettings s; // defaults, used whenever the file is missing/invalid
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      if (auto parsed = liteui_json::parse(ss.str());
+          parsed && parsed->type == liteui_json::Value::Type::Object) {
+        const liteui_json::Value &root = *parsed;
+        if (const auto *editor = root.find("editor")) {
+          if (const auto *v = editor->find("fontSize"))
+            s.fontSize = static_cast<float>(v->asNumber(s.fontSize));
+          if (const auto *v = editor->find("tabWidth"))
+            s.tabWidthSpaces = static_cast<int>(v->asNumber(s.tabWidthSpaces));
+          if (const auto *v = editor->find("wordWrap"))
+            s.wordWrap = v->asBool(s.wordWrap);
+          if (const auto *v = editor->find("showLineNumbers"))
+            s.showLineNumbers = v->asBool(s.showLineNumbers);
+          if (const auto *v = editor->find("showMinimap"))
+            s.showMinimap = v->asBool(s.showMinimap);
+        }
+        if (const auto *v = root.find("theme"))
+          s.theme = v->asString(s.theme);
+        if (const auto *term = root.find("terminal")) {
+          if (const auto *v = term->find("fontSize"))
+            s.terminalFontSize =
+                static_cast<float>(v->asNumber(s.terminalFontSize));
+        }
+      }
+    }
+    // Clamp so a hand-edited/corrupt file can't wedge the UI.
+    s.fontSize = std::clamp(s.fontSize, 6.0f, 72.0f);
+    s.terminalFontSize = std::clamp(s.terminalFontSize, 6.0f, 72.0f);
+    s.tabWidthSpaces = std::clamp(s.tabWidthSpaces, 1, 16);
+    if (s.theme != "dark" && s.theme != "light")
+      s.theme = "dark";
+    return s;
+  }
+
+  bool save(const std::string &path) const {
+    std::error_code ec;
+    std::filesystem::create_directories(
+        std::filesystem::path(path).parent_path(), ec);
+    liteui_json::Value root = liteui_json::Value::makeObject();
+    liteui_json::Value editor = liteui_json::Value::makeObject();
+    editor.set("fontSize", liteui_json::Value::makeNumber(fontSize));
+    editor.set("tabWidth", liteui_json::Value::makeNumber(tabWidthSpaces));
+    editor.set("wordWrap", liteui_json::Value::makeBool(wordWrap));
+    editor.set("showLineNumbers",
+               liteui_json::Value::makeBool(showLineNumbers));
+    editor.set("showMinimap", liteui_json::Value::makeBool(showMinimap));
+    root.set("editor", std::move(editor));
+    root.set("theme", liteui_json::Value::makeString(theme));
+    liteui_json::Value term = liteui_json::Value::makeObject();
+    term.set("fontSize", liteui_json::Value::makeNumber(terminalFontSize));
+    root.set("terminal", std::move(term));
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+      return false;
+    out << liteui_json::dump(root) << "\n";
+    return static_cast<bool>(out);
+  }
+};
+
+// The subset of colors a "theme" changes: the editor surface itself.
+struct EditorColorScheme {
+  Color background;
+  Color text;
+  Color placeholder;
+  Color caret;
+  Color selection;
+  Color lineNumber;
+  Color lineNumberBackground;
+  SyntaxTheme syntax;
+};
+
+inline EditorColorScheme editorColorSchemeForTheme(const std::string &theme) {
+  bool light = (theme == "light");
+  // The one place settings_.theme becomes actual colors — swap the whole
+  // chrome palette here too so it's never possible to update one without
+  // the other.
+  th::apply(light);
+  if (light) {
+    EditorColorScheme c;
+    c.background = Color{255, 255, 255, 255};
+    c.text = Color{30, 30, 30, 255};
+    c.placeholder = Color{150, 150, 150, 255};
+    c.caret = Color{20, 20, 20, 255};
+    c.selection = Color{173, 214, 255, 220};
+    c.lineNumber = Color{140, 140, 140, 255};
+    c.lineNumberBackground = Color{255, 255, 255, 255};
+    c.syntax.plainColor = Color{30, 30, 30};
+    c.syntax.keywordColor = Color{0, 0, 255};
+    c.syntax.commentColor = Color{0, 128, 0};
+    c.syntax.stringColor = Color{163, 21, 21};
+    c.syntax.numberColor = Color{9, 134, 88};
+    c.syntax.preprocessorColor = Color{128, 0, 128};
+    return c;
+  }
+  EditorColorScheme c; // "dark" — matches the previous hardcoded look
+  c.background = th::kEditorBg;
+  c.text = th::kEditorText;
+  c.placeholder = th::kPlaceholder;
+  c.caret = th::kCaret;
+  c.selection = Color{38, 79, 120, 220};
+  c.lineNumber = Color{133, 133, 133};
+  c.lineNumberBackground = th::kEditorBg;
+  c.syntax = SyntaxTheme{};
+  return c;
+}
+
 //================Editor Tabs =========================
 
 inline std::string editorTitleFromPath(const std::string &path) {
@@ -4947,15 +5463,18 @@ public:
   TabbedEditor(const std::string &windowTitle = "CODE")
       : ui_(windowTitle, -1, -1, true), title_(windowTitle),
         activeIndex_(std::make_shared<int>(-1)) {
-    ui_.setWindowBackground(th::kEditorBg);
+    settings_ = EditorSettings::load(settingsPath_);
+    wordWrap_ = settings_.wordWrap;
+    colors_ = editorColorSchemeForTheme(settings_.theme);
+    ui_.setWindowBackground(colors_.background);
     ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
     newWelcomeTab();
-    spawnNewTerminal(); // start with one terminal, like VS Code's default
+    spawnNewTerminal();
     ui_.addInterval(33, [this] {
       for (auto &t : terminals_)
         t.state->pollOutput();
     });
-    buildRoot(); // built once; tab strip + editor stack reconcile themselves
+    buildRoot();
     setupShortcuts();
     ui_.setOnCloseRequest([this] { attemptCloseWindow(); });
   }
@@ -5006,7 +5525,8 @@ public:
     doc.hasPath = true;
     doc.title = editorTitleFromPath(path);
     doc.crlf = detectsCRLF(content);
-    doc.highlighter = makeHighlighter(languageForExtension(path));
+    doc.highlighter =
+        makeHighlighter(languageForExtension(path), colors_.syntax);
     splitLinesInto(content, doc.state->lines);
     doc.state->cursor = {0, 0};
 
@@ -5252,6 +5772,9 @@ public:
 private:
   LiteUI ui_;
   std::string title_;
+  EditorSettings settings_;
+  EditorColorScheme colors_ = editorColorSchemeForTheme("dark");
+  std::string settingsPath_ = EditorSettings::defaultPath();
   std::vector<EditorDocument> docs_;
   std::shared_ptr<int> activeIndex_; // shared so Dynamic<> closures in the
                                      // *current* tree can read it without
@@ -5834,10 +6357,49 @@ private:
 
   bool wordWrap_ = false;
 
+  void saveSettings() { settings_.save(settingsPath_); }
+
   void toggleWordWrap() {
     wordWrap_ = !wordWrap_;
     for (auto &doc : docs_)
       doc.state->setWordWrap(wordWrap_);
+    settings_.wordWrap = wordWrap_;
+    saveSettings();
+  }
+
+  void setFontSize(float size) {
+    settings_.fontSize = std::clamp(size, 6.0f, 72.0f);
+    saveSettings();
+    ++settingsVersion_; // rebuilds the app body with the new font size
+  }
+
+  void toggleTheme() {
+    settings_.theme = (settings_.theme == "dark") ? "light" : "dark";
+    colors_ = editorColorSchemeForTheme(settings_.theme); // swaps th:: too
+    ui_.setWindowBackground(colors_.background);
+    ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
+    saveSettings();
+    ++settingsVersion_; // rebuilds the whole app body with the new palette
+  }
+
+  void reloadSettings() {
+    settings_ = EditorSettings::load(settingsPath_);
+    colors_ = editorColorSchemeForTheme(settings_.theme); // swaps th:: too
+    ui_.setWindowBackground(colors_.background);
+    ui_.setScrollbarColors(th::kScrollTrack, th::kScrollThumb);
+    wordWrap_ = settings_.wordWrap;
+    for (auto &doc : docs_)
+      doc.state->setWordWrap(wordWrap_); // word wrap applies live
+    ++settingsVersion_; // rebuilds the whole app body with any new settings
+  }
+  void increaseFontSize() { setFontSize(settings_.fontSize + 1.0f); }
+  void decreaseFontSize() { setFontSize(settings_.fontSize - 1.0f); }
+
+  void openSettingsFile() {
+    std::ifstream check(settingsPath_);
+    if (!check.good())
+      saveSettings(); // create it so there's something to edit
+    openFile(settingsPath_);
   }
 
   void showErrorDialog(std::string message) {
@@ -6960,7 +7522,7 @@ private:
     auto activeIdx = activeTerminalIndex_;
     liteui_terminal::Terminal shell;
     shell.state = terminals_[idx].state;
-    shell.fontSize = 13.0f;
+    shell.fontSize = settings_.terminalFontSize;
     shell.style.width = Size::full();
     shell.style.height = Size::full();
     shell.style.padding = EdgeInsets{4, 10, 6, 10};
@@ -7356,6 +7918,12 @@ private:
           {"Run Without Debugging", [this] { runActiveFile(); }}}});
     menus.push_back(
         {"Terminal", {{"New Terminal", [this] { spawnNewTerminal(); }}}});
+    menus.push_back({"Preferences",
+                     {{"Increase Font Size", [this] { increaseFontSize(); }},
+                      {"Decrease Font Size", [this] { decreaseFontSize(); }},
+                      {"Toggle Theme (Dark/Light)", [this] { toggleTheme(); }},
+                      {"Open Settings File", [this] { openSettingsFile(); }},
+                      {"Reload Settings", [this] { reloadSettings(); }}}});
     menus.push_back(
         {"Help", {{"About", [this] { *aboutDialogOpen_ = true; }}}});
 
@@ -7529,6 +8097,13 @@ private:
     return bar;
   }
 
+  // Bumped by setFontSize()/toggleTheme()/reloadSettings(). buildRoot()'s
+  // reactive body wrapper is keyed on this, so any of those three rebuild
+  // the whole app body (menu bar, sidebar, tabs, status bar, dialogs,
+  // editor stack — everything) on the next post-dispatch poll. See
+  // buildRoot() for why a targeted per-field update won't do.
+  int settingsVersion_ = 0;
+
   // A document's identity for keyed reconciliation. docs_ is append-only
   // (closing soft-deletes — see EditorDocument::closed), so a document's
   // index never changes for its whole lifetime, which is exactly the
@@ -7616,11 +8191,20 @@ private:
       return *activeIndexPtr == static_cast<int>(idx) ? Display::Flex
                                                       : Display::None;
     };
-    ed.style.backgroundColor = th::kEditorBg;
-    ed.showLineNumbers = true;
+    ed.style.backgroundColor = colors_.background;
+    ed.showLineNumbers = settings_.showLineNumbers;
+    ed.showMinimap = settings_.showMinimap;
+    ed.fontSize = settings_.fontSize;
+    ed.tabWidthSpaces = settings_.tabWidthSpaces;
     ed.fontFamily = "Monospace";
+    ed.textColor = colors_.text;
+    ed.placeholderColor = colors_.placeholder;
+    ed.caretColor = colors_.caret;
+    ed.selectionColor = colors_.selection;
+    ed.lineNumberColor = colors_.lineNumber;
+    ed.lineNumberBackground = colors_.lineNumberBackground;
     ed.wordWrap = wordWrap_;
-    ed.resetStateFromText = false; // reuse doc.state as-is
+    ed.resetStateFromText = false;
     ed.state = doc.state;
     std::shared_ptr<bool> modifiedFlag = doc.modified;
     ed.onChange = [modifiedFlag](const std::string &) { *modifiedFlag = true; };
@@ -8242,13 +8826,59 @@ private:
   // LiteUI's checkForUpdates() reconciles them after every dispatched
   // event. Opening or closing a document costs one build, not a
   // re-rasterization of every tab and every editor in the window.
+  // Called once, from the constructor. Everything the app actually looks
+  // like lives in buildAppBody(), wrapped in a single-item keyed list —
+  // see the comment there for why a plain root.addChild(...) tree, like
+  // this used to be, can't respond to a theme/font change on its own.
   void buildRoot() {
     View root;
     root.style.direction = FlexDirection::Column;
     root.style.width = Size::full();
     root.style.height = Size::full();
-    root.style.backgroundColor = th::kEditorBg;
-    root.addChild(buildMenuBar());
+    root.style.backgroundColor = [] { return th::kEditorBg; };
+
+    View body;
+    body.style.direction = FlexDirection::Column;
+    body.style.width = Size::full();
+    body.style.flexGrow = 1;
+    body.keysSource = [this] {
+      return std::vector<std::string>{std::to_string(settingsVersion_)};
+    };
+    body.itemBuilder = [this](const std::string &) { return buildAppBody(); };
+    root.addChild(std::move(body));
+
+    ui_.setRoot(std::move(root));
+  }
+
+  // Menu bar, sidebar, tab bar, status bar, dialogs, editor stack — the
+  // whole app, minus the outer root. Most of what's built in here reads
+  // th::kX / colors_ into a *plain* field (Style::hoverColor is a bare
+  // std::optional<Color>; CodeEditor's and TextInput's own color/fontSize
+  // members are plain Color/float, not Dynamic<>) — unlike
+  // Style::backgroundColor/borderColor or Text::color, which are
+  // Dynamic<Color> and already repoll live, these have no hook to push a
+  // later palette/font change into. So instead of hunting down every such
+  // field, buildRoot() wraps this whole function's output in a
+  // single-item keyed list, keyed on settingsVersion_. Bumping that
+  // counter (setFontSize()/toggleTheme()/reloadSettings() all do) makes
+  // reconcileChildren() treat the wrapper's one child as "new" and call
+  // this again — deferred to the next post-dispatch poll, same mechanism
+  // closeTab()'s soft-delete already relies on — rather than tearing the
+  // tree down synchronously from inside whatever menu click just changed
+  // the setting, which would destroy the very menu View still running
+  // that click's onClick on the call stack.
+  //
+  // Every doc's/terminal's own state (cursor, scroll, undo, PTY session)
+  // lives on EditorDocument/TerminalTab — class members, not the View —
+  // so nothing is lost by rebuilding: buildEditor()/buildTerminalOutput()
+  // both hand the same state back in (ed.state = doc.state, etc.).
+  View buildAppBody() {
+    View body;
+    body.style.direction = FlexDirection::Column;
+    body.style.width = Size::full();
+    body.style.flexGrow = 1;
+
+    body.addChild(buildMenuBar());
     View mainArea;
     mainArea.style.direction = FlexDirection::Row;
     mainArea.style.width = Size::full();
@@ -8275,8 +8905,17 @@ private:
     tabBar.style.overflowX = Overflow::Auto;
     tabBar.style.gap = 2;
     tabBar.style.backgroundColor = th::kTabBarBg;
+
+    // Defensive: keep the tab strip un-shrinkable, the same way
+    // buildHDivider()/buildTerminalPanel() already protect themselves.
+    // Without this, any sibling whose Fit-sizing balloons (as
+    // buildWelcomePane's did before the fix above) can eat into the
+    // tab bar's height via this file's flex-shrink pool.
     tabBar.style.flexShrink = 0;
 
+    // The keyed tabs live in their own container rather than directly in
+    // tabBar: reconcileChildren() replaces a node's children wholesale, so
+    // a keyed container can't also hold fixed siblings like the "+" button.
     View tabList;
     tabList.style.direction = FlexDirection::Row;
     tabList.style.alignItems = Align::Center;
@@ -8325,15 +8964,15 @@ private:
 
     mainArea.addChild(editorArea);
 
-    root.addChild(mainArea);
-    root.addChild(buildStatusBar());
-    root.addChild(buildDeleteDialog());
-    root.addChild(buildUnsavedChangesDialog());
-    root.addChild(buildErrorDialog());
-    root.addChild(buildAboutDialog());
-    root.addChild(buildExplorerContextMenu());
-    root.addChild(buildEditorContextMenu());
-    ui_.setRoot(std::move(root));
+    body.addChild(mainArea);
+    body.addChild(buildStatusBar());
+    body.addChild(buildDeleteDialog());
+    body.addChild(buildUnsavedChangesDialog());
+    body.addChild(buildErrorDialog());
+    body.addChild(buildAboutDialog());
+    body.addChild(buildExplorerContextMenu());
+    body.addChild(buildEditorContextMenu());
+    return body;
   }
 
   bool shortcutsInstalled_ = false;
@@ -8385,6 +9024,9 @@ private:
 
       beginDeleteConfirm();
     });
+
+    ui_.addShortcut(ctrl, Key::Equal, [this] { increaseFontSize(); });
+    ui_.addShortcut(ctrl, Key::Minus, [this] { decreaseFontSize(); });
   }
 
   bool commandsInstalled_ = false;
