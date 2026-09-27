@@ -513,20 +513,25 @@ struct Text {
 //  - No image decoding (PNG/JPEG/etc.) is included; CanvasImage just wraps
 //    raw, already-decoded RGBA8 pixels the app supplies (e.g. via stb_image
 //    used externally).
-//  - getImageData is fully supported on Linux (backed by a Cairo image
-//    surface) but unsupported on Windows in this build (a plain
-//    ID2D1RenderTarget isn't CPU-readable without WIC/DXGI plumbing this
-//    header doesn't pull in) — it always returns std::nullopt there.
-//    putImageData and drawImage work on both platforms.
+//  - getImageData and clearRect are now fully supported on BOTH platforms.
+//    On Windows this works because each canvas node's offscreen render
+//    target is backed by a WIC bitmap (D2D1CreateWicBitmapRenderTarget)
+//    rather than an opaque GPU-compatible bitmap — that bitmap is directly
+//    lockable, so getImageData reads real pixels and clearRect writes true
+//    (0,0,0,0) into a device-space quad derived from the current
+//    transform, exactly like the Linux/Cairo backend, rather than going
+//    through Direct2D's Clear() (which ignores clip/transform and wipes
+//    the whole target) or a FillRectangle (which can only ever
+//    source-over blend, never actually zero existing alpha). One
+//    difference from Cairo remains: the WIC-backed clear is a hard
+//    pixel-center test with no antialiasing at a rotated/skewed edge,
+//    where Cairo's CAIRO_OPERATOR_CLEAR fill is antialiased.
+//    putImageData and drawImage work on both platforms as before.
 //  - globalCompositeOperation maps onto the full range of Cairo operators
 //    on Linux; a plain ID2D1RenderTarget (v1) has no Porter-Duff blend
 //    control at all, so on Windows it's stored but has no visible effect
 //    — everything always draws with normal source-over alpha blending
 //    there.
-//  - clearRect gives a true sub-rectangle clear on Linux (via Cairo's
-//    CAIRO_OPERATOR_CLEAR) but clears the ENTIRE canvas on Windows
-//    (Direct2D v1's Clear() ignores clip/transform and always wipes the
-//    whole render target).
 //  - Radial gradients use Cairo's native two-circle model exactly on
 //    Linux; Direct2D only models a single circle plus a focal point, so
 //    the inner-radius stop is approximated there by rescaling stop
@@ -3443,12 +3448,24 @@ public:
     mutable float textLayoutBuiltForFontSize = -1.0f;
     mutable FontWeight textLayoutBuiltForFontWeight = FontWeight::Regular;
     mutable FontStyle textLayoutBuiltForFontStyle = FontStyle::Normal;
-    // A GPU-backed offscreen render target the size of this canvas node's
-    // inner (padding-excluded) content box, drawn into by onPaint and
-    // then blitted into the window's own render target every paint pass
-    // (see LiteUI::ensureCanvasTarget/paintCanvas). Rebuilt whenever the
-    // content box resizes.
-    mutable ID2D1BitmapRenderTarget *canvasTarget = nullptr;
+    // An offscreen render target the size of this canvas node's inner
+    // (padding-excluded) content box, drawn into by onPaint and then
+    // blitted into the window's own render target every paint pass (see
+    // LiteUI::ensureCanvasTarget/paintCanvas). Rebuilt whenever the
+    // content box resizes. Unlike a CreateCompatibleRenderTarget bitmap
+    // (opaque, GPU-side), this is backed by canvasWicBitmap below via
+    // D2D1CreateWicBitmapRenderTarget, so CanvasContext can lock real
+    // pixels for getImageData/clearRect — see the Canvas limitations
+    // note.
+    mutable ID2D1RenderTarget *canvasTarget = nullptr;
+    // The WIC bitmap backing canvasTarget above. Kept alongside it (not
+    // just a local inside ensureCanvasTarget) because CanvasContext needs
+    // it directly for getImageData/clearRect, and because a WIC-backed
+    // ID2D1RenderTarget has no GetBitmap() of its own the way
+    // ID2D1BitmapRenderTarget does — paintCanvas instead builds a fresh
+    // ID2D1Bitmap from this WIC bitmap on the window's own render target
+    // each time it blits.
+    mutable IWICBitmap *canvasWicBitmap = nullptr;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
 #else
     mutable GLuint textTexture = 0;
@@ -3518,6 +3535,10 @@ public:
     if (computed.canvasTarget) {
       computed.canvasTarget->Release();
       computed.canvasTarget = nullptr;
+    }
+    if (computed.canvasWicBitmap) {
+      computed.canvasWicBitmap->Release();
+      computed.canvasWicBitmap = nullptr;
     }
 #else
     if (computed.textTexture) {
@@ -3891,13 +3912,20 @@ inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
 
 class CanvasContext {
 public:
-  // `rt` is a bitmap render target sized exactly to the canvas node's
-  // inner (padding-excluded) content box, already BeginDraw()'d and
-  // cleared to transparent by the caller (see LiteUI::ensureCanvasTarget).
-  // `width`/`height` mirror that box's size so the app can query it back
-  // via width()/height() without hand-computing it.
-  CanvasContext(ID2D1RenderTarget *rt, float width, float height)
-      : rt_(rt), width_(width), height_(height) {
+  // `rt` is a render target sized exactly to the canvas node's inner
+  // (padding-excluded) content box, already BeginDraw()'d and cleared to
+  // transparent by the caller (see LiteUI::ensureCanvasTarget). `width`/
+  // `height` mirror that box's size so the app can query it back via
+  // width()/height() without hand-computing it. `wicBitmap`, when
+  // non-null, is the WIC bitmap backing `rt` (see LiteUI::
+  // ensureCanvasTarget) — it's what makes getImageData/clearRect able to
+  // touch real pixels instead of just going through Direct2D's own
+  // (limited) Clear()/FillRectangle. Left null when this CanvasContext
+  // isn't backed by a lockable bitmap, in which case getImageData/
+  // clearRect fall back to their old (fully-wipe / unsupported) behavior.
+  CanvasContext(ID2D1RenderTarget *rt, float width, float height,
+                IWICBitmap *wicBitmap = nullptr)
+      : rt_(rt), width_(width), height_(height), wicBitmap_(wicBitmap) {
     rt_->GetFactory(&factory_);
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
   }
@@ -4211,13 +4239,77 @@ public:
     startX_ = savedSX;
     startY_ = savedSY;
   }
-  // Direct2D (v1) render targets have no partial-area clear — Clear()
-  // always wipes the ENTIRE target regardless of clip/transform, so this
-  // clears the whole canvas rather than just (x,y,w,h) (Linux's Cairo
-  // backend gives a true sub-rectangle clear — see the Canvas limitations
-  // note at the top of this section).
-  void clearRect(float, float, float, float) {
-    rt_->Clear(D2D1::ColorF(0, 0, 0, 0));
+  // A true, transform-aware sub-rectangle clear (see the Canvas
+  // limitations note at the top of this section). Direct2D (v1) offers no
+  // way to do this through its own drawing calls — Clear() always wipes
+  // the ENTIRE target regardless of clip/transform, and FillRectangle can
+  // only ever source-over blend, never actually zero out existing alpha —
+  // so this writes straight into the WIC bitmap backing this canvas's
+  // render target instead. rt_->Flush() first, mirroring the Linux/Cairo
+  // backend's cairo_surface_flush(): without it, drawing already issued
+  // earlier in this same onPaint might not have been committed to the WIC
+  // bitmap yet, and we'd clear stale (or garbage) pixels. The rectangle
+  // is mapped through the current transform (matching HTML canvas
+  // semantics and this header's own Cairo backend) by testing each
+  // candidate destination pixel's center against the transform's inverse,
+  // so rotation/skew are honored exactly — not just translation/scale.
+  // Falls back to a no-op if there's no backing WIC bitmap (shouldn't
+  // happen for a real canvas node) or the transform isn't invertible.
+  void clearRect(float x, float y, float w, float h) {
+    if (!wicBitmap_)
+      return;
+    rt_->Flush(nullptr, nullptr);
+    float x0 = std::min(x, x + w), x1 = std::max(x, x + w);
+    float y0 = std::min(y, y + h), y1 = std::max(y, y + h);
+    // ReinterpretBaseType returns a Matrix3x2F* over transform_'s own
+    // memory (same layout, zero-copy) — dereference it to get a value we
+    // can safely Invert() without mutating transform_ itself.
+    D2D1::Matrix3x2F fwd = *D2D1::Matrix3x2F::ReinterpretBaseType(&transform_);
+    D2D1::Matrix3x2F inv = fwd;
+    if (!inv.Invert())
+      return;
+    // Bounding box of the transformed rect in device space, clamped to
+    // the canvas, so we only lock/touch pixels that could possibly change.
+    D2D1_POINT_2F corners[4] = {
+        fwd.TransformPoint(D2D1::Point2F(x0, y0)),
+        fwd.TransformPoint(D2D1::Point2F(x1, y0)),
+        fwd.TransformPoint(D2D1::Point2F(x1, y1)),
+        fwd.TransformPoint(D2D1::Point2F(x0, y1)),
+    };
+    float minX = corners[0].x, maxX = corners[0].x;
+    float minY = corners[0].y, maxY = corners[0].y;
+    for (int i = 1; i < 4; ++i) {
+      minX = std::min(minX, corners[i].x);
+      maxX = std::max(maxX, corners[i].x);
+      minY = std::min(minY, corners[i].y);
+      maxY = std::max(maxY, corners[i].y);
+    }
+    int ix0 = std::max(0, static_cast<int>(std::floor(minX)));
+    int iy0 = std::max(0, static_cast<int>(std::floor(minY)));
+    int ix1 = std::min(static_cast<int>(width_), static_cast<int>(std::ceil(maxX)));
+    int iy1 = std::min(static_cast<int>(height_), static_cast<int>(std::ceil(maxY)));
+    if (ix1 <= ix0 || iy1 <= iy0)
+      return;
+    WICRect lockRect{ix0, iy0, ix1 - ix0, iy1 - iy0};
+    IWICBitmapLock *lock = nullptr;
+    if (FAILED(wicBitmap_->Lock(&lockRect, WICBitmapLockWrite, &lock)))
+      return;
+    UINT stride = 0, bufSize = 0;
+    BYTE *data = nullptr;
+    lock->GetStride(&stride);
+    lock->GetDataPointer(&bufSize, &data);
+    for (int py = iy0; py < iy1; ++py) {
+      BYTE *row = data + static_cast<size_t>(py - iy0) * stride;
+      for (int px = ix0; px < ix1; ++px) {
+        D2D1_POINT_2F local =
+            inv.TransformPoint(D2D1::Point2F(px + 0.5f, py + 0.5f));
+        if (local.x >= x0 && local.x < x1 && local.y >= y0 && local.y < y1) {
+          BYTE *p = row + static_cast<size_t>(px - ix0) * 4;
+          p[0] = p[1] = p[2] = p[3] = 0; // premultiplied BGRA: alpha 0 => all 0
+        }
+      }
+    }
+    lock->Release();
   }
 
   // ---- text ----
@@ -4270,10 +4362,59 @@ public:
   }
 
   // ---- pixel data ----
-  // Not supported on Windows in this build — see the Canvas limitations
-  // note. Always returns std::nullopt here; fully supported on Linux.
-  std::optional<CanvasImage> getImageData(float, float, float, float) {
-    return std::nullopt;
+  // Fully supported (see the Canvas limitations note): reads straight out
+  // of the WIC bitmap backing this canvas's own render target. rt_->
+  // Flush() first for the same reason clearRect does — commit any drawing
+  // from earlier in this onPaint before reading raw pixels. Like the
+  // Cairo/Linux backend, and per the HTML canvas spec, this ignores the
+  // current transform and reads raw device pixels; pixels are stored
+  // premultiplied BGRA in the WIC bitmap and are un-premultiplied into
+  // CanvasImage's straight RGBA here, mirroring the Cairo path exactly.
+  // Returns std::nullopt only if there's no backing WIC bitmap at all
+  // (shouldn't happen for a real canvas node).
+  std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
+    if (!wicBitmap_)
+      return std::nullopt;
+    rt_->Flush(nullptr, nullptr);
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int iw = std::max(0, static_cast<int>(std::round(w)));
+    int ih = std::max(0, static_cast<int>(std::round(h)));
+    CanvasImage out(iw, ih);
+    if (iw == 0 || ih == 0)
+      return out;
+    UINT bw = 0, bh = 0;
+    wicBitmap_->GetSize(&bw, &bh);
+    int clipX0 = std::max(0, ix), clipY0 = std::max(0, iy);
+    int clipX1 = std::min(static_cast<int>(bw), ix + iw);
+    int clipY1 = std::min(static_cast<int>(bh), iy + ih);
+    if (clipX1 <= clipX0 || clipY1 <= clipY0)
+      return out; // entirely off-canvas: transparent black, like Cairo path
+    WICRect rect{clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0};
+    IWICBitmapLock *lock = nullptr;
+    if (FAILED(wicBitmap_->Lock(&rect, WICBitmapLockRead, &lock)))
+      return out;
+    UINT stride = 0, bufSize = 0;
+    BYTE *data = nullptr;
+    lock->GetStride(&stride);
+    lock->GetDataPointer(&bufSize, &data);
+    for (int row = 0; row < rect.Height; ++row) {
+      const BYTE *src = data + static_cast<size_t>(row) * stride;
+      int destRow = (clipY0 + row) - iy;
+      for (int col = 0; col < rect.Width; ++col) {
+        const BYTE *p = src + static_cast<size_t>(col) * 4;
+        int destCol = (clipX0 + col) - ix;
+        unsigned char b = p[0], g = p[1], r = p[2], a = p[3];
+        unsigned char *dst = out.pixels.data() +
+                             (static_cast<size_t>(destRow) * iw + destCol) * 4;
+        dst[0] = a ? static_cast<unsigned char>(std::min(255, r * 255 / a)) : 0;
+        dst[1] = a ? static_cast<unsigned char>(std::min(255, g * 255 / a)) : 0;
+        dst[2] = a ? static_cast<unsigned char>(std::min(255, b * 255 / a)) : 0;
+        dst[3] = a;
+      }
+    }
+    lock->Release();
+    return out;
   }
   // putImageData ignores the current transform and paints the pixels
   // directly at (dx,dy), matching HTML canvas semantics.
@@ -4672,6 +4813,10 @@ private:
 
   ID2D1RenderTarget *rt_;
   ID2D1Factory *factory_ = nullptr;
+  // Not owned — lifetime is the canvas node's Computed field
+  // (canvasWicBitmap), which outlives any single CanvasContext. Null when
+  // this context isn't backed by a lockable bitmap.
+  IWICBitmap *wicBitmap_ = nullptr;
   float width_, height_;
 
   D2D1_MATRIX_3X2_F transform_ = D2D1::Matrix3x2F::Identity();
@@ -7374,6 +7519,28 @@ private:
   // process (well, the LiteUI instance's) lifetime.
   ID2D1Factory *d2dFactory_ = nullptr;
 
+  // Backs every Canvas node's offscreen render target with a WIC bitmap
+  // (see ensureCanvasTarget) so getImageData/clearRect can lock real
+  // pixels — see the Canvas limitations note. Lazily created on first use
+  // and cached for the LiteUI instance's lifetime, unlike the file-dialog
+  // helpers above (each of which pairs its own CoInitializeEx/
+  // CoUninitialize per call): this factory has to outlive individual
+  // paint calls, so its COM apartment is torn down alongside it in
+  // ~LiteUI() instead.
+  IWICImagingFactory *wicFactory_ = nullptr;
+  bool wicComInitialized_ = false;
+  IWICImagingFactory *ensureWicFactory() {
+    if (wicFactory_)
+      return wicFactory_;
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    wicComInitialized_ = SUCCEEDED(coHr);
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wicFactory_))))
+      wicFactory_ = nullptr;
+    return wicFactory_;
+  }
+
   // Device-dependent: bound to hwnd_'s current size. Torn down and
   // recreated if EndDraw() ever reports D2DERR_RECREATE_TARGET (e.g. after
   // a display driver reset) — everything that draws goes through this
@@ -7922,10 +8089,13 @@ private:
     }
   }
 
-  // (Re)builds v.computed.canvasTarget — an offscreen bitmap render
-  // target sized to v's inner (padding-excluded) content box — whenever
-  // that size has changed since it was last built, then (re)invokes
-  // v.onPaint into it whenever the size changed OR the app requested a
+  // (Re)builds v.computed.canvasTarget — an offscreen render target sized
+  // to v's inner (padding-excluded) content box, backed by a WIC bitmap
+  // (v.computed.canvasWicBitmap) rather than an opaque GPU-compatible
+  // bitmap so CanvasContext can lock real pixels for getImageData/
+  // clearRect — see the Canvas limitations note. Rebuilt whenever that
+  // size has changed since it was last built, then v.onPaint is
+  // (re)invoked into it whenever the size changed OR the app requested a
   // redraw via View::requestCanvasRedraw() (canvasNeedsRedraw starts
   // true, so this always happens at least once). A plain repaint with
   // neither condition true is a no-op: the previous frame's bitmap is
@@ -7943,8 +8113,27 @@ private:
         v.computed.canvasTarget->Release();
         v.computed.canvasTarget = nullptr;
       }
-      renderTarget_->CreateCompatibleRenderTarget(D2D1::SizeF(innerW, innerH),
-                                                  &v.computed.canvasTarget);
+      if (v.computed.canvasWicBitmap) {
+        v.computed.canvasWicBitmap->Release();
+        v.computed.canvasWicBitmap = nullptr;
+      }
+      IWICImagingFactory *wic = ensureWicFactory();
+      // GUID_WICPixelFormat32bppPBGRA (premultiplied BGRA) is the pixel
+      // format Direct2D itself requires for a WIC bitmap render target,
+      // and matches the premultiplied byte order Cairo's own ARGB32
+      // surfaces use on the Linux backend — so getImageData/clearRect's
+      // pixel math below mirrors the Cairo path almost exactly.
+      if (wic && SUCCEEDED(wic->CreateBitmap(
+                     static_cast<UINT>(innerW), static_cast<UINT>(innerH),
+                     GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
+                     &v.computed.canvasWicBitmap))) {
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                              D2D1_ALPHA_MODE_PREMULTIPLIED));
+        d2dFactory_->CreateWicBitmapRenderTarget(
+            v.computed.canvasWicBitmap, props, &v.computed.canvasTarget);
+      }
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
@@ -7954,7 +8143,8 @@ private:
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
       v.computed.canvasTarget->BeginDraw();
       v.computed.canvasTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
-      CanvasContext ctx(v.computed.canvasTarget, innerW, innerH);
+      CanvasContext ctx(v.computed.canvasTarget, innerW, innerH,
+                        v.computed.canvasWicBitmap);
       v.onPaint(ctx);
       v.computed.canvasTarget->EndDraw();
       v.computed.canvasNeedsRedraw = false;
@@ -7963,13 +8153,26 @@ private:
 
   // Blits v's cached canvas bitmap into the window's own render target at
   // v's final on-screen position (inset by padding, same convention as
-  // paintText's x/y).
+  // paintText's x/y). Since a WIC-backed ID2D1RenderTarget has no
+  // GetBitmap() of its own (unlike the old ID2D1BitmapRenderTarget), this
+  // builds a fresh ID2D1Bitmap from canvasWicBitmap on `rt` (always
+  // renderTarget_ in practice) each call via CreateBitmapFromWicBitmap —
+  // a real CPU-to-GPU upload every paint, not just an AddRef the way
+  // GetBitmap() was. That's a deliberate trade-off for correctness and
+  // simplicity (it also sidesteps needing to invalidate any cached bitmap
+  // on device loss/D2DERR_RECREATE_TARGET); revisit with a cache keyed on
+  // canvasNeedsRedraw if this ever shows up as a bottleneck.
   void paintCanvas(ID2D1RenderTarget *rt, const View &v) {
     ensureCanvasTarget(v);
-    if (!v.computed.canvasTarget)
+    if (!v.computed.canvasTarget || !v.computed.canvasWicBitmap)
       return;
     ID2D1Bitmap *bmp = nullptr;
-    v.computed.canvasTarget->GetBitmap(&bmp);
+    // nullptr bitmapProperties (this parameter is optional, unlike
+    // CreateBitmap's required one above): the WIC bitmap is already
+    // GUID_WICPixelFormat32bppPBGRA, which maps directly onto
+    // DXGI_FORMAT_B8G8R8A8_UNORM + D2D1_ALPHA_MODE_PREMULTIPLIED, so
+    // there's no ambiguity for Direct2D to resolve by inferring it.
+    rt->CreateBitmapFromWicBitmap(v.computed.canvasWicBitmap, nullptr, &bmp);
     if (!bmp)
       return;
     const EdgeInsets &pad =
@@ -9858,6 +10061,13 @@ inline LiteUI::~LiteUI() {
     renderTarget_->Release();
   if (d2dFactory_)
     d2dFactory_->Release();
+  // wicFactory_'s COM apartment (see ensureWicFactory) is paired here
+  // rather than per-call, since the factory itself is cached for our
+  // whole lifetime.
+  if (wicFactory_)
+    wicFactory_->Release();
+  if (wicComInitialized_)
+    CoUninitialize();
   // Destroy the native window if it was successfully created.
   if (hwnd_)
     DestroyWindow(hwnd_);
