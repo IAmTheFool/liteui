@@ -310,50 +310,84 @@ inline View buildTextField(std::string &value, const std::string &placeholder,
   return wrapper;
 }
 
-inline View buildSlider(float &value) {
-  constexpr float kThumb = 18.0f;
-  auto trackWidth = std::make_shared<float>(0.0f);
+inline View buildSlider(float &value, float min = 0.0f, float max = 100.0f) {
+  constexpr float kTrackWidth = 300.0f, kTrackHeight = 6.0f;
+  constexpr float kThumbSize = 20.0f;
+  constexpr float kMaxThumbX = kTrackWidth - kThumbSize;
+
+  // Maps the current value to a thumb x-position. A plain lambda (not a
+  // View callback) so both the fill bar and the thumb can share the math.
+  auto thumbXFor = [min, max, kMaxThumbX](float v) {
+    return std::clamp((v - min) / (max - min), 0.0f, 1.0f) * kMaxThumbX;
+  };
+
+  // Shared so onPressAt and onDragTo -- two separate lambdas -- read and
+  // write the same grab offset across the life of one drag gesture.
+  auto grabX = std::make_shared<float>(0.0f);
+
+  // Where the fill should start growing from. For a normal 0-based range
+  // this is the low end (min), same as before. For a range that straddles
+  // zero (e.g. -100..100) it's 0 itself, so the fill grows outward from
+  // the center instead of always starting at the left edge.
+  const bool isBipolar = (min < 0.0f && max > 0.0f);
+  const float anchor = isBipolar ? 0.0f : min;
 
   View track;
-  track.style.height = Size::pixel(6);
-  track.style.width = Size::full();
-  track.style.backgroundColor = Color{225, 225, 225};
-  track.style.borderRadius = 3.0f;
-  track.onLayout = [trackWidth](float, float, float w, float) {
-    *trackWidth = w;
-  };
+  track.style.width = Size::pixel(kTrackWidth);
+  track.style.height = Size::pixel(kTrackHeight);
+  track.style.backgroundColor = Color{210, 210, 210};
+  track.style.borderRadius = kTrackHeight / 2;
 
-  auto updateFromLocalX = [&value, trackWidth](float localX) {
-    if (*trackWidth > 0)
-      value = std::clamp(localX / *trackWidth, 0.0f, 1.0f);
-  };
-  track.onPressAt = [updateFromLocalX](float localX, float) {
-    updateFromLocalX(localX);
-  };
-  track.onDragTo = [updateFromLocalX](float localX, float) {
-    updateFromLocalX(localX);
-  };
-
+  // Filled portion, absolutely positioned inside the track so it can grow
+  // independently of the thumb without disturbing flex layout. Spans from
+  // the anchor's thumb-center position to the current value's -- for a
+  // normal slider the anchor is at x=0 so this reduces to "fill from the
+  // left edge", exactly like before.
   View fill;
-  fill.style.height = Size::full();
-  fill.style.backgroundColor = kAccent;
-  fill.style.borderRadius = 3.0f;
-  fill.style.width = [&value, trackWidth]() -> Size {
-    return Size::pixel(value * *trackWidth);
+  fill.style.position = Position::Absolute;
+  fill.style.top = 0.0f;
+  fill.style.height = Size::pixel(kTrackHeight);
+  fill.style.left = [&value, thumbXFor, kThumbSize, anchor, isBipolar] {
+    // At a hard boundary (anchor == min) there's a real track edge to sit
+    // flush against, so use the raw, un-offset position (0). At the
+    // bipolar zero point there's no physical edge -- only a notional
+    // thumb -- so anchor to its center instead, same as the value side.
+    float anchorX =
+        isBipolar ? thumbXFor(anchor) + kThumbSize / 2 : thumbXFor(anchor);
+    float valueCenter = thumbXFor(value) + kThumbSize / 2;
+    return std::min(anchorX, valueCenter);
   };
+  fill.style.width = [&value, thumbXFor, kThumbSize, anchor, isBipolar] {
+    float anchorX =
+        isBipolar ? thumbXFor(anchor) + kThumbSize / 2 : thumbXFor(anchor);
+    float valueCenter = thumbXFor(value) + kThumbSize / 2;
+    return Size::pixel(std::abs(valueCenter - anchorX));
+  };
+  fill.style.backgroundColor = Color{80, 140, 220};
+  fill.style.borderRadius = kTrackHeight / 2;
   track.addChild(fill);
 
+  // Draggable thumb -- same press/drag pattern as the standalone draggable
+  // box: onPressAt remembers where inside the thumb the grab happened,
+  // onDragTo moves it (clamped) and writes the result back into `value`.
   View thumb;
   thumb.style.position = Position::Absolute;
-  thumb.style.top = -6.0f; // (kThumb - track height) / 2 = (18 - 6) / 2
-  thumb.style.width = Size::pixel(kThumb);
-  thumb.style.height = Size::pixel(kThumb);
+  thumb.style.left = [&value, thumbXFor] { return thumbXFor(value); };
+  thumb.style.top =
+      -(kThumbSize - kTrackHeight) / 2; // vertically centered on the track
+  thumb.style.width = Size::pixel(kThumbSize);
+  thumb.style.height = Size::pixel(kThumbSize);
   thumb.style.backgroundColor = Color{255, 255, 255};
   thumb.style.borderWidth = 2.0f;
-  thumb.style.borderColor = kAccent;
-  thumb.style.borderRadius = kThumb / 2.0f;
-  thumb.style.left = [&value, trackWidth]() -> float {
-    return value * *trackWidth - kThumb / 2.0f;
+  thumb.style.borderColor = Color{80, 140, 220};
+  thumb.style.borderRadius = kThumbSize / 2;
+
+  thumb.onPressAt = [grabX](float lx, float) { *grabX = lx; };
+  thumb.onDragTo = [&value, grabX, thumbXFor, min, max, kMaxThumbX](float lx,
+                                                                    float) {
+    float newThumbX =
+        std::clamp(thumbXFor(value) + (lx - *grabX), 0.0f, kMaxThumbX);
+    value = min + (newThumbX / kMaxThumbX) * (max - min);
   };
   track.addChild(thumb);
 
@@ -481,6 +515,13 @@ int main() {
   int activeTab = 0;
   bool deleteDialogOpen = false;
 
+  static float volume = 50.0f;
+  static float brightness = 20.0f;
+  // Negative-to-positive range: with min/max symmetric around 0 and the
+  // value starting at 0, thumbXFor((0 - -100) / (100 - -100)) = 0.5, so
+  // the thumb lands exactly in the middle of the track on first render.
+  static float balance = 0.0f;
+
   auto heading = [](const std::string &text) {
     Text t;
     t.label = text;
@@ -488,6 +529,28 @@ int main() {
     t.color = kTextGray;
     return t;
   };
+
+  // Plain Text struct + field assignment, same as the counter example --
+  // `label` is a Dynamic<std::string>, so handing it a lambda instead of
+  // a plain string makes it re-read every frame, the same polling that
+  // keeps style.left/top live during a drag.
+  Text volumeLabel;
+  volumeLabel.label = [&]() {
+    return "Volume: " + std::to_string((int)volume);
+  };
+  volumeLabel.fontSize = 16;
+
+  Text brightnessLabel;
+  brightnessLabel.label = [&]() {
+    return "Brightness: " + std::to_string((int)brightness);
+  };
+  brightnessLabel.fontSize = 16;
+
+  Text balanceLabel;
+  balanceLabel.label = [&]() {
+    return "Balance: " + std::to_string((int)balance);
+  };
+  balanceLabel.fontSize = 16;
 
   View root;
   root.style.direction = FlexDirection::Column;
@@ -517,6 +580,12 @@ int main() {
 
   root.addChild(heading("Volume"));
   root.addChild(buildSlider(sliderValue));
+  root.addChild(volumeLabel);
+  root.addChild(buildSlider(volume));
+  root.addChild(brightnessLabel);
+  root.addChild(buildSlider(brightness, 0.0f, 255.0f));
+  root.addChild(balanceLabel);
+  root.addChild(buildSlider(balance, -100.0f, 100.0f));
 
   root.addChild(heading("Country"));
   root.addChild(buildDropdown({"Option A", "Option B", "Option C"},

@@ -430,6 +430,10 @@ struct Style {
   Overflow overflowY = Overflow::Visible;
   bool contentPanEnabled = true;
   bool wheelScrollEnabled = true;
+  
+  Dynamic<std::optional<Color>> scrollTrackColor;
+  Dynamic<std::optional<Color>> scrollThumbColor;
+  bool scrollbarAutoHide = false;
   Dynamic<Display> display = Display::Flex;
   Dynamic<Visibility> visibility = Visibility::Visible;
 };
@@ -3425,6 +3429,8 @@ public:
     mutable FontStyle resolvedFontStyle = FontStyle::Normal;
     mutable EdgeInsets resolvedMargin;
     mutable EdgeInsets resolvedPadding;
+    mutable std::optional<Color> resolvedScrollTrackColor;
+    mutable std::optional<Color> resolvedScrollThumbColor;
     // Key list the current `children` were built for; compared against
     // keysSource each poll to decide whether to reconcile at all.
     mutable std::vector<std::string> resolvedKeys;
@@ -7015,6 +7021,24 @@ private:
         changed = true;
       }
     }
+    if (auto *fn = std::get_if<std::function<std::optional<Color>()>>(
+            &v.style.scrollTrackColor)) {
+      std::optional<Color> next = (*fn)();
+      if (next != v.computed.resolvedScrollTrackColor) {
+        v.computed.resolvedScrollTrackColor = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
+    if (auto *fn = std::get_if<std::function<std::optional<Color>()>>(
+            &v.style.scrollThumbColor)) {
+      std::optional<Color> next = (*fn)();
+      if (next != v.computed.resolvedScrollThumbColor) {
+        v.computed.resolvedScrollThumbColor = next;
+        v.computed.dirty = true;
+        changed = true;
+      }
+    }
     if (auto *fn = std::get_if<std::function<Display()>>(&v.style.display)) {
       Display next = (*fn)();
       if (next != v.computed.resolvedDisplay) {
@@ -7360,6 +7384,10 @@ public:
     windowBg_ = c;
     requestRepaint();
   }
+  // Sets the window-wide default scrollbar colors. A view with
+  // Style::scrollTrackColor/scrollThumbColor set overrides these defaults
+  // for itself only (see paintScrollbars/renderScrollbars) — there is no
+  // separate "global" color to opt back into once a view overrides one.
   void setScrollbarColors(Color track, Color thumb) {
     scrollTrack_ = track;
     scrollThumb_ = thumb;
@@ -8018,21 +8046,37 @@ private:
   // which is itself already visible or this function wouldn't have been
   // reached).
   void paintScrollbars(ID2D1RenderTarget *rt, const View &v) {
+    // Auto-hide: painted only while hovered, or while this exact view's
+    // thumb is mid-drag (so a fast drag that briefly outruns the pointer
+    // doesn't make the bar vanish out from under it).
+    if (v.style.scrollbarAutoHide && !v.computed.isHovered &&
+        !((scrollDrag_.mode == DragMode::VThumb ||
+           scrollDrag_.mode == DragMode::HThumb) &&
+          scrollDrag_.target == &v))
+      return;
+    // Per-view override falls back to the window-wide default independently
+    // for track and thumb (see Style::scrollTrackColor/scrollThumbColor).
+    Color track = resolveDynamic(v.style.scrollTrackColor,
+                                  v.computed.resolvedScrollTrackColor)
+                      .value_or(scrollTrack_);
+    Color thumb = resolveDynamic(v.style.scrollThumbColor,
+                                  v.computed.resolvedScrollThumbColor)
+                      .value_or(scrollThumb_);
     auto box = [&](const PixRect &r, Color c) {
       d2dFillRect(rt, r.x, r.y, r.w, r.h, c);
     };
     if (wantVBar(v)) {
-      box(vTrackRect(v), scrollTrack_);
-      box(vThumbRect(v), scrollThumb_);
+      box(vTrackRect(v), track);
+      box(vThumbRect(v), thumb);
     }
     if (wantHBar(v)) {
-      box(hTrackRect(v), scrollTrack_);
-      box(hThumbRect(v), scrollThumb_);
+      box(hTrackRect(v), track);
+      box(hThumbRect(v), thumb);
     }
     if (wantVBar(v) && wantHBar(v))
       d2dFillRect(rt, v.computed.x + v.computed.w - kScrollbarThickness,
                   v.computed.y + v.computed.h - kScrollbarThickness,
-                  kScrollbarThickness, kScrollbarThickness, scrollTrack_);
+                  kScrollbarThickness, kScrollbarThickness, track);
   }
 
   // Rebuilds v.computed.textLayout if it's missing or was built for a
@@ -9596,21 +9640,37 @@ private:
   // scrollbar correctly disappears if v itself has scrolled out of some
   // outer ancestor's viewport, same reasoning as the GDI version.
   void renderScrollbars(const View &v, const ClipRect &clip) {
+    // Auto-hide: painted only while hovered, or while this exact view's
+    // thumb is mid-drag (so a fast drag that briefly outruns the pointer
+    // doesn't make the bar vanish out from under it).
+    if (v.style.scrollbarAutoHide && !v.computed.isHovered &&
+        !((scrollDrag_.mode == DragMode::VThumb ||
+           scrollDrag_.mode == DragMode::HThumb) &&
+          scrollDrag_.target == &v))
+      return;
+    // Per-view override falls back to the window-wide default independently
+    // for track and thumb (see Style::scrollTrackColor/scrollThumbColor).
+    Color track = resolveDynamic(v.style.scrollTrackColor,
+                                  v.computed.resolvedScrollTrackColor)
+                      .value_or(scrollTrack_);
+    Color thumb = resolveDynamic(v.style.scrollThumbColor,
+                                  v.computed.resolvedScrollThumbColor)
+                      .value_or(scrollThumb_);
     auto box = [&](const PixRect &r, Color c) {
       drawRectGL(r.x, r.y, r.w, r.h, 0.0f, c, clip);
     };
     if (wantVBar(v)) {
-      box(vTrackRect(v), scrollTrack_);
-      box(vThumbRect(v), scrollThumb_);
+      box(vTrackRect(v), track);
+      box(vThumbRect(v), thumb);
     }
     if (wantHBar(v)) {
-      box(hTrackRect(v), scrollTrack_);
-      box(hThumbRect(v), scrollThumb_);
+      box(hTrackRect(v), track);
+      box(hThumbRect(v), thumb);
     }
     if (wantVBar(v) && wantHBar(v))
       drawRectGL(v.computed.x + v.computed.w - kScrollbarThickness,
                  v.computed.y + v.computed.h - kScrollbarThickness,
-                 kScrollbarThickness, kScrollbarThickness, 0.0f, scrollTrack_,
+                 kScrollbarThickness, kScrollbarThickness, 0.0f, track,
                  clip);
   }
 
