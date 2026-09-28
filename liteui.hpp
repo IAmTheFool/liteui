@@ -547,6 +547,73 @@ struct Text {
 //    a true outline of the glyph contours.
 //  - fillText/strokeText's maxWidth parameter is accepted for API
 //    familiarity but currently unused (no horizontal squeeze-to-fit).
+// ---- optional frame profiler ------------------------------------------
+// Compile with -DLITEUI_PROFILE to print, once per second on stderr, how
+// long each stage of interaction/painting takes (avg and worst case, in
+// ms, plus how many times it ran that second). Compiled out entirely
+// otherwise — LITEUI_PROF_START/ADD expand to nothing. Stages nest: e.g.
+// `build` (all of WM_PAINT's drawing) contains `canvas` and `blit`.
+#ifdef LITEUI_PROFILE
+#include <chrono>
+namespace liteui_prof {
+struct Stat {
+  double sum = 0, worst = 0;
+  int n = 0;
+  void add(double ms) {
+    sum += ms;
+    if (ms > worst)
+      worst = ms;
+    ++n;
+  }
+  double avg() const { return n ? sum / n : 0.0; }
+};
+struct Report {
+  Stat move, build, endDraw, canvas, blit, recompute, appPaint;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  void flushIfDue() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(1))
+      return;
+    auto line = [](const char *name, const Stat &s) {
+      if (s.n)
+        std::fprintf(stderr, "  %-9s x%-4d avg %6.2f ms  worst %6.2f ms\n",
+                     name, s.n, s.avg(), s.worst);
+    };
+    if (move.n || build.n) {
+      std::fprintf(stderr, "[liteui profile]\n");
+      line("mouse", move);
+      line("recompute", recompute);
+      line("build", build);
+      line("canvas", canvas);
+      line("appPaint", appPaint);
+      line("blit", blit);
+      line("EndDraw", endDraw);
+    }
+    move = build = endDraw = canvas = blit = recompute = appPaint = Stat{};
+    last = now;
+  }
+};
+inline Report &report() {
+  static Report r;
+  return r;
+}
+inline double msSince(std::chrono::steady_clock::time_point t) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t)
+      .count();
+}
+} // namespace liteui_prof
+#define LITEUI_PROF_START(var) auto var = std::chrono::steady_clock::now()
+#define LITEUI_PROF_ADD(stat, var)                                             \
+  do {                                                                         \
+    liteui_prof::report().stat.add(liteui_prof::msSince(var));                 \
+    liteui_prof::report().flushIfDue();                                        \
+  } while (0)
+#else
+#define LITEUI_PROF_START(var) ((void)0)
+#define LITEUI_PROF_ADD(stat, var) ((void)0)
+#endif
+
 class CanvasContext;
 
 // A simple RGBA8, straight- (non-premultiplied) alpha bitmap. The app is
@@ -3120,6 +3187,9 @@ struct Canvas {
   std::function<void(float localX, float localY)> onDragTo;
   std::function<void(float localX, float localY)> onMiddleDragTo;
   std::function<void(float localX, float localY)> onRightDragTo;
+  // See View::onDragEnd's comment for exactly when this fires (and when
+  // it deliberately doesn't).
+  std::function<void()> onDragEnd;
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
   std::function<bool()> canvasDirtySource;
@@ -3314,6 +3384,19 @@ public:
   std::function<void(float localX, float localY)> onMiddleDragTo;
   std::function<void(float localX, float localY)> onRightDragTo;
 
+  // Fired once when a drag in progress on this view legitimately ends: a
+  // matching button release, or the platform aborting it (input capture
+  // lost to alt-tab/a system dialog, a window-move grab swallowing the
+  // release). There's a single onDragEnd regardless of which button
+  // (Left/Middle/Right) was dragging — in practice a view wires up only
+  // one of onDragTo/onMiddleDragTo/onRightDragTo at a time, so this stays
+  // one callback instead of three. Deliberately NOT fired when the view
+  // itself is about to be destroyed (a fresh setRoot(), or any other
+  // invalidateViewPointers() case): the pointer may already be dangling
+  // by then, so those paths null dragView_ directly instead of going
+  // through endDrag() — same reasoning as onBlur being skipped there.
+  std::function<void()> onDragEnd;
+
   // Fired once per relayout(), right after placeNode() finalizes this
   // node's absolute on-screen box. Lets the app read a view's real
   // x/y/w/h to drive some other view's position — e.g. anchoring a
@@ -3473,6 +3556,20 @@ public:
     // each time it blits.
     mutable IWICBitmap *canvasWicBitmap = nullptr;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
+    // Caches the ID2D1Bitmap most recently uploaded by this canvas node's
+    // own CanvasContext::drawImage() (see that method's comment), keyed on
+    // the source CanvasImage's pixel buffer identity+size+dimensions. A
+    // repeat draw of the SAME image content — e.g. re-painting at a new
+    // zoom level, or a window resize that leaves the image itself
+    // untouched — reuses this instead of reconverting+reuploading every
+    // pixel again. Tied to canvasTarget (the bitmap was created against
+    // it), so it's released whenever canvasTarget is, both on resize
+    // (ensureCanvasTarget) and on teardown (freeTextResources) — a bitmap
+    // created against one render target can't be reused on another.
+    mutable ID2D1Bitmap *cachedImageBitmap = nullptr;
+    mutable const void *cachedImagePixels = nullptr;
+    mutable size_t cachedImagePixelsSize = 0;
+    mutable int cachedImageW = -1, cachedImageH = -1;
 #else
     mutable GLuint textTexture = 0;
     mutable int textTexW = 0, textTexH = 0;
@@ -3493,6 +3590,23 @@ public:
     mutable cairo_surface_t *canvasSurface = nullptr;
     mutable GLuint canvasTexture = 0;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
+    // Caches the cairo_surface_t most recently uploaded by this canvas
+    // node's own CanvasContext::drawImage() (see that method's comment),
+    // keyed on the source CanvasImage's pixel buffer identity+size+
+    // dimensions. A repeat draw of the SAME image content — e.g.
+    // re-painting at a new zoom level, or a window resize that leaves the
+    // image itself untouched — reuses this instead of reconverting+
+    // reuploading every pixel again. Unlike the Windows bitmap cache
+    // above, a standalone Cairo image surface isn't tied to any
+    // particular cairo_t, so it deliberately SURVIVES canvasSurface being
+    // rebuilt on a resize (the same image redrawn into a differently
+    // sized canvas is exactly the case this cache is for). It's only
+    // released in freeTextResources, or replaced when drawImage sees a
+    // different pixel buffer.
+    mutable cairo_surface_t *cachedImageSurface = nullptr;
+    mutable const void *cachedImagePixels = nullptr;
+    mutable size_t cachedImagePixelsSize = 0;
+    mutable int cachedImageW = -1, cachedImageH = -1;
 #endif
   } computed;
 
@@ -3546,6 +3660,10 @@ public:
       computed.canvasWicBitmap->Release();
       computed.canvasWicBitmap = nullptr;
     }
+    if (computed.cachedImageBitmap) {
+      computed.cachedImageBitmap->Release();
+      computed.cachedImageBitmap = nullptr;
+    }
 #else
     if (computed.textTexture) {
       glDeleteTextures(1, &computed.textTexture);
@@ -3558,6 +3676,10 @@ public:
     if (computed.canvasSurface) {
       cairo_surface_destroy(computed.canvasSurface);
       computed.canvasSurface = nullptr;
+    }
+    if (computed.cachedImageSurface) {
+      cairo_surface_destroy(computed.cachedImageSurface);
+      computed.cachedImageSurface = nullptr;
     }
 #endif
     for (auto &c : children)
@@ -3607,6 +3729,7 @@ inline View View::toView(Canvas c) {
   v.onDragTo = std::move(c.onDragTo);
   v.onMiddleDragTo = std::move(c.onMiddleDragTo);
   v.onRightDragTo = std::move(c.onRightDragTo);
+  v.onDragEnd = std::move(c.onDragEnd);
   v.onScrollUp = std::move(c.onScrollUp);
   v.onScrollDown = std::move(c.onScrollDown);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
@@ -3929,9 +4052,18 @@ public:
   // (limited) Clear()/FillRectangle. Left null when this CanvasContext
   // isn't backed by a lockable bitmap, in which case getImageData/
   // clearRect fall back to their old (fully-wipe / unsupported) behavior.
+  // `imageCacheOwner`, when non-null, is the canvas node's own
+  // View::Computed (see LiteUI::ensureCanvasTarget) — drawImage() below
+  // uses its cachedImageBitmap slot to skip reconverting+reuploading the
+  // same CanvasImage on a repeat draw (see drawImage's own comment). Left
+  // null for any CanvasContext not backed by a persistent per-node
+  // Computed, in which case drawImage falls back to its old (uncached,
+  // always reupload) behavior.
   CanvasContext(ID2D1RenderTarget *rt, float width, float height,
-                IWICBitmap *wicBitmap = nullptr)
-      : rt_(rt), width_(width), height_(height), wicBitmap_(wicBitmap) {
+                IWICBitmap *wicBitmap = nullptr,
+                const View::Computed *imageCacheOwner = nullptr)
+      : rt_(rt), width_(width), height_(height), wicBitmap_(wicBitmap),
+        imageCacheOwner_(imageCacheOwner) {
     rt_->GetFactory(&factory_);
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
   }
@@ -4349,14 +4481,44 @@ public:
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy, dw, dh);
   }
+  // Draws `img`, converting+uploading it to a fresh ID2D1Bitmap first
+  // unless imageCacheOwner_ already has one cached for this exact pixel
+  // buffer (see the constructor's comment and makeBitmap's). Caching is
+  // keyed on img.pixels.data()+size+width+height rather than any explicit
+  // "did this change" flag the app sets — CanvasImage carries no such
+  // flag — so it's a heuristic: it correctly detects a brand new image (a
+  // new allocation, e.g. every AdjustmentSet::applyTo() call) or a resized
+  // one (reallocates), which covers ordinary usage, but it would miss
+  // pixel values changed in place at the SAME address and size without an
+  // intervening resize. No code in this file mutates a CanvasImage that
+  // way between drawImage calls; an app that does would need to force a
+  // miss itself (e.g. by giving the image a fresh pixels vector).
   void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
                  float dx, float dy, float dw, float dh) {
     if (img.width <= 0 || img.height <= 0)
       return;
-    ID2D1Bitmap *bmp = makeBitmap(img);
-    if (!bmp) {
-
-      return;
+    ID2D1Bitmap *bmp = nullptr;
+    bool cacheHit =
+        imageCacheOwner_ && imageCacheOwner_->cachedImageBitmap &&
+        imageCacheOwner_->cachedImagePixels == img.pixels.data() &&
+        imageCacheOwner_->cachedImagePixelsSize == img.pixels.size() &&
+        imageCacheOwner_->cachedImageW == img.width &&
+        imageCacheOwner_->cachedImageH == img.height;
+    if (cacheHit) {
+      bmp = imageCacheOwner_->cachedImageBitmap;
+    } else {
+      bmp = makeBitmap(img);
+      if (!bmp)
+        return;
+      if (imageCacheOwner_) {
+        if (imageCacheOwner_->cachedImageBitmap)
+          imageCacheOwner_->cachedImageBitmap->Release();
+        imageCacheOwner_->cachedImageBitmap = bmp;
+        imageCacheOwner_->cachedImagePixels = img.pixels.data();
+        imageCacheOwner_->cachedImagePixelsSize = img.pixels.size();
+        imageCacheOwner_->cachedImageW = img.width;
+        imageCacheOwner_->cachedImageH = img.height;
+      }
     }
     rt_->SetTransform(transform_);
     D2D1_RECT_F dst = D2D1::RectF(dx, dy, dx + dw, dy + dh);
@@ -4364,7 +4526,12 @@ public:
 
     rt_->DrawBitmap(bmp, dst, globalAlpha_,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
-    bmp->Release();
+    // Only release when NOT cache-owned: an uncached draw (imageCacheOwner_
+    // null) still owns bmp itself and must free it here, exactly as
+    // before; a cached one is now owned by imageCacheOwner_ and lives on
+    // for a future hit.
+    if (!imageCacheOwner_)
+      bmp->Release();
   }
 
   // ---- pixel data ----
@@ -4713,16 +4880,32 @@ private:
     // D2D1 bitmaps require BGRA byte order AND premultiplied alpha for
     // CreateBitmap on an ID2D1RenderTarget (straight alpha is rejected
     // with D2DERR_UNSUPPORTED_PIXEL_FORMAT for this creation path).
-    std::vector<uint8_t> bgra(static_cast<size_t>(img.width) * img.height * 4);
-    for (size_t i = 0; i + 3 < bgra.size(); i += 4) {
-      uint8_t r = img.pixels[i + 0];
-      uint8_t g = img.pixels[i + 1];
-      uint8_t b = img.pixels[i + 2];
-      uint8_t a = img.pixels[i + 3];
-      bgra[i + 0] = static_cast<uint8_t>(b * a / 255);
-      bgra[i + 1] = static_cast<uint8_t>(g * a / 255);
-      bgra[i + 2] = static_cast<uint8_t>(r * a / 255);
-      bgra[i + 3] = a;
+    const size_t n = static_cast<size_t>(img.width) * img.height * 4;
+    if (img.pixels.size() < n)
+      return nullptr; // malformed image; don't read past the buffer
+    std::vector<uint8_t> bgra(n);
+    // Raw pointers (not vector operator[]) so an unoptimized Debug build
+    // doesn't pay a checked function call per byte; and an opaque pixel
+    // (a == 255, i.e. every pixel of a typical photo) skips the
+    // premultiply math — b * 255 / 255 == b, so the result is identical.
+    const uint8_t *src = img.pixels.data();
+    uint8_t *dst = bgra.data();
+    for (size_t i = 0; i + 3 < n; i += 4) {
+      uint8_t r = src[i + 0];
+      uint8_t g = src[i + 1];
+      uint8_t b = src[i + 2];
+      uint8_t a = src[i + 3];
+      if (a == 255) {
+        dst[i + 0] = b;
+        dst[i + 1] = g;
+        dst[i + 2] = r;
+        dst[i + 3] = 255;
+      } else {
+        dst[i + 0] = static_cast<uint8_t>(b * a / 255);
+        dst[i + 1] = static_cast<uint8_t>(g * a / 255);
+        dst[i + 2] = static_cast<uint8_t>(r * a / 255);
+        dst[i + 3] = a;
+      }
     }
     D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(
         DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
@@ -4824,6 +5007,9 @@ private:
   // this context isn't backed by a lockable bitmap.
   IWICBitmap *wicBitmap_ = nullptr;
   float width_, height_;
+  // Not owned — lifetime is the canvas node's own Computed (see the
+  // constructor's comment). Null when there's no per-node cache to use.
+  const View::Computed *imageCacheOwner_ = nullptr;
 
   D2D1_MATRIX_3X2_F transform_ = D2D1::Matrix3x2F::Identity();
   Paint fillPaint_ = Paint::solid(Color{0, 0, 0, 255});
@@ -4857,8 +5043,15 @@ public:
   // `cr` is a Cairo context targeting an image surface sized exactly to
   // the canvas node's inner (padding-excluded) content box, already
   // cleared to transparent by the caller (see LiteUI::ensureCanvasSurface).
-  CanvasContext(cairo_t *cr, float width, float height)
-      : cr_(cr), width_(width), height_(height) {}
+  // `imageCacheOwner`, when non-null, is the canvas node's own
+  // View::Computed — drawImage() below uses its cachedImageSurface slot
+  // to skip reconverting the same CanvasImage on a repeat draw (see
+  // drawImage's own comment). Left null for any CanvasContext not backed
+  // by a persistent per-node Computed.
+  CanvasContext(cairo_t *cr, float width, float height,
+                const View::Computed *imageCacheOwner = nullptr)
+      : cr_(cr), width_(width), height_(height),
+        imageCacheOwner_(imageCacheOwner) {}
   ~CanvasContext() = default;
   CanvasContext(const CanvasContext &) = delete;
   CanvasContext &operator=(const CanvasContext &) = delete;
@@ -5174,11 +5367,36 @@ public:
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy, dw, dh);
   }
+  // Draws `img`, converting it to a fresh Cairo image surface first unless
+  // imageCacheOwner_ already has one cached for this exact pixel buffer
+  // (see the constructor's comment and the Windows drawImage's — same
+  // caching heuristic and the same caveat about in-place pixel mutation
+  // applies here).
   void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
                  float dx, float dy, float dw, float dh) {
     if (img.width <= 0 || img.height <= 0)
       return;
-    cairo_surface_t *surf = imageToCairoSurface(img);
+    cairo_surface_t *surf = nullptr;
+    bool cacheHit =
+        imageCacheOwner_ && imageCacheOwner_->cachedImageSurface &&
+        imageCacheOwner_->cachedImagePixels == img.pixels.data() &&
+        imageCacheOwner_->cachedImagePixelsSize == img.pixels.size() &&
+        imageCacheOwner_->cachedImageW == img.width &&
+        imageCacheOwner_->cachedImageH == img.height;
+    if (cacheHit) {
+      surf = imageCacheOwner_->cachedImageSurface;
+    } else {
+      surf = imageToCairoSurface(img);
+      if (imageCacheOwner_) {
+        if (imageCacheOwner_->cachedImageSurface)
+          cairo_surface_destroy(imageCacheOwner_->cachedImageSurface);
+        imageCacheOwner_->cachedImageSurface = surf;
+        imageCacheOwner_->cachedImagePixels = img.pixels.data();
+        imageCacheOwner_->cachedImagePixelsSize = img.pixels.size();
+        imageCacheOwner_->cachedImageW = img.width;
+        imageCacheOwner_->cachedImageH = img.height;
+      }
+    }
     cairo_save(cr_);
     cairo_translate(cr_, dx, dy);
     cairo_scale(cr_, dw / std::max(1.0f, sw), dh / std::max(1.0f, sh));
@@ -5187,7 +5405,10 @@ public:
     cairo_pattern_set_filter(cairo_get_source(cr_), CAIRO_FILTER_BILINEAR);
     cairo_paint_with_alpha(cr_, globalAlpha_);
     cairo_restore(cr_);
-    cairo_surface_destroy(surf);
+    // Only destroy when NOT cache-owned — see the Windows drawImage's
+    // matching comment.
+    if (!imageCacheOwner_)
+      cairo_surface_destroy(surf);
   }
 
   // ---- pixel data ----
@@ -5394,10 +5615,17 @@ private:
         // pixels — byte order B,G,R,A on the little-endian platforms
         // this file targets (same convention as ensureTextTexture above).
         unsigned char *px = dst + col * 4;
-        px[0] = static_cast<unsigned char>(b * a / 255);
-        px[1] = static_cast<unsigned char>(g * a / 255);
-        px[2] = static_cast<unsigned char>(r * a / 255);
-        px[3] = a;
+        if (a == 255) { // opaque: premultiply is a no-op (x * 255 / 255 == x)
+          px[0] = b;
+          px[1] = g;
+          px[2] = r;
+          px[3] = 255;
+        } else {
+          px[0] = static_cast<unsigned char>(b * a / 255);
+          px[1] = static_cast<unsigned char>(g * a / 255);
+          px[2] = static_cast<unsigned char>(r * a / 255);
+          px[3] = a;
+        }
       }
     }
     cairo_surface_mark_dirty(surf);
@@ -5476,6 +5704,9 @@ private:
 
   cairo_t *cr_;
   float width_, height_;
+  // Not owned — lifetime is the canvas node's own Computed (see the
+  // constructor's comment). Null when there's no per-node cache to use.
+  const View::Computed *imageCacheOwner_ = nullptr;
 
   Paint fillPaint_ = Paint::solid(Color{0, 0, 0, 255});
   Paint strokePaint_ = Paint::solid(Color{0, 0, 0, 255});
@@ -7148,7 +7379,9 @@ private:
   // them all rather than risk resolving a dangling one on the next
   // release/motion/key event. focusedView_ is nulled directly rather than
   // via setFocus(nullptr): the old target may already be freed, so firing
-  // its onBlur would be a use-after-free.
+  // its onBlur would be a use-after-free. dragView_ is nulled directly
+  // for the same reason, bypassing endDrag() — firing onDragEnd here
+  // could dereference a freed view.
   void invalidateViewPointers() {
     for (int i = 0; i < 3; ++i) {
       pressedView_[i] = nullptr;
@@ -7522,6 +7755,21 @@ private:
     return changed;
   }
 
+  // Ends button i's drag, if one is in progress: fires the view's
+  // onDragEnd (see its comment on View) then clears dragView_[i]. Use this
+  // instead of assigning dragView_[i] = nullptr directly at any site where
+  // the view is still valid — i.e. everywhere except a view's own
+  // destruction (invalidateViewPointers, setRoot), where the pointer may
+  // already be dangling and firing a callback on it would be a
+  // use-after-free.
+  void endDrag(int i) {
+    if (View *v = dragView_[i]) {
+      dragView_[i] = nullptr;
+      if (v->onDragEnd)
+        v->onDragEnd();
+    }
+  }
+
   // Completes a pending press: fires pressedView_'s onClick only if the
   // release also landed on that same view, then clears the pending state
   // unconditionally (a press that never resolves shouldn't linger and
@@ -7532,7 +7780,7 @@ private:
     if (released && released == pressedView_[i])
       dispatchClick(released, btn);
     pressedView_[i] = nullptr;
-    dragView_[i] = nullptr;
+    endDrag(i);
     return pollAndRelayout();
   }
 
@@ -7650,12 +7898,16 @@ private:
       BeginPaint(hwnd, &ps);
       if (self) {
         self->ensureRenderTarget();
+        LITEUI_PROF_START(profBuild);
         self->renderTarget_->BeginDraw();
         self->renderTarget_->Clear(toD2DColor(self->windowBg_));
         self->paintBoxes(self->renderTarget_);
         self->paintRoot(self->renderTarget_);
         self->paintTooltip(self->renderTarget_);
+        LITEUI_PROF_ADD(build, profBuild);
+        LITEUI_PROF_START(profEnd);
         HRESULT hr = self->renderTarget_->EndDraw();
+        LITEUI_PROF_ADD(endDraw, profEnd);
         // D2DERR_RECREATE_TARGET means the underlying device is gone
         // (driver reset, GPU removal, etc.) — drop the target so the next
         // WM_PAINT's ensureRenderTarget() rebuilds it from scratch.
@@ -7707,7 +7959,7 @@ private:
           // The OS loop swallowed the release, so drop our pending press
           // instead of leaving it dangling.
           self->pressedView_[btnIdx(MouseButton::Left)] = nullptr;
-          self->dragView_[btnIdx(MouseButton::Left)] = nullptr;
+          self->endDrag(btnIdx(MouseButton::Left));
           InvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
@@ -7724,6 +7976,7 @@ private:
     // this costs nothing on ordinary hover.
     case WM_MOUSEMOVE: {
       if (self) {
+        LITEUI_PROF_START(profMove);
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         bool changed = self->updateScrollDrag(x, y);
@@ -7735,6 +7988,7 @@ private:
         self->updateTooltipHover(x, y);
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
+        LITEUI_PROF_ADD(move, profMove);
       }
       return 0;
     }
@@ -7857,7 +8111,7 @@ private:
       if (self) {
         for (int i = 0; i < 3; ++i) {
           self->pressedView_[i] = nullptr;
-          self->dragView_[i] = nullptr;
+          self->endDrag(i);
         }
         self->scrollDrag_ = {};
       }
@@ -8161,6 +8415,17 @@ private:
         v.computed.canvasWicBitmap->Release();
         v.computed.canvasWicBitmap = nullptr;
       }
+      // A bitmap cached against the OLD canvasTarget can't be reused on
+      // the new one (see CanvasContext::drawImage's comment) — drop it so
+      // the next drawImage call rebuilds fresh instead of leaking it or,
+      // worse, drawing a stale bitmap belonging to a released target.
+      if (v.computed.cachedImageBitmap) {
+        v.computed.cachedImageBitmap->Release();
+        v.computed.cachedImageBitmap = nullptr;
+      }
+      v.computed.cachedImagePixels = nullptr;
+      v.computed.cachedImagePixelsSize = 0;
+      v.computed.cachedImageW = v.computed.cachedImageH = -1;
       IWICImagingFactory *wic = ensureWicFactory();
       // GUID_WICPixelFormat32bppPBGRA (premultiplied BGRA) is the pixel
       // format Direct2D itself requires for a WIC bitmap render target,
@@ -8185,13 +8450,15 @@ private:
     if (!v.computed.canvasTarget)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
+      LITEUI_PROF_START(profCanvas);
       v.computed.canvasTarget->BeginDraw();
       v.computed.canvasTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
       CanvasContext ctx(v.computed.canvasTarget, innerW, innerH,
-                        v.computed.canvasWicBitmap);
+                        v.computed.canvasWicBitmap, &v.computed);
       v.onPaint(ctx);
       v.computed.canvasTarget->EndDraw();
       v.computed.canvasNeedsRedraw = false;
+      LITEUI_PROF_ADD(canvas, profCanvas);
     }
   }
 
@@ -8210,6 +8477,7 @@ private:
     ensureCanvasTarget(v);
     if (!v.computed.canvasTarget || !v.computed.canvasWicBitmap)
       return;
+    LITEUI_PROF_START(profBlit);
     ID2D1Bitmap *bmp = nullptr;
     // nullptr bitmapProperties (this parameter is optional, unlike
     // CreateBitmap's required one above): the WIC bitmap is already
@@ -8227,6 +8495,7 @@ private:
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->DrawBitmap(bmp, D2D1::RectF(x, y, x + sz.width, y + sz.height));
     bmp->Release();
+    LITEUI_PROF_ADD(blit, profBlit);
   }
 
   // `clip` is the accumulated visible region from scrollable ancestors.
@@ -9549,7 +9818,8 @@ private:
       cairo_set_source_rgba(cr, 0, 0, 0, 0);
       cairo_paint(cr);
       cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-      CanvasContext ctx(cr, static_cast<float>(iw), static_cast<float>(ih));
+      CanvasContext ctx(cr, static_cast<float>(iw), static_cast<float>(ih),
+                        &v.computed);
       v.onPaint(ctx);
       cairo_destroy(cr);
       v.computed.canvasNeedsRedraw = false;
@@ -9959,7 +10229,7 @@ private:
       // release moved back into the titlebar; cancel the pending press
       pressedView_[btnIdx(btn)] = nullptr;
     }
-    dragView_[btnIdx(btn)] = nullptr;
+    endDrag(btnIdx(btn));
     if (btn == MouseButton::Left)
       scrollDrag_ = {}; // scroll-drag tracking only ever exists for Left
   }

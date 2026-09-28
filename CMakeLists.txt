@@ -46,6 +46,15 @@ add_library(liteui::liteui ALIAS liteui)
 target_include_directories(liteui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(liteui INTERFACE cxx_std_23)
 
+# Optional frame profiler (see LITEUI_PROFILE in liteui.hpp). When ON, every
+# target that links liteui::liteui is compiled with -DLITEUI_PROFILE and
+# prints per-second timing of mouse handling / painting / etc. to stderr.
+# OFF by default: compiles to nothing.
+option(LITEUI_PROFILE "Print per-second frame timing to stderr" OFF)
+if(LITEUI_PROFILE)
+    target_compile_definitions(liteui INTERFACE LITEUI_PROFILE)
+endif()
+
 set(LITEUI_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/wayland-protocols")
 
 if(WIN32)

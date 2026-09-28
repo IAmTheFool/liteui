@@ -20,14 +20,36 @@
       "displayName": "MSVC Debug",
       "inherits": "windows-base",
       "binaryDir": "${sourceDir}/build/debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "msvc-release",
       "displayName": "MSVC Release",
       "inherits": "windows-base",
       "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "msvc-release-profile",
+      "displayName": "MSVC Release + Profiler",
+      "inherits": "msvc-release",
+      "binaryDir": "${sourceDir}/build/release-profile",
+      "cacheVariables": {
+        "LITEUI_PROFILE": "ON"
+      }
+    },
+    {
+      "name": "msvc-debug-profile",
+      "displayName": "MSVC Debug + Profiler",
+      "inherits": "msvc-debug",
+      "binaryDir": "${sourceDir}/build/debug-profile",
+      "cacheVariables": {
+        "LITEUI_PROFILE": "ON"
+      }
     },
     {
       "name": "linux-base",
@@ -48,20 +70,44 @@
       "displayName": "GCC Debug",
       "inherits": "linux-base",
       "binaryDir": "${sourceDir}/build/debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "gcc-release",
       "displayName": "GCC Release",
       "inherits": "linux-base",
       "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "msvc-debug" },
-    { "name": "release", "configurePreset": "msvc-release" },
-    { "name": "gcc-debug-build", "configurePreset": "gcc-debug" },
-    { "name": "gcc-release-build", "configurePreset": "gcc-release" }
+    {
+      "name": "debug",
+      "configurePreset": "msvc-debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "msvc-release"
+    },
+    {
+      "name": "release-profile",
+      "configurePreset": "msvc-release-profile"
+    },
+    {
+      "name": "debug-profile",
+      "configurePreset": "msvc-debug-profile"
+    },
+    {
+      "name": "gcc-debug-build",
+      "configurePreset": "gcc-debug"
+    },
+    {
+      "name": "gcc-release-build",
+      "configurePreset": "gcc-release"
+    }
   ]
 }
