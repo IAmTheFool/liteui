@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
 #include <png.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -6540,6 +6542,7 @@ private:
   bool hasRoot_ = false;
   static inline LiteUI *activeInstance_ = nullptr;
 
+  std::function<void()> wakeHandler_; // see setWakeHandler
   std::function<void()> onCloseRequest_;
   void handleCloseRequested() {
     if (onCloseRequest_)
@@ -7632,6 +7635,28 @@ public:
   void requestRepaint();
   static LiteUI *current() { return activeInstance_; }
 
+  // Wakes the event loop from ANY thread — the one LiteUI call that is safe
+  // off the UI thread. The loop normally sleeps until the OS hands it an
+  // event, so a background thread that has finished something (a render, a
+  // decode, a download) has no other way to make the UI notice. wake() makes
+  // the UI thread run the wake handler (if set) and then poll + repaint,
+  // exactly as after a click or an interval tick.
+  //
+  // Wakes coalesce: several wake() calls before the UI thread gets to them
+  // produce ONE callback, so a chatty worker cannot flood the loop. A wake
+  // is never lost: one issued while the UI thread is busy (or not yet in its
+  // loop) is delivered as soon as it next waits.
+  //
+  // Lifetime: the caller must stop every thread that can still call wake()
+  // (join them) before this LiteUI is destroyed.
+  void wake();
+  // Installs the handler wake() triggers; runs on the UI thread, once per
+  // coalesced wake, before the repaint. Optional — with none installed a wake
+  // still polls the Dynamic<> sources and repaints, which is all a worker
+  // needs when the UI reads its results from a canvasDirtySource. Set it from
+  // the UI thread before the first wake().
+  void setWakeHandler(std::function<void()> fn) { wakeHandler_ = std::move(fn); }
+
 private:
   // Called by both platform backends on every key press. Checks
   // shortcuts_ first (global, focus-independent), then falls through to
@@ -7790,6 +7815,11 @@ private:
   HWND hwnd_ = nullptr;
   bool moveRequested_ = false;
   std::unordered_map<UINT_PTR, std::function<void()>> timers_;
+
+  // wake(): a private window message posted from any thread. `wakePending_`
+  // keeps at most one such message in the queue (see wake / WndProc).
+  static constexpr UINT kWakeMsg = WM_APP + 1;
+  std::atomic<bool> wakePending_{false};
 
   // Device-independent: created once in the constructor, lives for the
   // process (well, the LiteUI instance's) lifetime.
@@ -8212,6 +8242,17 @@ private:
       }
       return 0;
     }
+    case kWakeMsg: {
+      if (self) {
+        // Clear the flag BEFORE running the handler: a wake() issued while
+        // the handler runs must post a fresh message, not be swallowed.
+        self->wakePending_.store(false);
+        if (self->wakeHandler_)
+          self->wakeHandler_();
+        self->requestRepaint();
+      }
+      return 0;
+    }
     case WM_TIMER: {
       if (self) {
         auto it = self->timers_.find(wp);
@@ -8623,6 +8664,12 @@ private:
     std::function<void()> fn;
   };
   std::vector<IntervalTimer> intervalTimers_;
+
+  // wake(): an eventfd folded into run()'s poll() set. write() from any
+  // thread makes it readable (writes add to a counter, so they coalesce);
+  // the loop drains it with one read(). Created with the object, so the
+  // descriptor is valid before any other thread can possibly call wake().
+  int wakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   int nextIntervalHandle_ = 1;
   std::unordered_map<int, int>
       intervalHandleToFd_; // handle -> fd, for removeInterval
@@ -8690,6 +8737,12 @@ private:
   double pointer_x_ = 0,
          pointer_y_ = 0; // Last known pointer position within
                          // the surface, in surface-local coordinates.
+
+  // Set by pointerMotion; cleared by flushPendingMotion. Motion events only
+  // record the newest position — the real work (drag handlers, hover,
+  // tooltip, cursor, redraw) runs once per event-loop iteration instead of
+  // once per event. See flushPendingMotion for why.
+  bool motionPending_ = false;
 
   bool maximized_ =
       false; // Tracks whether the window currently believes
@@ -8963,6 +9016,7 @@ private:
   // name so re-entering always re-applies one, rather than skipping the
   // very next setCursor() as a no-op change.
   static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *) {
+    static_cast<LiteUI *>(data)->flushPendingMotion();
     static_cast<LiteUI *>(data)->currentCursorName_.clear();
   }
   // Called on every pointer movement while over this surface.
@@ -8971,38 +9025,58 @@ private:
                             wl_fixed_t sy) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
-    // Update the stored x position.
+    // Only remember where the pointer is now. A compositor can deliver
+    // several motion events per frame (and a high-polling-rate mouse many
+    // more); doing the drag/hover/redraw work for each one made a slow
+    // onDragTo handler (e.g. a photo editor's slider recompute) run many
+    // times per frame, with vsync-blocked redraws in between. The work is
+    // done once per loop iteration by flushPendingMotion() instead, always
+    // with the newest position.
     self->pointer_x_ = wl_fixed_to_double(sx);
-    // Update the stored y position.
     self->pointer_y_ = wl_fixed_to_double(sy);
+    self->motionPending_ = true;
+  }
+
+  // Applies the most recent pointer position recorded by pointerMotion, if
+  // any: advances scrollbar drags / content pans and onDragTo handlers,
+  // refreshes hover and the tooltip timer, redraws once if anything
+  // changed, and updates the cursor image. Called once per event-loop
+  // iteration (see run()), and first thing in any handler that acts on the
+  // pointer position (button, axis, leave) so a press/release never sees a
+  // drag that is a few motion events behind.
+  //
+  // MUST NOT be called while a wl_display_prepare_read() is outstanding:
+  // redraw() -> eglSwapBuffers can read the display itself, which would
+  // wait forever on our own pending read intent.
+  void flushPendingMotion() {
+    if (!motionPending_)
+      return;
+    motionPending_ = false;
+
+    const float x = static_cast<float>(pointer_x_);
+    const float y = static_cast<float>(pointer_y_);
 
     // Advance any in-progress scrollbar drag / content pan (see
     // beginScrollPress/handlePress). A no-op, and cheap, when nothing's
     // being dragged.
-    bool changed = self->updateScrollDrag(static_cast<float>(self->pointer_x_),
-                                          static_cast<float>(self->pointer_y_));
-    if (self->updateAllDrags(static_cast<float>(self->pointer_x_),
-                             static_cast<float>(self->pointer_y_)))
+    bool changed = updateScrollDrag(x, y);
+    if (updateAllDrags(x, y))
       changed = true;
-    if (self->hasRoot_ &&
-        LiteUI::updateHover(self->root_, static_cast<float>(self->pointer_x_),
-                            static_cast<float>(self->pointer_y_), ClipRect{}))
+    if (hasRoot_ && LiteUI::updateHover(root_, x, y, ClipRect{}))
       changed = true;
 
     // arms/cancels/re-targets the tooltip timer. Handles its own
     // repaint scheduling internally (via requestTooltipRepaint), so it
     // doesn't need to participate in the `changed` flag above.
-    self->updateTooltipHover(static_cast<float>(self->pointer_x_),
-                             static_cast<float>(self->pointer_y_));
+    updateTooltipHover(x, y);
 
     if (changed)
-      self->redraw();
+      redraw();
 
     // Re-derive which edge (if any) the pointer is over and update the
     // cursor image to match, so the user sees a resize cursor before they
     // even click.
-    self->setCursor(cursorNameForEdge(
-        self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
+    setCursor(cursorNameForEdge(resizeEdgeAt(pointer_x_, pointer_y_)));
   }
   // Called on scroll/axis events — mouse wheel rotation or a touchpad's
   // continuous scroll gesture. `value` is already a relative-movement
@@ -9012,6 +9086,7 @@ private:
   static void pointerAxis(void *data, wl_pointer *, uint32_t, uint32_t axis,
                           wl_fixed_t value) {
     auto *self = static_cast<LiteUI *>(data);
+    self->flushPendingMotion(); // hit-test against the up-to-date position
     float delta = static_cast<float>(wl_fixed_to_double(value));
     float dx = 0, dy = 0;
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
@@ -9037,6 +9112,10 @@ private:
                             uint32_t button, uint32_t state) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUI *>(data);
+    // Bring any drag up to the final pointer position first, so a release
+    // that arrives in the same batch as the last few motion events ends the
+    // drag where the user actually let go.
+    self->flushPendingMotion();
     MouseButton btn;
     if (button == BTN_LEFT_CODE)
       btn = MouseButton::Left;
@@ -10445,6 +10524,8 @@ inline LiteUI::~LiteUI() {
     xkb_context_unref(xkbContext_);
   if (repeatTimerFd_ >= 0)
     close(repeatTimerFd_);
+  if (wakeFd_ >= 0)
+    close(wakeFd_);
   // Release the pointer device if one was obtained.
   if (pointer_)
     wl_pointer_destroy(pointer_);
@@ -10947,6 +11028,14 @@ inline void LiteUI::removeInterval(int handle) {
   KillTimer(hwnd_, static_cast<UINT_PTR>(handle));
   timers_.erase(static_cast<UINT_PTR>(handle));
 }
+inline void LiteUI::wake() {
+  if (!hwnd_)
+    return;
+  // PostMessage is documented as callable from any thread. Only post if none
+  // is already waiting; WndProc clears the flag when it picks it up.
+  if (!wakePending_.exchange(true) && !PostMessageW(hwnd_, kWakeMsg, 0, 0))
+    wakePending_.store(false); // queue full: let the next wake() retry
+}
 #else
 inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
   int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
@@ -10971,6 +11060,15 @@ inline void LiteUI::removeInterval(int handle) {
       intervalTimers_.end());
   close(fd);
   intervalHandleToFd_.erase(it);
+}
+inline void LiteUI::wake() {
+  if (wakeFd_ < 0)
+    return;
+  const uint64_t one = 1;
+  // Nonblocking eventfd: this can only fail if the 64-bit counter is full,
+  // in which case it is already readable and a wake is already pending.
+  if (write(wakeFd_, &one, sizeof one) < 0) {
+  }
 }
 #endif
 
@@ -11047,8 +11145,19 @@ inline void LiteUI::run() {
 // Linux/Wayland-specific event loop.
 #else
   while (running_) {
+    // Apply the newest pointer position (one drag/hover update + at most one
+    // redraw) before blocking. Must happen here, outside the
+    // prepare_read/read_events window below — see flushPendingMotion.
+    flushPendingMotion();
     while (wl_display_prepare_read(display_) != 0)
       wl_display_dispatch_pending(display_);
+    // Events dispatched by the loop above may have recorded fresh motion.
+    // Give up the read intent and go around again to flush it, rather than
+    // sleeping in poll() with an unapplied pointer position.
+    if (motionPending_) {
+      wl_display_cancel_read(display_);
+      continue;
+    }
     wl_display_flush(display_);
 
     std::vector<pollfd> fds;
@@ -11056,6 +11165,9 @@ inline void LiteUI::run() {
     size_t repeatIdx = fds.size();
     if (repeatTimerFd_ >= 0)
       fds.push_back({repeatTimerFd_, POLLIN, 0});
+    size_t wakeIdx = fds.size();
+    if (wakeFd_ >= 0)
+      fds.push_back({wakeFd_, POLLIN, 0});
     size_t intervalStart = fds.size();
     for (auto &t : intervalTimers_)
       fds.push_back({t.fd, POLLIN, 0});
@@ -11079,6 +11191,18 @@ inline void LiteUI::run() {
         uint64_t exp;
         read(intervalTimers_[i].fd, &exp, sizeof(exp));
         intervalTimers_[i].fn();
+        requestRepaint();
+      }
+    }
+
+    // wake() from another thread. Handled after the interval timers because
+    // the handler is free to add/remove intervals, which would shift the
+    // indices the loop above relies on.
+    if (wakeFd_ >= 0 && (fds[wakeIdx].revents & POLLIN)) {
+      uint64_t n;
+      if (read(wakeFd_, &n, sizeof n) > 0) { // drain: N wakes -> one callback
+        if (wakeHandler_)
+          wakeHandler_();
         requestRepaint();
       }
     }

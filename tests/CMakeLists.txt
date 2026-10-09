@@ -31,3 +31,19 @@ list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(CTest)
 include(Catch)
 catch_discover_tests(liteui_tests)
+
+
+# # ---- photo editor tests ---------------------------------------------
+# # Same source file as the photoeditor example, built a second time with
+# # PHOTOEDITOR_TESTS so main() is replaced by Catch2's main.
+# set(PHOTOEDITOR_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../examples/photoeditor.cpp)
+
+# if(EXISTS ${PHOTOEDITOR_SOURCE})
+#     add_executable(photoeditor_tests ${PHOTOEDITOR_SOURCE})
+#     target_compile_definitions(photoeditor_tests PRIVATE PHOTOEDITOR_TESTS)
+#     target_link_libraries(photoeditor_tests PRIVATE liteui::liteui Catch2::Catch2WithMain)
+#     catch_discover_tests(photoeditor_tests)
+# else()
+#     message(WARNING "tests: ${PHOTOEDITOR_SOURCE} not found, "
+#                     "skipping photoeditor_tests")
+# endif()
