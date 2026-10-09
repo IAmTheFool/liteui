@@ -103,10 +103,35 @@ constexpr size_t kMaxUndoSteps = 200;
 // fraction of the picture's SHORTER side (the original's when stored, the
 // current picture's once mapped).
 constexpr size_t kMaxMasks = 8;         // rows in the Masks pane's list
+constexpr size_t kMaxMaskParts = 6;     // shapes combined inside one mask
+constexpr int kCompTintEdge = 512;      // long side of a combined mask's tint
 constexpr float kMaskMinRadius = 0.02f; // smallest radial-mask radius
 constexpr float kMaskMaxRadius = 1.50f; // largest
 constexpr float kMaskHandlePx = 9.0f;   // overlay handle size, screen px
 constexpr float kMaskHitPx = 12.0f;     // overlay handle grab tolerance, px
+
+// Brush masks (see the "Brush mask" section of the masks block). A brush's
+// size is its RADIUS as a fraction of the picture's shorter side, like the
+// radial mask's radii.
+constexpr float kBrushMinSize = 0.005f;     // smallest brush radius
+constexpr float kBrushMaxSize = 0.50f;      // largest
+constexpr float kBrushDefaultSize = 0.05f;  // radius of a fresh brush
+constexpr float kBrushSpacing = 0.20f;      // render dab spacing, x radius
+constexpr float kBrushPointGap = 0.08f;     // min gap between recorded
+                                            // points, x radius
+constexpr size_t kBrushMaxStrokes = 512;    // per mask
+constexpr size_t kBrushMaxPoints = 20000;   // per stroke
+constexpr int kBrushTintEdge = 512;         // long side of the tint bitmap
+constexpr size_t kBrushLutSize = 1024;      // falloff table resolution
+constexpr int kBrushMapEdge = 2048;         // longest side the coverage map
+                                            // is rasterized at; bigger
+                                            // images upsample it
+constexpr size_t kBrushCacheSize = 6;       // memoized coverage maps
+
+// Luminosity range masks.
+constexpr float kLumMaxRamp = 0.5f;  // soft edge width at Smoothness = 100%,
+                                     // as a fraction of the 0..1 luminance
+constexpr int kLumTintEdge = 512;    // long side of the on-canvas tint bitmap
 
 // ---------------- Palette (dark, Lightroom-like) ----------------
 // Base swatches.
@@ -917,12 +942,17 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
 // one (same struct, same fields) already mapped into the current picture,
 // which is what rendering and the on-canvas editing work with.
 //
-// ADDING ANOTHER KIND OF MASK (linear gradient, brush, luminosity range...):
+// COMBINING: a mask is a list of PARTS (shapes) folded left to right with
+// Add / Subtract / Intersect (see MaskComposite). A new kind of shape needs
+// nothing for that: it only has to be one more MaskShape alternative.
+//
+// ADDING ANOTHER KIND OF MASK (color range, depth range...):
 //   1. a shape struct with its parameters (like RadialShape) and its three
 //      GeoFrame conversions (toSource, fromSource, applySourceEdit),
 //   2. an "Eval" struct (like RadialEval): the shape resolved against one
 //      concrete image size, able to say which part of a row it touches
-//      (rowSpan) and to fill in that row's weights (rowWeights),
+//      (rowSpan) and to fill in that row's weights (rowWeights; it is also
+//      handed the row's current pixels, for masks that depend on them),
 //   3. one more alternative in MaskShape and MaskEval (same order as MaskType)
 //      and one more line in maskTypeName and maskShapeToSource,
 //   4. its overlay + handles in the UI (paintMaskOverlay / maskPress / ...).
@@ -931,7 +961,7 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
 using AdjValues = std::array<float, static_cast<size_t>(AdjId::Count)>;
 
 // Same order as the alternatives of MaskShape / MaskEval below.
-enum class MaskType : int { Radial, Linear, Count };
+enum class MaskType : int { Radial, Linear, Brush, Luminosity, Count };
 
 static const char *maskTypeName(MaskType t) {
   switch (t) {
@@ -939,6 +969,10 @@ static const char *maskTypeName(MaskType t) {
     return "Radial";
   case MaskType::Linear:
     return "Linear";
+  case MaskType::Brush:
+    return "Brush";
+  case MaskType::Luminosity:
+    return "Luminosity";
   default:
     return "Mask";
   }
@@ -981,7 +1015,8 @@ struct RadialEval {
   // Weights for pixels [x0, x1) of row `y`: 1 inside `inner`, easing to 0 at
   // the outline (smoothstep), 0 outside. Plain loop, no std helpers, same
   // Debug-build reason as applyColorPass.
-  void rowWeights(int y, int x0, int x1, float *out) const {
+  void rowWeights(int y, int x0, int x1, float *out,
+                  const uint8_t * /*pix*/ = nullptr) const {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
     for (int x = x0; x < x1; ++x) {
       const float dx = (static_cast<float>(x) + 0.5f) - cx;
@@ -1117,7 +1152,8 @@ struct LinearEval {
   }
 
   // Plain loop, no std helpers (same Debug-build reason as RadialEval).
-  void rowWeights(int y, int x0, int x1, float *out) const {
+  void rowWeights(int y, int x0, int x1, float *out,
+                  const uint8_t * /*pix*/ = nullptr) const {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
     const float base = dy * uy;
     for (int x = x0; x < x1; ++x) {
@@ -1194,9 +1230,495 @@ struct LinearShape {
   }
 };
 
+// ---- Brush mask ----
+// Painted by hand: an ordered list of strokes, each a polyline of points
+// drawn with a round brush (its own size / feather / density) that either
+// ADDS to the mask or ERASES from it, in the order they were painted. Unlike
+// the gradients there is no closed form for the weight at a pixel, so the
+// shape is rasterized into a coverage map (BrushEval) that rowSpan /
+// rowWeights then just read. Points are stored like the other shapes' centers
+// (fractions of the ORIGINAL picture's width / height) and sizes like their
+// radii (fraction of its shorter side), so the GeoFrame maps a whole brush
+// into the current picture and the same strokes render identically on the
+// small preview and the full-size image.
+//
+// One stroke's coverage is the MAX over its dabs (not a sum), so a stroke
+// that crosses itself does not double up; strokes then combine in order:
+//     paint:  m = m + (1 - m) * c        erase:  m = m * (1 - c)
+// where c is the stroke's coverage times its density.
+//
+// Cost: rasterizing is proportional to the AREA painted, so on a big picture
+// the map is built at reduced size (longest side kBrushMapEdge) and read back
+// with bilinear interpolation; a mask is smooth anyway, and a 24 MP image
+// costs no more than a 3 MP one. The result is memoized (see prepare), so
+// dragging an Adjust slider re-rasterizes nothing.
+struct BrushPt {
+  float x = 0, y = 0; // fraction of the picture's width / height
+  bool operator==(const BrushPt &) const = default;
+};
+
+struct BrushStroke {
+  bool erase = false;
+  float size = kBrushDefaultSize; // radius, fraction of the SHORTER side
+  float feather = 0.5f;           // 0 = hard edge .. 1 = fades from the center
+  float density = 1.0f;           // 0..1, the most a stroke can add / remove
+  std::vector<BrushPt> pts;
+  bool operator==(const BrushStroke &) const = default;
+};
+
+// The brush resolved for one image size: the coverage map plus, per map row,
+// the pixels that can be non-zero.
+struct BrushEval {
+  int W = 0, H = 0;   // the image this is resolved for
+  int mw = 0, mh = 0; // the map's own size: W x H, or smaller for a big image
+  // 0..255 per map pixel, row-major mw x mh. Shared so copying an Eval (they
+  // live in a std::variant) stays cheap.
+  std::shared_ptr<const std::vector<uint8_t>> map;
+  // Per MAP row, [lo, hi) covers every non-zero pixel. A superset: an erase
+  // stroke does not shrink it.
+  std::shared_ptr<const std::vector<int>> lo, hi;
+
+  // The two map rows image row `y` interpolates between, and the blend.
+  void mapRows(int y, int &r0, int &r1, float &t) const {
+    const float fy = (static_cast<float>(y) + 0.5f) * static_cast<float>(mh) /
+                         static_cast<float>(H) -
+                     0.5f;
+    const int a = static_cast<int>(std::floor(fy));
+    t = fy - static_cast<float>(a);
+    r0 = a < 0 ? 0 : (a > mh - 1 ? mh - 1 : a);
+    r1 = a + 1 < 0 ? 0 : (a + 1 > mh - 1 ? mh - 1 : a + 1);
+  }
+
+  bool rowSpan(int y, int imgW, int &x0, int &x1) const {
+    if (!map || y < 0 || y >= H)
+      return false;
+    int r0, r1;
+    float t;
+    mapRows(y, r0, r1, t);
+    const int l = std::min((*lo)[static_cast<size_t>(r0)],
+                           (*lo)[static_cast<size_t>(r1)]);
+    const int h = std::max((*hi)[static_cast<size_t>(r0)],
+                           (*hi)[static_cast<size_t>(r1)]);
+    if (h <= l)
+      return false;
+    // Map pixels -> image pixels, padded for the interpolation's reach.
+    const float k = static_cast<float>(W) / static_cast<float>(mw);
+    const int pad = static_cast<int>(std::ceil(k)) + 1;
+    x0 = static_cast<int>(std::floor(static_cast<float>(l) * k)) - pad;
+    x1 = static_cast<int>(std::ceil(static_cast<float>(h) * k)) + pad;
+    x0 = x0 < 0 ? 0 : x0;
+    x1 = x1 > imgW ? imgW : x1;
+    return x1 > x0;
+  }
+
+  // Plain loops, no std helpers (same Debug-build reason as RadialEval).
+  void rowWeights(int y, int x0, int x1, float *out,
+                  const uint8_t * /*pix*/ = nullptr) const {
+    if (!map || y < 0 || y >= H) {
+      for (int x = x0; x < x1; ++x)
+        out[x - x0] = 0.0f;
+      return;
+    }
+    int r0, r1;
+    float ty;
+    mapRows(y, r0, r1, ty);
+    const uint8_t *row0 = map->data() + static_cast<size_t>(r0) *
+                                            static_cast<size_t>(mw);
+    const uint8_t *row1 = map->data() + static_cast<size_t>(r1) *
+                                            static_cast<size_t>(mw);
+    const float inv255 = 1.0f / 255.0f;
+    if (mw == W) { // map and image agree horizontally: no x interpolation
+      for (int x = x0; x < x1; ++x) {
+        const float a = static_cast<float>(row0[x]);
+        const float b = static_cast<float>(row1[x]);
+        out[x - x0] = (a + (b - a) * ty) * inv255;
+      }
+      return;
+    }
+    const float k = static_cast<float>(mw) / static_cast<float>(W);
+    for (int x = x0; x < x1; ++x) {
+      const float fx = (static_cast<float>(x) + 0.5f) * k - 0.5f;
+      const int a = static_cast<int>(std::floor(fx));
+      const float tx = fx - static_cast<float>(a);
+      const int c0 = a < 0 ? 0 : (a > mw - 1 ? mw - 1 : a);
+      const int c1 = a + 1 < 0 ? 0 : (a + 1 > mw - 1 ? mw - 1 : a + 1);
+      const float top = static_cast<float>(row0[c0]) * (1.0f - tx) +
+                        static_cast<float>(row0[c1]) * tx;
+      const float bot = static_cast<float>(row1[c0]) * (1.0f - tx) +
+                        static_cast<float>(row1[c1]) * tx;
+      out[x - x0] = (top + (bot - top) * ty) * inv255;
+    }
+  }
+};
+
+struct BrushShape {
+  std::vector<BrushStroke> strokes;
+  bool operator==(const BrushShape &) const = default;
+
+  // Stored (against the original picture) -> as it sits in the current one.
+  // Positions go through the frame, sizes scale with it.
+  BrushShape toSource(const GeoFrame &f) const {
+    BrushShape s = *this;
+    const double k = f.radiusScale();
+    for (BrushStroke &st : s.strokes) {
+      st.size = static_cast<float>(st.size * k);
+      for (BrushPt &p : st.pts) {
+        double px, py;
+        f.toSrc(p.x * f.origW, p.y * f.origH, px, py);
+        p.x = static_cast<float>(px / f.srcW);
+        p.y = static_cast<float>(py / f.srcH);
+      }
+    }
+    return s;
+  }
+  // The inverse, for the pieces a new stroke is made of: a point / a radius
+  // drawn on the current picture -> stored form. (No applySourceEdit: strokes
+  // are only ever appended, never edited in place, so nothing needs to fold
+  // an edit of the in-view form back field by field.)
+  static BrushPt pointFromSource(const BrushPt &p, const GeoFrame &f) {
+    double ox, oy;
+    f.toOrig(p.x * f.srcW, p.y * f.srcH, ox, oy);
+    return BrushPt{static_cast<float>(ox / f.origW),
+                   static_cast<float>(oy / f.origH)};
+  }
+  static float sizeFromSource(float size, const GeoFrame &f) {
+    return static_cast<float>(size / f.radiusScale());
+  }
+
+  // Memoized (defined below, after the cache): the same strokes at the same
+  // size come back without re-rasterizing.
+  BrushEval prepare(int W, int H) const;
+
+  // Rasterizes the strokes, in order, into a coverage map. With a `base` (the
+  // finished map of this brush's first `first` strokes, same size), only the
+  // strokes after those are stamped on top of a copy of it: strokes fold in
+  // order, so the result is identical to rasterizing them all.
+  BrushEval rasterize(int W, int H, const BrushEval *base = nullptr,
+                      size_t first = 0) const {
+    BrushEval e;
+    e.W = W;
+    e.H = H;
+    if (W <= 0 || H <= 0)
+      return e;
+    // Map size: the image's, shrunk (aspect kept) so its long side is at most
+    // kBrushMapEdge.
+    const int longSide = W > H ? W : H;
+    const float sc =
+        longSide > kBrushMapEdge
+            ? static_cast<float>(kBrushMapEdge) / static_cast<float>(longSide)
+            : 1.0f;
+    const int mw = std::max(1, static_cast<int>(std::lround(W * sc)));
+    const int mh = std::max(1, static_cast<int>(std::lround(H * sc)));
+    e.mw = mw;
+    e.mh = mh;
+    const size_t sw = static_cast<size_t>(mw);
+    std::shared_ptr<std::vector<uint8_t>> map;
+    std::shared_ptr<std::vector<int>> lo, hi;
+    if (base && base->map && base->mw == mw && base->mh == mh) {
+      map = std::make_shared<std::vector<uint8_t>>(*base->map);
+      lo = std::make_shared<std::vector<int>>(*base->lo);
+      hi = std::make_shared<std::vector<int>>(*base->hi);
+    } else {
+      first = 0; // no usable base: start from an empty map
+      map = std::make_shared<std::vector<uint8_t>>(
+          sw * static_cast<size_t>(mh), uint8_t{0});
+      lo = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), mw);
+      hi = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), 0);
+    }
+    const float S = static_cast<float>(mw < mh ? mw : mh);
+    const float fW = static_cast<float>(mw), fH = static_cast<float>(mh);
+    std::vector<uint8_t> cov; // one stroke's coverage, over its bbox only
+    std::array<uint8_t, kBrushLutSize + 1> lut{};
+
+    for (size_t si = first; si < strokes.size(); ++si) {
+      const BrushStroke &st = strokes[si];
+      if (st.pts.empty())
+        continue;
+      const float rad = (st.size < kBrushMinSize ? kBrushMinSize : st.size) * S;
+      const float r2 = rad * rad;
+
+      // Falloff over squared distance / r^2, density folded in: 1 inside
+      // `inner`, easing (smoothstep) to 0 at the rim.
+      const float inner = std::clamp(1.0f - st.feather, 0.0f, 0.99f);
+      const float dens = std::clamp(st.density, 0.0f, 1.0f);
+      for (size_t i = 0; i <= kBrushLutSize; ++i) {
+        const float d = std::sqrt(static_cast<float>(i) /
+                                  static_cast<float>(kBrushLutSize));
+        float w;
+        if (d <= inner) {
+          w = 1.0f;
+        } else if (d >= 1.0f) {
+          w = 0.0f;
+        } else {
+          const float t = (d - inner) / (1.0f - inner);
+          w = 1.0f - t * t * (3.0f - 2.0f * t);
+        }
+        lut[i] = static_cast<uint8_t>(std::lround(255.0f * w * dens));
+      }
+
+      // The stroke's bounding box (points +- radius), clamped to the map.
+      float minX = st.pts[0].x * fW, maxX = minX;
+      float minY = st.pts[0].y * fH, maxY = minY;
+      for (const BrushPt &p : st.pts) {
+        const float x = p.x * fW, y = p.y * fH;
+        minX = x < minX ? x : minX;
+        maxX = x > maxX ? x : maxX;
+        minY = y < minY ? y : minY;
+        maxY = y > maxY ? y : maxY;
+      }
+      const int bx0 =
+          static_cast<int>(std::floor(std::clamp(minX - rad, 0.0f, fW))) - 1;
+      const int by0 =
+          static_cast<int>(std::floor(std::clamp(minY - rad, 0.0f, fH))) - 1;
+      const int bx1 =
+          static_cast<int>(std::ceil(std::clamp(maxX + rad, 0.0f, fW))) + 1;
+      const int by1 =
+          static_cast<int>(std::ceil(std::clamp(maxY + rad, 0.0f, fH))) + 1;
+      const int cx0 = bx0 < 0 ? 0 : bx0, cy0 = by0 < 0 ? 0 : by0;
+      const int cx1 = bx1 > mw ? mw : bx1, cy1 = by1 > mh ? mh : by1;
+      if (cx1 <= cx0 || cy1 <= cy0)
+        continue;
+      const int bw = cx1 - cx0, bh = cy1 - cy0;
+      cov.assign(static_cast<size_t>(bw) * static_cast<size_t>(bh), 0);
+
+      // Stamp one round dab: coverage = max(existing, falloff).
+      const float lutScale = static_cast<float>(kBrushLutSize) / r2;
+      const auto stamp = [&](float cx, float cy) {
+        if (cx + rad < static_cast<float>(cx0) ||
+            cx - rad > static_cast<float>(cx1) ||
+            cy + rad < static_cast<float>(cy0) ||
+            cy - rad > static_cast<float>(cy1))
+          return; // wholly outside this stroke's box
+        int ix0 = static_cast<int>(std::floor(cx - rad - 0.5f));
+        int ix1 = static_cast<int>(std::ceil(cx + rad + 0.5f));
+        int iy0 = static_cast<int>(std::floor(cy - rad - 0.5f));
+        int iy1 = static_cast<int>(std::ceil(cy + rad + 0.5f));
+        ix0 = ix0 < cx0 ? cx0 : ix0;
+        iy0 = iy0 < cy0 ? cy0 : iy0;
+        ix1 = ix1 > cx1 ? cx1 : ix1;
+        iy1 = iy1 > cy1 ? cy1 : iy1;
+        for (int y = iy0; y < iy1; ++y) {
+          const float dy = (static_cast<float>(y) + 0.5f) - cy;
+          const float dy2 = dy * dy;
+          uint8_t *crow = cov.data() + static_cast<size_t>(y - cy0) *
+                                           static_cast<size_t>(bw);
+          for (int x = ix0; x < ix1; ++x) {
+            const float dx = (static_cast<float>(x) + 0.5f) - cx;
+            const float d2 = dx * dx + dy2;
+            if (d2 >= r2)
+              continue;
+            const uint8_t c = lut[static_cast<size_t>(d2 * lutScale)];
+            uint8_t &dst = crow[x - cx0];
+            if (c > dst)
+              dst = c;
+          }
+        }
+      };
+
+      // Walk the polyline in steps of a fraction of the radius.
+      const float step = std::max(1.0f, rad * kBrushSpacing);
+      float px = st.pts[0].x * fW, py = st.pts[0].y * fH;
+      stamp(px, py);
+      for (size_t k = 1; k < st.pts.size(); ++k) {
+        const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
+        const float len = std::hypot(qx - px, qy - py);
+        const int n =
+            std::min(static_cast<int>(std::ceil(len / step)), 1 << 16);
+        for (int j = 1; j <= n; ++j) {
+          const float t = static_cast<float>(j) / static_cast<float>(n);
+          stamp(px + (qx - px) * t, py + (qy - py) * t);
+        }
+        px = qx;
+        py = qy;
+      }
+
+      // Fold this stroke into the mask, and widen the rows' spans.
+      for (int y = 0; y < bh; ++y) {
+        const uint8_t *crow = cov.data() + static_cast<size_t>(y) *
+                                               static_cast<size_t>(bw);
+        uint8_t *mrow = map->data() + static_cast<size_t>(cy0 + y) * sw +
+                        static_cast<size_t>(cx0);
+        int first = -1, last = -1;
+        for (int x = 0; x < bw; ++x) {
+          const int c = crow[x];
+          if (c == 0)
+            continue;
+          const int cur = mrow[x];
+          if (st.erase) {
+            mrow[x] = static_cast<uint8_t>(cur - (cur * c + 127) / 255);
+          } else {
+            mrow[x] = static_cast<uint8_t>(cur + ((255 - cur) * c + 127) / 255);
+            if (first < 0)
+              first = x;
+            last = x;
+          }
+        }
+        if (first >= 0) {
+          int &l = (*lo)[static_cast<size_t>(cy0 + y)];
+          int &h = (*hi)[static_cast<size_t>(cy0 + y)];
+          l = std::min(l, cx0 + first);
+          h = std::max(h, cx0 + last + 1);
+        }
+      }
+    }
+    e.map = std::move(map);
+    e.lo = std::move(lo);
+    e.hi = std::move(hi);
+    return e;
+  }
+};
+
+// The last few coverage maps. Two things reuse them:
+//  * a render that only changed an Adjust slider (same strokes, same size)
+//    gets the very same map back;
+//  * a render after painting more (same first strokes, one more or one
+//    longer) starts from the map of those first strokes and stamps only what
+//    is new, so a pointer event costs one stroke, not the whole brush.
+// Keyed on the strokes themselves and the size; the render threads and the UI
+// thread all come through here, hence the lock. Maps are immutable once
+// built, so sharing them is safe.
+struct BrushCacheEntry {
+  BrushShape shape;
+  int W = 0, H = 0;
+  BrushEval eval;
+};
+static std::mutex gBrushCacheMutex;
+static std::vector<BrushCacheEntry> gBrushCache; // most recent first
+
+inline BrushEval BrushShape::prepare(int W, int H) const {
+  BrushEval base; // the longest cached run of our leading strokes, if any
+  size_t baseCount = 0;
+  bool haveBase = false;
+  {
+    const std::lock_guard<std::mutex> lock(gBrushCacheMutex);
+    for (size_t i = 0; i < gBrushCache.size(); ++i) {
+      const BrushCacheEntry &c = gBrushCache[i];
+      if (c.W != W || c.H != H)
+        continue;
+      if (c.shape == *this) {
+        BrushEval hit = c.eval;
+        if (i != 0) // keep the most recently used first
+          std::rotate(gBrushCache.begin(), gBrushCache.begin() + i,
+                      gBrushCache.begin() + i + 1);
+        return hit;
+      }
+      const size_t n = c.shape.strokes.size();
+      if (n < strokes.size() && (!haveBase || n > baseCount) &&
+          std::equal(c.shape.strokes.begin(), c.shape.strokes.end(),
+                     strokes.begin())) {
+        base = c.eval; // cheap: shares the maps
+        baseCount = n;
+        haveBase = true;
+        if (i != 0) // ...and keep it alive while it is being built on
+          std::rotate(gBrushCache.begin(), gBrushCache.begin() + i,
+                      gBrushCache.begin() + i + 1);
+        break; // entries are most-recent-first; good enough
+      }
+    }
+  }
+  BrushEval ev = haveBase ? rasterize(W, H, &base, baseCount)
+                          : rasterize(W, H); // slow part: outside the lock
+  const std::lock_guard<std::mutex> lock(gBrushCacheMutex);
+  gBrushCache.insert(gBrushCache.begin(), BrushCacheEntry{*this, W, H, ev});
+  if (gBrushCache.size() > kBrushCacheSize)
+    gBrushCache.pop_back();
+  return ev;
+}
+
+// ---- Luminosity range mask ----
+// Selects by brightness instead of by place: pixels whose luminance is inside
+// [lo, hi] get full weight, easing to zero over a soft edge OUTSIDE each end.
+// It is evaluated on the picture as it stands when the mask is reached (after
+// the global adjustments and the masks listed before it) but before its own
+// adjustments, so darkening the shadows does not change which pixels are
+// "shadows". There is nothing spatial about it, so it needs no GeoFrame
+// mapping: the in-view form is the stored form.
+struct LuminosityEval {
+  // Weight for each 8-bit luminance, built once per render request.
+  std::array<float, 256> lut{};
+
+  // Every pixel can be selected, so every row is in play.
+  bool rowSpan(int /*y*/, int W, int &x0, int &x1) const {
+    x0 = 0;
+    x1 = W;
+    return W > 0;
+  }
+
+  // Rec. 709 luma in integers (54 + 183 + 19 = 256). Plain loop, no std
+  // helpers, same Debug-build reason as RadialEval.
+  void rowWeights(int /*y*/, int x0, int x1, float *out,
+                  const uint8_t *pix = nullptr) const {
+    if (!pix) { // cannot happen through the pipeline; stay safe
+      for (int x = x0; x < x1; ++x)
+        out[x - x0] = 0.0f;
+      return;
+    }
+    const float *t = lut.data();
+    const int len = x1 - x0;
+    for (int i = 0; i < len; ++i) {
+      const uint8_t *p = pix + static_cast<size_t>(i) * 4;
+      const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
+      out[i] = t[l];
+    }
+  }
+};
+
+struct LuminosityShape {
+  float lo = 0.0f;       // luminance (0..1) where full weight begins
+  float hi = 0.35f;      // ...and ends. A new mask picks out the shadows.
+  float feather = 0.4f;  // 0 = hard cut .. 1 = widest soft edge
+  bool operator==(const LuminosityShape &) const = default;
+
+  // The range's two ends push each other: Min can never pass Max, nor Max go
+  // below Min (the one being dragged wins, the other follows).
+  void setLo(float v) {
+    lo = std::clamp(v, 0.0f, 1.0f);
+    if (hi < lo)
+      hi = lo;
+  }
+  void setHi(float v) {
+    hi = std::clamp(v, 0.0f, 1.0f);
+    if (lo > hi)
+      lo = hi;
+  }
+
+  // Not spatial: nothing to map through the frame.
+  LuminosityShape toSource(const GeoFrame &) const { return *this; }
+  void applySourceEdit(const LuminosityShape & /*before*/,
+                       const LuminosityShape &after, const GeoFrame &) {
+    *this = after;
+  }
+
+  LuminosityEval prepare(int /*W*/, int /*H*/) const {
+    LuminosityEval e;
+    const float a = std::clamp(std::min(lo, hi), 0.0f, 1.0f);
+    const float b = std::clamp(std::max(lo, hi), 0.0f, 1.0f);
+    const float f = std::clamp(feather, 0.0f, 1.0f) * kLumMaxRamp;
+    const auto smooth = [](float x) {
+      x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+      return x * x * (3.0f - 2.0f * x);
+    };
+    for (size_t i = 0; i < 256; ++i) {
+      const float t = static_cast<float>(i) / 255.0f;
+      float w;
+      if (f <= 1e-4f) {
+        w = (t >= a && t <= b) ? 1.0f : 0.0f;
+      } else {
+        const float up = smooth((t - (a - f)) / f); // rises into [a, b]
+        const float dn = 1.0f - smooth((t - b) / f); // falls after b
+        w = up * dn;
+      }
+      e.lut[i] = w;
+    }
+    return e;
+  }
+};
+
 // ---- Shape variants: one alternative per MaskType ----
-using MaskShape = std::variant<RadialShape, LinearShape>;
-using MaskEval = std::variant<RadialEval, LinearEval>;
+using MaskShape =
+    std::variant<RadialShape, LinearShape, BrushShape, LuminosityShape>;
+using MaskEval =
+    std::variant<RadialEval, LinearEval, BrushEval, LuminosityEval>;
 
 static MaskShape maskShapeToSource(const MaskShape &shape,
                                    const GeoFrame &f) {
@@ -1211,19 +1733,151 @@ static bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1) {
   return std::visit(
       [&](const auto &ev) { return ev.rowSpan(y, W, x0, x1); }, e);
 }
+// `pix` = the RGBA pixels of the row from x0 on, as they are when the mask
+// is reached (after the global adjustments and the masks before it). Only the
+// masks that depend on the picture's own values read it.
 static void maskRowWeights(const MaskEval &e, int y, int x0, int x1,
-                           float *out) {
-  std::visit([&](const auto &ev) { ev.rowWeights(y, x0, x1, out); }, e);
+                           float *out, const uint8_t *pix) {
+  std::visit([&](const auto &ev) { ev.rowWeights(y, x0, x1, out, pix); }, e);
 }
 
-// One mask as the user sees it: a shape, whether it is on / inverted, and its
-// own slider values (indexed by AdjId, 0 = untouched).
-struct Mask {
+// ---- Combining shapes ----
+// A mask is made of one or more parts. Part 0 starts the mask; every later
+// part is folded into what is there so far, left to right:
+//     Add        m = m + c - m c      (union: soft edges blend, never exceed 1)
+//     Subtract   m = m (1 - c)        (cut the part out)
+//     Intersect  m = m c              (keep only where both are)
+// where c is that part's own weight at the pixel. The order matters (it is a
+// fold, not a set operation), exactly like the mask's own Invert, which is
+// applied last to the result.
+enum class MaskOp : int { Add, Subtract, Intersect };
+
+static const char *maskOpName(MaskOp op) {
+  switch (op) {
+  case MaskOp::Add:
+    return "Add";
+  case MaskOp::Subtract:
+    return "Subtract";
+  case MaskOp::Intersect:
+    return "Intersect";
+  }
+  return "Add";
+}
+
+// A part with its shape already mapped into the picture being rendered.
+struct MaskPassPart {
   MaskShape shape;
-  bool enabled = true;
-  bool invert = false; // adjust everything OUTSIDE the shape instead
-  AdjValues adj{};
+  MaskOp op = MaskOp::Add;
+};
+
+// The parts of one mask resolved for one image size.
+struct MaskComposite {
+  std::vector<MaskEval> evals;
+  std::vector<MaskOp> ops; // ops[0] is ignored: part 0 starts the mask
+
+  // Which pixels [x0, x1) of row `y` can have a non-zero weight? A superset.
+  // Add widens the span, Intersect narrows it, Subtract can only remove
+  // weight so it leaves it alone. False if nothing is left.
+  bool rowSpan(int y, int W, int &x0, int &x1) const {
+    bool have = false;
+    int a = 0, b = 0;
+    for (size_t k = 0; k < evals.size(); ++k) {
+      int s0 = 0, s1 = 0;
+      const bool ok = maskRowSpan(evals[k], y, W, s0, s1);
+      const MaskOp op = k == 0 ? MaskOp::Add : ops[k];
+      if (op == MaskOp::Add) {
+        if (!ok)
+          continue;
+        if (!have) {
+          a = s0;
+          b = s1;
+          have = true;
+        } else {
+          a = a < s0 ? a : s0;
+          b = b > s1 ? b : s1;
+        }
+      } else if (op == MaskOp::Intersect) {
+        if (!have)
+          continue; // nothing to keep a part of
+        if (!ok) {
+          have = false;
+          continue;
+        }
+        a = a > s0 ? a : s0;
+        b = b < s1 ? b : s1;
+        if (b <= a)
+          have = false;
+      }
+    }
+    x0 = a;
+    x1 = b;
+    return have;
+  }
+
+  // Weights for pixels [x0, x1) of row `y`. `pix` is the RGBA row from x0 on
+  // (for the parts that depend on it); `tmp` is scratch for one row of
+  // weights. Plain loops, no std helpers (same Debug-build reason as
+  // RadialEval).
+  void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix,
+                  float *tmp) const {
+    const int len = x1 - x0;
+    if (evals.empty()) {
+      for (int i = 0; i < len; ++i)
+        out[i] = 0.0f;
+      return;
+    }
+    maskRowWeights(evals[0], y, x0, x1, out, pix);
+    for (size_t k = 1; k < evals.size(); ++k) {
+      maskRowWeights(evals[k], y, x0, x1, tmp, pix);
+      switch (ops[k]) {
+      case MaskOp::Add:
+        for (int i = 0; i < len; ++i)
+          out[i] = out[i] + tmp[i] - out[i] * tmp[i];
+        break;
+      case MaskOp::Subtract:
+        for (int i = 0; i < len; ++i)
+          out[i] = out[i] * (1.0f - tmp[i]);
+        break;
+      case MaskOp::Intersect:
+        for (int i = 0; i < len; ++i)
+          out[i] = out[i] * tmp[i];
+        break;
+      }
+    }
+  }
+};
+
+static MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts,
+                                      int W, int H) {
+  MaskComposite c;
+  c.evals.reserve(parts.size());
+  c.ops.reserve(parts.size());
+  for (const MaskPassPart &p : parts) {
+    c.evals.push_back(prepareMask(p.shape, W, H));
+    c.ops.push_back(p.op);
+  }
+  return c;
+}
+
+// One part of a mask: a shape and how it joins the parts before it.
+struct MaskPart {
+  MaskShape shape;
+  MaskOp op = MaskOp::Add; // ignored on the first part
   MaskType type() const { return static_cast<MaskType>(shape.index()); }
+  bool operator==(const MaskPart &) const = default;
+};
+
+// One mask as the user sees it: its parts, whether it is on / inverted, and
+// its own slider values (indexed by AdjId, 0 = untouched).
+struct Mask {
+  std::vector<MaskPart> parts; // never empty for a mask made by addMask
+  bool enabled = true;
+  bool invert = false; // adjust everything OUTSIDE the shapes instead
+  AdjValues adj{};
+  // The first part's kind: what a one-part mask is (the list names the rest).
+  MaskType type() const {
+    return parts.empty() ? MaskType::Radial : parts.front().type();
+  }
   bool operator==(const Mask &) const = default;
 };
 using MaskSet = std::vector<Mask>;
@@ -1260,7 +1914,7 @@ toneLutFromValues(const AdjValues &values,
 // A mask frozen for the render thread: its shape and everything its sliders
 // boil down to. Built on the UI thread (O(256)), copied into RenderParams.
 struct MaskPass {
-  MaskShape shape;
+  std::vector<MaskPassPart> parts; // combined left to right (MaskComposite)
   bool invert = false;
   bool tone = false;                // any Tone slider non-zero (lut is valid)
   std::array<uint8_t, 256> lut{};
@@ -1276,7 +1930,10 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
     if (!m.enabled)
       continue;
     MaskPass mp;
-    mp.shape = maskShapeToSource(m.shape, frame);
+    if (m.parts.empty())
+      continue;
+    for (const MaskPart &p : m.parts)
+      mp.parts.push_back(MaskPassPart{maskShapeToSource(p.shape, frame), p.op});
     mp.invert = m.invert;
     for (const auto &spec : kAdjustmentSpecs)
       if (spec.stage == AdjustmentSpec::Stage::Tone &&
@@ -1300,24 +1957,26 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
 // of which is image row `y0`). Per row: find the span the shape touches, copy
 // it to `scratch`, run the mask's own LUT + color pass on the copy, and blend
 // the result back by the weights. `scratch` holds one row of RGBA, `wbuf` one
-// row of weights.
-static void applyMaskToBlock(const MaskPass &mp, const MaskEval &ev,
+// row of weights, `wbuf2` a second one for combining parts.
+static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
                              uint8_t *q, size_t n, int y0, int W,
-                             uint8_t *scratch, float *wbuf) {
+                             uint8_t *scratch, float *wbuf, float *wbuf2) {
   const size_t rowBytes = static_cast<size_t>(W) * 4;
   const int rows = static_cast<int>(n / rowBytes);
   const uint8_t *lut = mp.lut.data();
   for (int r = 0; r < rows; ++r) {
     int x0 = 0, x1 = W;
     // Inverted masks affect the whole row (weight = 1 - w), so no span cut.
-    if (!mp.invert && !maskRowSpan(ev, y0 + r, W, x0, x1))
+    if (!mp.invert && !ev.rowSpan(y0 + r, W, x0, x1))
       continue;
     const int len = x1 - x0;
     if (len <= 0)
       continue;
-    maskRowWeights(ev, y0 + r, x0, x1, wbuf);
     uint8_t *row = q + static_cast<size_t>(r) * rowBytes +
                    static_cast<size_t>(x0) * 4;
+    // The weights see the row BEFORE this mask edits it, so a mask's own
+    // adjustment never changes what it selects.
+    ev.rowWeights(y0 + r, x0, x1, wbuf, row, wbuf2);
     const size_t bytes = static_cast<size_t>(len) * 4;
     std::copy_n(row, bytes, scratch);
     if (mp.tone)
@@ -1384,15 +2043,16 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
 
   // Masks are resolved against THIS image's size (the preview is smaller
   // than the full picture; the shapes are normalized so both agree).
-  std::vector<MaskEval> maskEvals;
+  std::vector<MaskComposite> maskEvals;
   std::vector<uint8_t> maskScratch;
-  std::vector<float> maskWeights;
+  std::vector<float> maskWeights, maskWeights2;
   if (!rp.masks.empty() && img->width > 0) {
     maskEvals.reserve(rp.masks.size());
     for (const MaskPass &m : rp.masks)
-      maskEvals.push_back(prepareMask(m.shape, img->width, img->height));
+      maskEvals.push_back(prepareComposite(m.parts, img->width, img->height));
     maskScratch.resize(rowBytes);
     maskWeights.resize(static_cast<size_t>(img->width));
+    maskWeights2.resize(static_cast<size_t>(img->width));
   }
 
   for (size_t off = 0; off < total; off += blockBytes) {
@@ -1417,7 +2077,8 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
     for (size_t k = 0; k < maskEvals.size(); ++k)
       applyMaskToBlock(rp.masks[k], maskEvals[k], q, n,
                        static_cast<int>(off / rowBytes), img->width,
-                       maskScratch.data(), maskWeights.data());
+                       maskScratch.data(), maskWeights.data(),
+                       maskWeights2.data());
   }
   return img;
 }
@@ -2156,9 +2817,61 @@ struct CropUi {
 
 // Mask-overlay drag in progress (see maskPress / maskDrag).
 struct MaskUi {
-  enum class Drag { None, Move, ResizeX, ResizeY, LinEnd, LinStart } drag =
-      Drag::None;
+  enum class Drag {
+    None,
+    Move,
+    ResizeX,
+    ResizeY,
+    LinEnd,
+    LinStart,
+    Paint // a brush stroke is being painted
+  } drag = Drag::None;
   float grabX = 0, grabY = 0; // Move: pointer offset from the mask's center
+
+  // Brush tool. These settings apply to the NEXT stroke; every stroke keeps
+  // the values it was painted with. Size is a radius, as a fraction of the
+  // SHORTER side of the picture on screen.
+  float brushSize = kBrushDefaultSize;
+  float brushFeather = 0.5f;
+  float brushDensity = 1.0f;
+  bool brushErase = false;
+  bool brushTint = true;      // paint the selected brush's coverage in red
+  float lastX = 0, lastY = 0; // Paint: last recorded point, document px
+  float curX = 0, curY = 0;   // Paint: pointer, document px (cursor ring)
+
+  // The red coverage bitmap of the selected brush mask, rebuilt only when the
+  // strokes (or the picture's size) change.
+  std::shared_ptr<CanvasImage> tint;
+  BrushShape tintShape;
+  bool tintInvert = false;
+
+  // The red selection bitmap of the selected luminosity mask. It is built
+  // from the picture as it stands just BEFORE that mask (see
+  // luminosityTintImage), so it is rebuilt when the shape, the mask's place in
+  // the list, or the pixels change. The pixels are keyed by the identity of
+  // the images on screen; weak pointers, so no picture is kept alive and no
+  // address can be mistaken for a newer image that reuses it.
+  std::shared_ptr<CanvasImage> lumTint;
+  LuminosityShape lumShape;
+  bool lumInvert = false;
+  int lumSel = -1;
+  std::weak_ptr<CanvasImage> lumKeyImage, lumKeyPreview;
+  // Small stand-in for state.source the tint is computed on.
+  std::shared_ptr<CanvasImage> lumBase;
+  std::weak_ptr<CanvasImage> lumBaseSrc;
+
+  // Which part of the selected mask the canvas and the shape sliders edit.
+  // Read it through selPart(), which keeps it in range.
+  int part = 0;
+
+  // The red bitmap of a selected mask with SEVERAL parts: the whole
+  // combination, evaluated like the renderer does (see compositeTintImage).
+  std::shared_ptr<CanvasImage> compTint;
+  std::vector<MaskPart> compParts; // in-view form, the cache key
+  bool compInvert = false;
+  bool compUsesPix = false;
+  int compSel = -1, compW = 0, compH = 0;
+  std::weak_ptr<CanvasImage> compKeyImage, compKeyPreview;
 };
 
 struct EditorState {
@@ -3849,6 +4562,8 @@ struct SliderSpec {
   std::function<std::string(float)> format; // value -> text after "name: "
   bool isAngle = false;   // drag drives the angle preview instead of the
                           // pixel-adjustment preview (see canvasDirtySource)
+  bool affectsPixels = true; // false: the value only changes a tool setting
+                             // (brush size...), so a drag needs no re-render
   bool hasAccent = false; // tint the fill + thumb border (Color Mixer bands)
   Color accent{};
   float trackW = 150.0f;       // track length in px
@@ -3945,6 +4660,10 @@ static View buildSliderRow(const SliderSpec &spec) {
     float newThumbX =
         std::clamp(thumbXFor(s.get()) + (lx - *grabX), 0.0f, kMaxThumbX);
     s.set(lo + (newThumbX / kMaxThumbX) * (hi - lo));
+    if (!s.affectsPixels) {
+      state.markDirty(); // just repaint (an overlay may show the setting)
+      return;
+    }
     enterDrag(s.isAngle); // switches recompute+paint to the preview path
     // Cheap: just records the new value and asks for a recompute before
     // the next frame paints (see canvasDirtySource) — doesn't itself touch
@@ -4374,6 +5093,9 @@ constexpr int kMaskCtlResizeX = 91;
 constexpr int kMaskCtlResizeY = 92;
 constexpr int kMaskCtlLinEnd = 93;
 constexpr int kMaskCtlLinStart = 94;
+constexpr int kMaskCtlBrush = 95; // one stroke = one undo step
+constexpr int kMaskCtlLumLo = 96;
+constexpr int kMaskCtlLumHi = 97;
 constexpr int kMaskCtlFeather = 1;
 constexpr int kMaskCtlAngle = 2;
 constexpr int kMaskCtlWidth = 3;
@@ -4404,27 +5126,72 @@ static const Mask *selectedMask() {
 // The mask's radial shape as it sits in the picture being shown (see the
 // "masks" block: masks are STORED against the original picture). Everything
 // on the canvas — outlines, hit tests, drags — works on this form.
+// The selected mask's part that the canvas and the shape sliders work on. A
+// mask can hold several parts (see MaskComposite); like selMask() this is
+// clamped on read, so undo / delete / open never need to fix it up.
+static int selPart() {
+  const Mask *m = selectedMask();
+  if (!m || m->parts.empty())
+    return 0;
+  const int n = static_cast<int>(m->parts.size());
+  if (state.mask.part >= n)
+    state.mask.part = n - 1;
+  if (state.mask.part < 0)
+    state.mask.part = 0;
+  return state.mask.part;
+}
+static const MaskPart *selectedPart() {
+  const Mask *m = selectedMask();
+  if (!m || m->parts.empty())
+    return nullptr;
+  return &m->parts[static_cast<size_t>(selPart())];
+}
+static MaskType selectedPartType() {
+  const MaskPart *p = selectedPart();
+  return p ? p->type() : MaskType::Count;
+}
+static bool selectedIsBrush() { // the SELECTED PART is a brush
+  return selectedPartType() == MaskType::Brush;
+}
+// "Show mask tint": a brush that stands alone has no outline, so it keeps its
+// own switch (on by default); everything else shares the common one.
+static bool &tintFlag() {
+  const Mask *m = selectedMask();
+  if (m && m->parts.size() == 1 && m->parts[0].type() == MaskType::Brush)
+    return state.mask.brushTint;
+  return state.maskShowTint;
+}
+
+// A part's shape as it sits in the picture being shown (see the "masks" block:
+// masks are STORED against the original picture). Everything on the canvas —
+// outlines, hit tests, drags — works on this form.
 template <class Shape>
-static std::optional<Shape> shapeInView(const Mask &m, const GeoFrame &f) {
-  if (const auto *r = std::get_if<Shape>(&m.shape))
+static std::optional<Shape> shapeInView(const MaskPart &p, const GeoFrame &f) {
+  if (const auto *r = std::get_if<Shape>(&p.shape))
     return r->toSource(f);
   return std::nullopt;
 }
-static std::optional<RadialShape> radialInView(const Mask &m,
+static std::optional<RadialShape> radialInView(const MaskPart &p,
                                                const GeoFrame &f) {
-  return shapeInView<RadialShape>(m, f);
+  return shapeInView<RadialShape>(p, f);
 }
-static std::optional<LinearShape> linearInView(const Mask &m,
+static std::optional<LinearShape> linearInView(const MaskPart &p,
                                                const GeoFrame &f) {
-  return shapeInView<LinearShape>(m, f);
+  return shapeInView<LinearShape>(p, f);
+}
+static std::optional<BrushShape> brushInView(const MaskPart &p,
+                                             const GeoFrame &f) {
+  return shapeInView<BrushShape>(p, f);
 }
 
-// Edits a mask's radial shape on its in-view form and stores the result back
+// Edits part `part` of a mask on its in-view form and stores the result back
 // (only the fields `fn` changed; see RadialShape::applySourceEdit).
 template <class Shape>
-static void editShapeInView(Mask &m, const GeoFrame &f,
+static void editShapeInView(Mask &m, size_t part, const GeoFrame &f,
                             const std::function<void(Shape &)> &fn) {
-  auto *stored = std::get_if<Shape>(&m.shape);
+  if (part >= m.parts.size())
+    return;
+  auto *stored = std::get_if<Shape>(&m.parts[part].shape);
   if (!stored)
     return;
   const Shape before = stored->toSource(f);
@@ -4432,18 +5199,19 @@ static void editShapeInView(Mask &m, const GeoFrame &f,
   fn(after);
   stored->applySourceEdit(before, after, f);
 }
-static void editRadialInView(Mask &m, const GeoFrame &f,
+static void editRadialInView(Mask &m, size_t part, const GeoFrame &f,
                              const std::function<void(RadialShape &)> &fn) {
-  editShapeInView<RadialShape>(m, f, fn);
+  editShapeInView<RadialShape>(m, part, f, fn);
 }
-static void editLinearInView(Mask &m, const GeoFrame &f,
+static void editLinearInView(Mask &m, size_t part, const GeoFrame &f,
                              const std::function<void(LinearShape &)> &fn) {
-  editShapeInView<LinearShape>(m, f, fn);
+  editShapeInView<LinearShape>(m, part, f, fn);
 }
 
 // Edits mask `idx` in a copy of the list and commits it. `control` >= 0 names
 // the control being dragged: repeated edits of the same control of the same
-// mask fold into one undo step (see AdjustmentSet::setMasks). -1 = discrete.
+// mask (and, for the selected mask, the same part) fold into one undo step
+// (see AdjustmentSet::setMasks). -1 = discrete.
 // Does NOT recompute the picture — slider / canvas drags do that through the
 // usual markAdjustDirty path; discrete actions call maskCommitDiscrete.
 static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
@@ -4451,8 +5219,12 @@ static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
   MaskSet ms = state.adjust.masks();
   if (idx < 0 || idx >= static_cast<int>(ms.size()))
     return;
+  const int part = idx == selMask() ? selPart() : 0;
   fn(ms[static_cast<size_t>(idx)]);
-  state.adjust.setMasks(ms, control < 0 ? -1 : idx * 100 + control);
+  state.adjust.setMasks(
+      ms, control < 0
+              ? -1
+              : (idx * static_cast<int>(kMaxMaskParts) + part) * 100 + control);
 }
 
 // A one-off change to the selected mask (toggle, reset): its own undo step and
@@ -4466,6 +5238,23 @@ static void maskEditDiscrete(const std::function<void(Mask &)> &fn) {
   state.markDirty();
 }
 
+// The starting shape of each kind of mask (nullopt for an unknown kind).
+static std::optional<MaskShape> newMaskShape(MaskType t) {
+  switch (t) {
+  case MaskType::Radial:
+    // Centered on the picture as it is shown now.
+    return RadialShape::fromSource(RadialShape{}, state.adjust.geoFrame());
+  case MaskType::Linear:
+    return LinearShape::fromSource(LinearShape{}, state.adjust.geoFrame());
+  case MaskType::Brush:
+    return BrushShape{}; // empty: the first drag on the image paints
+  case MaskType::Luminosity:
+    return LuminosityShape{}; // not spatial: nothing to place
+  default:
+    return std::nullopt;
+  }
+}
+
 static void addMask(MaskType t) {
   if (!state.original)
     return;
@@ -4474,22 +5263,16 @@ static void addMask(MaskType t) {
     setStatus("Mask limit reached (" + std::to_string(kMaxMasks) + ")", true);
     return;
   }
-  Mask m;
-  switch (t) {
-  case MaskType::Radial:
-    // The default shape, centered on the picture as it is shown now.
-    m.shape = RadialShape::fromSource(RadialShape{}, state.adjust.geoFrame());
-    break;
-  case MaskType::Linear:
-    m.shape = LinearShape::fromSource(LinearShape{}, state.adjust.geoFrame());
-    break;
-  default:
+  const auto shape = newMaskShape(t);
+  if (!shape)
     return;
-  }
+  Mask m;
+  m.parts.push_back(MaskPart{*shape, MaskOp::Add});
   ms.push_back(std::move(m));
   state.adjust.setMasks(ms, -1);
   state.maskSel = static_cast<int>(ms.size()) - 1;
-  // A new mask has no sliders moved yet, so no pixel changes: overlay only.
+  state.mask.part = 0;
+  // A new mask has no sliders moved yet, so no pixels change: overlay only.
   state.markDirty();
 }
 
@@ -4501,7 +5284,58 @@ static void deleteSelectedMask() {
   ms.erase(ms.begin() + i);
   state.adjust.setMasks(ms, -1);
   state.maskSel = std::min(i, static_cast<int>(ms.size()) - 1);
+  state.mask.part = 0;
   updateImageFromAdjustments();
+  state.markDirty();
+}
+
+// ---- Parts: combining shapes inside the selected mask ----
+// Adds a part of kind `t` (joined with Add; change it with setPartOp) and
+// selects it. The combined result is what matters from here on, so the tint
+// is switched on.
+static void addPart(MaskType t) {
+  const int i = selMask();
+  if (i < 0)
+    return;
+  const auto shape = newMaskShape(t);
+  if (!shape)
+    return;
+  MaskSet ms = state.adjust.masks();
+  Mask &m = ms[static_cast<size_t>(i)];
+  if (m.parts.size() >= kMaxMaskParts) {
+    setStatus("Part limit reached (" + std::to_string(kMaxMaskParts) + ")",
+              true);
+    return;
+  }
+  m.parts.push_back(MaskPart{*shape, MaskOp::Add});
+  state.adjust.setMasks(ms, -1);
+  state.mask.part = static_cast<int>(m.parts.size()) - 1;
+  state.maskShowTint = true;
+  updateImageFromAdjustments();
+  state.markDirty();
+}
+
+// How the selected part joins the ones before it (the first part has none).
+static void setPartOp(MaskOp op) {
+  const size_t j = static_cast<size_t>(selPart());
+  if (j == 0)
+    return;
+  maskEditDiscrete([&](Mask &m) {
+    if (j < m.parts.size())
+      m.parts[j].op = op;
+  });
+}
+
+static void removeSelectedPart() {
+  const Mask *sm = selectedMask();
+  if (!sm || sm->parts.size() <= 1)
+    return;
+  const size_t j = static_cast<size_t>(selPart());
+  maskEditDiscrete([&](Mask &m) {
+    if (m.parts.size() > 1 && j < m.parts.size())
+      m.parts.erase(m.parts.begin() + static_cast<std::ptrdiff_t>(j));
+  });
+  state.mask.part = static_cast<int>(j) - 1; // the one before; selPart clamps
   state.markDirty();
 }
 
@@ -4614,6 +5448,105 @@ static int linearHit(const LinearShape &l, float px, float py, bool handles) {
   return std::fabs(s) <= g.len ? kMaskHitBody : kMaskHitNone;
 }
 
+// ---- Brush painting ----
+// With a brush part selected, every press on the image starts a stroke and the
+// drag extends it; the whole stroke is one undo step (control kMaskCtlBrush,
+// closed by maskEndDrag). Points are recorded in document pixels of the
+// picture on screen and stored through the GeoFrame.
+
+// A brush mask has no body to grab; its "pin" (where its first stroke began)
+// is what an unselected brush is picked by.
+static bool brushPinHit(const BrushShape &b, float px, float py) {
+  if (b.strokes.empty() || b.strokes.front().pts.empty())
+    return false;
+  const BrushPt &p = b.strokes.front().pts.front();
+  const float tol = kMaskHitPx / state.zoom;
+  return std::hypot(px - p.x * state.docWidth(), py - p.y * state.docHeight()) <=
+         tol;
+}
+
+static void brushBegin(float px, float py) {
+  const int i = selMask();
+  if (i < 0)
+    return;
+  const size_t part = static_cast<size_t>(selPart());
+  const float W = state.docWidth(), H = state.docHeight();
+  const GeoFrame frame = state.adjust.geoFrame();
+  const MaskUi &u = state.mask;
+  BrushStroke st;
+  st.erase = u.brushErase;
+  st.size = BrushShape::sizeFromSource(u.brushSize, frame);
+  st.feather = u.brushFeather;
+  st.density = u.brushDensity;
+  st.pts.push_back(BrushShape::pointFromSource(BrushPt{px / W, py / H}, frame));
+  bool full = false;
+  maskEdit(
+      i,
+      [&](Mask &m) {
+        auto *b = part < m.parts.size()
+                      ? std::get_if<BrushShape>(&m.parts[part].shape)
+                      : nullptr;
+        if (!b)
+          return;
+        if (b->strokes.size() >= kBrushMaxStrokes) {
+          full = true;
+          return;
+        }
+        b->strokes.push_back(std::move(st));
+      },
+      kMaskCtlBrush);
+  if (full) {
+    setStatus("Brush stroke limit reached (" + std::to_string(kBrushMaxStrokes) +
+                  ")",
+              true);
+    return;
+  }
+  state.mask.drag = MaskUi::Drag::Paint;
+  state.mask.lastX = state.mask.curX = px;
+  state.mask.lastY = state.mask.curY = py;
+  enterDrag(false); // recompute on the cheap preview path while held
+  state.markAdjustDirty();
+  state.markDirty();
+}
+
+static void brushDragTo(float px, float py) {
+  const int i = selMask();
+  if (i < 0)
+    return;
+  MaskUi &u = state.mask;
+  const size_t part = static_cast<size_t>(selPart());
+  u.curX = px;
+  u.curY = py;
+  const float W = state.docWidth(), H = state.docHeight();
+  const float rad = u.brushSize * std::min(W, H);
+  // Skip points closer than a fraction of the radius: they add nothing to the
+  // rendered stroke and would only bloat it (and every undo snapshot).
+  const float gap = std::max(rad * kBrushPointGap, 0.5f / state.zoom);
+  if (std::hypot(px - u.lastX, py - u.lastY) >= gap) {
+    const GeoFrame frame = state.adjust.geoFrame();
+    const BrushPt pt =
+        BrushShape::pointFromSource(BrushPt{px / W, py / H}, frame);
+    maskEdit(
+        i,
+        [&](Mask &m) {
+          auto *b = part < m.parts.size()
+                        ? std::get_if<BrushShape>(&m.parts[part].shape)
+                        : nullptr;
+          if (!b || b->strokes.empty())
+            return;
+          auto &pts = b->strokes.back().pts;
+          if (pts.size() < kBrushMaxPoints)
+            pts.push_back(pt);
+        },
+        kMaskCtlBrush);
+    u.lastX = px;
+    u.lastY = py;
+    enterDrag(false);
+    state.markAdjustDirty();
+  }
+  state.markDirty(); // the cursor ring follows the pointer
+}
+
 static void maskPress(float lx, float ly) {
   if (!maskToolActive())
     return;
@@ -4622,9 +5555,39 @@ static void maskPress(float lx, float ly) {
   const GeoFrame frame = state.adjust.geoFrame();
   const float px = lx / state.zoom, py = ly / state.zoom;
   const int sel = selMask();
-  // Tries mask `i`; on a hit selects it and starts the matching drag.
-  auto tryMask = [&](int i, bool isSelected) -> bool {
-    const Mask &m = ms[static_cast<size_t>(i)];
+  const int selP = selPart();
+  const int nMasks = static_cast<int>(ms.size());
+  const auto partCount = [&](int i) {
+    return static_cast<int>(ms[static_cast<size_t>(i)].parts.size());
+  };
+  const auto partAt = [&](int i, int j) -> const MaskPart & {
+    return ms[static_cast<size_t>(i)].parts[static_cast<size_t>(j)];
+  };
+  // With a brush part selected every press paints (pick another part from
+  // the list, or its pin if it is a brush).
+  if (sel >= 0 && partCount(sel) > 0 &&
+      std::holds_alternative<BrushShape>(partAt(sel, selP).shape)) {
+    bool picked = false;
+    for (int i = nMasks - 1; i >= 0 && !picked; --i)
+      for (int j = partCount(i) - 1; j >= 0 && !picked; --j) {
+        if (i == sel && j == selP)
+          continue;
+        if (const auto bv = brushInView(partAt(i, j), frame))
+          if (brushPinHit(*bv, px, py)) {
+            state.maskSel = i;
+            state.mask.part = j;
+            state.markDirty();
+            picked = true;
+          }
+      }
+    if (!picked)
+      brushBegin(px, py);
+    return;
+  }
+  // Tries part `j` of mask `i`; on a hit selects it and starts the matching
+  // drag.
+  auto tryPart = [&](int i, int j, bool isSelected) -> bool {
+    const MaskPart &m = partAt(i, j);
     int hit = kMaskHitNone;
     float shapeCx = 0, shapeCy = 0; // center, fraction of the picture
     if (const auto rv = radialInView(m, frame)) {
@@ -4635,10 +5598,19 @@ static void maskPress(float lx, float ly) {
       hit = linearHit(*lv, px, py, isSelected);
       shapeCx = lv->cx;
       shapeCy = lv->cy;
+    } else if (const auto bv = brushInView(m, frame)) {
+      // Nothing to grab on a brush: its pin only selects it.
+      if (!brushPinHit(*bv, px, py))
+        return false;
+      state.maskSel = i;
+      state.mask.part = j;
+      state.markDirty();
+      return true;
     }
     if (hit == kMaskHitNone)
       return false;
     state.maskSel = i;
+    state.mask.part = j;
     if (hit == kMaskHitX) {
       state.mask.drag = MaskUi::Drag::ResizeX;
     } else if (hit == kMaskHitY) {
@@ -4655,12 +5627,22 @@ static void maskPress(float lx, float ly) {
     state.markDirty();
     return true;
   };
-  if (sel >= 0 && tryMask(sel, true))
+  if (sel >= 0 && partCount(sel) > 0 && tryPart(sel, selP, true))
     return;
+  // The selected mask's other parts next (last part first), so a click on one
+  // of them picks that part rather than a mask underneath.
+  if (sel >= 0)
+    for (int j = partCount(sel) - 1; j >= 0; --j)
+      if (j != selP && tryPart(sel, j, false))
+        return;
   // Otherwise clicking inside another mask selects it (topmost first).
-  for (int i = static_cast<int>(ms.size()) - 1; i >= 0; --i)
-    if (i != sel && tryMask(i, false))
-      return;
+  for (int i = nMasks - 1; i >= 0; --i) {
+    if (i == sel)
+      continue;
+    for (int j = partCount(i) - 1; j >= 0; --j)
+      if (tryPart(i, j, false))
+        return;
+  }
 }
 
 static void maskDrag(float lx, float ly) {
@@ -4672,12 +5654,17 @@ static void maskDrag(float lx, float ly) {
   const float W = state.docWidth(), H = state.docHeight();
   const float px = lx / state.zoom, py = ly / state.zoom;
   const MaskUi::Drag d = state.mask.drag;
+  if (d == MaskUi::Drag::Paint) {
+    brushDragTo(px, py);
+    return;
+  }
   const float grabX = state.mask.grabX, grabY = state.mask.grabY;
   const GeoFrame frame = state.adjust.geoFrame();
+  const size_t part = static_cast<size_t>(selPart());
   maskEdit(
       i,
       [&](Mask &m) {
-        editRadialInView(m, frame, [&](RadialShape &r) {
+        editRadialInView(m, part, frame, [&](RadialShape &r) {
           if (d == MaskUi::Drag::Move) {
             r.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             r.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -4693,7 +5680,7 @@ static void maskDrag(float lx, float ly) {
                                 kMaskMinRadius, kMaskMaxRadius);
           }
         });
-        editLinearInView(m, frame, [&](LinearShape &l) {
+        editLinearInView(m, part, frame, [&](LinearShape &l) {
           if (d == MaskUi::Drag::Move) {
             l.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             l.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -4910,35 +5897,367 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
   ctx.stroke();
 }
 
+// ---- Brush overlay ----
+// The red coverage bitmap: the brush rasterized at a small size through the
+// SAME BrushShape::prepare the renderer uses, so what is tinted is exactly what
+// gets adjusted. Cached until the strokes or the picture's size change (the
+// shape is compared, which is cheap next to rasterizing it).
+static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
+                                                   bool invert) {
+  const float W = state.docWidth(), H = state.docHeight();
+  const float sc =
+      std::min(1.0f, static_cast<float>(kBrushTintEdge) / std::max(W, H));
+  const int tw = std::max(1, static_cast<int>(std::lround(W * sc)));
+  const int th = std::max(1, static_cast<int>(std::lround(H * sc)));
+  MaskUi &u = state.mask;
+  if (u.tint && u.tint->width == tw && u.tint->height == th &&
+      u.tintInvert == invert && u.tintShape == b)
+    return u.tint;
+  const BrushEval ev = b.prepare(tw, th);
+  auto img = std::make_shared<CanvasImage>(tw, th);
+  std::vector<float> wb(static_cast<size_t>(tw));
+  for (int y = 0; y < th; ++y) {
+    ev.rowWeights(y, 0, tw, wb.data());
+    uint8_t *row = img->pixels.data() +
+                   static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
+    for (int x = 0; x < tw; ++x) {
+      float w = wb[static_cast<size_t>(x)];
+      if (invert)
+        w = 1.0f - w;
+      uint8_t *p = row + static_cast<size_t>(x) * 4;
+      p[0] = 255;
+      p[1] = 40;
+      p[2] = 40;
+      p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
+    }
+  }
+  u.tint = img;
+  u.tintShape = b;
+  u.tintInvert = invert;
+  return img;
+}
+
+static void paintBrushTint(CanvasContext &ctx, const BrushShape &b,
+                           bool invert) {
+  if (b.strokes.empty() && !invert)
+    return; // nothing painted yet
+  const auto img = brushTintImage(b, invert);
+  ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
+}
+
+// The pin marks where a brush mask's first stroke began (all a brush has
+// for an "outline"); the selected one is drawn solid.
+static void paintBrushPin(CanvasContext &ctx, const BrushShape &b,
+                          bool selected) {
+  if (b.strokes.empty() || b.strokes.front().pts.empty())
+    return;
+  const BrushPt &p = b.strokes.front().pts.front();
+  const float px = 1.0f / state.zoom; // one screen pixel, in image units
+  constexpr float kTwoPi = 6.28318530717959f;
+  const float cx = p.x * state.docWidth(), cy = p.y * state.docHeight();
+  const float r = kMaskHandlePx * px * 0.55f;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0.0f, kTwoPi);
+  ctx.setFillColor(Color{255, 255, 255, selected ? uint8_t{200} : uint8_t{90}});
+  ctx.fill();
+  ctx.setStrokeColor(Color{0, 0, 0, selected ? uint8_t{200} : uint8_t{120}});
+  ctx.setLineWidth(px * 1.5f);
+  ctx.stroke();
+}
+
+// The brush's footprint at the pointer while painting: the rim, and where the
+// feather begins.
+static void paintBrushCursor(CanvasContext &ctx) {
+  const MaskUi &u = state.mask;
+  const float px = 1.0f / state.zoom;
+  constexpr float kTwoPi = 6.28318530717959f;
+  const float r =
+      u.brushSize * std::min(state.docWidth(), state.docHeight());
+  ctx.beginPath();
+  ctx.arc(u.curX, u.curY, r, 0.0f, kTwoPi);
+  ctx.setStrokeColor(Color{0, 0, 0, 150});
+  ctx.setLineWidth(px * 3.0f);
+  ctx.stroke();
+  ctx.setStrokeColor(kColorWhite);
+  ctx.setLineWidth(px * 1.5f);
+  ctx.stroke();
+  const float inner = std::clamp(1.0f - u.brushFeather, 0.0f, 0.99f);
+  if (u.brushFeather > 0.02f && inner > 0.02f) {
+    ctx.beginPath();
+    ctx.arc(u.curX, u.curY, r * inner, 0.0f, kTwoPi);
+    ctx.setLineDash({4.0f * px, 4.0f * px});
+    ctx.setStrokeColor(Color{255, 255, 255, 170});
+    ctx.setLineWidth(px);
+    ctx.stroke();
+    ctx.setLineDash({});
+  }
+}
+
+// ---- Luminosity overlay ----
+static bool sameOwner(const std::weak_ptr<CanvasImage> &a,
+                      const std::shared_ptr<CanvasImage> &b) {
+  return !a.owner_before(b) && !b.owner_before(a);
+}
+
+// state.source box-downsampled by an integer factor to at most
+// kLumTintEdge on its long side (the source itself when already that small).
+static std::shared_ptr<CanvasImage> lumTintBase() {
+  const std::shared_ptr<CanvasImage> src = state.source;
+  if (!src || src->width <= 0 || src->height <= 0)
+    return nullptr;
+  MaskUi &u = state.mask;
+  if (u.lumBase && sameOwner(u.lumBaseSrc, src))
+    return u.lumBase;
+  const int longEdge = std::max(src->width, src->height);
+  const int k = std::max(1, (longEdge + kLumTintEdge - 1) / kLumTintEdge);
+  std::shared_ptr<CanvasImage> base = src;
+  if (k > 1) {
+    const int w = src->width / k, h = src->height / k;
+    if (w <= 0 || h <= 0)
+      return nullptr;
+    auto out = std::make_shared<CanvasImage>(w, h);
+    const int area = k * k;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        int sum[4] = {0, 0, 0, 0};
+        for (int dy = 0; dy < k; ++dy) {
+          const uint8_t *row =
+              &src->pixels[(static_cast<size_t>(y * k + dy) * src->width +
+                            static_cast<size_t>(x * k)) *
+                           4];
+          for (int dx = 0; dx < k; ++dx)
+            for (int c = 0; c < 4; ++c)
+              sum[c] += row[dx * 4 + c];
+        }
+        uint8_t *o = &out->pixels[(static_cast<size_t>(y) * w + x) * 4];
+        for (int c = 0; c < 4; ++c)
+          o[c] = static_cast<uint8_t>((sum[c] + area / 2) / area);
+      }
+    base = std::move(out);
+  }
+  u.lumBase = base;
+  u.lumBaseSrc = src;
+  return base;
+}
+
+// What the mask selects, as a red bitmap. The weights come from the SAME
+// LuminosityShape::prepare the renderer uses, run over the small picture as
+// it stands just before this mask: the global adjustments plus the masks
+// listed above it, but not this mask's own edits (which cannot change what it
+// selects). Cached until the shape, the picture's pixels or the mask's place in
+// the list change.
+static std::shared_ptr<CanvasImage>
+luminosityTintImage(const LuminosityShape &s, bool invert, int sel) {
+  MaskUi &u = state.mask;
+  if (u.lumTint && u.lumSel == sel && u.lumInvert == invert &&
+      u.lumShape == s && sameOwner(u.lumKeyImage, state.image) &&
+      sameOwner(u.lumKeyPreview, state.previewImage))
+    return u.lumTint;
+  const MaskSet &ms = state.adjust.masks();
+  const auto base = lumTintBase();
+  if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
+    return nullptr;
+  RenderParams rp = state.adjust.buildRenderParams();
+  rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
+                             state.adjust.geoFrame());
+  const auto pre = renderWith(*base, rp);
+  const int tw = pre->width, th = pre->height;
+  const LuminosityEval ev = s.prepare(tw, th);
+  auto img = std::make_shared<CanvasImage>(tw, th);
+  std::vector<float> wb(static_cast<size_t>(tw));
+  for (int y = 0; y < th; ++y) {
+    const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
+    ev.rowWeights(y, 0, tw, wb.data(), pre->pixels.data() + off);
+    uint8_t *row = img->pixels.data() + off;
+    for (int x = 0; x < tw; ++x) {
+      float w = wb[static_cast<size_t>(x)];
+      if (invert)
+        w = 1.0f - w;
+      uint8_t *p = row + static_cast<size_t>(x) * 4;
+      p[0] = 255;
+      p[1] = 40;
+      p[2] = 40;
+      p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
+    }
+  }
+  u.lumTint = img;
+  u.lumShape = s;
+  u.lumInvert = invert;
+  u.lumSel = sel;
+  u.lumKeyImage = state.image;
+  u.lumKeyPreview = state.previewImage;
+  return img;
+}
+
+static void paintLuminosityTint(CanvasContext &ctx, const LuminosityShape &s,
+                                bool invert, int sel) {
+  if (const auto img = luminosityTintImage(s, invert, sel))
+    ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
+}
+
+// ---- Combined mask overlay ----
+// The red bitmap of a selected mask with SEVERAL parts: the whole combination,
+// evaluated by the same MaskComposite the renderer uses, on a small picture.
+// If any part is a luminosity range the picture is the one just BEFORE this
+// mask (see luminosityTintImage); otherwise the weights need no pixels and
+// the bitmap is sized from the document. Cached on the parts in their in-view
+// form, so a rotate / crop / edit all rebuild it.
+static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
+                                                       int sel) {
+  MaskUi &u = state.mask;
+  const GeoFrame frame = state.adjust.geoFrame();
+  bool usesPix = false;
+  std::vector<MaskPart> view;
+  view.reserve(m.parts.size());
+  for (const MaskPart &p : m.parts) {
+    if (p.type() == MaskType::Luminosity)
+      usesPix = true;
+    view.push_back(MaskPart{maskShapeToSource(p.shape, frame), p.op});
+  }
+  int tw = 0, th = 0;
+  if (!usesPix) {
+    const float W = state.docWidth(), H = state.docHeight();
+    const float sc = std::min(1.0f, static_cast<float>(kCompTintEdge) /
+                                        std::max(W, H));
+    tw = std::max(1, static_cast<int>(std::lround(W * sc)));
+    th = std::max(1, static_cast<int>(std::lround(H * sc)));
+  }
+  if (u.compTint && u.compSel == sel && u.compInvert == m.invert &&
+      u.compUsesPix == usesPix && u.compParts == view &&
+      (usesPix ? (sameOwner(u.compKeyImage, state.image) &&
+                  sameOwner(u.compKeyPreview, state.previewImage))
+               : (u.compW == tw && u.compH == th)))
+    return u.compTint;
+
+  std::shared_ptr<CanvasImage> pre;
+  if (usesPix) {
+    const MaskSet &ms = state.adjust.masks();
+    const auto base = lumTintBase();
+    if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
+      return nullptr;
+    RenderParams rp = state.adjust.buildRenderParams();
+    rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel), frame);
+    pre = renderWith(*base, rp);
+    tw = pre->width;
+    th = pre->height;
+  }
+  std::vector<MaskPassPart> pp;
+  pp.reserve(view.size());
+  for (const MaskPart &p : view)
+    pp.push_back(MaskPassPart{p.shape, p.op});
+  const MaskComposite comp = prepareComposite(pp, tw, th);
+  auto img = std::make_shared<CanvasImage>(tw, th);
+  std::vector<float> wb(static_cast<size_t>(tw)), wb2(static_cast<size_t>(tw));
+  for (int y = 0; y < th; ++y) {
+    const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
+    comp.rowWeights(y, 0, tw, wb.data(),
+                    pre ? pre->pixels.data() + off : nullptr, wb2.data());
+    uint8_t *row = img->pixels.data() + off;
+    for (int x = 0; x < tw; ++x) {
+      float w = wb[static_cast<size_t>(x)];
+      if (m.invert)
+        w = 1.0f - w;
+      uint8_t *p = row + static_cast<size_t>(x) * 4;
+      p[0] = 255;
+      p[1] = 40;
+      p[2] = 40;
+      p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
+    }
+  }
+  u.compTint = img;
+  u.compParts = std::move(view);
+  u.compInvert = m.invert;
+  u.compUsesPix = usesPix;
+  u.compSel = sel;
+  u.compW = tw;
+  u.compH = th;
+  u.compKeyImage = state.image;
+  u.compKeyPreview = state.previewImage;
+  return img;
+}
+
+static void paintCompositeTint(CanvasContext &ctx, const Mask &m, int sel) {
+  if (const auto img = compositeTintImage(m, sel))
+    ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
+}
+
+// A part's outline / handles / pin (nothing for a luminosity range).
+static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
+                             const GeoFrame &frame, bool selected) {
+  if (const auto r = radialInView(p, frame))
+    paintRadialOutline(ctx, *r, selected);
+  else if (const auto l = linearInView(p, frame))
+    paintLinearOutline(ctx, *l, selected);
+  else if (const auto b = brushInView(p, frame))
+    paintBrushPin(ctx, *b, selected);
+}
+
 static void paintMaskOverlay(CanvasContext &ctx) {
   const MaskSet &ms = state.adjust.masks();
   const int sel = selMask();
+  const int selP = selPart();
   const GeoFrame frame = state.adjust.geoFrame();
   // Unselected masks first (faint), the selected one on top.
   for (int i = 0; i < static_cast<int>(ms.size()); ++i) {
     if (i == sel)
       continue;
-    const Mask &um = ms[static_cast<size_t>(i)];
-    if (const auto r = radialInView(um, frame))
-      paintRadialOutline(ctx, *r, false);
-    else if (const auto l = linearInView(um, frame))
-      paintLinearOutline(ctx, *l, false);
+    for (const MaskPart &p : ms[static_cast<size_t>(i)].parts)
+      paintPartOutline(ctx, p, frame, false);
   }
   if (sel < 0)
     return;
   const Mask &m = ms[static_cast<size_t>(sel)];
-  if (const auto r = radialInView(m, frame)) {
+  if (m.parts.empty())
+    return;
+  if (m.parts.size() > 1) {
+    // Several parts: tint the combination, then the parts' own outlines
+    // (the selected part's with its handles).
+    if (state.maskShowTint)
+      paintCompositeTint(ctx, m, sel);
+    for (int j = 0; j < static_cast<int>(m.parts.size()); ++j)
+      if (j != selP)
+        paintPartOutline(ctx, m.parts[static_cast<size_t>(j)], frame, false);
+    paintPartOutline(ctx, m.parts[static_cast<size_t>(selP)], frame, true);
+    if (state.mask.drag == MaskUi::Drag::Paint && selectedIsBrush())
+      paintBrushCursor(ctx);
+    return;
+  }
+  const MaskPart &p = m.parts[0];
+  if (const auto r = radialInView(p, frame)) {
     if (state.maskShowTint)
       paintRadialTint(ctx, *r, m.invert);
     paintRadialOutline(ctx, *r, true);
-  } else if (const auto l = linearInView(m, frame)) {
+  } else if (const auto l = linearInView(p, frame)) {
     if (state.maskShowTint)
       paintLinearTint(ctx, *l, m.invert);
     paintLinearOutline(ctx, *l, true);
+  } else if (const auto b = brushInView(p, frame)) {
+    if (state.mask.brushTint)
+      paintBrushTint(ctx, *b, m.invert);
+    paintBrushPin(ctx, *b, true);
+    if (state.mask.drag == MaskUi::Drag::Paint)
+      paintBrushCursor(ctx);
+  } else if (const auto lm = shapeInView<LuminosityShape>(p, frame)) {
+    // No outline or handles: the tint is the whole overlay.
+    if (state.maskShowTint)
+      paintLuminosityTint(ctx, *lm, m.invert, sel);
   }
 }
 
 // ---- Masks pane widgets ----
+
+// What a mask is called in the list: its first part's kind, then the next
+// one, then how many more ("Radial + Brush +1").
+static std::string maskLabel(const Mask &m) {
+  if (m.parts.empty())
+    return "Empty";
+  std::string s = maskTypeName(m.parts[0].type());
+  if (m.parts.size() >= 2)
+    s += std::string(" + ") + maskTypeName(m.parts[1].type());
+  if (m.parts.size() > 2)
+    s += " +" + std::to_string(m.parts.size() - 2);
+  return s;
+}
 
 // One row of the mask list: "1  Radial", highlighted when selected. There are
 // kMaxMasks of these, shown only for the masks that exist (the view tree is
@@ -4963,6 +6282,8 @@ static View buildMaskRow(size_t i) {
       std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
   b.onClick = [i] {
+    if (state.maskSel != static_cast<int>(i))
+      state.mask.part = 0; // a different mask: start on its first part
     state.maskSel = static_cast<int>(i);
     state.markDirty(); // move the overlay to it
   };
@@ -4973,7 +6294,7 @@ static View buildMaskRow(size_t i) {
     if (i >= ms.size())
       return std::string();
     const Mask &m = ms[i];
-    std::string s = std::to_string(i + 1) + "   " + maskTypeName(m.type());
+    std::string s = std::to_string(i + 1) + "   " + maskLabel(m);
     if (m.invert)
       s += "  (inverted)";
     if (!m.enabled)
@@ -4986,7 +6307,55 @@ static View buildMaskRow(size_t i) {
   return b;
 }
 
-// A shape slider for the selected radial mask. `get` / `set` see the shape
+// One row of the selected mask's PART list: "1   Radial", "2   Subtract:
+// Brush". Shown only while the mask has more than one part (a one-part mask
+// looks exactly as it always did).
+static View buildPartRow(size_t j) {
+  View b;
+  b.style.width = Size::full();
+  b.style.height = Size::pixel(26);
+  b.style.flexShrink = 0;
+  b.style.borderRadius = 4.0f;
+  b.style.alignItems = Align::Center;
+  b.style.padding = EdgeInsets{0, 10, 0, 18};
+  b.style.hoverColor = kColorActivityHover;
+  b.style.display = std::function<Display()>([j] {
+    const Mask *m = selectedMask();
+    return m && m->parts.size() > 1 && j < m->parts.size() ? Display::Flex
+                                                           : Display::None;
+  });
+  const auto isSel = [j] {
+    return selMask() >= 0 && static_cast<size_t>(selPart()) == j;
+  };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
+    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
+  b.style.borderWidth =
+      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
+  b.style.borderColor = kColorDividerHover;
+  b.onClick = [j] {
+    state.mask.part = static_cast<int>(j);
+    state.markDirty(); // move the handles to it
+  };
+
+  Text t;
+  t.label = std::function<std::string()>([j]() -> std::string {
+    const Mask *m = selectedMask();
+    if (!m || j >= m->parts.size())
+      return std::string();
+    std::string s = std::to_string(j + 1) + "   ";
+    if (j > 0)
+      s += std::string(maskOpName(m->parts[j].op)) + ": ";
+    s += maskTypeName(m->parts[j].type());
+    return s;
+  });
+  t.fontSize = 12.0f;
+  t.color = kColorTextDark;
+  b.addChild(std::move(t));
+  return b;
+}
+
+// A shape slider for the selected part. `get` / `set` see the shape
 // itself; `control` names the undo-coalescing control.
 template <class Shape>
 static SliderSpec maskShapeSlider(const char *name, float lo, float hi,
@@ -4999,16 +6368,18 @@ static SliderSpec maskShapeSlider(const char *name, float lo, float hi,
   s.hi = hi;
   // The sliders show and edit the shape as it sits in the picture on screen.
   s.get = [get] {
-    const Mask *m = selectedMask();
+    const MaskPart *p = selectedPart();
     const auto r =
-        m ? shapeInView<Shape>(*m, state.adjust.geoFrame()) : std::nullopt;
+        p ? shapeInView<Shape>(*p, state.adjust.geoFrame()) : std::nullopt;
     return r ? get(*r) : 0.0f;
   };
   s.set = [set, control](float v) {
     const GeoFrame frame = state.adjust.geoFrame();
+    const size_t part = static_cast<size_t>(selPart());
     maskEdit(selMask(),
              [&](Mask &m) {
-               editShapeInView<Shape>(m, frame, [&](Shape &r) { set(r, v); });
+               editShapeInView<Shape>(m, part, frame,
+                                      [&](Shape &r) { set(r, v); });
              },
              control);
   };
@@ -6171,7 +7542,10 @@ int main() {
     return state.image
                ? "Add a mask, then adjust it. Drag the shape on the image to "
                  "move it, or its square handles to resize (on a linear "
-                 "gradient they also turn it)."
+                 "gradient they also turn it). With a brush, drag on the "
+                 "image to paint; pick another mask from the list. A "
+                 "luminosity range has no handles: set it with its sliders. "
+                 "Add parts to a mask to combine shapes."
                : "Open an image to add masks.";
   });
   maskHint.fontSize = 12.0f;
@@ -6185,6 +7559,12 @@ int main() {
       [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
       "+ Linear Gradient", [] { addMask(MaskType::Linear); }, {}, true,
+      [] { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Brush", [] { addMask(MaskType::Brush); }, {}, true,
+      [] { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Luminosity Range", [] { addMask(MaskType::Luminosity); }, {}, true,
       [] { return state.original != nullptr; }));
 
   for (size_t i = 0; i < kMaxMasks; ++i)
@@ -6216,10 +7596,53 @@ int main() {
   maskEditor.addChild(sidebarButton(
       "Show mask tint",
       [] {
-        state.maskShowTint = !state.maskShowTint;
+        bool &flag = tintFlag();
+        flag = !flag;
         state.markDirty();
       },
-      [] { return state.maskShowTint; }));
+      [] { return tintFlag(); }));
+
+  // Parts: combine several shapes into this mask. Each part after the first
+  // is joined to the ones before it (Add / Subtract / Intersect); the rows
+  // only appear once there is more than one.
+  View partsSec;
+  partsSec.style.width = Size::full();
+  partsSec.style.direction = FlexDirection::Column;
+  partsSec.style.gap = 6.0f;
+  partsSec.addChild(sectionLabel("Parts"));
+  for (size_t j = 0; j < kMaxMaskParts; ++j)
+    partsSec.addChild(buildPartRow(j));
+  View opRow; // how the selected part joins the rest (not for the first)
+  opRow.style.width = Size::full();
+  opRow.style.direction = FlexDirection::Column;
+  opRow.style.gap = 6.0f;
+  opRow.style.display = std::function<Display()>(
+      []() -> Display { return selPart() > 0 ? Display::Flex : Display::None; });
+  for (const MaskOp op : {MaskOp::Add, MaskOp::Subtract, MaskOp::Intersect})
+    opRow.addChild(sidebarButton(
+        maskOpName(op), [op] { setPartOp(op); },
+        [op] {
+          const MaskPart *p = selectedPart();
+          return p && selPart() > 0 && p->op == op;
+        }));
+  partsSec.addChild(std::move(opRow));
+  partsSec.addChild(sidebarButton("+ Part: Radial",
+                                  [] { addPart(MaskType::Radial); }));
+  partsSec.addChild(sidebarButton("+ Part: Linear",
+                                  [] { addPart(MaskType::Linear); }));
+  partsSec.addChild(sidebarButton("+ Part: Brush",
+                                  [] { addPart(MaskType::Brush); }));
+  partsSec.addChild(sidebarButton("+ Part: Luminosity",
+                                  [] { addPart(MaskType::Luminosity); }));
+  View removeRow;
+  removeRow.style.width = Size::full();
+  removeRow.style.display = std::function<Display()>([]() -> Display {
+    const Mask *m = selectedMask();
+    return m && m->parts.size() > 1 ? Display::Flex : Display::None;
+  });
+  removeRow.addChild(sidebarButton("Remove Part", removeSelectedPart));
+  partsSec.addChild(std::move(removeRow));
+  maskEditor.addChild(std::move(partsSec));
 
   // Shape sliders, per mask type (shown only for that type).
   View radialShape;
@@ -6227,8 +7650,8 @@ int main() {
   radialShape.style.direction = FlexDirection::Column;
   radialShape.style.gap = 12.0f;
   radialShape.style.display = std::function<Display()>([]() -> Display {
-    const Mask *m = selectedMask();
-    return m && m->type() == MaskType::Radial ? Display::Flex : Display::None;
+    return selectedPartType() == MaskType::Radial ? Display::Flex
+                                                  : Display::None;
   });
   radialShape.addChild(sectionLabel("Shape"));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
@@ -6254,8 +7677,8 @@ int main() {
   linearShape.style.direction = FlexDirection::Column;
   linearShape.style.gap = 12.0f;
   linearShape.style.display = std::function<Display()>([]() -> Display {
-    const Mask *m = selectedMask();
-    return m && m->type() == MaskType::Linear ? Display::Flex : Display::None;
+    return selectedPartType() == MaskType::Linear ? Display::Flex
+                                                  : Display::None;
   });
   linearShape.addChild(sectionLabel("Shape"));
   linearShape.addChild(buildSliderRow(maskLinearSlider(
@@ -6266,6 +7689,87 @@ int main() {
       "Angle", -180.0f, 180.0f, [](const LinearShape &l) { return l.angle; },
       [](LinearShape &l, float v) { l.angle = v; }, kMaskCtlAngle)));
   maskEditor.addChild(std::move(linearShape));
+
+  // Luminosity range (shown for a luminosity mask): which brightnesses it
+  // selects. Min can never pass Max, nor Max go below Min.
+  View lumShape;
+  lumShape.style.width = Size::full();
+  lumShape.style.direction = FlexDirection::Column;
+  lumShape.style.gap = 12.0f;
+  lumShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Luminosity ? Display::Flex
+                                                      : Display::None;
+  });
+  lumShape.addChild(sectionLabel("Range"));
+  lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
+      "Min", 0.0f, 100.0f,
+      [](const LuminosityShape &l) { return l.lo * 100.0f; },
+      [](LuminosityShape &l, float v) { l.setLo(v / 100.0f); },
+      kMaskCtlLumLo)));
+  lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
+      "Max", 0.0f, 100.0f,
+      [](const LuminosityShape &l) { return l.hi * 100.0f; },
+      [](LuminosityShape &l, float v) { l.setHi(v / 100.0f); },
+      kMaskCtlLumHi)));
+  lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
+      "Smoothness", 0.0f, 100.0f,
+      [](const LuminosityShape &l) { return l.feather * 100.0f; },
+      [](LuminosityShape &l, float v) { l.feather = v / 100.0f; },
+      kMaskCtlFeather)));
+  maskEditor.addChild(std::move(lumShape));
+
+  // Brush settings (shown for a brush mask). They apply to the NEXT stroke;
+  // strokes already painted keep the values they were painted with.
+  const auto brushSlider = [](const char *name, float lo, float hi,
+                              std::function<float()> get,
+                              std::function<void(float)> set) {
+    SliderSpec s;
+    s.name = name;
+    s.lo = lo;
+    s.hi = hi;
+    s.get = std::move(get);
+    s.set = std::move(set);
+    s.format = [](float v) {
+      return std::to_string(static_cast<int>(std::lround(v)));
+    };
+    s.affectsPixels = false;
+    return buildSliderRow(s);
+  };
+  View brushShape;
+  brushShape.style.width = Size::full();
+  brushShape.style.direction = FlexDirection::Column;
+  brushShape.style.gap = 12.0f;
+  brushShape.style.display = std::function<Display()>(
+      []() -> Display { return selectedIsBrush() ? Display::Flex : Display::None; });
+  brushShape.addChild(sidebarButton(
+      "Erase",
+      [] {
+        state.mask.brushErase = !state.mask.brushErase;
+        state.markDirty();
+      },
+      [] { return state.mask.brushErase; }));
+  brushShape.addChild(brushSlider(
+      "Size", 1.0f, kBrushMaxSize * 100.0f,
+      [] { return state.mask.brushSize * 100.0f; },
+      [](float v) {
+        state.mask.brushSize =
+            std::clamp(v / 100.0f, kBrushMinSize, kBrushMaxSize);
+      }));
+  brushShape.addChild(brushSlider(
+      "Feather", 0.0f, 100.0f, [] { return state.mask.brushFeather * 100.0f; },
+      [](float v) { state.mask.brushFeather = std::clamp(v / 100.0f, 0.0f, 1.0f); }));
+  brushShape.addChild(brushSlider(
+      "Density", 1.0f, 100.0f, [] { return state.mask.brushDensity * 100.0f; },
+      [](float v) { state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
+  brushShape.addChild(sidebarButton("Clear Strokes", [] {
+    const size_t part = static_cast<size_t>(selPart());
+    maskEditDiscrete([part](Mask &m) {
+      if (part < m.parts.size())
+        if (auto *b = std::get_if<BrushShape>(&m.parts[part].shape))
+          b->strokes.clear();
+    });
+  }));
+  maskEditor.addChild(std::move(brushShape));
 
   // The mask's own adjustments: same table as the Adjust pane.
   bool maskColorHeaderAdded = false;
