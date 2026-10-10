@@ -1,6 +1,7 @@
 // Simple Photo Editor.
 
 #include "liteui.hpp"
+#include "sam_segmenter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,8 @@
 #include <thread>
 #include <variant>
 #include <vector>
+
+constexpr float kSamSoftness = 2.0f; // logit -> coverage steepness (edge softness)
 
 // ---------------- Layout constants ----------------
 constexpr float kTitlebarH = 36.0f;
@@ -72,7 +75,7 @@ constexpr float kMixLumAmount = 0.5f;    // luminance +100 = halfway to white
 constexpr float kMixChromaFull = 0.10f;  // chroma (0..1) at which a pixel is
                                          // "colored enough" for full effect
 constexpr int kMixLutSize = 720;         // hue lookup resolution (0.5 degree)
-constexpr float kMixTabW = 46.0f; // Hue/Sat/Lum tab width (3 + gaps = 150)
+constexpr float kMixTabW = 46.0f;        // Hue/Sat/Lum tab width (3 + gaps = 150)
 
 // Histogram: at most ~kHistMaxSamples pixels are visited per recompute
 // (strided grid), so it stays cheap on full-resolution images.
@@ -113,25 +116,34 @@ constexpr float kMaskHitPx = 12.0f;     // overlay handle grab tolerance, px
 // Brush masks (see the "Brush mask" section of the masks block). A brush's
 // size is its RADIUS as a fraction of the picture's shorter side, like the
 // radial mask's radii.
-constexpr float kBrushMinSize = 0.005f;     // smallest brush radius
-constexpr float kBrushMaxSize = 0.50f;      // largest
-constexpr float kBrushDefaultSize = 0.05f;  // radius of a fresh brush
-constexpr float kBrushSpacing = 0.20f;      // render dab spacing, x radius
-constexpr float kBrushPointGap = 0.08f;     // min gap between recorded
-                                            // points, x radius
-constexpr size_t kBrushMaxStrokes = 512;    // per mask
-constexpr size_t kBrushMaxPoints = 20000;   // per stroke
-constexpr int kBrushTintEdge = 512;         // long side of the tint bitmap
-constexpr size_t kBrushLutSize = 1024;      // falloff table resolution
-constexpr int kBrushMapEdge = 2048;         // longest side the coverage map
-                                            // is rasterized at; bigger
-                                            // images upsample it
-constexpr size_t kBrushCacheSize = 6;       // memoized coverage maps
+constexpr float kBrushMinSize = 0.005f;    // smallest brush radius
+constexpr float kBrushMaxSize = 0.50f;     // largest
+constexpr float kBrushDefaultSize = 0.05f; // radius of a fresh brush
+constexpr float kBrushSpacing = 0.20f;     // render dab spacing, x radius
+constexpr float kBrushPointGap = 0.08f;    // min gap between recorded
+                                           // points, x radius
+constexpr size_t kBrushMaxStrokes = 512;   // per mask
+constexpr size_t kBrushMaxPoints = 20000;  // per stroke
+constexpr int kBrushTintEdge = 512;        // long side of the tint bitmap
+constexpr size_t kBrushLutSize = 1024;     // falloff table resolution
+constexpr int kBrushMapEdge = 2048;        // longest side the coverage map
+                                           // is rasterized at; bigger
+                                           // images upsample it
+constexpr size_t kBrushCacheSize = 6;      // memoized coverage maps
 
 // Luminosity range masks.
-constexpr float kLumMaxRamp = 0.5f;  // soft edge width at Smoothness = 100%,
-                                     // as a fraction of the 0..1 luminance
-constexpr int kLumTintEdge = 512;    // long side of the on-canvas tint bitmap
+constexpr float kLumMaxRamp = 0.5f; // soft edge width at Smoothness = 100%,
+                                    // as a fraction of the 0..1 luminance
+constexpr int kLumTintEdge = 512;   // long side of the on-canvas tint bitmap
+
+// Object masks
+constexpr int kObjectMapEdge = 1024;       // long side of a stored/warped map
+constexpr float kObjectMaxGrow = 0.03f;    // grow = +/-1 -> 3% of long side
+constexpr float kObjectMaxFeather = 0.02f; // feather = 1 -> 2% of long side
+constexpr size_t kObjectCacheSize = 6;
+
+constexpr int kSegPrepEdge = 512; // long side the stand-in segmenter works at
+constexpr int kSegTolerance = 40; // stand-in: RGB distance for "same color"
 
 // ---------------- Palette (dark, Lightroom-like) ----------------
 // Base swatches.
@@ -155,10 +167,10 @@ constexpr Color kColorWhite{255, 255, 255, 255}; // real white (image, glyphs)
 
 // Chrome backgrounds.
 constexpr Color kColorRootBg = kHeaderBg;
-constexpr Color kColorPanelBg = kPanelBg;         // sidebar
-constexpr Color kColorTitlebarBg = kHeaderBg;     // titlebar
-constexpr Color kColorActivityBarBg = kHeaderBg;  // activity bar, idle buttons
-constexpr Color kColorMenuHover{62, 62, 62, 255}; // menu / win-btn hover
+constexpr Color kColorPanelBg = kPanelBg;             // sidebar
+constexpr Color kColorTitlebarBg = kHeaderBg;         // titlebar
+constexpr Color kColorActivityBarBg = kHeaderBg;      // activity bar, idle buttons
+constexpr Color kColorMenuHover{62, 62, 62, 255};     // menu / win-btn hover
 constexpr Color kColorActivityHover{84, 84, 84, 255}; // button / tab hover
 constexpr Color kColorActivityActive = kIconActiveBg; // selected activity btn
 constexpr Color kColorDivider = kDivider;             // divider bg
@@ -166,10 +178,10 @@ constexpr Color kColorTrack = kTrackFill;             // slider + scroll track
 constexpr Color kColorScrollThumb = kTrackEdge;
 
 // Text.
-constexpr Color kColorTextDark = kValue;    // titles, menu labels
-constexpr Color kColorTextMid = kTitle;     // info pane, win-btn glyphs
-constexpr Color kColorTextIcon = kIconRing; // activity bar icons
-constexpr Color kColorTextMuted = kLabel;   // section titles
+constexpr Color kColorTextDark = kValue;             // titles, menu labels
+constexpr Color kColorTextMid = kTitle;              // info pane, win-btn glyphs
+constexpr Color kColorTextIcon = kIconRing;          // activity bar icons
+constexpr Color kColorTextMuted = kLabel;            // section titles
 constexpr Color kColorTextFaint{120, 120, 120, 255}; // placeholders
 
 // Dropdown menu.
@@ -197,7 +209,8 @@ constexpr Color kColorStatusHover = kPanelBg;
 constexpr Color kColorStatusError{255, 214, 102, 255};
 
 // A sidebar tab in the activity bar.
-struct Activity {
+struct Activity
+{
   int id;
   std::string title;
   std::string icon; // single glyph
@@ -210,7 +223,8 @@ struct Activity {
 // pick it up automatically; nothing else needs to change.
 
 // Order must match kAdjustmentSpecs below (it is indexed by AdjId).
-enum class AdjId : int {
+enum class AdjId : int
+{
   Exposure,
   Brightness,
   Contrast,
@@ -241,8 +255,13 @@ enum class AdjId : int {
 //                  pass built in ColorPass / applyColorPass below, which runs
 //                  after the LUT and rounds to 8 bits only once at the end.
 // The slider UI, undo/coalescing, and preview path treat both stages alike.
-struct AdjustmentSpec {
-  enum class Stage { Tone, Color };
+struct AdjustmentSpec
+{
+  enum class Stage
+  {
+    Tone,
+    Color
+  };
   AdjId id;
   std::string label;
   float min, max;
@@ -257,7 +276,8 @@ struct AdjustmentSpec {
 // thrown off by an offset that was meant to be applied after it.
 // Hermite smoothstep on [e0, e1]: 0 below e0, 1 above e1, smooth between.
 // Used to build the tonal-range weights for Highlights/Shadows/Whites/Blacks.
-static inline float smoothStep01(float e0, float e1, float x) {
+static inline float smoothStep01(float e0, float e1, float x)
+{
   const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
   return t * t * (3.0f - 2.0f * t);
 }
@@ -266,15 +286,18 @@ static const std::array<AdjustmentSpec, static_cast<size_t>(AdjId::Count)>
     kAdjustmentSpecs = {{
         {AdjId::Exposure, "Exposure", static_cast<float>(kExposureMin),
          static_cast<float>(kExposureMax),
-         [](float x, float value) { return x * (1.0f + value / 100.0f); }},
+         [](float x, float value)
+         { return x * (1.0f + value / 100.0f); }},
         {AdjId::Brightness, "Brightness", static_cast<float>(kBrightnessMin),
          static_cast<float>(kBrightnessMax),
-         [](float x, float value) { return x + std::round(value); }},
+         [](float x, float value)
+         { return x + std::round(value); }},
         // Contrast: linear stretch/squash around mid-gray. -100 flattens to
         // gray, +100 doubles the distance from 128 (clipping the ends).
         {AdjId::Contrast, "Contrast", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax),
-         [](float x, float value) {
+         [](float x, float value)
+         {
            return 128.0f + (x - 128.0f) * (1.0f + value / 100.0f);
          }},
         // Highlights / Shadows / Whites / Blacks: add up to +/- (scale * 100)
@@ -286,23 +309,27 @@ static const std::array<AdjustmentSpec, static_cast<size_t>(AdjId::Count)>
         // approximation, not a luminance-preserving recovery.
         {AdjId::Highlights, "Highlights", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax),
-         [](float x, float value) {
+         [](float x, float value)
+         {
            return x + value * 0.6f * smoothStep01(0.4f, 1.0f, x / 255.0f);
          }},
         {AdjId::Shadows, "Shadows", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax),
-         [](float x, float value) {
+         [](float x, float value)
+         {
            return x +
                   value * 0.6f * (1.0f - smoothStep01(0.0f, 0.6f, x / 255.0f));
          }},
         {AdjId::Whites, "Whites", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax),
-         [](float x, float value) {
+         [](float x, float value)
+         {
            return x + value * 0.4f * smoothStep01(0.75f, 1.0f, x / 255.0f);
          }},
         {AdjId::Blacks, "Blacks", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax),
-         [](float x, float value) {
+         [](float x, float value)
+         {
            return x +
                   value * 0.4f * (1.0f - smoothStep01(0.0f, 0.25f, x / 255.0f));
          }},
@@ -330,7 +357,8 @@ static const std::array<AdjustmentSpec, static_cast<size_t>(AdjId::Count)>
 // baked into three small tables indexed by hue (MixLut), built once per
 // render request. The per-pixel work is then: RGB -> HSL, three table reads,
 // HSL -> RGB (see applyColorPass).
-enum class MixBand : int {
+enum class MixBand : int
+{
   Red,
   Orange,
   Yellow,
@@ -341,13 +369,20 @@ enum class MixBand : int {
   Magenta,
   Count
 };
-enum class MixChan : int { Hue, Saturation, Luminance, Count };
+enum class MixChan : int
+{
+  Hue,
+  Saturation,
+  Luminance,
+  Count
+};
 constexpr size_t kMixBandCount = static_cast<size_t>(MixBand::Count);
 constexpr size_t kMixChanCount = static_cast<size_t>(MixChan::Count);
 
 // Flat storage: channel-major, so index = chan * kMixBandCount + band.
 using MixValues = std::array<float, kMixBandCount * kMixChanCount>;
-constexpr size_t mixIndex(MixChan c, size_t band) {
+constexpr size_t mixIndex(MixChan c, size_t band)
+{
   return static_cast<size_t>(c) * kMixBandCount + band;
 }
 
@@ -355,26 +390,28 @@ constexpr size_t mixIndex(MixChan c, size_t band) {
 constexpr std::array<float, kMixBandCount + 1> kMixCenters = {
     0.0f, 30.0f, 60.0f, 120.0f, 180.0f, 240.0f, 270.0f, 320.0f, 360.0f};
 
-static const char *mixBandName(size_t band) {
+static const char *mixBandName(size_t band)
+{
   static const char *const names[kMixBandCount] = {
       "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"};
   return names[band];
 }
-static Color mixBandColor(size_t band) {
+static Color mixBandColor(size_t band)
+{
   static const Color colors[kMixBandCount] = {
-      {230, 60, 60, 255},  {240, 140, 50, 255}, {225, 195, 40, 255},
-      {70, 180, 80, 255},  {50, 185, 190, 255}, {60, 110, 230, 255},
-      {140, 80, 210, 255}, {215, 70, 170, 255}};
+      {230, 60, 60, 255}, {240, 140, 50, 255}, {225, 195, 40, 255}, {70, 180, 80, 255}, {50, 185, 190, 255}, {60, 110, 230, 255}, {140, 80, 210, 255}, {215, 70, 170, 255}};
   return colors[band];
 }
 
-static bool mixAnyNonZero(const MixValues &m) {
+static bool mixAnyNonZero(const MixValues &m)
+{
   for (float v : m)
     if (v != 0.0f)
       return true;
   return false;
 }
-static bool mixChanAnyNonZero(const MixValues &m, MixChan c) {
+static bool mixChanAnyNonZero(const MixValues &m, MixChan c)
+{
   for (size_t b = 0; b < kMixBandCount; ++b)
     if (m[mixIndex(c, b)] != 0.0f)
       return true;
@@ -382,15 +419,18 @@ static bool mixChanAnyNonZero(const MixValues &m, MixChan c) {
 }
 
 // Per-hue results, indexed by round(hue / 360 * kMixLutSize).
-struct MixLut {
+struct MixLut
+{
   std::array<float, kMixLutSize> hueShift{}; // degrees to add to the hue
   std::array<float, kMixLutSize> satMul{};   // multiplier on HSL saturation
   std::array<float, kMixLutSize> lumAdj{};   // -1..+1 luminance amount
 };
 
-static MixLut buildMixLut(const MixValues &m) {
+static MixLut buildMixLut(const MixValues &m)
+{
   MixLut lut;
-  for (int i = 0; i < kMixLutSize; ++i) {
+  for (int i = 0; i < kMixLutSize; ++i)
+  {
     const float hue = static_cast<float>(i) * 360.0f / kMixLutSize;
     size_t j = 0; // segment [kMixCenters[j], kMixCenters[j + 1])
     while (j < kMixBandCount - 1 && hue >= kMixCenters[j + 1])
@@ -399,7 +439,8 @@ static MixLut buildMixLut(const MixValues &m) {
     const float t = smoothStep01(0.0f, 1.0f,
                                  (hue - kMixCenters[j]) /
                                      (kMixCenters[j + 1] - kMixCenters[j]));
-    auto blend = [&](MixChan c) {
+    auto blend = [&](MixChan c)
+    {
       return (m[mixIndex(c, j)] * (1.0f - t) + m[mixIndex(c, nx)] * t) / 100.0f;
     };
     const size_t k = static_cast<size_t>(i);
@@ -422,12 +463,20 @@ static MixLut buildMixLut(const MixValues &m) {
 // vectors, luminance offsets of all four wheels) is baked into one small
 // per-luma table of RGB offsets (GradeLut). The per-pixel work is: luma,
 // one table read, three adds (see applyColorPass).
-enum class GradeRange : int { Shadows, Midtones, Highlights, Global, Count };
+enum class GradeRange : int
+{
+  Shadows,
+  Midtones,
+  Highlights,
+  Global,
+  Count
+};
 constexpr size_t kGradeRangeCount = static_cast<size_t>(GradeRange::Count);
 constexpr float kGradeTintStrength = 0.30f; // sat 100 shifts a channel by 30%
 constexpr float kGradeLumAmount = 0.30f;    // lum +/-100 = +/-30% of 255
 
-struct GradeWheel {
+struct GradeWheel
+{
   float hue = 0.0f;    // 0..359 degrees
   float sat = 0.0f;    // 0..100
   float lum = 0.0f;    // -100..100
@@ -436,12 +485,14 @@ struct GradeWheel {
   bool operator==(const GradeWheel &) const = default;
 };
 
-struct ColorGrade {
+struct ColorGrade
+{
   std::array<GradeWheel, kGradeRangeCount> wheel{};
   float blending = 50.0f; // 0..100
   float balance = 0.0f;   // -100..100
   bool operator==(const ColorGrade &) const = default;
-  bool anyActive() const {
+  bool anyActive() const
+  {
     for (const auto &w : wheel)
       if (w.visible && !w.neutral())
         return true;
@@ -453,13 +504,15 @@ struct ColorGrade {
 using GradeLut = std::array<std::array<float, 256>, 3>;
 
 // Fully saturated RGB (0..1) for a hue in degrees.
-static void gradeHueToRgb(float h, float *rgb) {
+static void gradeHueToRgb(float h, float *rgb)
+{
   h = std::fmod(h, 360.0f);
   if (h < 0.0f)
     h += 360.0f;
   const float hp = h / 60.0f;
   const float x = 1.0f - std::fabs(std::fmod(hp, 2.0f) - 1.0f);
-  switch (static_cast<int>(hp) % 6) {
+  switch (static_cast<int>(hp) % 6)
+  {
   case 0:
     rgb[0] = 1;
     rgb[1] = x;
@@ -493,12 +546,14 @@ static void gradeHueToRgb(float h, float *rgb) {
   }
 }
 
-static GradeLut buildGradeLut(const ColorGrade &g) {
+static GradeLut buildGradeLut(const ColorGrade &g)
+{
   // Tint vector + luminance offset per wheel. The tint is the hue's color
   // minus its own luma, so it shifts color without changing brightness.
   float tint[kGradeRangeCount][3] = {};
   float lumOff[kGradeRangeCount] = {};
-  for (size_t r = 0; r < kGradeRangeCount; ++r) {
+  for (size_t r = 0; r < kGradeRangeCount; ++r)
+  {
     const GradeWheel &w = g.wheel[r];
     if (!w.visible)
       continue;
@@ -518,7 +573,8 @@ static GradeLut buildGradeLut(const ColorGrade &g) {
   const float hw = 0.05f + 0.30f * (g.blending / 100.0f);
 
   GradeLut lut{};
-  for (int i = 0; i < 256; ++i) {
+  for (int i = 0; i < 256; ++i)
+  {
     const float y = static_cast<float>(i) / 255.0f;
     float wS = 1.0f - smoothStep01(cs - hw, cs + hw, y);
     float wH = smoothStep01(ch - hw, ch + hw, y);
@@ -526,7 +582,8 @@ static GradeLut buildGradeLut(const ColorGrade &g) {
     if (wM < 0.0f)
       wM = 0.0f;
     const float sum = wS + wM + wH; // > 1 only when the ranges overlap a lot
-    if (sum > 1.0f) {
+    if (sum > 1.0f)
+    {
       wS /= sum;
       wM /= sum;
       wH /= sum;
@@ -549,7 +606,8 @@ static GradeLut buildGradeLut(const ColorGrade &g) {
 // grading. Works on
 // the gamma-encoded values directly (no linearization) — a standard, cheap
 // approximation for a first version.
-struct ColorPass {
+struct ColorPass
+{
   bool active = false;       // false = skip the pass entirely (fast path)
   float gain[3] = {1, 1, 1}; // per-channel white-balance gains (R,G,B)
   float vibrance = 0.0f;     // -1..+1
@@ -563,7 +621,8 @@ struct ColorPass {
 // UI values are the -100..+100 slider values.
 static ColorPass makeColorPass(float temperature, float tint, float vibrance,
                                float saturation, const MixValues &mix,
-                               const ColorGrade &grade) {
+                               const ColorGrade &grade)
+{
   ColorPass cp;
   cp.mix = mixAnyNonZero(mix);
   cp.grade = grade.anyActive();
@@ -591,7 +650,8 @@ static ColorPass makeColorPass(float temperature, float tint, float vibrance,
   return cp;
 }
 
-static inline uint8_t toU8Clamped(float v) {
+static inline uint8_t toU8Clamped(float v)
+{
   v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
   return static_cast<uint8_t>(v + 0.5f);
 }
@@ -599,7 +659,8 @@ static inline uint8_t toU8Clamped(float v) {
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched). Raw pointers
 // and no std::clamp/min/max calls in the loop, for the same Debug-build
 // reason as AdjustmentSet::applyTo.
-static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
+static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
+{
   if (!cp.active)
     return;
   const float gR = cp.gain[0], gG = cp.gain[1], gB = cp.gain[2];
@@ -614,11 +675,13 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
   const float *lutHue = cp.mixLut.hueShift.data();
   const float *lutSat = cp.mixLut.satMul.data();
   const float *lutLum = cp.mixLut.lumAdj.data();
-  for (size_t i = 0; i + 3 < n; i += 4) {
+  for (size_t i = 0; i + 3 < n; i += 4)
+  {
     float r = static_cast<float>(p[i]) * gR;
     float g = static_cast<float>(p[i + 1]) * gG;
     float b = static_cast<float>(p[i + 2]) * gB;
-    if (doVib) {
+    if (doVib)
+    {
       // Positive vibrance boosts muted colors most (weight 1 - s); negative
       // mutes already-saturated colors most (weight s). s = HSV saturation.
       const float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
@@ -630,13 +693,15 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
       g = l + (g - l) * k;
       b = l + (b - l) * k;
     }
-    if (doSat) {
+    if (doSat)
+    {
       const float l = 0.299f * r + 0.587f * g + 0.114f * b;
       r = l + (r - l) * sat;
       g = l + (g - l) * sat;
       b = l + (b - l) * sat;
     }
-    if (doMix) {
+    if (doMix)
+    {
       // Color Mixer. Work in HSL on values clamped to 0..255.
       r = r < 0.0f ? 0.0f : (r > 255.0f ? 255.0f : r);
       g = g < 0.0f ? 0.0f : (g > 255.0f ? 255.0f : g);
@@ -644,15 +709,21 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
       const float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
       const float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
       const float d = mx - mn;
-      if (d > 0.0f) { // d == 0 is a pure gray: no hue, nothing to mix
-        float h;      // hue in sextants, 0..6
-        if (mx == r) {
+      if (d > 0.0f)
+      {          // d == 0 is a pure gray: no hue, nothing to mix
+        float h; // hue in sextants, 0..6
+        if (mx == r)
+        {
           h = (g - b) / d;
           if (h < 0.0f)
             h += 6.0f;
-        } else if (mx == g) {
+        }
+        else if (mx == g)
+        {
           h = (b - r) / d + 2.0f;
-        } else {
+        }
+        else
+        {
           h = (r - g) / d + 4.0f;
         }
         h *= 60.0f; // degrees
@@ -695,7 +766,8 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
         const float x = c * (1.0f - (f < 0.0f ? -f : f));
         const float m0 = l - 0.5f * c;
         float r1, g1, b1;
-        switch (sector) {
+        switch (sector)
+        {
         case 0:
           r1 = c;
           g1 = x;
@@ -732,7 +804,8 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
         b = (b1 + m0) * 255.0f;
       }
     }
-    if (doGrade) {
+    if (doGrade)
+    {
       // Color Grading: offsets depend only on the pixel's luma.
       r = r < 0.0f ? 0.0f : (r > 255.0f ? 255.0f : r);
       g = g < 0.0f ? 0.0f : (g > 255.0f ? 255.0f : g);
@@ -755,7 +828,8 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n) {
 // A crop region in pixels of the oriented, straightened image (see
 // EditorState::rotated). A default-constructed CropRect (w == h == 0) means
 // "no crop — use the whole image".
-struct CropRect {
+struct CropRect
+{
   int x = 0, y = 0, w = 0, h = 0;
   bool empty() const { return w <= 0 || h <= 0; }
   bool operator==(const CropRect &) const = default;
@@ -765,14 +839,16 @@ struct CropRect {
 // clockwise quarter turns. Together these cover all 8 ways to rotate/flip a
 // picture, so any sequence of rotate/flip buttons collapses into one value
 // (e.g. flip-H then flip-V is just rot = 2, no matter how often it's done).
-struct Orient {
+struct Orient
+{
   int rot = 0;       // 0..3 clockwise quarter turns, applied after the flip
   bool flip = false; // mirror left-right first
   bool identity() const { return rot == 0 && !flip; }
   bool operator==(const Orient &) const = default;
 };
 
-struct Dims {
+struct Dims
+{
   int w, h;
 };
 
@@ -786,7 +862,8 @@ constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 // Both formulas are symmetric in (w, h), so a picture that is later turned a
 // further quarter-turn gets exactly the transposed size — which is what
 // lets a crop rectangle follow a 90-degree turn by simple index math.
-static Dims rotatedDims(int w, int h, float deg, bool expand) {
+static Dims rotatedDims(int w, int h, float deg, bool expand)
+{
   if (deg == 0.0f)
     return {w, h};
   const double rad = static_cast<double>(deg) * kDegToRad;
@@ -801,7 +878,6 @@ static Dims rotatedDims(int w, int h, float deg, bool expand) {
           std::max(1, static_cast<int>(std::floor(sc * dh + eps)))};
 }
 
-
 // Where a point of the ORIGINAL picture ends up after orient -> straighten ->
 // crop (the order syncSource runs them), as one similarity transform in
 // continuous pixel coordinates (pixel centers at +0.5):
@@ -812,40 +888,47 @@ static Dims rotatedDims(int w, int h, float deg, bool expand) {
 // lengths are preserved and only positions and axis directions change. Masks
 // are stored against the ORIGINAL picture and mapped through this to wherever
 // the picture currently is, so no geometry change ever has to touch a mask.
-struct GeoFrame {
+struct GeoFrame
+{
   double m00 = 1, m01 = 0, m10 = 0, m11 = 1, tx = 0, ty = 0;
   double origW = 1, origH = 1; // the untouched picture, px
   double srcW = 1, srcH = 1;   // after orient / straighten / crop, px
 
   double det() const { return m00 * m11 - m01 * m10; }
-  void toSrc(double x, double y, double &ox, double &oy) const {
+  void toSrc(double x, double y, double &ox, double &oy) const
+  {
     ox = m00 * x + m01 * y + tx;
     oy = m10 * x + m11 * y + ty;
   }
-  void toOrig(double x, double y, double &ox, double &oy) const {
+  void toOrig(double x, double y, double &ox, double &oy) const
+  {
     const double px = x - tx, py = y - ty, d = det();
     ox = (m11 * px - m01 * py) / d;
     oy = (-m10 * px + m00 * py) / d;
   }
   // Ratio of the two pictures' shorter sides: radii are stored as a fraction
   // of the original's, but shown against the current picture's.
-  double radiusScale() const {
+  double radiusScale() const
+  {
     return std::min(origW, origH) / std::min(srcW, srcH);
   }
   // Direction of an axis (degrees, clockwise) in the original -> in the
   // source. An axis has no head or tail, so the result is kept in [-90, 90].
-  static float wrapAxis(float a) {
+  static float wrapAxis(float a)
+  {
     while (a > 90.0f)
       a -= 180.0f;
     while (a < -90.0f)
       a += 180.0f;
     return a;
   }
-  float axisToSrc(float deg) const {
+  float axisToSrc(float deg) const
+  {
     const double phi = std::atan2(m10, m00) / kDegToRad; // where +x goes
     return wrapAxis(static_cast<float>(det() > 0 ? deg + phi : phi - deg));
   }
-  float axisToOrig(float deg) const {
+  float axisToOrig(float deg) const
+  {
     const double phi = std::atan2(m10, m00) / kDegToRad;
     return wrapAxis(static_cast<float>(det() > 0 ? deg - phi : phi - deg));
   }
@@ -853,13 +936,15 @@ struct GeoFrame {
   // the original -> in the source and back. Unlike an axis, an arrow has a
   // head, so a mirror or a half turn must not fold it onto its opposite: the
   // unit vector is pushed through the linear part and the angle re-read.
-  float dirToSrc(float deg) const {
+  float dirToSrc(float deg) const
+  {
     const double a = static_cast<double>(deg) * kDegToRad;
     const double vx = std::cos(a), vy = std::sin(a);
     return static_cast<float>(
         std::atan2(m10 * vx + m11 * vy, m00 * vx + m01 * vy) / kDegToRad);
   }
-  float dirToOrig(float deg) const {
+  float dirToOrig(float deg) const
+  {
     const double a = static_cast<double>(deg) * kDegToRad;
     const double vx = std::cos(a), vy = std::sin(a), d = det();
     return static_cast<float>(
@@ -872,7 +957,8 @@ struct GeoFrame {
 // original size known yet (ow <= 0) the frame is the identity and masks pass
 // through unchanged.
 static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
-                             bool expand, const CropRect &crop) {
+                             bool expand, const CropRect &crop)
+{
   GeoFrame f;
   if (ow <= 0 || oh <= 0)
     return f;
@@ -881,7 +967,8 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
   int w = ow, h = oh;
   // Composes p' = A p + b after everything so far.
   auto post = [&f](double a00, double a01, double a10, double a11, double b0,
-                   double b1) {
+                   double b1)
+  {
     const double n00 = a00 * f.m00 + a01 * f.m10;
     const double n01 = a00 * f.m01 + a01 * f.m11;
     const double n10 = a10 * f.m00 + a11 * f.m10;
@@ -892,11 +979,13 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
   };
   if (o.flip) // orientImage: mirror first...
     post(-1, 0, 0, 1, w, 0);
-  for (int i = 0; i < o.rot; ++i) { // ...then clockwise quarter turns
-    post(0, -1, 1, 0, h, 0);        // (x, y) -> (h - y, x)
+  for (int i = 0; i < o.rot; ++i)
+  {                          // ...then clockwise quarter turns
+    post(0, -1, 1, 0, h, 0); // (x, y) -> (h - y, x)
     std::swap(w, h);
   }
-  if (angle != 0.0f) { // rotateArbitrary: clockwise about the center
+  if (angle != 0.0f)
+  { // rotateArbitrary: clockwise about the center
     const Dims d = rotatedDims(w, h, angle, expand);
     const double rad = static_cast<double>(angle) * kDegToRad;
     const double c = std::cos(rad), s = std::sin(rad);
@@ -904,7 +993,8 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
          d.h / 2.0 - (s * w / 2.0 + c * h / 2.0));
     w = d.w, h = d.h;
   }
-  if (!crop.empty()) { // cropImage's clamping, exactly
+  if (!crop.empty())
+  { // cropImage's clamping, exactly
     const int x0 = std::clamp(crop.x, 0, w), y0 = std::clamp(crop.y, 0, h);
     const int x1 = std::clamp(crop.x + crop.w, x0, w);
     const int y1 = std::clamp(crop.y + crop.h, y0, h);
@@ -961,10 +1051,20 @@ static GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
 using AdjValues = std::array<float, static_cast<size_t>(AdjId::Count)>;
 
 // Same order as the alternatives of MaskShape / MaskEval below.
-enum class MaskType : int { Radial, Linear, Brush, Luminosity, Count };
+enum class MaskType : int
+{
+  Radial,
+  Linear,
+  Brush,
+  Luminosity,
+  Object,
+  Count
+};
 
-static const char *maskTypeName(MaskType t) {
-  switch (t) {
+static const char *maskTypeName(MaskType t)
+{
+  switch (t)
+  {
   case MaskType::Radial:
     return "Radial";
   case MaskType::Linear:
@@ -973,6 +1073,8 @@ static const char *maskTypeName(MaskType t) {
     return "Brush";
   case MaskType::Luminosity:
     return "Luminosity";
+  case MaskType::Object:
+    return "Object";
   default:
     return "Mask";
   }
@@ -981,20 +1083,22 @@ static const char *maskTypeName(MaskType t) {
 // ---- Radial (elliptical) mask ----
 // The shape resolved for one image size: pixel-space center, rotation and the
 // constants the per-row work needs.
-struct RadialEval {
-  float cx = 0, cy = 0;    // center, px
-  float c = 1, s = 0;      // cos / sin of the clockwise rotation
+struct RadialEval
+{
+  float cx = 0, cy = 0;       // center, px
+  float c = 1, s = 0;         // cos / sin of the clockwise rotation
   float invRx = 0, invRy = 0; // 1 / radius, px
-  float inner = 0;         // normalized distance where the falloff begins
-  float invFall = 1;       // 1 / (1 - inner)
-  float qa = 0, qb = 0;    // 1/rx^2, 1/ry^2 (row-span quadratic)
+  float inner = 0;            // normalized distance where the falloff begins
+  float invFall = 1;          // 1 / (1 - inner)
+  float qa = 0, qb = 0;       // 1/rx^2, 1/ry^2 (row-span quadratic)
 
   // Which pixels [x0, x1) of row `y` can have a non-zero weight? False if none
   // (the ellipse doesn't reach this row). Exact for the rotated ellipse: for
   // a row at offset dy from the center the outline is the quadratic
   //   A dx^2 + B dy dx + C dy^2 = 1   with det = A C - B^2/4 = qa qb,
   // so its two roots are  dx = (-B dy/2 +- sqrt(A - qa qb dy^2)) / A.
-  bool rowSpan(int y, int W, int &x0, int &x1) const {
+  bool rowSpan(int y, int W, int &x0, int &x1) const
+  {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
     const float A = c * c * qa + s * s * qb;
     const float B = 2.0f * c * s * (qa - qb);
@@ -1016,19 +1120,26 @@ struct RadialEval {
   // the outline (smoothstep), 0 outside. Plain loop, no std helpers, same
   // Debug-build reason as applyColorPass.
   void rowWeights(int y, int x0, int x1, float *out,
-                  const uint8_t * /*pix*/ = nullptr) const {
+                  const uint8_t * /*pix*/ = nullptr) const
+  {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
-    for (int x = x0; x < x1; ++x) {
+    for (int x = x0; x < x1; ++x)
+    {
       const float dx = (static_cast<float>(x) + 0.5f) - cx;
       const float u = (dx * c + dy * s) * invRx;
       const float v = (-dx * s + dy * c) * invRy;
       const float d = std::sqrt(u * u + v * v);
       float w;
-      if (d <= inner) {
+      if (d <= inner)
+      {
         w = 1.0f;
-      } else if (d >= 1.0f) {
+      }
+      else if (d >= 1.0f)
+      {
         w = 0.0f;
-      } else {
+      }
+      else
+      {
         const float t = (d - inner) * invFall;
         w = 1.0f - t * t * (3.0f - 2.0f * t);
       }
@@ -1037,7 +1148,8 @@ struct RadialEval {
   }
 };
 
-struct RadialShape {
+struct RadialShape
+{
   float cx = 0.5f, cy = 0.5f; // center, fraction of image width / height
   float rx = 0.3f, ry = 0.3f; // half-axes, fraction of the SHORTER image side
   float angle = 0.0f;         // rotation of the rx axis, degrees clockwise
@@ -1046,13 +1158,15 @@ struct RadialShape {
 
   // Inner edge of the falloff, normalized: 1 - feather, kept a hair short of
   // 1 so a "hard" edge is still a (one-percent) ramp and never divides by 0.
-  float innerFrac() const {
+  float innerFrac() const
+  {
     const float in = 1.0f - feather;
     return in < 0.0f ? 0.0f : (in > 0.99f ? 0.99f : in);
   }
 
   // Stored (against the original picture) -> as it sits in the current one.
-  RadialShape toSource(const GeoFrame &f) const {
+  RadialShape toSource(const GeoFrame &f) const
+  {
     RadialShape s = *this;
     double px, py;
     f.toSrc(cx * f.origW, cy * f.origH, px, py);
@@ -1065,7 +1179,8 @@ struct RadialShape {
     return s;
   }
   // The inverse: a shape drawn on the current picture -> stored form.
-  static RadialShape fromSource(const RadialShape &s, const GeoFrame &f) {
+  static RadialShape fromSource(const RadialShape &s, const GeoFrame &f)
+  {
     RadialShape r = s;
     double ox, oy;
     f.toOrig(s.cx * f.srcW, s.cy * f.srcH, ox, oy);
@@ -1082,8 +1197,10 @@ struct RadialShape {
   // slider never nudges the position through float round-off, and an
   // unchanged mask compares equal (so it makes no undo step).
   void applySourceEdit(const RadialShape &before, const RadialShape &after,
-                       const GeoFrame &f) {
-    if (after.cx != before.cx || after.cy != before.cy) {
+                       const GeoFrame &f)
+  {
+    if (after.cx != before.cx || after.cy != before.cy)
+    {
       const RadialShape p = fromSource(after, f);
       cx = p.cx;
       cy = p.cy;
@@ -1099,7 +1216,8 @@ struct RadialShape {
       feather = after.feather;
   }
 
-  RadialEval prepare(int W, int H) const {
+  RadialEval prepare(int W, int H) const
+  {
     const float S = static_cast<float>(W < H ? W : H);
     const float rad = angle * (3.14159265358979f / 180.0f);
     const float pxRx = (rx < kMaskMinRadius ? kMaskMinRadius : rx) * S;
@@ -1124,16 +1242,18 @@ struct RadialShape {
 // center point, a direction `u` (the way the effect fades OUT) and a half
 // length: the ramp runs from the line `len` behind the center (weight 1)
 // to the line `len` ahead of it (weight 0), perpendicular to `u`.
-struct LinearEval {
-  float cx = 0, cy = 0;     // center, px
-  float ux = 0, uy = 1;     // unit direction of fade-out
-  float len = 1;            // half length of the ramp, px
-  float invLen = 1;         // 1 / len
+struct LinearEval
+{
+  float cx = 0, cy = 0; // center, px
+  float ux = 0, uy = 1; // unit direction of fade-out
+  float len = 1;        // half length of the ramp, px
+  float invLen = 1;     // 1 / len
 
   // Which pixels [x0, x1) of row `y` can have a non-zero weight? The weight is
   // non-zero exactly where s < 1, and s is linear in x, so that is a
   // half-line of the row (or all / none of it when the axis is vertical).
-  bool rowSpan(int y, int W, int &x0, int &x1) const {
+  bool rowSpan(int y, int W, int &x0, int &x1) const
+  {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
     const float bound = len - dy * uy; // need  dx * ux < bound
     x0 = 0;
@@ -1141,10 +1261,13 @@ struct LinearEval {
     if (std::fabs(ux) < 1e-6f)
       return bound > 0.0f;
     const float edge = bound / ux; // dx = edge is the weight-0 line
-    if (ux > 0.0f) {
+    if (ux > 0.0f)
+    {
       const int e = static_cast<int>(std::ceil(cx + edge)) + 1;
       x1 = e > W ? W : e;
-    } else {
+    }
+    else
+    {
       const int e = static_cast<int>(std::floor(cx + edge)) - 1;
       x0 = e < 0 ? 0 : e;
     }
@@ -1153,18 +1276,25 @@ struct LinearEval {
 
   // Plain loop, no std helpers (same Debug-build reason as RadialEval).
   void rowWeights(int y, int x0, int x1, float *out,
-                  const uint8_t * /*pix*/ = nullptr) const {
+                  const uint8_t * /*pix*/ = nullptr) const
+  {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
     const float base = dy * uy;
-    for (int x = x0; x < x1; ++x) {
+    for (int x = x0; x < x1; ++x)
+    {
       const float dx = (static_cast<float>(x) + 0.5f) - cx;
       const float s = (dx * ux + base) * invLen; // -1 .. +1 across the ramp
       float w;
-      if (s <= -1.0f) {
+      if (s <= -1.0f)
+      {
         w = 1.0f;
-      } else if (s >= 1.0f) {
+      }
+      else if (s >= 1.0f)
+      {
         w = 0.0f;
-      } else {
+      }
+      else
+      {
         const float t = (s + 1.0f) * 0.5f;
         w = 1.0f - t * t * (3.0f - 2.0f * t);
       }
@@ -1173,7 +1303,8 @@ struct LinearEval {
   }
 };
 
-struct LinearShape {
+struct LinearShape
+{
   float cx = 0.5f, cy = 0.5f; // center, fraction of image width / height
   float len = 0.25f;          // half length of the ramp, fraction of the
                               // SHORTER image side
@@ -1182,7 +1313,8 @@ struct LinearShape {
                               // fading towards the bottom
   bool operator==(const LinearShape &) const = default;
 
-  LinearShape toSource(const GeoFrame &f) const {
+  LinearShape toSource(const GeoFrame &f) const
+  {
     LinearShape s = *this;
     double px, py;
     f.toSrc(cx * f.origW, cy * f.origH, px, py);
@@ -1192,7 +1324,8 @@ struct LinearShape {
     s.angle = f.dirToSrc(angle);
     return s;
   }
-  static LinearShape fromSource(const LinearShape &s, const GeoFrame &f) {
+  static LinearShape fromSource(const LinearShape &s, const GeoFrame &f)
+  {
     LinearShape r = s;
     double ox, oy;
     f.toOrig(s.cx * f.srcW, s.cy * f.srcH, ox, oy);
@@ -1204,8 +1337,10 @@ struct LinearShape {
   }
   // Same contract as RadialShape::applySourceEdit: only changed fields.
   void applySourceEdit(const LinearShape &before, const LinearShape &after,
-                       const GeoFrame &f) {
-    if (after.cx != before.cx || after.cy != before.cy) {
+                       const GeoFrame &f)
+  {
+    if (after.cx != before.cx || after.cy != before.cy)
+    {
       const LinearShape p = fromSource(after, f);
       cx = p.cx;
       cy = p.cy;
@@ -1216,7 +1351,8 @@ struct LinearShape {
       angle = f.dirToOrig(after.angle);
   }
 
-  LinearEval prepare(int W, int H) const {
+  LinearEval prepare(int W, int H) const
+  {
     const float S = static_cast<float>(W < H ? W : H);
     const float rad = angle * (3.14159265358979f / 180.0f);
     LinearEval e;
@@ -1252,12 +1388,14 @@ struct LinearShape {
 // with bilinear interpolation; a mask is smooth anyway, and a 24 MP image
 // costs no more than a 3 MP one. The result is memoized (see prepare), so
 // dragging an Adjust slider re-rasterizes nothing.
-struct BrushPt {
+struct BrushPt
+{
   float x = 0, y = 0; // fraction of the picture's width / height
   bool operator==(const BrushPt &) const = default;
 };
 
-struct BrushStroke {
+struct BrushStroke
+{
   bool erase = false;
   float size = kBrushDefaultSize; // radius, fraction of the SHORTER side
   float feather = 0.5f;           // 0 = hard edge .. 1 = fades from the center
@@ -1268,7 +1406,8 @@ struct BrushStroke {
 
 // The brush resolved for one image size: the coverage map plus, per map row,
 // the pixels that can be non-zero.
-struct BrushEval {
+struct RasterEval
+{
   int W = 0, H = 0;   // the image this is resolved for
   int mw = 0, mh = 0; // the map's own size: W x H, or smaller for a big image
   // 0..255 per map pixel, row-major mw x mh. Shared so copying an Eval (they
@@ -1279,7 +1418,8 @@ struct BrushEval {
   std::shared_ptr<const std::vector<int>> lo, hi;
 
   // The two map rows image row `y` interpolates between, and the blend.
-  void mapRows(int y, int &r0, int &r1, float &t) const {
+  void mapRows(int y, int &r0, int &r1, float &t) const
+  {
     const float fy = (static_cast<float>(y) + 0.5f) * static_cast<float>(mh) /
                          static_cast<float>(H) -
                      0.5f;
@@ -1289,7 +1429,8 @@ struct BrushEval {
     r1 = a + 1 < 0 ? 0 : (a + 1 > mh - 1 ? mh - 1 : a + 1);
   }
 
-  bool rowSpan(int y, int imgW, int &x0, int &x1) const {
+  bool rowSpan(int y, int imgW, int &x0, int &x1) const
+  {
     if (!map || y < 0 || y >= H)
       return false;
     int r0, r1;
@@ -1313,8 +1454,10 @@ struct BrushEval {
 
   // Plain loops, no std helpers (same Debug-build reason as RadialEval).
   void rowWeights(int y, int x0, int x1, float *out,
-                  const uint8_t * /*pix*/ = nullptr) const {
-    if (!map || y < 0 || y >= H) {
+                  const uint8_t * /*pix*/ = nullptr) const
+  {
+    if (!map || y < 0 || y >= H)
+    {
       for (int x = x0; x < x1; ++x)
         out[x - x0] = 0.0f;
       return;
@@ -1327,8 +1470,10 @@ struct BrushEval {
     const uint8_t *row1 = map->data() + static_cast<size_t>(r1) *
                                             static_cast<size_t>(mw);
     const float inv255 = 1.0f / 255.0f;
-    if (mw == W) { // map and image agree horizontally: no x interpolation
-      for (int x = x0; x < x1; ++x) {
+    if (mw == W)
+    { // map and image agree horizontally: no x interpolation
+      for (int x = x0; x < x1; ++x)
+      {
         const float a = static_cast<float>(row0[x]);
         const float b = static_cast<float>(row1[x]);
         out[x - x0] = (a + (b - a) * ty) * inv255;
@@ -1336,7 +1481,8 @@ struct BrushEval {
       return;
     }
     const float k = static_cast<float>(mw) / static_cast<float>(W);
-    for (int x = x0; x < x1; ++x) {
+    for (int x = x0; x < x1; ++x)
+    {
       const float fx = (static_cast<float>(x) + 0.5f) * k - 0.5f;
       const int a = static_cast<int>(std::floor(fx));
       const float tx = fx - static_cast<float>(a);
@@ -1351,18 +1497,29 @@ struct BrushEval {
   }
 };
 
-struct BrushShape {
+struct BrushEval : RasterEval
+{
+};
+struct ObjectEval : RasterEval
+{
+};
+
+struct BrushShape
+{
   std::vector<BrushStroke> strokes;
   bool operator==(const BrushShape &) const = default;
 
   // Stored (against the original picture) -> as it sits in the current one.
   // Positions go through the frame, sizes scale with it.
-  BrushShape toSource(const GeoFrame &f) const {
+  BrushShape toSource(const GeoFrame &f) const
+  {
     BrushShape s = *this;
     const double k = f.radiusScale();
-    for (BrushStroke &st : s.strokes) {
+    for (BrushStroke &st : s.strokes)
+    {
       st.size = static_cast<float>(st.size * k);
-      for (BrushPt &p : st.pts) {
+      for (BrushPt &p : st.pts)
+      {
         double px, py;
         f.toSrc(p.x * f.origW, p.y * f.origH, px, py);
         p.x = static_cast<float>(px / f.srcW);
@@ -1375,13 +1532,15 @@ struct BrushShape {
   // drawn on the current picture -> stored form. (No applySourceEdit: strokes
   // are only ever appended, never edited in place, so nothing needs to fold
   // an edit of the in-view form back field by field.)
-  static BrushPt pointFromSource(const BrushPt &p, const GeoFrame &f) {
+  static BrushPt pointFromSource(const BrushPt &p, const GeoFrame &f)
+  {
     double ox, oy;
     f.toOrig(p.x * f.srcW, p.y * f.srcH, ox, oy);
     return BrushPt{static_cast<float>(ox / f.origW),
                    static_cast<float>(oy / f.origH)};
   }
-  static float sizeFromSource(float size, const GeoFrame &f) {
+  static float sizeFromSource(float size, const GeoFrame &f)
+  {
     return static_cast<float>(size / f.radiusScale());
   }
 
@@ -1394,7 +1553,8 @@ struct BrushShape {
   // strokes after those are stamped on top of a copy of it: strokes fold in
   // order, so the result is identical to rasterizing them all.
   BrushEval rasterize(int W, int H, const BrushEval *base = nullptr,
-                      size_t first = 0) const {
+                      size_t first = 0) const
+  {
     BrushEval e;
     e.W = W;
     e.H = H;
@@ -1414,11 +1574,14 @@ struct BrushShape {
     const size_t sw = static_cast<size_t>(mw);
     std::shared_ptr<std::vector<uint8_t>> map;
     std::shared_ptr<std::vector<int>> lo, hi;
-    if (base && base->map && base->mw == mw && base->mh == mh) {
+    if (base && base->map && base->mw == mw && base->mh == mh)
+    {
       map = std::make_shared<std::vector<uint8_t>>(*base->map);
       lo = std::make_shared<std::vector<int>>(*base->lo);
       hi = std::make_shared<std::vector<int>>(*base->hi);
-    } else {
+    }
+    else
+    {
       first = 0; // no usable base: start from an empty map
       map = std::make_shared<std::vector<uint8_t>>(
           sw * static_cast<size_t>(mh), uint8_t{0});
@@ -1430,7 +1593,8 @@ struct BrushShape {
     std::vector<uint8_t> cov; // one stroke's coverage, over its bbox only
     std::array<uint8_t, kBrushLutSize + 1> lut{};
 
-    for (size_t si = first; si < strokes.size(); ++si) {
+    for (size_t si = first; si < strokes.size(); ++si)
+    {
       const BrushStroke &st = strokes[si];
       if (st.pts.empty())
         continue;
@@ -1441,15 +1605,21 @@ struct BrushShape {
       // `inner`, easing (smoothstep) to 0 at the rim.
       const float inner = std::clamp(1.0f - st.feather, 0.0f, 0.99f);
       const float dens = std::clamp(st.density, 0.0f, 1.0f);
-      for (size_t i = 0; i <= kBrushLutSize; ++i) {
+      for (size_t i = 0; i <= kBrushLutSize; ++i)
+      {
         const float d = std::sqrt(static_cast<float>(i) /
                                   static_cast<float>(kBrushLutSize));
         float w;
-        if (d <= inner) {
+        if (d <= inner)
+        {
           w = 1.0f;
-        } else if (d >= 1.0f) {
+        }
+        else if (d >= 1.0f)
+        {
           w = 0.0f;
-        } else {
+        }
+        else
+        {
           const float t = (d - inner) / (1.0f - inner);
           w = 1.0f - t * t * (3.0f - 2.0f * t);
         }
@@ -1459,7 +1629,8 @@ struct BrushShape {
       // The stroke's bounding box (points +- radius), clamped to the map.
       float minX = st.pts[0].x * fW, maxX = minX;
       float minY = st.pts[0].y * fH, maxY = minY;
-      for (const BrushPt &p : st.pts) {
+      for (const BrushPt &p : st.pts)
+      {
         const float x = p.x * fW, y = p.y * fH;
         minX = x < minX ? x : minX;
         maxX = x > maxX ? x : maxX;
@@ -1483,7 +1654,8 @@ struct BrushShape {
 
       // Stamp one round dab: coverage = max(existing, falloff).
       const float lutScale = static_cast<float>(kBrushLutSize) / r2;
-      const auto stamp = [&](float cx, float cy) {
+      const auto stamp = [&](float cx, float cy)
+      {
         if (cx + rad < static_cast<float>(cx0) ||
             cx - rad > static_cast<float>(cx1) ||
             cy + rad < static_cast<float>(cy0) ||
@@ -1497,12 +1669,14 @@ struct BrushShape {
         iy0 = iy0 < cy0 ? cy0 : iy0;
         ix1 = ix1 > cx1 ? cx1 : ix1;
         iy1 = iy1 > cy1 ? cy1 : iy1;
-        for (int y = iy0; y < iy1; ++y) {
+        for (int y = iy0; y < iy1; ++y)
+        {
           const float dy = (static_cast<float>(y) + 0.5f) - cy;
           const float dy2 = dy * dy;
           uint8_t *crow = cov.data() + static_cast<size_t>(y - cy0) *
                                            static_cast<size_t>(bw);
-          for (int x = ix0; x < ix1; ++x) {
+          for (int x = ix0; x < ix1; ++x)
+          {
             const float dx = (static_cast<float>(x) + 0.5f) - cx;
             const float d2 = dx * dx + dy2;
             if (d2 >= r2)
@@ -1519,12 +1693,14 @@ struct BrushShape {
       const float step = std::max(1.0f, rad * kBrushSpacing);
       float px = st.pts[0].x * fW, py = st.pts[0].y * fH;
       stamp(px, py);
-      for (size_t k = 1; k < st.pts.size(); ++k) {
+      for (size_t k = 1; k < st.pts.size(); ++k)
+      {
         const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
         const float len = std::hypot(qx - px, qy - py);
         const int n =
             std::min(static_cast<int>(std::ceil(len / step)), 1 << 16);
-        for (int j = 1; j <= n; ++j) {
+        for (int j = 1; j <= n; ++j)
+        {
           const float t = static_cast<float>(j) / static_cast<float>(n);
           stamp(px + (qx - px) * t, py + (qy - py) * t);
         }
@@ -1533,27 +1709,33 @@ struct BrushShape {
       }
 
       // Fold this stroke into the mask, and widen the rows' spans.
-      for (int y = 0; y < bh; ++y) {
+      for (int y = 0; y < bh; ++y)
+      {
         const uint8_t *crow = cov.data() + static_cast<size_t>(y) *
                                                static_cast<size_t>(bw);
         uint8_t *mrow = map->data() + static_cast<size_t>(cy0 + y) * sw +
                         static_cast<size_t>(cx0);
         int first = -1, last = -1;
-        for (int x = 0; x < bw; ++x) {
+        for (int x = 0; x < bw; ++x)
+        {
           const int c = crow[x];
           if (c == 0)
             continue;
           const int cur = mrow[x];
-          if (st.erase) {
+          if (st.erase)
+          {
             mrow[x] = static_cast<uint8_t>(cur - (cur * c + 127) / 255);
-          } else {
+          }
+          else
+          {
             mrow[x] = static_cast<uint8_t>(cur + ((255 - cur) * c + 127) / 255);
             if (first < 0)
               first = x;
             last = x;
           }
         }
-        if (first >= 0) {
+        if (first >= 0)
+        {
           int &l = (*lo)[static_cast<size_t>(cy0 + y)];
           int &h = (*hi)[static_cast<size_t>(cy0 + y)];
           l = std::min(l, cx0 + first);
@@ -1577,7 +1759,8 @@ struct BrushShape {
 // Keyed on the strokes themselves and the size; the render threads and the UI
 // thread all come through here, hence the lock. Maps are immutable once
 // built, so sharing them is safe.
-struct BrushCacheEntry {
+struct BrushCacheEntry
+{
   BrushShape shape;
   int W = 0, H = 0;
   BrushEval eval;
@@ -1585,17 +1768,20 @@ struct BrushCacheEntry {
 static std::mutex gBrushCacheMutex;
 static std::vector<BrushCacheEntry> gBrushCache; // most recent first
 
-inline BrushEval BrushShape::prepare(int W, int H) const {
+inline BrushEval BrushShape::prepare(int W, int H) const
+{
   BrushEval base; // the longest cached run of our leading strokes, if any
   size_t baseCount = 0;
   bool haveBase = false;
   {
     const std::lock_guard<std::mutex> lock(gBrushCacheMutex);
-    for (size_t i = 0; i < gBrushCache.size(); ++i) {
+    for (size_t i = 0; i < gBrushCache.size(); ++i)
+    {
       const BrushCacheEntry &c = gBrushCache[i];
       if (c.W != W || c.H != H)
         continue;
-      if (c.shape == *this) {
+      if (c.shape == *this)
+      {
         BrushEval hit = c.eval;
         if (i != 0) // keep the most recently used first
           std::rotate(gBrushCache.begin(), gBrushCache.begin() + i,
@@ -1605,7 +1791,8 @@ inline BrushEval BrushShape::prepare(int W, int H) const {
       const size_t n = c.shape.strokes.size();
       if (n < strokes.size() && (!haveBase || n > baseCount) &&
           std::equal(c.shape.strokes.begin(), c.shape.strokes.end(),
-                     strokes.begin())) {
+                     strokes.begin()))
+      {
         base = c.eval; // cheap: shares the maps
         baseCount = n;
         haveBase = true;
@@ -1633,12 +1820,14 @@ inline BrushEval BrushShape::prepare(int W, int H) const {
 // adjustments, so darkening the shadows does not change which pixels are
 // "shadows". There is nothing spatial about it, so it needs no GeoFrame
 // mapping: the in-view form is the stored form.
-struct LuminosityEval {
+struct LuminosityEval
+{
   // Weight for each 8-bit luminance, built once per render request.
   std::array<float, 256> lut{};
 
   // Every pixel can be selected, so every row is in play.
-  bool rowSpan(int /*y*/, int W, int &x0, int &x1) const {
+  bool rowSpan(int /*y*/, int W, int &x0, int &x1) const
+  {
     x0 = 0;
     x1 = W;
     return W > 0;
@@ -1647,15 +1836,18 @@ struct LuminosityEval {
   // Rec. 709 luma in integers (54 + 183 + 19 = 256). Plain loop, no std
   // helpers, same Debug-build reason as RadialEval.
   void rowWeights(int /*y*/, int x0, int x1, float *out,
-                  const uint8_t *pix = nullptr) const {
-    if (!pix) { // cannot happen through the pipeline; stay safe
+                  const uint8_t *pix = nullptr) const
+  {
+    if (!pix)
+    { // cannot happen through the pipeline; stay safe
       for (int x = x0; x < x1; ++x)
         out[x - x0] = 0.0f;
       return;
     }
     const float *t = lut.data();
     const int len = x1 - x0;
-    for (int i = 0; i < len; ++i) {
+    for (int i = 0; i < len; ++i)
+    {
       const uint8_t *p = pix + static_cast<size_t>(i) * 4;
       const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
       out[i] = t[l];
@@ -1663,20 +1855,23 @@ struct LuminosityEval {
   }
 };
 
-struct LuminosityShape {
-  float lo = 0.0f;       // luminance (0..1) where full weight begins
-  float hi = 0.35f;      // ...and ends. A new mask picks out the shadows.
-  float feather = 0.4f;  // 0 = hard cut .. 1 = widest soft edge
+struct LuminosityShape
+{
+  float lo = 0.0f;      // luminance (0..1) where full weight begins
+  float hi = 0.35f;     // ...and ends. A new mask picks out the shadows.
+  float feather = 0.4f; // 0 = hard cut .. 1 = widest soft edge
   bool operator==(const LuminosityShape &) const = default;
 
   // The range's two ends push each other: Min can never pass Max, nor Max go
   // below Min (the one being dragged wins, the other follows).
-  void setLo(float v) {
+  void setLo(float v)
+  {
     lo = std::clamp(v, 0.0f, 1.0f);
     if (hi < lo)
       hi = lo;
   }
-  void setHi(float v) {
+  void setHi(float v)
+  {
     hi = std::clamp(v, 0.0f, 1.0f);
     if (lo > hi)
       lo = hi;
@@ -1685,26 +1880,33 @@ struct LuminosityShape {
   // Not spatial: nothing to map through the frame.
   LuminosityShape toSource(const GeoFrame &) const { return *this; }
   void applySourceEdit(const LuminosityShape & /*before*/,
-                       const LuminosityShape &after, const GeoFrame &) {
+                       const LuminosityShape &after, const GeoFrame &)
+  {
     *this = after;
   }
 
-  LuminosityEval prepare(int /*W*/, int /*H*/) const {
+  LuminosityEval prepare(int /*W*/, int /*H*/) const
+  {
     LuminosityEval e;
     const float a = std::clamp(std::min(lo, hi), 0.0f, 1.0f);
     const float b = std::clamp(std::max(lo, hi), 0.0f, 1.0f);
     const float f = std::clamp(feather, 0.0f, 1.0f) * kLumMaxRamp;
-    const auto smooth = [](float x) {
+    const auto smooth = [](float x)
+    {
       x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
       return x * x * (3.0f - 2.0f * x);
     };
-    for (size_t i = 0; i < 256; ++i) {
+    for (size_t i = 0; i < 256; ++i)
+    {
       const float t = static_cast<float>(i) / 255.0f;
       float w;
-      if (f <= 1e-4f) {
+      if (f <= 1e-4f)
+      {
         w = (t >= a && t <= b) ? 1.0f : 0.0f;
-      } else {
-        const float up = smooth((t - (a - f)) / f); // rises into [a, b]
+      }
+      else
+      {
+        const float up = smooth((t - (a - f)) / f);  // rises into [a, b]
         const float dn = 1.0f - smooth((t - b) / f); // falls after b
         w = up * dn;
       }
@@ -1714,31 +1916,309 @@ struct LuminosityShape {
   }
 };
 
+// ---- Object mask ----
+// A coverage bitmap produced by a segmentation (hand-made test map now, a
+// SAM-style model later). STORED against the ORIGINAL picture; toSource()
+// warps it into the picture on screen. Maps are immutable and shared, and
+// equality compares their id, so undo snapshots and setMasks' `m == masks_`
+// stay cheap.
+struct ObjectMap
+{
+  int w = 0, h = 0;
+  std::vector<uint8_t> a; // coverage 0..255, row-major
+  uint64_t id = 0;        // unique per result (and per warp, see below)
+};
+struct ObjectPrompt
+{
+  float x = 0, y = 0; // fraction of the picture
+  bool fg = true;
+  bool operator==(const ObjectPrompt &) const = default;
+};
+
+static uint64_t nextObjectMapId()
+{
+  static std::atomic<uint64_t> n{1};
+  return n++;
+}
+static uint64_t hashMix(uint64_t h, double v)
+{
+  uint64_t b;
+  std::memcpy(&b, &v, sizeof b);
+  return h ^ (b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+}
+
+// Box-based morphology / blur along one axis. Plain loops, same Debug-build
+// reason as the other per-pixel code.
+static void objAxisMorph(const std::vector<uint8_t> &in,
+                         std::vector<uint8_t> &out, int w, int h, int r,
+                         bool dilate, bool horizontal)
+{
+  out.resize(in.size());
+  const int len = horizontal ? w : h, lines = horizontal ? h : w;
+  const size_t step = horizontal ? 1 : static_cast<size_t>(w);
+  const size_t lineStep = horizontal ? static_cast<size_t>(w) : 1;
+  for (int l = 0; l < lines; ++l)
+  {
+    const uint8_t *s = in.data() + static_cast<size_t>(l) * lineStep;
+    uint8_t *d = out.data() + static_cast<size_t>(l) * lineStep;
+    for (int i = 0; i < len; ++i)
+    {
+      const int lo = i - r < 0 ? 0 : i - r;
+      const int hi = i + r > len - 1 ? len - 1 : i + r;
+      uint8_t v = dilate ? 0 : 255;
+      for (int k = lo; k <= hi; ++k)
+      {
+        const uint8_t p = s[static_cast<size_t>(k) * step];
+        v = dilate ? (p > v ? p : v) : (p < v ? p : v);
+      }
+      d[static_cast<size_t>(i) * step] = v;
+    }
+  }
+}
+static void objAxisBlur(const std::vector<uint8_t> &in,
+                        std::vector<uint8_t> &out, int w, int h, int r,
+                        bool horizontal)
+{
+  out.resize(in.size());
+  const int len = horizontal ? w : h, lines = horizontal ? h : w;
+  const size_t step = horizontal ? 1 : static_cast<size_t>(w);
+  const size_t lineStep = horizontal ? static_cast<size_t>(w) : 1;
+  const int cnt = 2 * r + 1;
+  for (int l = 0; l < lines; ++l)
+  {
+    const uint8_t *s = in.data() + static_cast<size_t>(l) * lineStep;
+    uint8_t *d = out.data() + static_cast<size_t>(l) * lineStep;
+    const auto at = [&](int i)
+    {
+      i = i < 0 ? 0 : (i > len - 1 ? len - 1 : i);
+      return static_cast<int>(s[static_cast<size_t>(i) * step]);
+    };
+    int sum = 0;
+    for (int k = -r; k <= r; ++k)
+      sum += at(k);
+    for (int i = 0; i < len; ++i)
+    {
+      d[static_cast<size_t>(i) * step] =
+          static_cast<uint8_t>((sum + cnt / 2) / cnt);
+      sum += at(i + r + 1) - at(i - r);
+    }
+  }
+}
+
+// Warps a stored map (original orientation) into the picture on screen.
+// The result's id mixes in the frame, so anything that caches on the in-view
+// shape (compositeTintImage's `compParts == view`) is invalidated by a
+// rotate / flip / straighten / crop, not just by a new segmentation.
+static std::mutex gObjWarpMutex;
+static std::vector<std::shared_ptr<const ObjectMap>> gObjWarpCache;
+
+static std::shared_ptr<const ObjectMap>
+warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
+              const GeoFrame &f)
+{
+  uint64_t id = src->id;
+  for (double v : {f.m00, f.m01, f.m10, f.m11, f.tx, f.ty, f.origW, f.origH,
+                   f.srcW, f.srcH})
+    id = hashMix(id, v);
+  {
+    const std::lock_guard<std::mutex> lock(gObjWarpMutex);
+    for (const auto &c : gObjWarpCache)
+      if (c->id == id)
+        return c;
+  }
+  const double sc =
+      std::min(1.0, static_cast<double>(kObjectMapEdge) /
+                        std::max(f.srcW, f.srcH));
+  const int dw = std::max(1, static_cast<int>(std::lround(f.srcW * sc)));
+  const int dh = std::max(1, static_cast<int>(std::lround(f.srcH * sc)));
+  auto out = std::make_shared<ObjectMap>();
+  out->w = dw;
+  out->h = dh;
+  out->id = id;
+  out->a.assign(static_cast<size_t>(dw) * static_cast<size_t>(dh), 0);
+  const int sw = src->w, sh = src->h;
+  const auto at = [&](int x, int y)
+  {
+    x = x < 0 ? 0 : (x > sw - 1 ? sw - 1 : x);
+    y = y < 0 ? 0 : (y > sh - 1 ? sh - 1 : y);
+    return static_cast<float>(
+        src->a[static_cast<size_t>(y) * static_cast<size_t>(sw) +
+               static_cast<size_t>(x)]);
+  };
+  for (int y = 0; y < dh; ++y)
+    for (int x = 0; x < dw; ++x)
+    {
+      double ox, oy;
+      f.toOrig((x + 0.5) * f.srcW / dw, (y + 0.5) * f.srcH / dh, ox, oy);
+      if (ox < 0 || oy < 0 || ox >= f.origW || oy >= f.origH)
+        continue; // outside the original (straighten's empty corners)
+      const double u = ox / f.origW * sw - 0.5, v = oy / f.origH * sh - 0.5;
+      const int x0 = static_cast<int>(std::floor(u));
+      const int y0 = static_cast<int>(std::floor(v));
+      const float fx = static_cast<float>(u - x0),
+                  fy = static_cast<float>(v - y0);
+      const float top = at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx;
+      const float bot = at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx;
+      out->a[static_cast<size_t>(y) * static_cast<size_t>(dw) +
+             static_cast<size_t>(x)] =
+          static_cast<uint8_t>(std::lround(top + (bot - top) * fy));
+    }
+  const std::lock_guard<std::mutex> lock(gObjWarpMutex);
+  gObjWarpCache.insert(gObjWarpCache.begin(), out);
+  if (gObjWarpCache.size() > kObjectCacheSize)
+    gObjWarpCache.pop_back();
+  return out;
+}
+
+struct ObjectCacheEntry
+{
+  uint64_t id;
+  float grow, feather;
+  ObjectEval eval;
+};
+static std::mutex gObjEvalMutex;
+static std::vector<ObjectCacheEntry> gObjEvalCache;
+
+struct ObjectShape
+{
+  std::shared_ptr<const ObjectMap> map; // stored: original orientation;
+                                        // in-view form: warped
+  std::vector<ObjectPrompt> prompts;    // for refinement (step 2)
+  float feather = 0.0f;                 // 0..1
+  float grow = 0.0f;                    // -1 (shrink) .. +1 (grow)
+  bool operator==(const ObjectShape &o) const
+  {
+    return (map ? map->id : 0) == (o.map ? o.map->id : 0) &&
+           prompts == o.prompts && feather == o.feather && grow == o.grow;
+  }
+
+  ObjectShape toSource(const GeoFrame &f) const
+  {
+    ObjectShape s = *this;
+    for (ObjectPrompt &p : s.prompts)
+    {
+      double px, py;
+      f.toSrc(p.x * f.origW, p.y * f.origH, px, py);
+      p.x = static_cast<float>(px / f.srcW);
+      p.y = static_cast<float>(py / f.srcH);
+    }
+    if (map && map->w > 0 && map->h > 0)
+      s.map = warpObjectMap(map, f);
+    return s;
+  }
+  // Only the sliders edit an object; the bitmap and prompts are replaced
+  // wholesale by setSelectedObjectMap.
+  void applySourceEdit(const ObjectShape & /*before*/,
+                       const ObjectShape &after, const GeoFrame &)
+  {
+    feather = after.feather;
+    grow = after.grow;
+  }
+
+  // Resolves for one image size: grow/shrink, then feather, then per-row
+  // spans. Independent of W/H except for the stored sizes, so the preview
+  // and full-size renders share one cached result.
+  ObjectEval prepare(int W, int H) const
+  {
+    ObjectEval e;
+    e.W = W;
+    e.H = H;
+    if (!map || map->w <= 0 || map->h <= 0)
+      return e;
+    {
+      const std::lock_guard<std::mutex> lock(gObjEvalMutex);
+      for (const auto &c : gObjEvalCache)
+        if (c.id == map->id && c.grow == grow && c.feather == feather)
+        {
+          ObjectEval hit = c.eval;
+          hit.W = W;
+          hit.H = H;
+          return hit;
+        }
+    }
+    const int mw = map->w, mh = map->h, longSide = std::max(mw, mh);
+    std::vector<uint8_t> a = map->a, tmp;
+    const int rg = static_cast<int>(
+        std::lround(std::fabs(grow) * kObjectMaxGrow * longSide));
+    if (rg > 0)
+    {
+      objAxisMorph(a, tmp, mw, mh, rg, grow > 0, true);
+      objAxisMorph(tmp, a, mw, mh, rg, grow > 0, false);
+    }
+    const int rf = static_cast<int>(
+        std::lround(feather * kObjectMaxFeather * longSide));
+    if (rf > 0)
+      for (int pass = 0; pass < 2; ++pass)
+      { // two box passes ~ gaussian
+        objAxisBlur(a, tmp, mw, mh, rf, true);
+        objAxisBlur(tmp, a, mw, mh, rf, false);
+      }
+    auto lo = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), mw);
+    auto hi = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), 0);
+    for (int y = 0; y < mh; ++y)
+    {
+      const uint8_t *row = a.data() + static_cast<size_t>(y) * mw;
+      int first = -1, last = -1;
+      for (int x = 0; x < mw; ++x)
+        if (row[x])
+        {
+          if (first < 0)
+            first = x;
+          last = x;
+        }
+      if (first >= 0)
+      {
+        (*lo)[static_cast<size_t>(y)] = first;
+        (*hi)[static_cast<size_t>(y)] = last + 1;
+      }
+    }
+    e.mw = mw;
+    e.mh = mh;
+    e.map = std::make_shared<const std::vector<uint8_t>>(std::move(a));
+    e.lo = std::move(lo);
+    e.hi = std::move(hi);
+    const std::lock_guard<std::mutex> lock(gObjEvalMutex);
+    gObjEvalCache.insert(gObjEvalCache.begin(),
+                         ObjectCacheEntry{map->id, grow, feather, e});
+    if (gObjEvalCache.size() > kObjectCacheSize)
+      gObjEvalCache.pop_back();
+    return e;
+  }
+};
+
 // ---- Shape variants: one alternative per MaskType ----
-using MaskShape =
-    std::variant<RadialShape, LinearShape, BrushShape, LuminosityShape>;
-using MaskEval =
-    std::variant<RadialEval, LinearEval, BrushEval, LuminosityEval>;
+using MaskShape = std::variant<RadialShape, LinearShape, BrushShape,
+                               LuminosityShape, ObjectShape>;
+using MaskEval = std::variant<RadialEval, LinearEval, BrushEval,
+                              LuminosityEval, ObjectEval>;
 
 static MaskShape maskShapeToSource(const MaskShape &shape,
-                                   const GeoFrame &f) {
-  return std::visit([&](const auto &s) -> MaskShape { return s.toSource(f); },
+                                   const GeoFrame &f)
+{
+  return std::visit([&](const auto &s) -> MaskShape
+                    { return s.toSource(f); },
                     shape);
 }
-static MaskEval prepareMask(const MaskShape &shape, int W, int H) {
+static MaskEval prepareMask(const MaskShape &shape, int W, int H)
+{
   return std::visit(
-      [&](const auto &s) -> MaskEval { return s.prepare(W, H); }, shape);
+      [&](const auto &s) -> MaskEval
+      { return s.prepare(W, H); }, shape);
 }
-static bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1) {
+static bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1)
+{
   return std::visit(
-      [&](const auto &ev) { return ev.rowSpan(y, W, x0, x1); }, e);
+      [&](const auto &ev)
+      { return ev.rowSpan(y, W, x0, x1); }, e);
 }
 // `pix` = the RGBA pixels of the row from x0 on, as they are when the mask
 // is reached (after the global adjustments and the masks before it). Only the
 // masks that depend on the picture's own values read it.
 static void maskRowWeights(const MaskEval &e, int y, int x0, int x1,
-                           float *out, const uint8_t *pix) {
-  std::visit([&](const auto &ev) { ev.rowWeights(y, x0, x1, out, pix); }, e);
+                           float *out, const uint8_t *pix)
+{
+  std::visit([&](const auto &ev)
+             { ev.rowWeights(y, x0, x1, out, pix); }, e);
 }
 
 // ---- Combining shapes ----
@@ -1750,10 +2230,17 @@ static void maskRowWeights(const MaskEval &e, int y, int x0, int x1,
 // where c is that part's own weight at the pixel. The order matters (it is a
 // fold, not a set operation), exactly like the mask's own Invert, which is
 // applied last to the result.
-enum class MaskOp : int { Add, Subtract, Intersect };
+enum class MaskOp : int
+{
+  Add,
+  Subtract,
+  Intersect
+};
 
-static const char *maskOpName(MaskOp op) {
-  switch (op) {
+static const char *maskOpName(MaskOp op)
+{
+  switch (op)
+  {
   case MaskOp::Add:
     return "Add";
   case MaskOp::Subtract:
@@ -1765,41 +2252,52 @@ static const char *maskOpName(MaskOp op) {
 }
 
 // A part with its shape already mapped into the picture being rendered.
-struct MaskPassPart {
+struct MaskPassPart
+{
   MaskShape shape;
   MaskOp op = MaskOp::Add;
 };
 
 // The parts of one mask resolved for one image size.
-struct MaskComposite {
+struct MaskComposite
+{
   std::vector<MaskEval> evals;
   std::vector<MaskOp> ops; // ops[0] is ignored: part 0 starts the mask
 
   // Which pixels [x0, x1) of row `y` can have a non-zero weight? A superset.
   // Add widens the span, Intersect narrows it, Subtract can only remove
   // weight so it leaves it alone. False if nothing is left.
-  bool rowSpan(int y, int W, int &x0, int &x1) const {
+  bool rowSpan(int y, int W, int &x0, int &x1) const
+  {
     bool have = false;
     int a = 0, b = 0;
-    for (size_t k = 0; k < evals.size(); ++k) {
+    for (size_t k = 0; k < evals.size(); ++k)
+    {
       int s0 = 0, s1 = 0;
       const bool ok = maskRowSpan(evals[k], y, W, s0, s1);
       const MaskOp op = k == 0 ? MaskOp::Add : ops[k];
-      if (op == MaskOp::Add) {
+      if (op == MaskOp::Add)
+      {
         if (!ok)
           continue;
-        if (!have) {
+        if (!have)
+        {
           a = s0;
           b = s1;
           have = true;
-        } else {
+        }
+        else
+        {
           a = a < s0 ? a : s0;
           b = b > s1 ? b : s1;
         }
-      } else if (op == MaskOp::Intersect) {
+      }
+      else if (op == MaskOp::Intersect)
+      {
         if (!have)
           continue; // nothing to keep a part of
-        if (!ok) {
+        if (!ok)
+        {
           have = false;
           continue;
         }
@@ -1819,17 +2317,21 @@ struct MaskComposite {
   // weights. Plain loops, no std helpers (same Debug-build reason as
   // RadialEval).
   void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix,
-                  float *tmp) const {
+                  float *tmp) const
+  {
     const int len = x1 - x0;
-    if (evals.empty()) {
+    if (evals.empty())
+    {
       for (int i = 0; i < len; ++i)
         out[i] = 0.0f;
       return;
     }
     maskRowWeights(evals[0], y, x0, x1, out, pix);
-    for (size_t k = 1; k < evals.size(); ++k) {
+    for (size_t k = 1; k < evals.size(); ++k)
+    {
       maskRowWeights(evals[k], y, x0, x1, tmp, pix);
-      switch (ops[k]) {
+      switch (ops[k])
+      {
       case MaskOp::Add:
         for (int i = 0; i < len; ++i)
           out[i] = out[i] + tmp[i] - out[i] * tmp[i];
@@ -1848,11 +2350,13 @@ struct MaskComposite {
 };
 
 static MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts,
-                                      int W, int H) {
+                                      int W, int H)
+{
   MaskComposite c;
   c.evals.reserve(parts.size());
   c.ops.reserve(parts.size());
-  for (const MaskPassPart &p : parts) {
+  for (const MaskPassPart &p : parts)
+  {
     c.evals.push_back(prepareMask(p.shape, W, H));
     c.ops.push_back(p.op);
   }
@@ -1860,7 +2364,8 @@ static MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts,
 }
 
 // One part of a mask: a shape and how it joins the parts before it.
-struct MaskPart {
+struct MaskPart
+{
   MaskShape shape;
   MaskOp op = MaskOp::Add; // ignored on the first part
   MaskType type() const { return static_cast<MaskType>(shape.index()); }
@@ -1869,13 +2374,15 @@ struct MaskPart {
 
 // One mask as the user sees it: its parts, whether it is on / inverted, and
 // its own slider values (indexed by AdjId, 0 = untouched).
-struct Mask {
+struct Mask
+{
   std::vector<MaskPart> parts; // never empty for a mask made by addMask
   bool enabled = true;
   bool invert = false; // adjust everything OUTSIDE the shapes instead
   AdjValues adj{};
   // The first part's kind: what a one-part mask is (the list names the rest).
-  MaskType type() const {
+  MaskType type() const
+  {
     return parts.empty() ? MaskType::Radial : parts.front().type();
   }
   bool operator==(const Mask &) const = default;
@@ -1887,11 +2394,14 @@ using MaskSet = std::vector<Mask>;
 // last. Shared by the global pipeline (AdjustmentSet::buildLut) and masks.
 static std::array<uint8_t, 256>
 toneLutFromValues(const AdjValues &values,
-                  const std::array<float, 256> *curveLut) {
+                  const std::array<float, 256> *curveLut)
+{
   std::array<uint8_t, 256> lut{};
-  for (int i = 0; i < 256; ++i) {
+  for (int i = 0; i < 256; ++i)
+  {
     float x = static_cast<float>(i);
-    for (const auto &spec : kAdjustmentSpecs) {
+    for (const auto &spec : kAdjustmentSpecs)
+    {
       if (spec.stage != AdjustmentSpec::Stage::Tone)
         continue; // color-stage sliders are handled by applyColorPass
       const float v = values[static_cast<size_t>(spec.id)];
@@ -1913,10 +2423,11 @@ toneLutFromValues(const AdjValues &values,
 
 // A mask frozen for the render thread: its shape and everything its sliders
 // boil down to. Built on the UI thread (O(256)), copied into RenderParams.
-struct MaskPass {
+struct MaskPass
+{
   std::vector<MaskPassPart> parts; // combined left to right (MaskComposite)
   bool invert = false;
-  bool tone = false;                // any Tone slider non-zero (lut is valid)
+  bool tone = false; // any Tone slider non-zero (lut is valid)
   std::array<uint8_t, 256> lut{};
   ColorPass color;
 };
@@ -1924,9 +2435,11 @@ struct MaskPass {
 // Only masks that are on AND would change something are included. Shapes are
 // mapped into the current picture here, once, on the UI thread.
 static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
-                                             const GeoFrame &frame) {
+                                             const GeoFrame &frame)
+{
   std::vector<MaskPass> out;
-  for (const Mask &m : masks) {
+  for (const Mask &m : masks)
+  {
     if (!m.enabled)
       continue;
     MaskPass mp;
@@ -1960,11 +2473,13 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
 // row of weights, `wbuf2` a second one for combining parts.
 static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
                              uint8_t *q, size_t n, int y0, int W,
-                             uint8_t *scratch, float *wbuf, float *wbuf2) {
+                             uint8_t *scratch, float *wbuf, float *wbuf2)
+{
   const size_t rowBytes = static_cast<size_t>(W) * 4;
   const int rows = static_cast<int>(n / rowBytes);
   const uint8_t *lut = mp.lut.data();
-  for (int r = 0; r < rows; ++r) {
+  for (int r = 0; r < rows; ++r)
+  {
     int x0 = 0, x1 = W;
     // Inverted masks affect the whole row (weight = 1 - w), so no span cut.
     if (!mp.invert && !ev.rowSpan(y0 + r, W, x0, x1))
@@ -1980,13 +2495,15 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
     const size_t bytes = static_cast<size_t>(len) * 4;
     std::copy_n(row, bytes, scratch);
     if (mp.tone)
-      for (size_t i = 0; i + 3 < bytes; i += 4) {
+      for (size_t i = 0; i + 3 < bytes; i += 4)
+      {
         scratch[i] = lut[scratch[i]];
         scratch[i + 1] = lut[scratch[i + 1]];
         scratch[i + 2] = lut[scratch[i + 2]];
       }
     applyColorPass(mp.color, scratch, bytes);
-    for (int i = 0; i < len; ++i) {
+    for (int i = 0; i < len; ++i)
+    {
       float w = wbuf[i];
       if (mp.invert)
         w = 1.0f - w;
@@ -1994,7 +2511,8 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
         continue;
       uint8_t *p = row + static_cast<size_t>(i) * 4;
       const uint8_t *t = scratch + static_cast<size_t>(i) * 4;
-      for (int k = 0; k < 3; ++k) {
+      for (int k = 0; k < 3; ++k)
+      {
         const float a = static_cast<float>(p[k]);
         const float b = static_cast<float>(t[k]);
         p[k] = toU8Clamped(a + (b - a) * w);
@@ -2011,10 +2529,11 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
 // float color pass. Building it is O(256) (AdjustmentSet::buildRenderParams),
 // so the UI thread builds one and hands a *copy* to the render worker — the
 // worker never touches the AdjustmentSet, which the UI thread keeps mutating.
-struct RenderParams {
+struct RenderParams
+{
   std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
   ColorPass color;                                // float pass, after the LUTs
-  std::vector<MaskPass> masks; // local adjustments, applied after all of it
+  std::vector<MaskPass> masks;                    // local adjustments, applied after all of it
 };
 
 // Runs the whole per-pixel pipeline on a copy of `src` (which is never
@@ -2029,7 +2548,8 @@ struct RenderParams {
 // reason as applyColorPass.
 static std::shared_ptr<CanvasImage>
 renderWith(const CanvasImage &src, const RenderParams &rp,
-           const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0) {
+           const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)
+{
   auto img = std::make_shared<CanvasImage>(src);
   uint8_t *p = img->pixels.data();
   const size_t total = img->pixels.size();
@@ -2046,7 +2566,8 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
   std::vector<MaskComposite> maskEvals;
   std::vector<uint8_t> maskScratch;
   std::vector<float> maskWeights, maskWeights2;
-  if (!rp.masks.empty() && img->width > 0) {
+  if (!rp.masks.empty() && img->width > 0)
+  {
     maskEvals.reserve(rp.masks.size());
     for (const MaskPass &m : rp.masks)
       maskEvals.push_back(prepareComposite(m.parts, img->width, img->height));
@@ -2055,19 +2576,25 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
     maskWeights2.resize(static_cast<size_t>(img->width));
   }
 
-  for (size_t off = 0; off < total; off += blockBytes) {
+  for (size_t off = 0; off < total; off += blockBytes)
+  {
     if (latest && latest->load(std::memory_order_relaxed) != gen)
       return nullptr; // superseded: abandon
     const size_t n = total - off < blockBytes ? total - off : blockBytes;
     uint8_t *q = p + off;
-    if (sharedLut) { // fast path (no per-channel curves): one shared table
-      for (size_t i = 0; i + 3 < n; i += 4) {
+    if (sharedLut)
+    { // fast path (no per-channel curves): one shared table
+      for (size_t i = 0; i + 3 < n; i += 4)
+      {
         q[i] = lr[q[i]];
         q[i + 1] = lr[q[i + 1]];
         q[i + 2] = lr[q[i + 2]];
       }
-    } else {
-      for (size_t i = 0; i + 3 < n; i += 4) {
+    }
+    else
+    {
+      for (size_t i = 0; i + 3 < n; i += 4)
+      {
         q[i] = lr[q[i]];
         q[i + 1] = lg[q[i + 1]];
         q[i + 2] = lb[q[i + 2]];
@@ -2093,7 +2620,8 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
 // (Fritsch-Carlson / PCHIP): it passes through every point, never overshoots
 // between neighbors, and stays monotone wherever the points are — so dragging
 // a point can't make the curve ring or invert by accident.
-struct CurvePoint {
+struct CurvePoint
+{
   float x = 0.0f, y = 0.0f;
   bool operator==(const CurvePoint &) const = default;
 };
@@ -2103,42 +2631,61 @@ static CurvePoints identityCurve() { return {{0.0f, 0.0f}, {255.0f, 255.0f}}; }
 
 // Which curve is being edited / stored. Master applies to all three channels
 // (first); Red/Green/Blue then apply to their own channel only.
-enum class CurveChannel : int { Master, Red, Green, Blue, Count };
+enum class CurveChannel : int
+{
+  Master,
+  Red,
+  Green,
+  Blue,
+  Count
+};
 constexpr size_t kCurveChannelCount = static_cast<size_t>(CurveChannel::Count);
 using CurveSet = std::array<CurvePoints, kCurveChannelCount>;
 
-static CurveSet identityCurves() {
+static CurveSet identityCurves()
+{
   return {identityCurve(), identityCurve(), identityCurve(), identityCurve()};
 }
 
 // Evaluates the curve at every input level 0..255 (unrounded, clamped).
-static std::array<float, 256> curveToLut(const CurvePoints &pts) {
+static std::array<float, 256> curveToLut(const CurvePoints &pts)
+{
   std::array<float, 256> lut{};
   const size_t n = pts.size();
-  if (n < 2) {
+  if (n < 2)
+  {
     for (int i = 0; i < 256; ++i)
       lut[i] = static_cast<float>(i);
     return lut;
   }
   std::vector<float> h(n - 1), d(n - 1), m(n);
-  for (size_t k = 0; k + 1 < n; ++k) {
+  for (size_t k = 0; k + 1 < n; ++k)
+  {
     h[k] = std::max(pts[k + 1].x - pts[k].x, 1e-3f);
     d[k] = (pts[k + 1].y - pts[k].y) / h[k];
   }
-  if (n == 2) {
+  if (n == 2)
+  {
     m[0] = m[1] = d[0];
-  } else {
-    for (size_t k = 1; k + 1 < n; ++k) {
-      if (d[k - 1] * d[k] <= 0.0f) {
+  }
+  else
+  {
+    for (size_t k = 1; k + 1 < n; ++k)
+    {
+      if (d[k - 1] * d[k] <= 0.0f)
+      {
         m[k] = 0.0f; // local extremum or flat: no overshoot
-      } else {
+      }
+      else
+      {
         const float w1 = 2.0f * h[k] + h[k - 1];
         const float w2 = h[k] + 2.0f * h[k - 1];
         m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
       }
     }
     // Shape-preserving one-sided end slopes.
-    auto endSlope = [](float h0, float h1, float d0, float d1) {
+    auto endSlope = [](float h0, float h1, float d0, float d1)
+    {
       float sl = ((2.0f * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
       if (sl * d0 <= 0.0f)
         sl = 0.0f;
@@ -2150,14 +2697,20 @@ static std::array<float, 256> curveToLut(const CurvePoints &pts) {
     m[n - 1] = endSlope(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
   }
   size_t k = 0;
-  for (int i = 0; i < 256; ++i) {
+  for (int i = 0; i < 256; ++i)
+  {
     const float x = static_cast<float>(i);
     float v;
-    if (x <= pts.front().x) {
+    if (x <= pts.front().x)
+    {
       v = pts.front().y;
-    } else if (x >= pts.back().x) {
+    }
+    else if (x >= pts.back().x)
+    {
       v = pts.back().y;
-    } else {
+    }
+    else
+    {
       while (k + 2 < n && x > pts[k + 1].x)
         ++k;
       const float t = (x - pts[k].x) / h[k];
@@ -2173,7 +2726,8 @@ static std::array<float, 256> curveToLut(const CurvePoints &pts) {
 
 // True when rounding the curve to 8 bits gives the identity mapping — the
 // pipeline skips the curve stage entirely then (exactly equivalent).
-static bool curveIsIdentity(const std::array<float, 256> &lut) {
+static bool curveIsIdentity(const std::array<float, 256> &lut)
+{
   for (int i = 0; i < 256; ++i)
     if (std::lround(lut[i]) != i)
       return false;
@@ -2182,7 +2736,8 @@ static bool curveIsIdentity(const std::array<float, 256> &lut) {
 
 // Inserts an interior point at (x, y), keeping the list sorted. Returns its
 // index, or -1 if it would sit on/next to an existing point or an end.
-static int curveInsert(CurvePoints &pts, float x, float y) {
+static int curveInsert(CurvePoints &pts, float x, float y)
+{
   x = std::clamp(x, 0.0f, 255.0f);
   y = std::clamp(y, 0.0f, 255.0f);
   size_t i = 0;
@@ -2198,7 +2753,8 @@ static int curveInsert(CurvePoints &pts, float x, float y) {
 
 // Moves point `idx`. End points keep their x; interior points stay strictly
 // between their neighbors (kCurveMinGap apart), so order never changes.
-static void curveMovePoint(CurvePoints &pts, int idx, float x, float y) {
+static void curveMovePoint(CurvePoints &pts, int idx, float x, float y)
+{
   if (idx < 0 || idx >= static_cast<int>(pts.size()))
     return;
   pts[idx].y = std::clamp(y, 0.0f, 255.0f);
@@ -2211,7 +2767,8 @@ static void curveMovePoint(CurvePoints &pts, int idx, float x, float y) {
 }
 
 // Removes an interior point; the two end points can't be removed.
-static bool curveRemove(CurvePoints &pts, int idx) {
+static bool curveRemove(CurvePoints &pts, int idx)
+{
   if (idx <= 0 || idx >= static_cast<int>(pts.size()) - 1)
     return false;
   pts.erase(pts.begin() + idx);
@@ -2228,7 +2785,8 @@ static bool curveRemove(CurvePoints &pts, int idx) {
 // entry instead of growing it every frame; touching a different slider (or
 // an undo/redo, or a crop) starts a fresh entry. Dragging Exposure from -20
 // to +40 is one undo step, not hundreds. A crop is always exactly one step.
-class AdjustmentSet {
+class AdjustmentSet
+{
 public:
   float get(AdjId id) const { return values_[static_cast<size_t>(id)]; }
   const CropRect &crop() const { return crop_; }
@@ -2236,15 +2794,20 @@ public:
   float angle() const { return angle_; }  // straighten angle, degrees CW
   bool expand() const { return expand_; } // straighten: keep the full canvas?
   // One of the four tone curves (default: the master RGB curve).
-  const CurvePoints &curve(CurveChannel ch = CurveChannel::Master) const {
+  const CurvePoints &curve(CurveChannel ch = CurveChannel::Master) const
+  {
     return curves_[static_cast<size_t>(ch)];
   }
 
-  void set(AdjId id, float value) {
+  void set(AdjId id, float value)
+  {
     values_[static_cast<size_t>(id)] = value;
-    if (id == lastEdited_ && historyIndex_ + 1 == history_.size()) {
+    if (id == lastEdited_ && historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same drag: overwrite
-    } else {
+    }
+    else
+    {
       appendSnapshot();
       lastEdited_ = id;
     }
@@ -2252,7 +2815,8 @@ public:
 
   // Commits a new crop (in original-image coordinates; an empty CropRect
   // removes the crop). Always its own undo step.
-  void setCrop(const CropRect &c) {
+  void setCrop(const CropRect &c)
+  {
     if (c == crop_)
       return;
     crop_ = c;
@@ -2264,7 +2828,8 @@ public:
   // rectangle remapped into them (the crop is stored relative to the
   // oriented, straightened image, so all three must change together). One
   // undo step.
-  void setGeometry(const Orient &o, float angle, const CropRect &c) {
+  void setGeometry(const Orient &o, float angle, const CropRect &c)
+  {
     if (o == orient_ && angle == angle_ && c == crop_)
       return;
     orient_ = o;
@@ -2277,13 +2842,15 @@ public:
   // so any committed crop is dropped (undo brings it back). `coalesce` = true
   // for a slider drag (many calls per second): repeated calls fold into one
   // undo step. false for a discrete action (a nudge button, reset).
-  void setAngle(float deg, bool coalesce) {
+  void setAngle(float deg, bool coalesce)
+  {
     if (deg == angle_)
       return;
     angle_ = deg;
     crop_ = CropRect{};
     if (coalesce && lastEdited_ == kEditAngle &&
-        historyIndex_ + 1 == history_.size()) {
+        historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same drag: overwrite
       return;
     }
@@ -2295,7 +2862,8 @@ public:
   // true = grow the canvas so nothing is lost (corners transparent). Only
   // affects the picture when the angle is non-zero, but is always its own
   // undo step so undo/redo stays predictable.
-  void setExpand(bool expand) {
+  void setExpand(bool expand)
+  {
     if (expand == expand_)
       return;
     expand_ = expand;
@@ -2308,13 +2876,15 @@ public:
   // added/dragged (many calls per second): repeated calls to the SAME channel
   // fold into ONE undo step, until endCurveEdit() closes it. false for a
   // discrete action (delete a point, reset the curve).
-  void setCurve(CurveChannel ch, const CurvePoints &c, bool coalesce) {
+  void setCurve(CurveChannel ch, const CurvePoints &c, bool coalesce)
+  {
     CurvePoints &cur = curves_[static_cast<size_t>(ch)];
     if (c == cur)
       return;
     cur = c;
     if (coalesce && lastEdited_ == kEditCurve && lastCurveCh_ == ch &&
-        historyIndex_ + 1 == history_.size()) {
+        historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same gesture
       return;
     }
@@ -2323,12 +2893,14 @@ public:
     lastCurveCh_ = ch;
   }
   // Master-curve shorthand.
-  void setCurve(const CurvePoints &c, bool coalesce) {
+  void setCurve(const CurvePoints &c, bool coalesce)
+  {
     setCurve(CurveChannel::Master, c, coalesce);
   }
   // Resets all four curves to straight lines as ONE undo step (no-op if they
   // already are).
-  void resetAllCurves() {
+  void resetAllCurves()
+  {
     const CurvePoints id = identityCurve();
     bool any = false;
     for (const auto &c : curves_)
@@ -2339,7 +2911,8 @@ public:
     pushStep();
   }
   // The point drag ended: the next curve edit starts a fresh undo step.
-  void endCurveEdit() {
+  void endCurveEdit()
+  {
     if (lastEdited_ == kEditCurve)
       lastEdited_ = AdjId::Count;
   }
@@ -2350,13 +2923,15 @@ public:
   // Sets one Color Mixer slider. Like set(): repeated calls for the SAME
   // slider (a drag) fold into one undo step; touching another slider, or any
   // other edit / undo / redo, starts a fresh one.
-  void setMix(MixChan c, size_t band, float value) {
+  void setMix(MixChan c, size_t band, float value)
+  {
     const size_t idx = mixIndex(c, band);
     if (value == mix_[idx])
       return;
     mix_[idx] = value;
     if (lastEdited_ == kEditMix && lastMixIdx_ == idx &&
-        historyIndex_ + 1 == history_.size()) {
+        historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same drag: overwrite
       return;
     }
@@ -2365,7 +2940,8 @@ public:
     lastMixIdx_ = idx;
   }
   // Zeroes all 24 Color Mixer sliders as ONE undo step (no-op if already 0).
-  void resetMix() {
+  void resetMix()
+  {
     if (!mixAnyNonZero(mix_))
       return;
     mix_.fill(0.0f);
@@ -2377,23 +2953,27 @@ public:
   // Commits a new grade. `key` identifies the control being dragged: repeated
   // calls with the SAME key fold into one undo step (until endGradeEdit()).
   // key < 0 = a discrete action (eye toggle, reset): always its own step.
-  void setGrade(const ColorGrade &g, int key) {
+  void setGrade(const ColorGrade &g, int key)
+  {
     if (g == grade_)
       return;
     grade_ = g;
     if (key >= 0 && lastEdited_ == kEditGrade && lastGradeKey_ == key &&
-        historyIndex_ + 1 == history_.size()) {
+        historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same drag: overwrite
       return;
     }
     pushStep();
-    if (key >= 0) {
+    if (key >= 0)
+    {
       lastEdited_ = kEditGrade;
       lastGradeKey_ = key;
     }
   }
   // The drag ended: the next grading edit starts a fresh undo step.
-  void endGradeEdit() {
+  void endGradeEdit()
+  {
     if (lastEdited_ == kEditGrade)
       lastEdited_ = AdjId::Count;
   }
@@ -2402,11 +2982,13 @@ public:
   // The untouched picture's size: masks are stored against it, and mapped
   // into the current orient / straighten / crop through geoFrame(). Set once
   // per opened file, after reset().
-  void setOriginalSize(int w, int h) {
+  void setOriginalSize(int w, int h)
+  {
     origW_ = w;
     origH_ = h;
   }
-  GeoFrame geoFrame() const {
+  GeoFrame geoFrame() const
+  {
     return makeGeoFrame(origW_, origH_, orient_, angle_, expand_, crop_);
   }
   const MaskSet &masks() const { return masks_; }
@@ -2415,30 +2997,35 @@ public:
   // the SAME key fold into one undo step (until endMaskEdit()); key < 0 = a
   // discrete action (add, delete, toggle): always its own step. Callers pack
   // the mask index into the key so two masks never share a step.
-  void setMasks(const MaskSet &m, int key) {
+  void setMasks(const MaskSet &m, int key)
+  {
     if (m == masks_)
       return;
     masks_ = m;
     if (key >= 0 && lastEdited_ == kEditMask && lastMaskKey_ == key &&
-        historyIndex_ + 1 == history_.size()) {
+        historyIndex_ + 1 == history_.size())
+    {
       history_[historyIndex_] = snapshot(); // still the same drag: overwrite
       return;
     }
     pushStep();
-    if (key >= 0) {
+    if (key >= 0)
+    {
       lastEdited_ = kEditMask;
       lastMaskKey_ = key;
     }
   }
   // The drag ended: the next mask edit starts a fresh undo step.
-  void endMaskEdit() {
+  void endMaskEdit()
+  {
     if (lastEdited_ == kEditMask)
       lastEdited_ = AdjId::Count;
   }
 
   // Fresh baseline for a newly opened image: every slider back to 0, no
   // crop, no rotation/flip, no history to undo into.
-  void reset() {
+  void reset()
+  {
     values_.fill(0.0f);
     mix_.fill(0.0f);
     grade_ = ColorGrade{};
@@ -2456,13 +3043,15 @@ public:
   bool canUndo() const { return historyIndex_ > 0; }
   bool canRedo() const { return historyIndex_ + 1 < history_.size(); }
 
-  void undo() {
+  void undo()
+  {
     if (!canUndo())
       return;
     restore(history_[--historyIndex_]);
     lastEdited_ = AdjId::Count; // next slider touch starts a new entry
   }
-  void redo() {
+  void redo()
+  {
     if (!canRedo())
       return;
     restore(history_[++historyIndex_]);
@@ -2475,7 +3064,8 @@ public:
   // slider drag is applying it, and that's now one array lookup per
   // channel instead of a float multiply/add + lround + clamp per spec per
   // channel.
-  std::array<uint8_t, 256> buildLut() const {
+  std::array<uint8_t, 256> buildLut() const
+  {
     // The master curve runs after the tone sliders (Lightroom's order). It's
     // skipped outright when it rounds to identity, so the untouched-curve
     // result stays bit-identical to before the curve existed.
@@ -2488,12 +3078,15 @@ public:
   // each channel's own curve on top. A channel whose curve is a straight line
   // just reuses the shared table, so with no per-channel curves all three
   // tables are identical (see applyTo's fast path).
-  std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const {
+  std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const
+  {
     const auto base = buildLut();
     std::array<std::array<uint8_t, 256>, 3> out{};
-    for (size_t c = 0; c < 3; ++c) {
+    for (size_t c = 0; c < 3; ++c)
+    {
       const auto cl = curveToLut(curves_[1 + c]);
-      if (curveIsIdentity(cl)) {
+      if (curveIsIdentity(cl))
+      {
         out[c] = base;
         continue;
       }
@@ -2506,7 +3099,8 @@ public:
 
   // Freezes the current slider/curve state into a self-contained value that
   // another thread can use (see RenderParams).
-  RenderParams buildRenderParams() const {
+  RenderParams buildRenderParams() const
+  {
     RenderParams rp;
     rp.luts = buildChannelLuts();
     rp.color = buildColorPass();
@@ -2519,11 +3113,13 @@ public:
   // re-running after any value change never compounds onto a prior result.
   // Synchronous; the full-resolution path for big images goes through
   // RenderWorker instead (see updateImageFromAdjustments).
-  std::shared_ptr<CanvasImage> applyTo(const CanvasImage &original) const {
+  std::shared_ptr<CanvasImage> applyTo(const CanvasImage &original) const
+  {
     return renderWith(original, buildRenderParams());
   }
 
-  ColorPass buildColorPass() const {
+  ColorPass buildColorPass() const
+  {
     return makeColorPass(get(AdjId::Temperature), get(AdjId::Tint),
                          get(AdjId::Vibrance), get(AdjId::Saturation), mix_,
                          grade_);
@@ -2532,7 +3128,8 @@ public:
 private:
   // Everything one undo step restores: slider values, crop, orientation,
   // straighten angle and corner mode.
-  struct Snapshot {
+  struct Snapshot
+  {
     std::array<float, static_cast<size_t>(AdjId::Count)> values{};
     CropRect crop;
     Orient orient;
@@ -2543,11 +3140,13 @@ private:
     ColorGrade grade;
     MaskSet masks;
   };
-  Snapshot snapshot() const {
-    return {values_, crop_,  orient_, angle_, expand_,
-            curves_, mix_,   grade_,  masks_};
+  Snapshot snapshot() const
+  {
+    return {values_, crop_, orient_, angle_, expand_,
+            curves_, mix_, grade_, masks_};
   }
-  void restore(const Snapshot &s) {
+  void restore(const Snapshot &s)
+  {
     values_ = s.values;
     crop_ = s.crop;
     orient_ = s.orient;
@@ -2563,11 +3162,13 @@ private:
   // (history_ holds the baseline plus at most that many steps). Leaves
   // lastEdited_ to the caller, since slider drags set it and everything
   // else clears it.
-  void appendSnapshot() {
+  void appendSnapshot()
+  {
     history_.resize(historyIndex_ + 1); // discard any redo tail
     history_.push_back(snapshot());
     ++historyIndex_;
-    if (history_.size() > kMaxUndoSteps + 1) {
+    if (history_.size() > kMaxUndoSteps + 1)
+    {
       const size_t drop = history_.size() - (kMaxUndoSteps + 1);
       history_.erase(history_.begin(),
                      history_.begin() + static_cast<std::ptrdiff_t>(drop));
@@ -2576,7 +3177,8 @@ private:
   }
   // Appends the current state as a new undo step (dropping any redo tail)
   // and ends any in-progress slider/angle drag coalescing.
-  void pushStep() {
+  void pushStep()
+  {
     appendSnapshot();
     lastEdited_ = AdjId::Count;
   }
@@ -2612,7 +3214,7 @@ private:
   ColorGrade grade_;
   int lastGradeKey_ = -1; // control of the open Color Grading drag
   MaskSet masks_;
-  int lastMaskKey_ = -1; // control of the open mask drag
+  int lastMaskKey_ = -1;      // control of the open mask drag
   int origW_ = 0, origH_ = 0; // see setOriginalSize
   std::vector<Snapshot> history_{Snapshot{}};
   size_t historyIndex_ = 0;
@@ -2637,9 +3239,11 @@ private:
 // (see renderWith) so it abandons itself within a few milliseconds of being
 // superseded. Only the newest request can win, so jobs are never queued up:
 // a newer submit simply replaces one still waiting.
-class RenderWorker {
+class RenderWorker
+{
 public:
-  struct Result {
+  struct Result
+  {
     uint64_t gen = 0;
     std::shared_ptr<CanvasImage> image;
   };
@@ -2648,7 +3252,8 @@ public:
   RenderWorker(const RenderWorker &) = delete;
   RenderWorker &operator=(const RenderWorker &) = delete;
 
-  ~RenderWorker() {
+  ~RenderWorker()
+  {
     // Makes a render in progress bail at its next block; thread_ (declared
     // last, so destroyed first) then requests stop and joins.
     latest_.store(kShutdown);
@@ -2665,9 +3270,11 @@ public:
   // This worker is a static and so outlives main()'s LiteUI — call this
   // before that LiteUI is destroyed, or a late notify would wake a dead
   // window.
-  void shutdown() {
+  void shutdown()
+  {
     latest_.store(kShutdown); // a render in progress bails at its next block
-    if (thread_.joinable()) {
+    if (thread_.joinable())
+    {
       thread_.request_stop(); // also wakes a worker sleeping for a job
       thread_.join();
     }
@@ -2677,9 +3284,11 @@ public:
   // be modified afterwards (the editor's source images are replaced, never
   // edited in place).
   void submit(std::shared_ptr<const CanvasImage> src,
-              const RenderParams &params) {
+              const RenderParams &params)
+  {
     if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st) { run(st); });
+      thread_ = std::jthread([this](std::stop_token st)
+                             { run(st); });
     const uint64_t gen = ++counter_;
     latest_.store(gen);
     outstanding_ = true;
@@ -2692,7 +3301,8 @@ public:
   }
 
   // Forgets whatever is waiting or running; its result will never be taken.
-  void invalidate() {
+  void invalidate()
+  {
     latest_.store(++counter_);
     outstanding_ = false;
     std::lock_guard lk(m_);
@@ -2704,7 +3314,8 @@ public:
   bool outstanding() const { return outstanding_; }
 
   // Non-blocking: the finished result of the newest request, if it is ready.
-  std::optional<Result> collect() {
+  std::optional<Result> collect()
+  {
     if (!outstanding_)
       return std::nullopt;
     std::lock_guard lk(m_);
@@ -2720,9 +3331,11 @@ public:
 
   // Blocking: waits for the newest request to finish. Only call while
   // outstanding() (nothing else could ever wake it).
-  Result waitForLatest() {
+  Result waitForLatest()
+  {
     std::unique_lock lk(m_);
-    doneCv_.wait(lk, [this] { return done_.has_value(); });
+    doneCv_.wait(lk, [this]
+                 { return done_.has_value(); });
     Result r = std::move(*done_);
     done_.reset();
     outstanding_ = false;
@@ -2730,19 +3343,23 @@ public:
   }
 
 private:
-  struct Job {
+  struct Job
+  {
     uint64_t gen = 0;
     std::shared_ptr<const CanvasImage> src;
     RenderParams params;
   };
   static constexpr uint64_t kShutdown = ~uint64_t{0};
 
-  void run(std::stop_token st) {
-    for (;;) {
+  void run(std::stop_token st)
+  {
+    for (;;)
+    {
       Job job;
       {
         std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this] { return pending_.has_value(); }))
+        if (!workCv_.wait(lk, st, [this]
+                          { return pending_.has_value(); }))
           return; // stop requested and nothing waiting
         job = std::move(*pending_);
         pending_.reset();
@@ -2789,7 +3406,8 @@ constexpr int kEdgeMove = 16;
 
 // Aspect-ratio presets in the Crop pane. ratio (width / height): 0 = free,
 // negative = "same as the image being cropped".
-struct CropAspect {
+struct CropAspect
+{
   const char *label;
   float ratio;
 };
@@ -2805,19 +3423,28 @@ static const std::array<CropAspect, 6> kCropAspects = {{
 // The live (not yet applied) selection rectangle and the drag currently
 // editing it. Coordinates are in pixels of the image being shown
 // (EditorState::image), not the original.
-struct CropUi {
+struct CropUi
+{
   float l = 0, t = 0, r = 0, b = 0;
   size_t aspectIdx = 0; // index into kCropAspects
 
-  enum class Drag { None, New, Move, Resize } drag = Drag::None;
+  enum class Drag
+  {
+    None,
+    New,
+    Move,
+    Resize
+  } drag = Drag::None;
   int mask = 0;               // Resize: which edges (kEdge* bits)
   float ax = 0, ay = 0;       // New: the fixed anchor corner
   float grabX = 0, grabY = 0; // Move: pointer offset from selection's l/t
 };
 
 // Mask-overlay drag in progress (see maskPress / maskDrag).
-struct MaskUi {
-  enum class Drag {
+struct MaskUi
+{
+  enum class Drag
+  {
     None,
     Move,
     ResizeX,
@@ -2838,6 +3465,15 @@ struct MaskUi {
   bool brushTint = true;      // paint the selected brush's coverage in red
   float lastX = 0, lastY = 0; // Paint: last recorded point, document px
   float curX = 0, curY = 0;   // Paint: pointer, document px (cursor ring)
+
+  // Object tool.
+  bool objBg = false; // plain clicks add BACKGROUND points (touchpad-friendly
+                      // alternative to right-click)
+  struct ObjPending
+  {
+    int mask = -1, part = -1;
+    std::vector<ObjectPrompt> prompts; // original-picture fractions
+  } objPending;
 
   // The red coverage bitmap of the selected brush mask, rebuilt only when the
   // strokes (or the picture's size) change.
@@ -2872,9 +3508,11 @@ struct MaskUi {
   bool compUsesPix = false;
   int compSel = -1, compW = 0, compH = 0;
   std::weak_ptr<CanvasImage> compKeyImage, compKeyPreview;
+  uint64_t encodedKey = 0; // imageSerial the segmenter has already analyzed
 };
 
-struct EditorState {
+struct EditorState
+{
   std::shared_ptr<CanvasImage> original; // untouched decoded pixels; null
                                          // until something is opened
   std::shared_ptr<CanvasImage> oriented; // original rotated/flipped per
@@ -2924,7 +3562,7 @@ struct EditorState {
 
   // Masks pane (activity 7). The masks themselves live in `adjust` (so they
   // are undoable); this is only which one is selected and how it is shown.
-  int maskSel = -1; // index into adjust.masks(); read it through selMask()
+  int maskSel = -1;          // index into adjust.masks(); read it through selMask()
   bool maskShowTint = false; // paint the selected mask's weight in red
   MaskUi mask;
 
@@ -2945,21 +3583,27 @@ struct EditorState {
   float previewDocW = 0.0f, previewDocH = 0.0f;
   bool dragIsAngle = false; // the drag in progress is the angle slider
 
+  uint64_t imageSerial = 0; // bumps on every opened file (keys segmenter caches)
+
   // True while `previewImage` stands in for `image`: during a drag, and after
   // it until the background full-resolution render lands (renderWorker).
-  bool showPreview() const {
+  bool showPreview() const
+  {
     return previewImage && (dragging || renderWorker.outstanding());
   }
 
-  bool previewDocActive() const {
+  bool previewDocActive() const
+  {
     return dragging && previewImage && previewDocW > 0.0f;
   }
-  float docWidth() const {
+  float docWidth() const
+  {
     if (previewDocActive())
       return previewDocW;
     return image ? static_cast<float>(image->width) : kPlaceholderW;
   }
-  float docHeight() const {
+  float docHeight() const
+  {
     if (previewDocActive())
       return previewDocH;
     return image ? static_cast<float>(image->height) : kPlaceholderH;
@@ -2981,12 +3625,14 @@ static EditorState state;
 // Shows `msg` in the status bar. Kept to one short line: newlines (library
 // error strings sometimes have them) become spaces, and long text is cut on
 // a UTF-8 boundary with an ellipsis.
-static void setStatus(std::string msg, bool isError) {
+static void setStatus(std::string msg, bool isError)
+{
   constexpr size_t kMaxLen = 110;
   for (char &c : msg)
     if (c == '\n' || c == '\r')
       c = ' ';
-  if (msg.size() > kMaxLen) {
+  if (msg.size() > kMaxLen)
+  {
     size_t cut = kMaxLen - 3;
     while (cut > 0 && (static_cast<unsigned char>(msg[cut]) & 0xC0) == 0x80)
       --cut; // don't split a multi-byte character
@@ -2996,17 +3642,20 @@ static void setStatus(std::string msg, bool isError) {
   state.statusMsg = std::move(msg);
   state.statusIsError = isError;
 }
-static void clearStatus() {
+static void clearStatus()
+{
   state.statusMsg.clear();
   state.statusIsError = false;
 }
 
-static std::string baseName(const std::string &path) {
+static std::string baseName(const std::string &path)
+{
   size_t slash = path.find_last_of("/\\");
   return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-static void setZoom(float z) {
+static void setZoom(float z)
+{
   state.zoom = std::clamp(z, kZoomMin, kZoomMax);
   state.markDirty();
 }
@@ -3030,7 +3679,8 @@ static void submitGeometryJob();
 // from there. Nothing runs while no render is outstanding, so an idle editor
 // costs nothing.
 
-static void adoptFullRender(RenderWorker::Result &&r) {
+static void adoptFullRender(RenderWorker::Result &&r)
+{
   state.image = std::move(r.image);
   state.previewImage.reset(); // the real thing replaces the stand-in
   state.histStale = true;
@@ -3038,14 +3688,16 @@ static void adoptFullRender(RenderWorker::Result &&r) {
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust.
-static void collectFullRender() {
+static void collectFullRender()
+{
   if (auto r = renderWorker.collect())
     adoptFullRender(std::move(*r));
 }
 
 // Blocking: makes `state.image` current. For the few places that need the
 // real pixels *now* (export).
-static void finishFullRender() {
+static void finishFullRender()
+{
   if (!renderWorker.outstanding())
     return;
   adoptFullRender(renderWorker.waitForLatest());
@@ -3053,7 +3705,8 @@ static void finishFullRender() {
 
 // A drag starts (or continues) on the preview path. A full-resolution render
 // still in flight would be for values the drag is about to change, so drop it.
-static void enterDrag(bool isAngle) {
+static void enterDrag(bool isAngle)
+{
   if (!state.dragging)
     renderWorker.invalidate();
   state.dragging = true; // switches recompute+paint to the preview path
@@ -3068,7 +3721,8 @@ static void enterDrag(bool isAngle) {
 // a single editing session for one big photo always takes the same path —
 // it doesn't flip to synchronous just because a crop happened to shrink
 // `source` below the threshold.
-static bool isLargeImage(const CanvasImage &img) {
+static bool isLargeImage(const CanvasImage &img)
+{
   return std::max(img.width, img.height) >
          static_cast<int>(kPreviewMaxEdge * kPreviewMinRatio);
 }
@@ -3089,10 +3743,11 @@ static bool isLargeImage(const CanvasImage &img) {
 //    (crop, rotate, straighten, a newly opened file), because then
 //    `source`, `image`, the document size and the crop selection must all
 //    change together.
-static void updateImageFromAdjustments() {
+static void updateImageFromAdjustments()
+{
   if (!state.original)
     return;
-  clearStatus(); // the image is about to change: an old message is stale
+  clearStatus();             // the image is about to change: an old message is stale
   renderWorker.invalidate(); // whatever was in flight is now out of date
 
   // Orient/straighten/crop are comparatively expensive at full resolution —
@@ -3100,7 +3755,8 @@ static void updateImageFromAdjustments() {
   // geometryWorker instead of blocking here. geometryDirty() folds in
   // "a job is already running" (see its definition): either way, submit()
   // replaces whatever's in flight, so this is safe to call every time.
-  if (isLargeImage(*state.original) && geometryDirty()) {
+  if (isLargeImage(*state.original) && geometryDirty())
+  {
     submitGeometryJob();
     return; // keep showing the current picture until the bundle lands
   }
@@ -3111,7 +3767,8 @@ static void updateImageFromAdjustments() {
   const bool canDefer = state.previewBase && !sourceChanged && state.image &&
                         state.image->width == state.source->width &&
                         state.image->height == state.source->height;
-  if (canDefer) {
+  if (canDefer)
+  {
     updatePreviewFromAdjustments(); // cheap stand-in, shown immediately
     renderWorker.submit(state.source, state.adjust.buildRenderParams());
     return;
@@ -3128,7 +3785,8 @@ static void updateImageFromAdjustments() {
 // within kPreviewMaxEdge * kPreviewMinRatio — below that, a preview
 // wouldn't be meaningfully cheaper than the full image, so the drag path
 // just uses the full-resolution one. Runs once per opened image.
-static std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src) {
+static std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)
+{
   if (!isLargeImage(src))
     return nullptr;
   int longEdge = std::max(src.width, src.height);
@@ -3139,9 +3797,11 @@ static std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src) {
   auto out = std::make_shared<CanvasImage>(w, h);
   const int area = k * k;
   for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x) {
+    for (int x = 0; x < w; ++x)
+    {
       int sum[4] = {0, 0, 0, 0};
-      for (int dy = 0; dy < k; ++dy) {
+      for (int dy = 0; dy < k; ++dy)
+      {
         const uint8_t *row =
             &src.pixels[(static_cast<size_t>(y * k + dy) * src.width + x * k) *
                         4];
@@ -3160,7 +3820,8 @@ static std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src) {
 // instead of the full-resolution original. Only touches state.previewImage;
 // state.image (and so the document size, export, and info labels) is left
 // alone until the drag ends.
-static void updatePreviewFromAdjustments() {
+static void updatePreviewFromAdjustments()
+{
   if (!state.previewBase)
     return;
   state.previewImage = state.adjust.applyTo(*state.previewBase);
@@ -3172,14 +3833,16 @@ static void updatePreviewFromAdjustments() {
 
 // Copies the `r` region of `src` into a new image (clamped to src's bounds).
 static std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src,
-                                              const CropRect &r) {
+                                              const CropRect &r)
+{
   const int x0 = std::clamp(r.x, 0, src.width);
   const int y0 = std::clamp(r.y, 0, src.height);
   const int x1 = std::clamp(r.x + r.w, x0, src.width);
   const int y1 = std::clamp(r.y + r.h, y0, src.height);
   const int w = x1 - x0, h = y1 - y0;
   auto out = std::make_shared<CanvasImage>(w, h);
-  for (int y = 0; y < h; ++y) {
+  for (int y = 0; y < h; ++y)
+  {
     const uint8_t *from =
         src.pixels.data() + (static_cast<size_t>(y0 + y) * src.width + x0) * 4;
     std::copy_n(from, static_cast<size_t>(w) * 4,
@@ -3189,11 +3852,13 @@ static std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src,
 }
 
 // Returns `src` rotated 90 degrees clockwise (w x h becomes h x w).
-static std::shared_ptr<CanvasImage> rotate90cw(const CanvasImage &src) {
+static std::shared_ptr<CanvasImage> rotate90cw(const CanvasImage &src)
+{
   const int w = src.width, h = src.height;
   auto out = std::make_shared<CanvasImage>(h, w);
   for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x) {
+    for (int x = 0; x < w; ++x)
+    {
       // Source (x, y) lands at column h-1-y, row x of the result.
       const uint8_t *from = &src.pixels[(static_cast<size_t>(y) * w + x) * 4];
       uint8_t *to =
@@ -3204,7 +3869,8 @@ static std::shared_ptr<CanvasImage> rotate90cw(const CanvasImage &src) {
 }
 
 // Returns `src` mirrored left-right.
-static std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src) {
+static std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src)
+{
   const int w = src.width, h = src.height;
   auto out = std::make_shared<CanvasImage>(w, h);
   for (int y = 0; y < h; ++y)
@@ -3217,7 +3883,8 @@ static std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src) {
 // Applies `o` to `src`. The identity orientation returns `src` itself (no
 // copy), so an unrotated image costs nothing extra.
 static std::shared_ptr<CanvasImage>
-orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o) {
+orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o)
+{
   if (o.identity())
     return src;
   std::shared_ptr<CanvasImage> cur = src;
@@ -3247,7 +3914,8 @@ orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o) {
 static std::shared_ptr<CanvasImage>
 rotateArbitrary(const CanvasImage &src, float deg, bool expand,
                 const std::atomic<uint64_t> *latest = nullptr,
-                uint64_t gen = 0) {
+                uint64_t gen = 0)
+{
   if (deg == 0.0f)
     return std::make_shared<CanvasImage>(src);
   constexpr int kRotateCheckRows = 64;
@@ -3260,14 +3928,17 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
   const double dcx = d.w / 2.0, dcy = d.h / 2.0; // output center
   const uint8_t *sp = src.pixels.data();
   uint8_t *op = out->pixels.data();
-  auto clampi = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+  auto clampi = [](int v, int hi)
+  { return v < 0 ? 0 : (v > hi ? hi : v); };
 
-  for (int y = 0; y < d.h; ++y) {
+  for (int y = 0; y < d.h; ++y)
+  {
     if (latest && (y % kRotateCheckRows) == 0 &&
         latest->load(std::memory_order_relaxed) != gen)
       return nullptr; // superseded: abandon
     const double oy = y + 0.5 - dcy;
-    for (int x = 0; x < d.w; ++x) {
+    for (int x = 0; x < d.w; ++x)
+    {
       const double ox = x + 0.5 - dcx;
       // Inverse of a clockwise rotation (y points down): where in the
       // source does this output pixel's center come from?
@@ -3275,7 +3946,8 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
       const double sy = -ox * sn + oy * cs + scy;
 
       float cov = 1.0f;
-      if (expand) {
+      if (expand)
+      {
         const double edge =
             std::min(std::min(sx, sw - sx), std::min(sy, sh - sy));
         if (edge <= -0.5)
@@ -3303,7 +3975,8 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
       if (A <= 0.0f)
         continue;
       uint8_t *o = op + (static_cast<size_t>(y) * d.w + x) * 4;
-      for (int ch = 0; ch < 3; ++ch) {
+      for (int ch = 0; ch < 3; ++ch)
+      {
         const float c =
             (p00[ch] * a00 + p10[ch] * a10 + p01[ch] * a01 + p11[ch] * a11) / A;
         o[ch] = static_cast<uint8_t>(std::clamp(c + 0.5f, 0.0f, 255.0f));
@@ -3314,12 +3987,14 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
   return out;
 }
 
-static bool cropToolActive() {
+static bool cropToolActive()
+{
   return state.activeActivity == 2 && state.image != nullptr;
 }
 
 // Width/height ratio the selection is locked to, or 0 for free-form.
-static float cropAspect() {
+static float cropAspect()
+{
   const float ratio = kCropAspects[state.crop.aspectIdx].ratio;
   if (ratio >= 0.0f)
     return ratio;
@@ -3331,7 +4006,8 @@ static float cropAspect() {
 
 // Shrinks the selection (about its center) to the locked aspect ratio, so
 // it always stays inside where it already was.
-static void cropFitToAspect() {
+static void cropFitToAspect()
+{
   const float a = cropAspect();
   if (a <= 0.0f)
     return;
@@ -3351,7 +4027,8 @@ static void cropFitToAspect() {
 }
 
 // Selection = the whole image being cropped (then fitted to the aspect lock).
-static void resetCropSelection() {
+static void resetCropSelection()
+{
   auto &c = state.crop;
   c.l = 0.0f;
   c.t = 0.0f;
@@ -3361,7 +4038,8 @@ static void resetCropSelection() {
   cropFitToAspect();
 }
 
-static void setCropAspect(size_t idx) {
+static void setCropAspect(size_t idx)
+{
   state.crop.aspectIdx = idx;
   cropFitToAspect();
   state.markDirty();
@@ -3373,7 +4051,8 @@ static void setCropAspect(size_t idx) {
 // rotate/flip/straighten, an undo/redo across any of them, or (force) when a
 // new image is opened. Also re-seeds the selection, since the image the
 // selection is measured against just changed size.
-static void syncSource(bool force) {
+static void syncSource(bool force)
+{
   if (!state.original)
     return;
   const CropRect crop = state.adjust.crop();
@@ -3390,12 +4069,14 @@ static void syncSource(bool force) {
   if (!force && state.source && !rotateChanged && crop == state.sourceCrop)
     return;
 
-  if (orientChanged) {
+  if (orientChanged)
+  {
     state.oriented = orientImage(state.original, orient);
     state.orientedFor = orient;
     state.orientedPreview = makePreviewBase(*state.oriented);
   }
-  if (rotateChanged) {
+  if (rotateChanged)
+  {
     state.rotated = angle == 0.0f
                         ? state.oriented
                         : rotateArbitrary(*state.oriented, angle, expand);
@@ -3428,12 +4109,14 @@ static void syncSource(bool force) {
 // only the crop is edited afterwards, but keeps a job a pure function of
 // its five inputs, with nothing that can drift out of sync — and the extra
 // work only costs latency on a background thread, never a UI freeze.
-class GeometryWorker {
+class GeometryWorker
+{
 public:
   // Exactly the geometry-derived EditorState fields, adopted as one atomic
   // swap on the UI thread (see adoptGeometryBundle) so the picture, its
   // document size, and the crop selection always change together.
-  struct Bundle {
+  struct Bundle
+  {
     std::shared_ptr<CanvasImage> oriented;
     Orient orientedFor;
     std::shared_ptr<CanvasImage> orientedPreview;
@@ -3445,7 +4128,8 @@ public:
     std::shared_ptr<CanvasImage> previewBase;
     std::shared_ptr<CanvasImage> image;
   };
-  struct Result {
+  struct Result
+  {
     uint64_t gen = 0;
     Bundle bundle;
   };
@@ -3457,9 +4141,11 @@ public:
 
   // See RenderWorker::setNotify / ::shutdown — same contract.
   void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
-  void shutdown() {
+  void shutdown()
+  {
     latest_.store(kShutdown);
-    if (thread_.joinable()) {
+    if (thread_.joinable())
+    {
       thread_.request_stop();
       thread_.join();
     }
@@ -3470,22 +4156,25 @@ public:
   // edited in place — the same rule RenderWorker::submit relies on).
   void submit(std::shared_ptr<CanvasImage> original, const Orient &orient,
               float angle, bool expand, const CropRect &crop,
-              const RenderParams &renderParams) {
+              const RenderParams &renderParams)
+  {
     if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st) { run(st); });
+      thread_ = std::jthread([this](std::stop_token st)
+                             { run(st); });
     const uint64_t gen = ++counter_;
     latest_.store(gen);
     outstanding_ = true;
     {
       std::lock_guard lk(m_);
-      pending_ = Job{gen,  std::move(original), orient, angle, expand,
+      pending_ = Job{gen, std::move(original), orient, angle, expand,
                      crop, renderParams};
       done_.reset();
     }
     workCv_.notify_one();
   }
 
-  void invalidate() {
+  void invalidate()
+  {
     latest_.store(++counter_);
     outstanding_ = false;
     std::lock_guard lk(m_);
@@ -3495,7 +4184,8 @@ public:
 
   bool outstanding() const { return outstanding_; }
 
-  std::optional<Result> collect() {
+  std::optional<Result> collect()
+  {
     if (!outstanding_)
       return std::nullopt;
     std::lock_guard lk(m_);
@@ -3509,9 +4199,11 @@ public:
     return r;
   }
 
-  Result waitForLatest() {
+  Result waitForLatest()
+  {
     std::unique_lock lk(m_);
-    doneCv_.wait(lk, [this] { return done_.has_value(); });
+    doneCv_.wait(lk, [this]
+                 { return done_.has_value(); });
     Result r = std::move(*done_);
     done_.reset();
     outstanding_ = false;
@@ -3519,7 +4211,8 @@ public:
   }
 
 private:
-  struct Job {
+  struct Job
+  {
     uint64_t gen = 0;
     // Non-const, unlike RenderWorker::Job::src: orientImage (identity case)
     // and the rest of this pipeline are written in terms of the same
@@ -3538,8 +4231,10 @@ private:
   // by row/block inside the two per-pixel passes (rotateArbitrary,
   // renderWith) — so a job superseded mid-straighten or mid-render abandons
   // within a few milliseconds rather than finishing unwanted work.
-  std::optional<Bundle> buildBundle(const Job &job) {
-    auto cancelled = [&] { return latest_.load() != job.gen; };
+  std::optional<Bundle> buildBundle(const Job &job)
+  {
+    auto cancelled = [&]
+    { return latest_.load() != job.gen; };
     if (cancelled())
       return std::nullopt;
     Bundle b;
@@ -3550,9 +4245,12 @@ private:
     b.orientedPreview = makePreviewBase(*b.oriented);
     if (cancelled())
       return std::nullopt;
-    if (job.angle == 0.0f) {
+    if (job.angle == 0.0f)
+    {
       b.rotated = b.oriented;
-    } else {
+    }
+    else
+    {
       b.rotated = rotateArbitrary(*b.oriented, job.angle, job.expand, &latest_,
                                   job.gen);
       if (!b.rotated)
@@ -3573,12 +4271,15 @@ private:
     return b;
   }
 
-  void run(std::stop_token st) {
-    for (;;) {
+  void run(std::stop_token st)
+  {
+    for (;;)
+    {
       Job job;
       {
         std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this] { return pending_.has_value(); }))
+        if (!workCv_.wait(lk, st, [this]
+                          { return pending_.has_value(); }))
           return; // stop requested and nothing waiting
         job = std::move(*pending_);
         pending_.reset();
@@ -3621,7 +4322,8 @@ static GeometryWorker geometryWorker;
 // never actually independent — but checking both directly, rather than
 // relying on that invariant, means a bug elsewhere fails safe (one wasted
 // resubmit) instead of silently letting a stale in-flight job get adopted.
-static bool geometryDirty() {
+static bool geometryDirty()
+{
   if (geometryWorker.outstanding())
     return true;
   if (!state.oriented || !state.rotated)
@@ -3638,7 +4340,8 @@ static bool geometryDirty() {
   return state.adjust.crop() != state.sourceCrop;
 }
 
-static void submitGeometryJob() {
+static void submitGeometryJob()
+{
   geometryWorker.submit(state.original, state.adjust.orient(),
                         state.adjust.angle(), state.adjust.expand(),
                         state.adjust.crop(), state.adjust.buildRenderParams());
@@ -3648,7 +4351,8 @@ static void submitGeometryJob() {
 // Swaps in every field of a finished geometry rebuild together, so the
 // picture, its document size, and the crop selection never show a
 // combination that belonged to two different requests.
-static void adoptGeometryBundle(GeometryWorker::Result &&r) {
+static void adoptGeometryBundle(GeometryWorker::Result &&r)
+{
   GeometryWorker::Bundle &b = r.bundle;
   state.oriented = std::move(b.oriented);
   state.orientedFor = b.orientedFor;
@@ -3670,14 +4374,16 @@ static void adoptGeometryBundle(GeometryWorker::Result &&r) {
 
 // Non-blocking; polled once per frame from flushPendingAdjust, alongside
 // collectFullRender.
-static void collectGeometryJob() {
+static void collectGeometryJob()
+{
   if (auto r = geometryWorker.collect())
     adoptGeometryBundle(std::move(*r));
 }
 
 // Blocking: makes every field a geometry rebuild touches current. For the
 // one place that needs the real pixels *now* (export).
-static void finishGeometryJob() {
+static void finishGeometryJob()
+{
   if (!geometryWorker.outstanding())
     return;
   adoptGeometryBundle(geometryWorker.waitForLatest());
@@ -3693,19 +4399,22 @@ static bool geometryBusy() { return geometryWorker.outstanding(); }
 
 // Which part of the selection is under (px, py) (image coordinates)?
 // Returns kEdge* bits for a handle, kEdgeMove for the interior, 0 for none.
-static int cropHitTest(float px, float py) {
+static int cropHitTest(float px, float py)
+{
   const auto &c = state.crop;
   const float tol = kCropHitPx / state.zoom;
   const bool inX = px >= c.l - tol && px <= c.r + tol;
   const bool inY = py >= c.t - tol && py <= c.b + tol;
   int m = 0;
-  if (inY) {
+  if (inY)
+  {
     if (std::abs(px - c.l) <= tol)
       m |= kEdgeL;
     else if (std::abs(px - c.r) <= tol)
       m |= kEdgeR;
   }
-  if (inX) {
+  if (inX)
+  {
     if (std::abs(py - c.t) <= tol)
       m |= kEdgeT;
     else if (std::abs(py - c.b) <= tol)
@@ -3721,23 +4430,27 @@ static int cropHitTest(float px, float py) {
 // Sets the selection to the rectangle spanned by a fixed corner (ax, ay)
 // and the pointer, honoring the aspect lock and the image bounds. Used for
 // both "drag out a new selection" and "drag a corner handle".
-static void cropDragCorner(float ax, float ay, float px, float py) {
+static void cropDragCorner(float ax, float ay, float px, float py)
+{
   auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float a = cropAspect();
   const float sx = px >= ax ? 1.0f : -1.0f;
   const float sy = py >= ay ? 1.0f : -1.0f;
   float w = std::abs(px - ax), h = std::abs(py - ay);
-  if (a > 0.0f) {
+  if (a > 0.0f)
+  {
     w = std::max(w, h * a); // grow to whichever dimension asks for more
     h = w / a;
     const float maxW = sx > 0.0f ? W - ax : ax;
     const float maxH = sy > 0.0f ? H - ay : ay;
-    if (w > maxW) {
+    if (w > maxW)
+    {
       w = maxW;
       h = w / a;
     }
-    if (h > maxH) {
+    if (h > maxH)
+    {
       h = maxH;
       w = h * a;
     }
@@ -3750,21 +4463,24 @@ static void cropDragCorner(float ax, float ay, float px, float py) {
 }
 
 // Drags one edge or corner of the existing selection to the pointer.
-static void cropResize(int mask, float px, float py) {
+static void cropResize(int mask, float px, float py)
+{
   auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float minSz = std::min({kCropMinPx, W, H});
   const bool horiz = (mask & (kEdgeL | kEdgeR)) != 0;
   const bool vert = (mask & (kEdgeT | kEdgeB)) != 0;
 
-  if (horiz && vert) { // corner: the opposite corner stays put
+  if (horiz && vert)
+  { // corner: the opposite corner stays put
     cropDragCorner((mask & kEdgeL) ? c.r : c.l, (mask & kEdgeT) ? c.b : c.t, px,
                    py);
     return;
   }
 
   const float a = cropAspect();
-  if (a <= 0.0f) { // free-form edge
+  if (a <= 0.0f)
+  { // free-form edge
     if (mask & kEdgeL)
       c.l = std::clamp(px, 0.0f, c.r - minSz);
     if (mask & kEdgeR)
@@ -3778,7 +4494,8 @@ static void cropResize(int mask, float px, float py) {
 
   // Aspect-locked edge: the dragged edge sets the primary dimension, and
   // the other dimension follows, centered on where the selection was.
-  if (horiz) {
+  if (horiz)
+  {
     const float cy = (c.t + c.b) / 2.0f;
     const bool left = (mask & kEdgeL) != 0;
     const float room = left ? c.r : W - c.l;
@@ -3792,7 +4509,9 @@ static void cropResize(int mask, float px, float py) {
       c.r = c.l + w;
     c.t = cy - h / 2.0f;
     c.b = cy + h / 2.0f;
-  } else {
+  }
+  else
+  {
     const float cx = (c.l + c.r) / 2.0f;
     const bool top = (mask & kEdgeT) != 0;
     const float room = top ? c.b : H - c.t;
@@ -3811,7 +4530,8 @@ static void cropResize(int mask, float px, float py) {
 
 // Canvas mouse handlers. (lx, ly) are canvas-local screen px; dividing by
 // the zoom gives image pixels.
-static void cropPress(float lx, float ly) {
+static void cropPress(float lx, float ly)
+{
   state.openMenu = -1; // the canvas now swallows presses that used to fall
                        // through to the workspace's "close menu" handler
   if (!cropToolActive())
@@ -3820,14 +4540,19 @@ static void cropPress(float lx, float ly) {
   const float px = std::clamp(lx / state.zoom, 0.0f, state.docWidth());
   const float py = std::clamp(ly / state.zoom, 0.0f, state.docHeight());
   const int hit = cropHitTest(px, py);
-  if (hit == kEdgeMove) {
+  if (hit == kEdgeMove)
+  {
     c.drag = CropUi::Drag::Move;
     c.grabX = px - c.l;
     c.grabY = py - c.t;
-  } else if (hit) {
+  }
+  else if (hit)
+  {
     c.drag = CropUi::Drag::Resize;
     c.mask = hit;
-  } else {
+  }
+  else
+  {
     // Empty area: start a new selection here. The old one stays until the
     // pointer actually moves, so a plain click doesn't wipe it out.
     c.drag = CropUi::Drag::New;
@@ -3836,21 +4561,24 @@ static void cropPress(float lx, float ly) {
   }
 }
 
-static void cropDrag(float lx, float ly) {
+static void cropDrag(float lx, float ly)
+{
   auto &c = state.crop;
   if (!cropToolActive() || c.drag == CropUi::Drag::None)
     return;
   const float W = state.docWidth(), H = state.docHeight();
   const float px = std::clamp(lx / state.zoom, 0.0f, W);
   const float py = std::clamp(ly / state.zoom, 0.0f, H);
-  switch (c.drag) {
+  switch (c.drag)
+  {
   case CropUi::Drag::New:
     cropDragCorner(c.ax, c.ay, px, py);
     break;
   case CropUi::Drag::Resize:
     cropResize(c.mask, px, py);
     break;
-  case CropUi::Drag::Move: {
+  case CropUi::Drag::Move:
+  {
     const float w = c.r - c.l, h = c.b - c.t;
     c.l = std::clamp(px - c.grabX, 0.0f, W - w);
     c.t = std::clamp(py - c.grabY, 0.0f, H - h);
@@ -3865,7 +4593,8 @@ static void cropDrag(float lx, float ly) {
 }
 
 // Commits the current selection as the crop (one undo step).
-static void applyCrop() {
+static void applyCrop()
+{
   if (!state.source || geometryBusy())
     return;
   const auto &c = state.crop;
@@ -3887,7 +4616,8 @@ static void applyCrop() {
 }
 
 // Drops the committed crop, restoring the full original (one undo step).
-static void removeCrop() {
+static void removeCrop()
+{
   if (geometryBusy() || state.adjust.crop().empty())
     return;
   state.adjust.setCrop(CropRect{});
@@ -3896,7 +4626,13 @@ static void removeCrop() {
 
 // ---------------- Rotate / flip ----------------
 
-enum class GeoOp { RotateCW, RotateCCW, FlipH, FlipV };
+enum class GeoOp
+{
+  RotateCW,
+  RotateCCW,
+  FlipH,
+  FlipV
+};
 
 // Applies one rotate/flip to an orientation, and moves the crop rectangle
 // with it so the same part of the picture stays selected. (W, H) is the size
@@ -3910,8 +4646,10 @@ enum class GeoOp { RotateCW, RotateCCW, FlipH, FlipV };
 // degrees clockwise, mirrored, is tilted 5 degrees counter-clockwise), while
 // a quarter-turn leaves it alone — turns about the same center commute.
 static void geoStep(Orient &o, float &angle, CropRect &c, int &W, int &H,
-                    GeoOp op) {
-  switch (op) {
+                    GeoOp op)
+{
+  switch (op)
+  {
   case GeoOp::RotateCW:
     o.rot = (o.rot + 1) % 4;
     if (!c.empty())
@@ -3945,7 +4683,8 @@ static void geoStep(Orient &o, float &angle, CropRect &c, int &W, int &H,
 
 // One undo step. `state.rotated` is what crops are measured against, so its
 // size is the (W, H) geoStep needs.
-static void applyGeoOp(GeoOp op) {
+static void applyGeoOp(GeoOp op)
+{
   if (!state.original || !state.rotated || geometryBusy())
     return;
   Orient o = state.adjust.orient();
@@ -3960,7 +4699,8 @@ static void applyGeoOp(GeoOp op) {
 // Undoes every 90-degree turn and flip in one step (the crop follows,
 // staying on the same part of the picture; the straighten angle is kept,
 // still tilting the picture the same way relative to its own edges).
-static void resetOrientation() {
+static void resetOrientation()
+{
   if (!state.original || !state.rotated || geometryBusy() ||
       state.adjust.orient().identity())
     return;
@@ -3979,30 +4719,35 @@ static void resetOrientation() {
 // ---------------- Straighten (arbitrary-angle rotation) ----------------
 
 // Angles are kept to 0.1 degree, and to exactly 0 near zero.
-static float snapAngle(float deg) {
+static float snapAngle(float deg)
+{
   deg = std::clamp(std::round(deg * 10.0f) / 10.0f, -kAngleMax, kAngleMax);
   return deg == 0.0f ? 0.0f : deg;
 }
 
 // Slider drag: one undo step per drag. Only records the value — the
 // resample is deferred to canvasDirtySource (see there), once per frame.
-static void setAngleFromSlider(float deg) {
+static void setAngleFromSlider(float deg)
+{
   state.adjust.setAngle(snapAngle(deg), /*coalesce=*/true);
 }
 
 // A discrete change (nudge button / reset): its own undo step, resampled at
 // full resolution on the next frame.
-static void setAngleDiscrete(float deg) {
+static void setAngleDiscrete(float deg)
+{
   if (!state.original)
     return;
   state.adjust.setAngle(snapAngle(deg), /*coalesce=*/false);
   state.markAdjustDirty();
 }
-static void nudgeAngle(float delta) {
+static void nudgeAngle(float delta)
+{
   setAngleDiscrete(state.adjust.angle() + delta);
 }
 
-static void setCornerMode(bool expand) {
+static void setCornerMode(bool expand)
+{
   if (!state.original)
     return;
   state.adjust.setExpand(expand);
@@ -4013,7 +4758,8 @@ static void setCornerMode(bool expand) {
 // `orientedPreview` instead of the full-resolution picture, drawn stretched
 // to the size the full-resolution result will have (previewDoc*). The
 // full-resolution turn runs once, when the drag ends (View::onDragEnd).
-static void updateAnglePreview() {
+static void updateAnglePreview()
+{
   if (!state.orientedPreview || !state.oriented)
     return;
   const float a = state.adjust.angle();
@@ -4028,14 +4774,16 @@ static void updateAnglePreview() {
   state.markDirty();
 }
 
-static void undo() {
+static void undo()
+{
   if (!state.adjust.canUndo())
     return;
   state.adjust.undo();
   updateImageFromAdjustments();
 }
 
-static void redo() {
+static void redo()
+{
   if (!state.adjust.canRedo())
     return;
   state.adjust.redo();
@@ -4053,9 +4801,11 @@ static void redo() {
 // A decode already running can't be interrupted (the image libraries have no
 // cancel hook), so opening a second file queues behind it and the first
 // file's result is simply dropped when it finishes.
-class DecodeWorker {
+class DecodeWorker
+{
 public:
-  struct Result {
+  struct Result
+  {
     uint64_t gen = 0;
     std::string path;
     std::optional<CanvasImage> image; // empty on failure
@@ -4069,17 +4819,21 @@ public:
 
   void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
   // Joins the thread; blocks until a decode already in progress finishes.
-  void shutdown() {
+  void shutdown()
+  {
     latest_.store(kShutdown);
-    if (thread_.joinable()) {
+    if (thread_.joinable())
+    {
       thread_.request_stop();
       thread_.join();
     }
   }
 
-  void submit(std::string path) {
+  void submit(std::string path)
+  {
     if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st) { run(st); });
+      thread_ = std::jthread([this](std::stop_token st)
+                             { run(st); });
     const uint64_t gen = ++counter_;
     latest_.store(gen);
     outstanding_ = true;
@@ -4099,7 +4853,8 @@ public:
   const std::string &pendingPath() const { return pendingPath_; }
 
   // Non-blocking: the newest request's result, if it has finished.
-  std::optional<Result> collect() {
+  std::optional<Result> collect()
+  {
     if (!outstanding_)
       return std::nullopt;
     std::lock_guard lk(m_);
@@ -4114,18 +4869,22 @@ public:
   }
 
 private:
-  struct Job {
+  struct Job
+  {
     uint64_t gen = 0;
     std::string path;
   };
   static constexpr uint64_t kShutdown = ~uint64_t{0};
 
-  void run(std::stop_token st) {
-    for (;;) {
+  void run(std::stop_token st)
+  {
+    for (;;)
+    {
       Job job;
       {
         std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this] { return pending_.has_value(); }))
+        if (!workCv_.wait(lk, st, [this]
+                          { return pending_.has_value(); }))
           return; // stop requested and nothing waiting
         job = std::move(*pending_);
         pending_.reset();
@@ -4161,9 +4920,434 @@ private:
 
 static DecodeWorker decodeWorker;
 
+// ---------------- Object segmentation (background) ----------------
+struct SegmentRequest
+{
+  std::shared_ptr<const CanvasImage> image; // the untouched original
+  uint64_t imageKey = 0;                    // state.imageSerial
+  std::vector<ObjectPrompt> prompts;        // original-picture fractions
+  int maskIdx = -1, part = -1;              // where the result goes
+  bool prefetch = false;                    // encode only (warm the model), no result map
+};
+
+// ---- Stand-in segmenter (replaced by MobileSAM in step 3) ----
+// Magic wand: grow from each foreground point over pixels whose color is
+// within kSegTolerance of the seed's color; background points grow the same
+// way and are subtracted. Same contract the real model will have: image +
+// prompts in, coverage map out, cancellable, runs on the worker thread.
+struct SegPrepared
+{ // what a model would cache per image (an embedding)
+  int w = 0, h = 0;
+  std::vector<uint8_t> rgb; // w*h*3
+};
+
+static std::shared_ptr<const SegPrepared> prepareSegImage(const CanvasImage &s)
+{
+  const int k = std::max(
+      1, (std::max(s.width, s.height) + kSegPrepEdge - 1) / kSegPrepEdge);
+  auto out = std::make_shared<SegPrepared>();
+  out->w = std::max(1, s.width / k);
+  out->h = std::max(1, s.height / k);
+  out->rgb.resize(static_cast<size_t>(out->w) * out->h * 3);
+  const int area = k * k;
+  for (int y = 0; y < out->h; ++y)
+    for (int x = 0; x < out->w; ++x)
+    {
+      int sum[3] = {0, 0, 0};
+      for (int dy = 0; dy < k; ++dy)
+        for (int dx = 0; dx < k; ++dx)
+        {
+          const uint8_t *p =
+              &s.pixels[(static_cast<size_t>(y * k + dy) * s.width +
+                         static_cast<size_t>(x * k + dx)) *
+                        4];
+          sum[0] += p[0];
+          sum[1] += p[1];
+          sum[2] += p[2];
+        }
+      uint8_t *o = &out->rgb[(static_cast<size_t>(y) * out->w + x) * 3];
+      for (int c = 0; c < 3; ++c)
+        o[c] = static_cast<uint8_t>((sum[c] + area / 2) / area);
+    }
+  return out;
+}
+
+// False if cancelled.
+static bool segGrow(const SegPrepared &im, int sx, int sy,
+                    std::vector<uint8_t> &mark,
+                    const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  const int w = im.w, h = im.h;
+  int ref[3] = {0, 0, 0}, n = 0; // seed color: mean of a 5x5 patch
+  for (int y = std::max(0, sy - 2); y <= std::min(h - 1, sy + 2); ++y)
+    for (int x = std::max(0, sx - 2); x <= std::min(w - 1, sx + 2); ++x)
+    {
+      const uint8_t *p = &im.rgb[(static_cast<size_t>(y) * w + x) * 3];
+      ref[0] += p[0];
+      ref[1] += p[1];
+      ref[2] += p[2];
+      ++n;
+    }
+  for (int c = 0; c < 3; ++c)
+    ref[c] /= n;
+  const int tolSq = kSegTolerance * kSegTolerance;
+  std::vector<int> stack;
+  const auto tryPush = [&](int x, int y)
+  {
+    if (x < 0 || y < 0 || x >= w || y >= h)
+      return;
+    const size_t i = static_cast<size_t>(y) * w + x;
+    if (mark[i])
+      return;
+    const uint8_t *p = &im.rgb[i * 3];
+    const int dr = p[0] - ref[0], dg = p[1] - ref[1], db = p[2] - ref[2];
+    if (dr * dr + dg * dg + db * db > tolSq)
+      return;
+    mark[i] = 1;
+    stack.push_back(static_cast<int>(i));
+  };
+  tryPush(sx, sy);
+  size_t pops = 0;
+  while (!stack.empty())
+  {
+    if ((++pops & 4095) == 0 && latest &&
+        latest->load(std::memory_order_relaxed) != gen)
+      return false;
+    const int i = stack.back();
+    stack.pop_back();
+    const int x = i % w, y = i / w;
+    tryPush(x - 1, y);
+    tryPush(x + 1, y);
+    tryPush(x, y - 1);
+    tryPush(x, y + 1);
+  }
+  return true;
+}
+
+// Worker thread only (the cache below is not locked). Returns null if
+// cancelled or if `*err` is set.
+static std::shared_ptr<const ObjectMap>
+segmentObjectWand(const CanvasImage &img, uint64_t key,
+                  const std::vector<ObjectPrompt> &prompts, std::string *err,
+                  const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  static uint64_t cachedKey = 0;
+  static std::shared_ptr<const SegPrepared> cached;
+  if (!cached || cachedKey != key)
+  {
+    cached = prepareSegImage(img);
+    cachedKey = key;
+  }
+  const SegPrepared &im = *cached;
+  const size_t n = static_cast<size_t>(im.w) * im.h;
+  std::vector<uint8_t> fg(n, 0), bg(n, 0);
+  for (const ObjectPrompt &p : prompts)
+  {
+    const int sx = std::clamp(static_cast<int>(p.x * im.w), 0, im.w - 1);
+    const int sy = std::clamp(static_cast<int>(p.y * im.h), 0, im.h - 1);
+    if (!segGrow(im, sx, sy, p.fg ? fg : bg, latest, gen))
+      return nullptr; // cancelled
+  }
+  auto m = std::make_shared<ObjectMap>();
+  m->w = im.w;
+  m->h = im.h;
+  m->id = nextObjectMapId();
+  m->a.resize(n);
+  for (size_t i = 0; i < n; ++i)
+    m->a[i] = (fg[i] && !bg[i]) ? 255 : 0;
+  (void)err;
+  return m;
+}
+
+// Which engine is active, shown in the Object panel (written by the worker,
+// read by the UI thread's label poll).
+static std::mutex gSegInfoMutex;
+static std::string gSegInfo = "Engine: loads on first use";
+static void setSegInfo(std::string s)
+{
+  std::lock_guard<std::mutex> lk(gSegInfoMutex);
+  gSegInfo = std::move(s);
+}
+static std::string getSegInfo()
+{
+  std::lock_guard<std::mutex> lk(gSegInfoMutex);
+  return gSegInfo;
+}
+
+// Models: $LITEROOM_MODELS, else a "models" folder next to the executable.
+static std::string samModelDir()
+{
+  if (const char *e = std::getenv("LITEROOM_MODELS"); e && *e)
+    return e;
+#if defined(_WIN32)
+  wchar_t wbuf[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, wbuf, MAX_PATH);
+  if (n > 0 && n < MAX_PATH)
+  {
+    std::wstring w(wbuf, n);
+    const size_t slash = w.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+      w.resize(slash);
+    const int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0,
+                                        nullptr, nullptr);
+    std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+    if (len > 0)
+      WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), len, nullptr,
+                          nullptr);
+    return s + "\\models";
+  }
+#else
+  char buf[4096];
+  const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n > 0)
+  {
+    std::string p(buf, static_cast<size_t>(n));
+    const size_t slash = p.find_last_of('/');
+    if (slash != std::string::npos)
+      return p.substr(0, slash) + "/models";
+  }
+#endif
+  return "models";
+}
+
+// Worker thread only. Prefetch (no prompts): load + encode, return null with
+// no error. Falls back to the color-grow stand-in when SAM is unavailable.
+static std::shared_ptr<const ObjectMap>
+segmentObject(const CanvasImage &img, uint64_t key,
+              const std::vector<ObjectPrompt> &prompts, std::string *err,
+              const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  static sam::Segmenter seg;
+  static int backend = 0; // 0 untried, 1 SAM, -1 fallback
+  static uint64_t encodedKey = 0;
+  if (backend == 0)
+  {
+    const std::string dir = samModelDir();
+    std::string e;
+    if (seg.load(dir + "/mobile_sam.encoder.onnx",
+                 dir + "/mobile_sam.decoder.onnx", &e))
+    {
+      backend = 1;
+      setSegInfo("Engine: MobileSAM");
+    }
+    else
+    {
+      backend = -1;
+      setSegInfo("Engine: basic color grow (" + e + "; looked in " + dir + ")");
+    }
+  }
+  if (backend < 0)
+    return prompts.empty()
+               ? nullptr
+               : segmentObjectWand(img, key, prompts, err, latest, gen);
+
+  if (encodedKey != key)
+  {
+    if (!seg.encode(img.pixels.data(), img.width, img.height, err))
+      return nullptr;
+    encodedKey = key;
+  }
+  if (prompts.empty() ||
+      (latest && latest->load(std::memory_order_relaxed) != gen))
+    return nullptr; // prefetch, or superseded while encoding
+
+  std::vector<sam::Point> pts;
+  pts.reserve(prompts.size());
+  for (const ObjectPrompt &p : prompts)
+    pts.push_back({p.x, p.y, p.fg});
+  std::vector<float> logits;
+  int w = 0, h = 0;
+  if (!seg.decode(pts, &logits, &w, &h, err))
+    return nullptr;
+  auto m = std::make_shared<ObjectMap>();
+  m->w = w;
+  m->h = h;
+  m->id = nextObjectMapId();
+  m->a.resize(logits.size());
+  for (size_t i = 0; i < logits.size(); ++i) // soft edge: sigmoid of the logit
+    m->a[i] = static_cast<uint8_t>(std::lround(
+        255.0f / (1.0f + std::exp(-logits[i] * kSamSoftness))));
+  return m;
+}
+
+// Same thread model as DecodeWorker / RenderWorker (see there).
+class SegmentWorker
+{
+public:
+  struct Result
+  {
+    uint64_t gen = 0;
+    SegmentRequest req;                   // image dropped; prompts + target kept
+    std::shared_ptr<const ObjectMap> map; // null on failure
+    std::string error;
+  };
+
+  SegmentWorker() = default;
+  SegmentWorker(const SegmentWorker &) = delete;
+  SegmentWorker &operator=(const SegmentWorker &) = delete;
+  ~SegmentWorker() { latest_.store(kShutdown); }
+
+  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
+  void shutdown()
+  {
+    latest_.store(kShutdown);
+    if (thread_.joinable())
+    {
+      thread_.request_stop();
+      thread_.join();
+    }
+  }
+
+  void submit(SegmentRequest req)
+  {
+    if (!thread_.joinable())
+      thread_ = std::jthread([this](std::stop_token st)
+                             { run(st); });
+    const uint64_t gen = ++counter_;
+    latest_.store(gen);
+    outstanding_ = true;
+    {
+      std::lock_guard lk(m_);
+      pending_ = Job{gen, std::move(req)};
+      done_.reset();
+    }
+    workCv_.notify_one();
+  }
+  void invalidate()
+  {
+    latest_.store(++counter_);
+    outstanding_ = false;
+    std::lock_guard lk(m_);
+    pending_.reset();
+    done_.reset();
+  }
+  bool outstanding() const { return outstanding_; }
+
+  std::optional<Result> collect()
+  {
+    if (!outstanding_)
+      return std::nullopt;
+    std::lock_guard lk(m_);
+    if (done_ && done_->gen != latest_.load())
+      done_.reset();
+    if (!done_)
+      return std::nullopt;
+    Result r = std::move(*done_);
+    done_.reset();
+    outstanding_ = false;
+    return r;
+  }
+
+private:
+  struct Job
+  {
+    uint64_t gen = 0;
+    SegmentRequest req;
+  };
+  static constexpr uint64_t kShutdown = ~uint64_t{0};
+
+  void run(std::stop_token st)
+  {
+    for (;;)
+    {
+      Job job;
+      {
+        std::unique_lock lk(m_);
+        if (!workCv_.wait(lk, st, [this]
+                          { return pending_.has_value(); }))
+          return;
+        job = std::move(*pending_);
+        pending_.reset();
+      }
+      if (latest_.load() != job.gen)
+        continue;
+      Result r;
+      r.gen = job.gen;
+      r.map = segmentObject(*job.req.image, job.req.imageKey, job.req.prompts,
+                            &r.error, &latest_, job.gen);
+      r.req = std::move(job.req);
+      r.req.image.reset();
+      {
+        std::lock_guard lk(m_);
+        if (latest_.load() != job.gen)
+          continue; // superseded or shut down while running
+        done_ = std::move(r);
+      }
+      if (notify_)
+        notify_();
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable_any workCv_;
+  std::optional<Job> pending_;
+  std::optional<Result> done_;
+  std::function<void()> notify_;
+  std::atomic<uint64_t> latest_{0};
+  uint64_t counter_ = 0;
+  bool outstanding_ = false;
+  std::jthread thread_;
+};
+
+static SegmentWorker segmentWorker;
+
+// UI thread: commits a finished segmentation. Prompts and map land in ONE
+// undo step. A result for a mask/part that is gone (deleted, undone away) is
+// dropped.
+static void adoptSegment(SegmentWorker::Result &&r)
+{
+
+  if (r.req.prefetch)
+  {
+    if (!r.error.empty())
+      setStatus("Object selection unavailable: " + r.error, true);
+    else
+    {
+      state.mask.encodedKey = r.req.imageKey;
+      clearStatus();
+    }
+    state.markDirty();
+    return;
+  }
+  state.mask.objPending = {};
+  state.markDirty();
+  if (!r.map)
+  {
+    setStatus("Object selection failed" +
+                  (r.error.empty() ? std::string() : ": " + r.error),
+              true);
+    return;
+  }
+  MaskSet ms = state.adjust.masks();
+  if (r.req.maskIdx < 0 || r.req.maskIdx >= static_cast<int>(ms.size()))
+    return;
+  Mask &m = ms[static_cast<size_t>(r.req.maskIdx)];
+  if (r.req.part < 0 || r.req.part >= static_cast<int>(m.parts.size()))
+    return;
+  auto *o =
+      std::get_if<ObjectShape>(&m.parts[static_cast<size_t>(r.req.part)].shape);
+  if (!o)
+    return;
+  o->map = r.map;
+  o->prompts = std::move(r.req.prompts);
+  state.mask.encodedKey = r.req.imageKey;
+  state.adjust.setMasks(ms, -1);
+  clearStatus();
+  state.markAdjustDirty(); // re-render through the normal (drag-safe) path
+}
+
+// Polled once per frame from flushPendingAdjust.
+static void collectSegmentJob()
+{
+  if (auto r = segmentWorker.collect())
+    adoptSegment(std::move(*r));
+}
+
 // Swaps a finished decode into the editor (UI thread only).
-static void adoptDecoded(DecodeWorker::Result &&r) {
-  if (!r.image) {
+static void adoptDecoded(DecodeWorker::Result &&r)
+{
+  if (!r.image)
+  {
     // Leave whatever image is already open untouched and say what happened.
     setStatus("Couldn't open " + baseName(r.path) + ": " +
                   (r.error.empty() ? std::string("unsupported or damaged image")
@@ -4178,6 +5362,9 @@ static void adoptDecoded(DecodeWorker::Result &&r) {
   // must never be adopted over the new one.
   renderWorker.invalidate();
   geometryWorker.invalidate();
+  segmentWorker.invalidate();
+  state.mask.objPending = {};
+  ++state.imageSerial;
 
   state.original = std::make_shared<CanvasImage>(std::move(*r.image));
   state.imagePath = std::move(r.path);
@@ -4186,18 +5373,20 @@ static void adoptDecoded(DecodeWorker::Result &&r) {
   state.adjust.setOriginalSize(state.original->width, state.original->height);
   state.dragging = false;
   state.dragIsAngle = false;
-  state.image.reset(); // the old file's pixels: force the synchronous path
-  syncSource(true); // source = original; builds previewBase, resets selection
+  state.image.reset();          // the old file's pixels: force the synchronous path
+  syncSource(true);             // source = original; builds previewBase, resets selection
   updateImageFromAdjustments(); // builds state.image from state.source
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust.
-static void collectDecodeJob() {
+static void collectDecodeJob()
+{
   if (auto r = decodeWorker.collect())
     adoptDecoded(std::move(*r));
 }
 
-static void openImage() {
+static void openImage()
+{
   auto path = openFilePicker(
       "Open Image", {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
   if (!path)
@@ -4215,14 +5404,16 @@ static void openImage() {
 #if defined(_WIN32)
 
 static bool encodePngFile(const std::string &path, const CanvasImage &img,
-                          std::string *errorOut) {
+                          std::string *errorOut)
+{
   HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   bool weInitialized = coHr == S_OK;
 
   IWICImagingFactory *factory = nullptr;
   HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
                                 CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
+  if (FAILED(hr))
+  {
     if (weInitialized)
       CoUninitialize();
     if (errorOut)
@@ -4234,7 +5425,8 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
   IWICBitmapEncoder *encoder = nullptr;
   IWICBitmapFrameEncode *frame = nullptr;
   bool ok = false;
-  do {
+  do
+  {
     if (FAILED(factory->CreateStream(&stream)))
       break;
     if (FAILED(stream->InitializeFromFilename(toWide(path).c_str(),
@@ -4259,17 +5451,21 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
     const BYTE *src = img.pixels.data();
     std::vector<BYTE> swizzled;
 
-    if (IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA)) {
+    if (IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA))
+    {
       // Encoder substituted BGRA — swap R and B.
       swizzled.resize(img.pixels.size());
-      for (size_t i = 0; i < img.pixels.size(); i += 4) {
+      for (size_t i = 0; i < img.pixels.size(); i += 4)
+      {
         swizzled[i + 0] = img.pixels[i + 2]; // B
         swizzled[i + 1] = img.pixels[i + 1]; // G
         swizzled[i + 2] = img.pixels[i + 0]; // R
         swizzled[i + 3] = img.pixels[i + 3]; // A
       }
       src = swizzled.data();
-    } else if (!IsEqualGUID(fmt, GUID_WICPixelFormat32bppRGBA)) {
+    }
+    else if (!IsEqualGUID(fmt, GUID_WICPixelFormat32bppRGBA))
+    {
       break; // some other format we don't handle
     }
 
@@ -4300,9 +5496,11 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
 #else // Linux
 
 static bool encodePngFile(const std::string &path, const CanvasImage &img,
-                          std::string *errorOut) {
+                          std::string *errorOut)
+{
   FILE *fp = fopen(path.c_str(), "wb");
-  if (!fp) {
+  if (!fp)
+  {
     if (errorOut)
       *errorOut = "failed to open file for writing";
     return false;
@@ -4311,7 +5509,8 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
   png_structp png =
       png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
   png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info) {
+  if (!png || !info)
+  {
     if (png)
       png_destroy_write_struct(&png, nullptr);
     fclose(fp);
@@ -4320,7 +5519,8 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
     return false;
   }
 
-  if (setjmp(png_jmpbuf(png))) {
+  if (setjmp(png_jmpbuf(png)))
+  {
     png_destroy_write_struct(&png, &info);
     fclose(fp);
     if (errorOut)
@@ -4349,7 +5549,8 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
 
 #endif
 
-static void exportImage() {
+static void exportImage()
+{
   if (!state.image)
     return;            // nothing open to export
   finishGeometryJob(); // never export the stale (pre-rebuild) picture
@@ -4369,7 +5570,8 @@ static void exportImage() {
               true);
 }
 
-static void toggleSidebar() {
+static void toggleSidebar()
+{
   state.activeActivity = (state.activeActivity == -1) ? 0 : -1;
   state.markDirty(); // the crop overlay shows only while the Crop pane is open
 }
@@ -4378,7 +5580,8 @@ static void toggleSidebar() {
 
 // One row of a dropdown: label, action, and an optional shortcut hint shown
 // right-aligned (display only — the real bindings are in main()).
-struct MenuItem {
+struct MenuItem
+{
   std::string label;
   std::function<void()> action;
   std::string shortcut = {}; // optional
@@ -4389,17 +5592,18 @@ struct MenuItem {
 // (EditorState::openMenu); picking an item runs its action and closes the
 // menu.
 static View menuButton(const std::string &label, int id,
-                       std::vector<MenuItem> items) {
+                       std::vector<MenuItem> items)
+{
   View btn;
   btn.style.height = Size::full();
   btn.style.padding = EdgeInsets{0, 12, 0, 12};
   btn.style.justifyContent = Justify::Center;
   btn.style.alignItems = Align::Center;
   btn.style.hoverColor = kColorMenuHover;
-  btn.style.backgroundColor = std::function<Color()>([id] {
-    return state.openMenu == id ? kColorMenuHover : kColorTransparent;
-  });
-  btn.onClick = [id] { state.openMenu = (state.openMenu == id) ? -1 : id; };
+  btn.style.backgroundColor = std::function<Color()>([id]
+                                                     { return state.openMenu == id ? kColorMenuHover : kColorTransparent; });
+  btn.onClick = [id]
+  { state.openMenu = (state.openMenu == id) ? -1 : id; };
 
   Text label_;
   label_.label = label;
@@ -4420,9 +5624,11 @@ static View menuButton(const std::string &label, int id,
   dropdown.style.padding = EdgeInsets::all(4.0f);
   dropdown.style.zIndex = 100;
   dropdown.style.display = std::function<Display()>(
-      [id] { return state.openMenu == id ? Display::Flex : Display::None; });
+      [id]
+      { return state.openMenu == id ? Display::Flex : Display::None; });
 
-  for (auto &item : items) {
+  for (auto &item : items)
+  {
     View row;
     row.style.height = Size::pixel(30);
     row.style.width = Size::full();
@@ -4432,7 +5638,8 @@ static View menuButton(const std::string &label, int id,
     row.style.borderRadius = 3.0f;
     row.style.hoverColor = kColorDropdownRowHover;
     std::function<void()> action = item.action;
-    row.onClick = [action] {
+    row.onClick = [action]
+    {
       action();
       state.openMenu = -1;
     };
@@ -4442,7 +5649,8 @@ static View menuButton(const std::string &label, int id,
     t.fontSize = 13.0f;
     t.color = kColorTextDark;
     row.addChild(std::move(t));
-    if (!item.shortcut.empty()) {
+    if (!item.shortcut.empty())
+    {
       Text hint;
       hint.label = item.shortcut;
       hint.fontSize = 12.0f;
@@ -4458,7 +5666,8 @@ static View menuButton(const std::string &label, int id,
 
 // One of the three window-control buttons (minimize/maximize/close).
 static View winButton(const std::string &glyph, Color hoverBg,
-                      std::function<void()> onClick) {
+                      std::function<void()> onClick)
+{
   View v;
   v.style.width = Size::pixel(46);
   v.style.height = Size::full();
@@ -4481,7 +5690,8 @@ static View winButton(const std::string &glyph, Color hoverBg,
 // that case (undo()/redo() already check before doing anything).
 static View titlebarIconBtn(const std::string &glyph,
                             std::function<void()> onClick,
-                            std::function<bool()> enabled = {}) {
+                            std::function<bool()> enabled = {})
+{
   View v;
   v.style.width = Size::pixel(28);
   v.style.height = Size::pixel(28);
@@ -4494,9 +5704,8 @@ static View titlebarIconBtn(const std::string &glyph,
   Text t;
   t.label = glyph;
   t.fontSize = 14.0f;
-  t.color = enabled ? Dynamic<Color>(std::function<Color()>([enabled] {
-    return enabled() ? kColorTextDark : kColorTextFaint;
-  }))
+  t.color = enabled ? Dynamic<Color>(std::function<Color()>([enabled]
+                                                            { return enabled() ? kColorTextDark : kColorTextFaint; }))
                     : Dynamic<Color>(kColorTextDark);
   v.addChild(std::move(t));
   return v;
@@ -4509,7 +5718,8 @@ static View sidebarButton(const std::string &label,
                           std::function<void()> onClick,
                           std::function<bool()> selected = {},
                           bool primary = false,
-                          std::function<bool()> enabled = {}) {
+                          std::function<bool()> enabled = {})
+{
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -4519,20 +5729,22 @@ static View sidebarButton(const std::string &label,
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.hoverColor = primary ? kColorAccentHover : kColorActivityHover;
   b.style.backgroundColor =
-      std::function<Color()>([selected, primary, enabled]() -> Color {
+      std::function<Color()>([selected, primary, enabled]() -> Color
+                             {
         if (enabled && !enabled())
           return kColorActivityBarBg; // dimmed: no primary fill while busy
         if (primary)
           return kColorAccent;
         return (selected && selected()) ? kColorDropdownRowHover
-                                        : kColorActivityBarBg;
-      });
+                                        : kColorActivityBarBg; });
   b.style.borderWidth = std::function<float()>(
-      [selected] { return (selected && selected()) ? 1.0f : 0.0f; });
+      [selected]
+      { return (selected && selected()) ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
   // A disabled button ignores clicks (the action functions also re-check, so
   // shortcuts are covered) and shows muted text.
-  b.onClick = [onClick = std::move(onClick), enabled] {
+  b.onClick = [onClick = std::move(onClick), enabled]
+  {
     if (!enabled || enabled())
       onClick();
   };
@@ -4542,9 +5754,8 @@ static View sidebarButton(const std::string &label,
   t.fontSize = 13.0f;
   const Color liveColor = primary ? kColorWhite : kColorTextDark;
   if (enabled)
-    t.color = std::function<Color()>([enabled, liveColor]() -> Color {
-      return enabled() ? liveColor : kColorTextMuted;
-    });
+    t.color = std::function<Color()>([enabled, liveColor]() -> Color
+                                     { return enabled() ? liveColor : kColorTextMuted; });
   else
     t.color = liveColor;
   b.addChild(std::move(t));
@@ -4554,17 +5765,18 @@ static View sidebarButton(const std::string &label,
 // What a slider row needs to know: its label, range, how to read/write the
 // value, and how to print it. Shared by the Adjust sliders (via
 // buildAdjustmentSlider) and the Straighten angle slider.
-struct SliderSpec {
+struct SliderSpec
+{
   std::string name;
   float lo = 0.0f, hi = 1.0f;
   std::function<float()> get;
-  std::function<void(float)> set; // called with each new value while dragging
+  std::function<void(float)> set;           // called with each new value while dragging
   std::function<std::string(float)> format; // value -> text after "name: "
-  bool isAngle = false;   // drag drives the angle preview instead of the
-                          // pixel-adjustment preview (see canvasDirtySource)
-  bool affectsPixels = true; // false: the value only changes a tool setting
-                             // (brush size...), so a drag needs no re-render
-  bool hasAccent = false; // tint the fill + thumb border (Color Mixer bands)
+  bool isAngle = false;                     // drag drives the angle preview instead of the
+                                            // pixel-adjustment preview (see canvasDirtySource)
+  bool affectsPixels = true;                // false: the value only changes a tool setting
+                                            // (brush size...), so a drag needs no re-render
+  bool hasAccent = false;                   // tint the fill + thumb border (Color Mixer bands)
   Color accent{};
   float trackW = 150.0f;       // track length in px
   std::function<void()> onEnd; // optional: fired when a drag on it ends
@@ -4575,7 +5787,8 @@ struct SliderSpec {
 // than binding a raw float& the way a standalone slider widget would —
 // that's what lets AdjustmentSet coalesce a whole drag into one undo step
 // instead of one per frame.
-static View buildSliderRow(const SliderSpec &spec) {
+static View buildSliderRow(const SliderSpec &spec)
+{
   const float kTrackW = spec.trackW;
   constexpr float kTrackH = 4.0f;
   constexpr float kThumb = 16.0f;
@@ -4591,7 +5804,8 @@ static View buildSliderRow(const SliderSpec &spec) {
   const bool isBipolar = (lo < 0.0f && hi > 0.0f);
   const float anchor = isBipolar ? 0.0f : lo;
 
-  auto thumbXFor = [lo, hi, kMaxThumbX](float v) {
+  auto thumbXFor = [lo, hi, kMaxThumbX](float v)
+  {
     return std::clamp((v - lo) / (hi - lo), 0.0f, 1.0f) * kMaxThumbX;
   };
 
@@ -4601,7 +5815,8 @@ static View buildSliderRow(const SliderSpec &spec) {
 
   Text rowLabel;
   rowLabel.label = std::function<std::string()>(
-      [s] { return s.name + ": " + s.format(s.get()); });
+      [s]
+      { return s.name + ": " + s.format(s.get()); });
   rowLabel.fontSize = 13.0f;
   rowLabel.color = kColorTextMid;
   group.addChild(std::move(rowLabel));
@@ -4621,18 +5836,18 @@ static View buildSliderRow(const SliderSpec &spec) {
   fill.style.position = Position::Absolute;
   fill.style.top = 0.0f;
   fill.style.height = Size::pixel(kTrackH);
-  fill.style.left = std::function<float()>([s, thumbXFor, anchor, isBipolar] {
+  fill.style.left = std::function<float()>([s, thumbXFor, anchor, isBipolar]
+                                           {
     float anchorX =
         isBipolar ? thumbXFor(anchor) + kThumb / 2.0f : thumbXFor(anchor);
     float valueCenter = thumbXFor(s.get()) + kThumb / 2.0f;
-    return std::min(anchorX, valueCenter);
-  });
-  fill.style.width = std::function<Size()>([s, thumbXFor, anchor, isBipolar] {
+    return std::min(anchorX, valueCenter); });
+  fill.style.width = std::function<Size()>([s, thumbXFor, anchor, isBipolar]
+                                           {
     float anchorX =
         isBipolar ? thumbXFor(anchor) + kThumb / 2.0f : thumbXFor(anchor);
     float valueCenter = thumbXFor(s.get()) + kThumb / 2.0f;
-    return Size::pixel(std::abs(valueCenter - anchorX));
-  });
+    return Size::pixel(std::abs(valueCenter - anchorX)); });
   fill.style.backgroundColor = s.hasAccent ? s.accent : kTrackEdge;
   fill.style.borderRadius = kTrackH / 2.0f;
   track.addChild(std::move(fill));
@@ -4644,7 +5859,8 @@ static View buildSliderRow(const SliderSpec &spec) {
   View thumb;
   thumb.style.position = Position::Absolute;
   thumb.style.left =
-      std::function<float()>([s, thumbXFor] { return thumbXFor(s.get()); });
+      std::function<float()>([s, thumbXFor]
+                             { return thumbXFor(s.get()); });
   thumb.style.top = -(kThumb - kTrackH) / 2.0f; // vertically centered
   thumb.style.width = Size::pixel(kThumb);
   thumb.style.height = Size::pixel(kThumb);
@@ -4653,14 +5869,17 @@ static View buildSliderRow(const SliderSpec &spec) {
   thumb.style.borderColor = s.hasAccent ? s.accent : kThumbEdge;
   thumb.style.borderRadius = kThumb / 2.0f;
 
-  thumb.onPressAt = [grabX](float lx, float) { *grabX = lx; };
-  thumb.onDragTo = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float) {
+  thumb.onPressAt = [grabX](float lx, float)
+  { *grabX = lx; };
+  thumb.onDragTo = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float)
+  {
     if (!state.original)
       return; // no image loaded yet — nothing to adjust
     float newThumbX =
         std::clamp(thumbXFor(s.get()) + (lx - *grabX), 0.0f, kMaxThumbX);
     s.set(lo + (newThumbX / kMaxThumbX) * (hi - lo));
-    if (!s.affectsPixels) {
+    if (!s.affectsPixels)
+    {
       state.markDirty(); // just repaint (an overlay may show the setting)
       return;
     }
@@ -4674,7 +5893,8 @@ static View buildSliderRow(const SliderSpec &spec) {
   // recompute (deferred to the next canvasDirtySource poll like any other
   // adjustment change — endPress polls right after this fires, so it lands
   // in the same frame the mouse is released).
-  thumb.onDragEnd = [s] {
+  thumb.onDragEnd = [s]
+  {
     if (s.onEnd)
       s.onEnd();
     if (!state.dragging)
@@ -4691,15 +5911,19 @@ static View buildSliderRow(const SliderSpec &spec) {
 
 // One Adjust-pane slider for one AdjustmentSpec: adding a new adjustment to
 // kAdjustmentSpecs needs no new UI code at all.
-static View buildAdjustmentSlider(const AdjustmentSpec &spec) {
+static View buildAdjustmentSlider(const AdjustmentSpec &spec)
+{
   const AdjId id = spec.id;
   SliderSpec s;
   s.name = spec.label;
   s.lo = spec.min;
   s.hi = spec.max;
-  s.get = [id] { return state.adjust.get(id); };
-  s.set = [id](float v) { state.adjust.set(id, v); };
-  s.format = [](float v) {
+  s.get = [id]
+  { return state.adjust.get(id); };
+  s.set = [id](float v)
+  { state.adjust.set(id, v); };
+  s.format = [](float v)
+  {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
   return buildSliderRow(s);
@@ -4710,14 +5934,18 @@ static MixChan gMixChan = MixChan::Hue; // which of Hue / Sat / Lum is shown
 
 // One Color Mixer slider (a band's Hue, Saturation or Luminance), tinted in
 // the band's own color. Same undo/preview behavior as every Adjust slider.
-static View buildMixSlider(MixChan chan, size_t band) {
+static View buildMixSlider(MixChan chan, size_t band)
+{
   SliderSpec s;
   s.name = mixBandName(band);
   s.lo = static_cast<float>(kMixMin);
   s.hi = static_cast<float>(kMixMax);
-  s.get = [chan, band] { return state.adjust.mix(chan, band); };
-  s.set = [chan, band](float v) { state.adjust.setMix(chan, band, v); };
-  s.format = [](float v) {
+  s.get = [chan, band]
+  { return state.adjust.mix(chan, band); };
+  s.set = [chan, band](float v)
+  { state.adjust.setMix(chan, band, v); };
+  s.format = [](float v)
+  {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
   s.hasAccent = true;
@@ -4726,7 +5954,8 @@ static View buildMixSlider(MixChan chan, size_t band) {
 }
 
 // Zeroes all 24 mixer sliders (one undo step).
-static void resetColorMix() {
+static void resetColorMix()
+{
   state.adjust.resetMix();
   state.markAdjustDirty();
 }
@@ -4743,7 +5972,8 @@ constexpr float kGradeTabW = 40.0f;
 static int gGradeMode = 0;   // 0 = 3-way, 1..4 = Shadows..Global
 static int gGradeActive = 1; // wheel shown in the H/S/L readout (Midtones)
 
-static const char *gradeRangeName(int r) {
+static const char *gradeRangeName(int r)
+{
   static const char *const n[kGradeRangeCount] = {"Shadows", "Midtones",
                                                   "Highlights", "Global"};
   return n[r];
@@ -4753,10 +5983,12 @@ static const char *gradeRangeName(int r) {
 constexpr float kGradeWheelBrightness[kGradeRangeCount] = {0.62f, 1.0f, 0.80f,
                                                            1.0f};
 
-static Color gradeHsv(float h, float s, float v, uint8_t a = 255) {
+static Color gradeHsv(float h, float s, float v, uint8_t a = 255)
+{
   float c[3];
   gradeHueToRgb(h, c);
-  auto to8 = [&](float f) {
+  auto to8 = [&](float f)
+  {
     const float o = (f * s + (1.0f - s)) * v * 255.0f; // blend toward white
     return static_cast<uint8_t>(std::lround(std::clamp(o, 0.0f, 255.0f)));
   };
@@ -4764,7 +5996,8 @@ static Color gradeHsv(float h, float s, float v, uint8_t a = 255) {
 }
 
 static size_t gradeHash(float v) { return std::hash<float>{}(v); }
-static size_t gradeMix(size_t a, size_t b) {
+static size_t gradeMix(size_t a, size_t b)
+{
   return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
 }
 
@@ -4772,7 +6005,8 @@ static size_t gradeMix(size_t a, size_t b) {
 // angle = hue (0 at 3 o'clock, counter-clockwise), radius = saturation,
 // white in the centre. Cached in a map so the CanvasImage address stays
 // stable (liteui caches the converted surface per image).
-static const CanvasImage &gradeWheelImage(int d, float brightness) {
+static const CanvasImage &gradeWheelImage(int d, float brightness)
+{
   static std::map<std::pair<int, int>, CanvasImage> cache;
   const auto key =
       std::make_pair(d, static_cast<int>(std::lround(brightness * 100)));
@@ -4782,8 +6016,10 @@ static const CanvasImage &gradeWheelImage(int d, float brightness) {
 
   CanvasImage img(d, d);
   const float R = d / 2.0f;
-  for (int y = 0; y < d; ++y) {
-    for (int x = 0; x < d; ++x) {
+  for (int y = 0; y < d; ++y)
+  {
+    for (int x = 0; x < d; ++x)
+    {
       const float dx = x + 0.5f - R, dy = y + 0.5f - R;
       const float dist = std::sqrt(dx * dx + dy * dy);
       const float alpha = std::clamp(R - dist + 0.5f, 0.0f, 1.0f); // AA rim
@@ -4803,16 +6039,19 @@ static const CanvasImage &gradeWheelImage(int d, float brightness) {
 
 // Applies `fn` to a copy of the current grade and commits it (key: see
 // AdjustmentSet::setGrade).
-static void gradeEdit(const std::function<void(ColorGrade &)> &fn, int key) {
+static void gradeEdit(const std::function<void(ColorGrade &)> &fn, int key)
+{
   ColorGrade g = state.adjust.grade();
   fn(g);
   state.adjust.setGrade(g, key);
 }
 
 // Leaves the low-res drag preview and asks for one full-resolution render.
-static void gradeEndDrag() {
+static void gradeEndDrag()
+{
   state.adjust.endGradeEdit();
-  if (state.dragging) {
+  if (state.dragging)
+  {
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
@@ -4822,29 +6061,36 @@ static void gradeEndDrag() {
 // A slider bound to one field (hue / sat / lum) of one wheel.
 static View buildGradeWheelSlider(const std::string &name, int range,
                                   float GradeWheel::*field, float lo, float hi,
-                                  int keyBase, float trackW, bool isSigned) {
+                                  int keyBase, float trackW, bool isSigned)
+{
   SliderSpec s;
   s.name = name;
   s.lo = lo;
   s.hi = hi;
   s.trackW = trackW;
-  s.get = [range, field] { return state.adjust.grade().wheel[range].*field; };
-  s.set = [range, field, keyBase](float v) {
-    gradeEdit([&](ColorGrade &g) { g.wheel[range].*field = std::round(v); },
+  s.get = [range, field]
+  { return state.adjust.grade().wheel[range].*field; };
+  s.set = [range, field, keyBase](float v)
+  {
+    gradeEdit([&](ColorGrade &g)
+              { g.wheel[range].*field = std::round(v); },
               keyBase + range);
     gGradeActive = range;
   };
-  s.format = [isSigned](float v) {
+  s.format = [isSigned](float v)
+  {
     const int i = static_cast<int>(std::lround(v));
     return isSigned && i > 0 ? "+" + std::to_string(i) : std::to_string(i);
   };
-  s.onEnd = [] { state.adjust.endGradeEdit(); };
+  s.onEnd = []
+  { state.adjust.endGradeEdit(); };
   return buildSliderRow(s);
 }
 
 // One hue/saturation wheel: click or drag sets hue (angle) + saturation
 // (radius); right-click resets both.
-static View buildGradeWheel(int range, int diameter, float pad) {
+static View buildGradeWheel(int range, int diameter, float pad)
+{
   const float size = static_cast<float>(diameter) + 2.0f * pad;
   View c;
   c.isCanvas = true;
@@ -4852,17 +6098,20 @@ static View buildGradeWheel(int range, int diameter, float pad) {
   c.style.height = Size::pixel(size);
   c.style.flexShrink = 0;
 
-  auto apply = [range, diameter, size](float lx, float ly, bool drag) {
+  auto apply = [range, diameter, size](float lx, float ly, bool drag)
+  {
     if (!state.original)
       return; // no image loaded yet — nothing to grade
     const float R = diameter / 2.0f, cx = size / 2.0f, cy = size / 2.0f;
     const float dx = lx - cx, dy = ly - cy;
     const float dist = std::sqrt(dx * dx + dy * dy);
     gradeEdit(
-        [&](ColorGrade &g) {
+        [&](ColorGrade &g)
+        {
           GradeWheel &w = g.wheel[range];
           w.sat = std::round(std::clamp(dist / R, 0.0f, 1.0f) * 100.0f);
-          if (dist > 2.0f) { // keep the old hue while sitting on the centre
+          if (dist > 2.0f)
+          { // keep the old hue while sitting on the centre
             float hue = std::atan2(-dy, dx) * 180.0f / kGradePi;
             if (hue < 0.0f)
               hue += 360.0f;
@@ -4875,14 +6124,18 @@ static View buildGradeWheel(int range, int diameter, float pad) {
       enterDrag(false); // switches recompute+paint to the preview path
     state.markAdjustDirty();
   };
-  c.onPressAt = [apply](float lx, float ly) { apply(lx, ly, false); };
-  c.onDragTo = [apply](float lx, float ly) { apply(lx, ly, true); };
-  c.onDragEnd = [] { gradeEndDrag(); };
+  c.onPressAt = [apply](float lx, float ly)
+  { apply(lx, ly, false); };
+  c.onDragTo = [apply](float lx, float ly)
+  { apply(lx, ly, true); };
+  c.onDragEnd = []
+  { gradeEndDrag(); };
   c.onRightClick = [range] { // reset hue + sat, keep luminance
     if (!state.original)
       return;
     gradeEdit(
-        [&](ColorGrade &g) {
+        [&](ColorGrade &g)
+        {
           g.wheel[range].hue = 0.0f;
           g.wheel[range].sat = 0.0f;
         },
@@ -4891,7 +6144,8 @@ static View buildGradeWheel(int range, int diameter, float pad) {
     state.markAdjustDirty();
   };
 
-  c.onPaint = [range, diameter](CanvasContext &ctx) {
+  c.onPaint = [range, diameter](CanvasContext &ctx)
+  {
     const GradeWheel &w = state.adjust.grade().wheel[range];
     const float cx = ctx.width() / 2, cy = ctx.height() / 2;
     const float R = diameter / 2.0f;
@@ -4918,7 +6172,8 @@ static View buildGradeWheel(int range, int diameter, float pad) {
     const float k = std::clamp(w.sat / 100.0f * 3.0f, 0.0f, 1.0f);
     const Color full = gradeHsv(w.hue, 1.0f, 1.0f);
     const Color grey{70, 70, 70};
-    auto lerp8 = [k](uint8_t a, uint8_t b) {
+    auto lerp8 = [k](uint8_t a, uint8_t b)
+    {
       return static_cast<uint8_t>(std::lround(a + (b - a) * k));
     };
     ctx.setFillColor(Color{lerp8(grey.r, full.r), lerp8(grey.g, full.g),
@@ -4942,7 +6197,8 @@ static View buildGradeWheel(int range, int diameter, float pad) {
 
   // Repaint only when this wheel changed (drag, undo/redo, reset, new image).
   auto last = std::make_shared<size_t>(~size_t{0});
-  c.canvasDirtySource = [range, last]() -> bool {
+  c.canvasDirtySource = [range, last]() -> bool
+  {
     const GradeWheel &w = state.adjust.grade().wheel[range];
     size_t h = gradeHash(w.hue);
     h = gradeMix(h, gradeHash(w.sat));
@@ -4956,23 +6212,27 @@ static View buildGradeWheel(int range, int diameter, float pad) {
 }
 
 // Eye icon: toggles that wheel's preview (one undo step).
-static View buildGradeEye(int range) {
+static View buildGradeEye(int range)
+{
   View c;
   c.isCanvas = true;
   c.style.width = Size::pixel(22);
   c.style.height = Size::pixel(14);
   c.style.flexShrink = 0;
-  c.onClick = [range] {
+  c.onClick = [range]
+  {
     if (!state.original)
       return;
     gradeEdit(
-        [&](ColorGrade &g) {
+        [&](ColorGrade &g)
+        {
           g.wheel[range].visible = !g.wheel[range].visible;
         },
         -1);
     state.markAdjustDirty();
   };
-  c.onPaint = [range](CanvasContext &ctx) {
+  c.onPaint = [range](CanvasContext &ctx)
+  {
     const bool on = state.adjust.grade().wheel[range].visible;
     const float cx = ctx.width() / 2, cy = ctx.height() / 2;
     const Color col = on ? Color{190, 190, 190} : Color{118, 118, 118};
@@ -4987,7 +6247,8 @@ static View buildGradeEye(int range) {
     ctx.beginPath();
     ctx.arc(cx, cy, 2.2f, 0, 2 * kGradePi);
     ctx.fill();
-    if (!on) {
+    if (!on)
+    {
       ctx.beginPath();
       ctx.moveTo(cx - 8, cy + 6);
       ctx.lineTo(cx + 8, cy - 6);
@@ -4995,7 +6256,8 @@ static View buildGradeEye(int range) {
     }
   };
   auto last = std::make_shared<int>(-1);
-  c.canvasDirtySource = [range, last]() -> bool {
+  c.canvasDirtySource = [range, last]() -> bool
+  {
     const int now = state.adjust.grade().wheel[range].visible ? 1 : 0;
     if (now == *last)
       return false;
@@ -5006,7 +6268,8 @@ static View buildGradeEye(int range) {
 }
 
 // wheel + eye row + luminance slider, as one column
-static View buildGradeWheelBlock(int range, int diameter, float pad) {
+static View buildGradeWheelBlock(int range, int diameter, float pad)
+{
   const float size = static_cast<float>(diameter) + 2.0f * pad;
   View col;
   col.style.direction = FlexDirection::Column;
@@ -5027,7 +6290,8 @@ static View buildGradeWheelBlock(int range, int diameter, float pad) {
 }
 
 // 3-way mode: big Midtones wheel on top, Shadows + Highlights below.
-static View buildGradeThreeWay() {
+static View buildGradeThreeWay()
+{
   View col;
   col.style.direction = FlexDirection::Column;
   col.style.alignItems = Align::Center;
@@ -5039,7 +6303,8 @@ static View buildGradeThreeWay() {
   row.style.direction = FlexDirection::Row;
   row.style.justifyContent = Justify::Center;
   row.style.gap = 2.0f;
-  auto labeled = [](int range) {
+  auto labeled = [](int range)
+  {
     View v;
     v.style.direction = FlexDirection::Column;
     v.style.alignItems = Align::Center;
@@ -5058,7 +6323,8 @@ static View buildGradeThreeWay() {
 }
 
 // Single-range mode: one large wheel + Hue / Saturation / Luminance sliders.
-static View buildGradeSingle(int range) {
+static View buildGradeSingle(int range)
+{
   View col;
   col.style.direction = FlexDirection::Column;
   col.style.alignItems = Align::Center;
@@ -5074,7 +6340,8 @@ static View buildGradeSingle(int range) {
 }
 
 // Resets every wheel, Blending and Balance (one undo step).
-static void resetColorGrade() {
+static void resetColorGrade()
+{
   state.adjust.setGrade(ColorGrade{}, -1);
   state.markAdjustDirty();
 }
@@ -5088,7 +6355,7 @@ static void resetColorGrade() {
 // The Masks pane (activity 7) edits `state.adjust.masks()`. Sliders go through
 // buildSliderRow like everywhere else; the shape can also be dragged on the
 // canvas (press inside = move, press a square handle = resize).
-constexpr int kMaskCtlMove = 90;   // undo-coalescing control ids (see maskEdit)
+constexpr int kMaskCtlMove = 90; // undo-coalescing control ids (see maskEdit)
 constexpr int kMaskCtlResizeX = 91;
 constexpr int kMaskCtlResizeY = 92;
 constexpr int kMaskCtlLinEnd = 93;
@@ -5103,13 +6370,15 @@ constexpr int kMaskCtlHeight = 4;
 constexpr int kMaskCtlLength = 5;
 constexpr int kMaskCtlAdj = 10; // + AdjId
 
-static bool maskToolActive() {
+static bool maskToolActive()
+{
   return state.activeActivity == 7 && state.image != nullptr;
 }
 
 // The selected mask's index, or -1. Clamped here instead of at every place
 // that can shrink the list (undo, redo, open, delete).
-static int selMask() {
+static int selMask()
+{
   const int n = static_cast<int>(state.adjust.masks().size());
   if (state.maskSel >= n)
     state.maskSel = n - 1;
@@ -5118,7 +6387,8 @@ static int selMask() {
   return state.maskSel;
 }
 
-static const Mask *selectedMask() {
+static const Mask *selectedMask()
+{
   const int i = selMask();
   return i < 0 ? nullptr : &state.adjust.masks()[static_cast<size_t>(i)];
 }
@@ -5129,7 +6399,8 @@ static const Mask *selectedMask() {
 // The selected mask's part that the canvas and the shape sliders work on. A
 // mask can hold several parts (see MaskComposite); like selMask() this is
 // clamped on read, so undo / delete / open never need to fix it up.
-static int selPart() {
+static int selPart()
+{
   const Mask *m = selectedMask();
   if (!m || m->parts.empty())
     return 0;
@@ -5140,22 +6411,26 @@ static int selPart() {
     state.mask.part = 0;
   return state.mask.part;
 }
-static const MaskPart *selectedPart() {
+static const MaskPart *selectedPart()
+{
   const Mask *m = selectedMask();
   if (!m || m->parts.empty())
     return nullptr;
   return &m->parts[static_cast<size_t>(selPart())];
 }
-static MaskType selectedPartType() {
+static MaskType selectedPartType()
+{
   const MaskPart *p = selectedPart();
   return p ? p->type() : MaskType::Count;
 }
-static bool selectedIsBrush() { // the SELECTED PART is a brush
+static bool selectedIsBrush()
+{ // the SELECTED PART is a brush
   return selectedPartType() == MaskType::Brush;
 }
 // "Show mask tint": a brush that stands alone has no outline, so it keeps its
 // own switch (on by default); everything else shares the common one.
-static bool &tintFlag() {
+static bool &tintFlag()
+{
   const Mask *m = selectedMask();
   if (m && m->parts.size() == 1 && m->parts[0].type() == MaskType::Brush)
     return state.mask.brushTint;
@@ -5166,21 +6441,25 @@ static bool &tintFlag() {
 // masks are STORED against the original picture). Everything on the canvas —
 // outlines, hit tests, drags — works on this form.
 template <class Shape>
-static std::optional<Shape> shapeInView(const MaskPart &p, const GeoFrame &f) {
+static std::optional<Shape> shapeInView(const MaskPart &p, const GeoFrame &f)
+{
   if (const auto *r = std::get_if<Shape>(&p.shape))
     return r->toSource(f);
   return std::nullopt;
 }
 static std::optional<RadialShape> radialInView(const MaskPart &p,
-                                               const GeoFrame &f) {
+                                               const GeoFrame &f)
+{
   return shapeInView<RadialShape>(p, f);
 }
 static std::optional<LinearShape> linearInView(const MaskPart &p,
-                                               const GeoFrame &f) {
+                                               const GeoFrame &f)
+{
   return shapeInView<LinearShape>(p, f);
 }
 static std::optional<BrushShape> brushInView(const MaskPart &p,
-                                             const GeoFrame &f) {
+                                             const GeoFrame &f)
+{
   return shapeInView<BrushShape>(p, f);
 }
 
@@ -5188,7 +6467,8 @@ static std::optional<BrushShape> brushInView(const MaskPart &p,
 // (only the fields `fn` changed; see RadialShape::applySourceEdit).
 template <class Shape>
 static void editShapeInView(Mask &m, size_t part, const GeoFrame &f,
-                            const std::function<void(Shape &)> &fn) {
+                            const std::function<void(Shape &)> &fn)
+{
   if (part >= m.parts.size())
     return;
   auto *stored = std::get_if<Shape>(&m.parts[part].shape);
@@ -5200,11 +6480,13 @@ static void editShapeInView(Mask &m, size_t part, const GeoFrame &f,
   stored->applySourceEdit(before, after, f);
 }
 static void editRadialInView(Mask &m, size_t part, const GeoFrame &f,
-                             const std::function<void(RadialShape &)> &fn) {
+                             const std::function<void(RadialShape &)> &fn)
+{
   editShapeInView<RadialShape>(m, part, f, fn);
 }
 static void editLinearInView(Mask &m, size_t part, const GeoFrame &f,
-                             const std::function<void(LinearShape &)> &fn) {
+                             const std::function<void(LinearShape &)> &fn)
+{
   editShapeInView<LinearShape>(m, part, f, fn);
 }
 
@@ -5215,7 +6497,8 @@ static void editLinearInView(Mask &m, size_t part, const GeoFrame &f,
 // Does NOT recompute the picture — slider / canvas drags do that through the
 // usual markAdjustDirty path; discrete actions call maskCommitDiscrete.
 static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
-                     int control) {
+                     int control)
+{
   MaskSet ms = state.adjust.masks();
   if (idx < 0 || idx >= static_cast<int>(ms.size()))
     return;
@@ -5229,7 +6512,8 @@ static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
 
 // A one-off change to the selected mask (toggle, reset): its own undo step and
 // an immediate recompute.
-static void maskEditDiscrete(const std::function<void(Mask &)> &fn) {
+static void maskEditDiscrete(const std::function<void(Mask &)> &fn)
+{
   const int i = selMask();
   if (i < 0)
     return;
@@ -5238,9 +6522,168 @@ static void maskEditDiscrete(const std::function<void(Mask &)> &fn) {
   state.markDirty();
 }
 
+static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
+{
+  const size_t part = static_cast<size_t>(selPart());
+  maskEditDiscrete([&](Mask &mk)
+                   {
+    if (part < mk.parts.size())
+      if (auto *o = std::get_if<ObjectShape>(&mk.parts[part].shape))
+        o->map = m; });
+  state.maskShowTint = true;
+  state.markDirty();
+}
+
+// Step-1 stand-in for a segmenter: pixels brighter than the picture's mean.
+static std::shared_ptr<const ObjectMap> makeTestObjectMap()
+{
+  if (!state.original)
+    return nullptr;
+  const CanvasImage &im = *state.original;
+  const int k = std::max(1, (std::max(im.width, im.height) +
+                             kObjectMapEdge - 1) /
+                                kObjectMapEdge);
+  const int w = std::max(1, im.width / k), h = std::max(1, im.height / k);
+  std::vector<int> luma(static_cast<size_t>(w) * h);
+  double sum = 0;
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+    {
+      const uint8_t *p =
+          &im.pixels[(static_cast<size_t>(y * k) * im.width + x * k) * 4];
+      const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
+      luma[static_cast<size_t>(y) * w + x] = l;
+      sum += l;
+    }
+  const double mean = sum / static_cast<double>(luma.size());
+  auto m = std::make_shared<ObjectMap>();
+  m->w = w;
+  m->h = h;
+  m->id = nextObjectMapId();
+  m->a.resize(luma.size());
+  for (size_t i = 0; i < luma.size(); ++i)
+    m->a[i] = luma[i] > mean ? 255 : 0;
+  return m;
+}
+
+static bool selectedIsObject()
+{
+  return selectedPartType() == MaskType::Object;
+}
+
+// The prompts a new click builds on: the ones still being segmented for this
+// part, else the committed ones. Original-picture fractions.
+static std::vector<ObjectPrompt> objectCurrentPrompts(int mask, int part)
+{
+  const MaskUi::ObjPending &p = state.mask.objPending;
+  if (p.mask == mask && p.part == part)
+    return p.prompts;
+  const MaskSet &ms = state.adjust.masks();
+  if (mask < 0 || mask >= static_cast<int>(ms.size()))
+    return {};
+  const Mask &m = ms[static_cast<size_t>(mask)];
+  if (part < 0 || part >= static_cast<int>(m.parts.size()))
+    return {};
+  if (const auto *o = std::get_if<ObjectShape>(&m.parts[static_cast<size_t>(part)].shape))
+    return o->prompts;
+  return {};
+}
+
+static void clearSelectedObject()
+{
+  segmentWorker.invalidate();
+  state.mask.objPending = {};
+  const size_t part = static_cast<size_t>(selPart());
+  maskEditDiscrete([part](Mask &m)
+                   {
+    if (part < m.parts.size())
+      if (auto *o = std::get_if<ObjectShape>(&m.parts[part].shape)) {
+        o->map.reset();
+        o->prompts.clear();
+      } });
+}
+
+static void objectPrefetch()
+{
+  if (!state.original || segmentWorker.outstanding() ||
+      state.mask.encodedKey == state.imageSerial)
+    return;
+  SegmentRequest req;
+  req.image = state.original;
+  req.imageKey = state.imageSerial;
+  req.prefetch = true;
+  segmentWorker.submit(std::move(req));
+  setStatus("Preparing object selection...", false);
+}
+
+// A click on the picture with an object part selected. Left click adds a
+// point (foreground, or background if "Click adds Background" is on);
+// right click adds the opposite kind; clicking an existing dot removes it.
+static void objectPress(float lx, float ly, bool rightClick)
+{
+  state.openMenu = -1;
+  if (!maskToolActive() || !selectedIsObject() || !state.original)
+    return;
+  const int mask = selMask(), part = selPart();
+  const GeoFrame frame = state.adjust.geoFrame();
+  const float W = state.docWidth(), H = state.docHeight();
+  const float px = lx / state.zoom, py = ly / state.zoom;
+  std::vector<ObjectPrompt> prompts = objectCurrentPrompts(mask, part);
+
+  // Existing dot under the pointer -> remove it.
+  const float tol = kMaskHitPx / state.zoom;
+  bool removed = false;
+  for (size_t k = 0; k < prompts.size(); ++k)
+  {
+    double sx, sy;
+    frame.toSrc(prompts[k].x * frame.origW, prompts[k].y * frame.origH, sx,
+                sy);
+    if (std::hypot(sx / frame.srcW * W - px, sy / frame.srcH * H - py) <= tol)
+    {
+      prompts.erase(prompts.begin() + static_cast<std::ptrdiff_t>(k));
+      removed = true;
+      break;
+    }
+  }
+  if (!removed)
+  {
+    double ox, oy; // view -> original
+    frame.toOrig(px / W * frame.srcW, py / H * frame.srcH, ox, oy);
+    if (ox < 0 || oy < 0 || ox >= frame.origW || oy >= frame.origH)
+      return; // outside the picture (straighten's empty corners)
+    ObjectPrompt p;
+    p.x = static_cast<float>(ox / frame.origW);
+    p.y = static_cast<float>(oy / frame.origH);
+    p.fg = (rightClick != state.mask.objBg) ? false : true;
+    // left + objBg=false -> fg; left + objBg=true -> bg;
+    // right + objBg=false -> bg; right + objBg=true -> fg
+    prompts.push_back(p);
+  }
+  if (prompts.empty())
+  { // last dot removed: nothing selected any more
+    clearSelectedObject();
+    return;
+  }
+  SegmentRequest req;
+  req.image = state.original;
+  req.imageKey = state.imageSerial;
+  req.prompts = prompts;
+  req.maskIdx = mask;
+  req.part = part;
+  state.mask.objPending = {mask, part, std::move(prompts)};
+  segmentWorker.submit(std::move(req));
+  setStatus(state.mask.encodedKey == state.imageSerial
+                ? "Selecting object..."
+                : "Analyzing image (first selection takes a moment)...",
+            false);
+  state.markDirty();
+}
+
 // The starting shape of each kind of mask (nullopt for an unknown kind).
-static std::optional<MaskShape> newMaskShape(MaskType t) {
-  switch (t) {
+static std::optional<MaskShape> newMaskShape(MaskType t)
+{
+  switch (t)
+  {
   case MaskType::Radial:
     // Centered on the picture as it is shown now.
     return RadialShape::fromSource(RadialShape{}, state.adjust.geoFrame());
@@ -5250,16 +6693,22 @@ static std::optional<MaskShape> newMaskShape(MaskType t) {
     return BrushShape{}; // empty: the first drag on the image paints
   case MaskType::Luminosity:
     return LuminosityShape{}; // not spatial: nothing to place
+  case MaskType::Object:
+    return ObjectShape{};
   default:
     return std::nullopt;
   }
 }
 
-static void addMask(MaskType t) {
+static void objectPrefetch();
+
+static void addMask(MaskType t)
+{
   if (!state.original)
     return;
   MaskSet ms = state.adjust.masks();
-  if (ms.size() >= kMaxMasks) {
+  if (ms.size() >= kMaxMasks)
+  {
     setStatus("Mask limit reached (" + std::to_string(kMaxMasks) + ")", true);
     return;
   }
@@ -5274,9 +6723,13 @@ static void addMask(MaskType t) {
   state.mask.part = 0;
   // A new mask has no sliders moved yet, so no pixels change: overlay only.
   state.markDirty();
+
+  if (t == MaskType::Object)
+    objectPrefetch();
 }
 
-static void deleteSelectedMask() {
+static void deleteSelectedMask()
+{
   const int i = selMask();
   if (i < 0)
     return;
@@ -5293,7 +6746,8 @@ static void deleteSelectedMask() {
 // Adds a part of kind `t` (joined with Add; change it with setPartOp) and
 // selects it. The combined result is what matters from here on, so the tint
 // is switched on.
-static void addPart(MaskType t) {
+static void addPart(MaskType t)
+{
   const int i = selMask();
   if (i < 0)
     return;
@@ -5302,7 +6756,8 @@ static void addPart(MaskType t) {
     return;
   MaskSet ms = state.adjust.masks();
   Mask &m = ms[static_cast<size_t>(i)];
-  if (m.parts.size() >= kMaxMaskParts) {
+  if (m.parts.size() >= kMaxMaskParts)
+  {
     setStatus("Part limit reached (" + std::to_string(kMaxMaskParts) + ")",
               true);
     return;
@@ -5313,38 +6768,45 @@ static void addPart(MaskType t) {
   state.maskShowTint = true;
   updateImageFromAdjustments();
   state.markDirty();
+
+  if (t == MaskType::Object)
+    objectPrefetch();
 }
 
 // How the selected part joins the ones before it (the first part has none).
-static void setPartOp(MaskOp op) {
+static void setPartOp(MaskOp op)
+{
   const size_t j = static_cast<size_t>(selPart());
   if (j == 0)
     return;
-  maskEditDiscrete([&](Mask &m) {
+  maskEditDiscrete([&](Mask &m)
+                   {
     if (j < m.parts.size())
-      m.parts[j].op = op;
-  });
+      m.parts[j].op = op; });
 }
 
-static void removeSelectedPart() {
+static void removeSelectedPart()
+{
   const Mask *sm = selectedMask();
   if (!sm || sm->parts.size() <= 1)
     return;
   const size_t j = static_cast<size_t>(selPart());
-  maskEditDiscrete([&](Mask &m) {
+  maskEditDiscrete([&](Mask &m)
+                   {
     if (m.parts.size() > 1 && j < m.parts.size())
-      m.parts.erase(m.parts.begin() + static_cast<std::ptrdiff_t>(j));
-  });
+      m.parts.erase(m.parts.begin() + static_cast<std::ptrdiff_t>(j)); });
   state.mask.part = static_cast<int>(j) - 1; // the one before; selPart clamps
   state.markDirty();
 }
 
 // A drag on the canvas or a mask slider ended: leave the low-res preview and
 // ask for one full-resolution render (same job as gradeEndDrag).
-static void maskEndDrag() {
+static void maskEndDrag()
+{
   state.mask.drag = MaskUi::Drag::None;
   state.adjust.endMaskEdit();
-  if (state.dragging) {
+  if (state.dragging)
+  {
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
@@ -5352,15 +6814,17 @@ static void maskEndDrag() {
 }
 
 // ---- Radial mask geometry on the canvas (document pixels) ----
-struct MaskGeom {
-  float cx, cy;   // center
-  float rx, ry;   // half-axes
-  float ang;      // radians, clockwise
-  float c, s;     // cos, sin of ang
-  float S;        // the shorter document side (radius unit)
+struct MaskGeom
+{
+  float cx, cy; // center
+  float rx, ry; // half-axes
+  float ang;    // radians, clockwise
+  float c, s;   // cos, sin of ang
+  float S;      // the shorter document side (radius unit)
 };
 
-static MaskGeom radialGeom(const RadialShape &r) {
+static MaskGeom radialGeom(const RadialShape &r)
+{
   MaskGeom g{};
   const float W = state.docWidth(), H = state.docHeight();
   g.S = std::min(W, H);
@@ -5374,7 +6838,8 @@ static MaskGeom radialGeom(const RadialShape &r) {
   return g;
 }
 
-enum {
+enum
+{
   kMaskHitNone = 0,
   kMaskHitBody,
   kMaskHitX,
@@ -5385,15 +6850,18 @@ enum {
 
 // What is under (px, py)? Handles (only for the selected mask) win over the
 // body. The four handles sit on the rotated axes at the ellipse outline.
-static int maskHit(const RadialShape &r, float px, float py, bool handles) {
+static int maskHit(const RadialShape &r, float px, float py, bool handles)
+{
   const MaskGeom g = radialGeom(r);
   const float tol = kMaskHitPx / state.zoom;
-  if (handles) {
+  if (handles)
+  {
     const float hx[2] = {g.cx + g.rx * g.c, g.cx - g.rx * g.c};
     const float hy[2] = {g.cy + g.rx * g.s, g.cy - g.rx * g.s};
     const float vx[2] = {g.cx - g.ry * g.s, g.cx + g.ry * g.s};
     const float vy[2] = {g.cy + g.ry * g.c, g.cy - g.ry * g.c};
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < 2; ++k)
+    {
       if (std::hypot(px - hx[k], py - hy[k]) <= tol)
         return kMaskHitX;
       if (std::hypot(px - vx[k], py - vy[k]) <= tol)
@@ -5407,12 +6875,13 @@ static int maskHit(const RadialShape &r, float px, float py, bool handles) {
 }
 
 // ---- Linear mask geometry on the canvas (document pixels) ----
-struct LinGeom {
-  float cx, cy;   // center
-  float ux, uy;   // unit direction of fade-out
-  float len;      // half length of the ramp
-  float ang;      // radians
-  float S;        // the shorter document side
+struct LinGeom
+{
+  float cx, cy; // center
+  float ux, uy; // unit direction of fade-out
+  float len;    // half length of the ramp
+  float ang;    // radians
+  float S;      // the shorter document side
   // The weight-1 line's and the weight-0 line's axis points.
   float sx() const { return cx - ux * len; }
   float sy() const { return cy - uy * len; }
@@ -5420,7 +6889,8 @@ struct LinGeom {
   float ey() const { return cy + uy * len; }
 };
 
-static LinGeom linearGeom(const LinearShape &l) {
+static LinGeom linearGeom(const LinearShape &l)
+{
   LinGeom g{};
   const float W = state.docWidth(), H = state.docHeight();
   g.S = std::min(W, H);
@@ -5435,10 +6905,12 @@ static LinGeom linearGeom(const LinearShape &l) {
 
 // Handles (selected mask only) sit where the axis crosses the two lines; the
 // body is the band between the lines.
-static int linearHit(const LinearShape &l, float px, float py, bool handles) {
+static int linearHit(const LinearShape &l, float px, float py, bool handles)
+{
   const LinGeom g = linearGeom(l);
   const float tol = kMaskHitPx / state.zoom;
-  if (handles) {
+  if (handles)
+  {
     if (std::hypot(px - g.ex(), py - g.ey()) <= tol)
       return kMaskHitLinEnd;
     if (std::hypot(px - g.sx(), py - g.sy()) <= tol)
@@ -5456,7 +6928,8 @@ static int linearHit(const LinearShape &l, float px, float py, bool handles) {
 
 // A brush mask has no body to grab; its "pin" (where its first stroke began)
 // is what an unselected brush is picked by.
-static bool brushPinHit(const BrushShape &b, float px, float py) {
+static bool brushPinHit(const BrushShape &b, float px, float py)
+{
   if (b.strokes.empty() || b.strokes.front().pts.empty())
     return false;
   const BrushPt &p = b.strokes.front().pts.front();
@@ -5465,7 +6938,8 @@ static bool brushPinHit(const BrushShape &b, float px, float py) {
          tol;
 }
 
-static void brushBegin(float px, float py) {
+static void brushBegin(float px, float py)
+{
   const int i = selMask();
   if (i < 0)
     return;
@@ -5482,20 +6956,23 @@ static void brushBegin(float px, float py) {
   bool full = false;
   maskEdit(
       i,
-      [&](Mask &m) {
+      [&](Mask &m)
+      {
         auto *b = part < m.parts.size()
                       ? std::get_if<BrushShape>(&m.parts[part].shape)
                       : nullptr;
         if (!b)
           return;
-        if (b->strokes.size() >= kBrushMaxStrokes) {
+        if (b->strokes.size() >= kBrushMaxStrokes)
+        {
           full = true;
           return;
         }
         b->strokes.push_back(std::move(st));
       },
       kMaskCtlBrush);
-  if (full) {
+  if (full)
+  {
     setStatus("Brush stroke limit reached (" + std::to_string(kBrushMaxStrokes) +
                   ")",
               true);
@@ -5509,7 +6986,8 @@ static void brushBegin(float px, float py) {
   state.markDirty();
 }
 
-static void brushDragTo(float px, float py) {
+static void brushDragTo(float px, float py)
+{
   const int i = selMask();
   if (i < 0)
     return;
@@ -5522,13 +7000,15 @@ static void brushDragTo(float px, float py) {
   // Skip points closer than a fraction of the radius: they add nothing to the
   // rendered stroke and would only bloat it (and every undo snapshot).
   const float gap = std::max(rad * kBrushPointGap, 0.5f / state.zoom);
-  if (std::hypot(px - u.lastX, py - u.lastY) >= gap) {
+  if (std::hypot(px - u.lastX, py - u.lastY) >= gap)
+  {
     const GeoFrame frame = state.adjust.geoFrame();
     const BrushPt pt =
         BrushShape::pointFromSource(BrushPt{px / W, py / H}, frame);
     maskEdit(
         i,
-        [&](Mask &m) {
+        [&](Mask &m)
+        {
           auto *b = part < m.parts.size()
                         ? std::get_if<BrushShape>(&m.parts[part].shape)
                         : nullptr;
@@ -5547,7 +7027,8 @@ static void brushDragTo(float px, float py) {
   state.markDirty(); // the cursor ring follows the pointer
 }
 
-static void maskPress(float lx, float ly) {
+static void maskPress(float lx, float ly)
+{
   if (!maskToolActive())
     return;
   state.mask.drag = MaskUi::Drag::None;
@@ -5557,23 +7038,28 @@ static void maskPress(float lx, float ly) {
   const int sel = selMask();
   const int selP = selPart();
   const int nMasks = static_cast<int>(ms.size());
-  const auto partCount = [&](int i) {
+  const auto partCount = [&](int i)
+  {
     return static_cast<int>(ms[static_cast<size_t>(i)].parts.size());
   };
-  const auto partAt = [&](int i, int j) -> const MaskPart & {
+  const auto partAt = [&](int i, int j) -> const MaskPart &
+  {
     return ms[static_cast<size_t>(i)].parts[static_cast<size_t>(j)];
   };
   // With a brush part selected every press paints (pick another part from
   // the list, or its pin if it is a brush).
   if (sel >= 0 && partCount(sel) > 0 &&
-      std::holds_alternative<BrushShape>(partAt(sel, selP).shape)) {
+      std::holds_alternative<BrushShape>(partAt(sel, selP).shape))
+  {
     bool picked = false;
     for (int i = nMasks - 1; i >= 0 && !picked; --i)
-      for (int j = partCount(i) - 1; j >= 0 && !picked; --j) {
+      for (int j = partCount(i) - 1; j >= 0 && !picked; --j)
+      {
         if (i == sel && j == selP)
           continue;
         if (const auto bv = brushInView(partAt(i, j), frame))
-          if (brushPinHit(*bv, px, py)) {
+          if (brushPinHit(*bv, px, py))
+          {
             state.maskSel = i;
             state.mask.part = j;
             state.markDirty();
@@ -5584,21 +7070,34 @@ static void maskPress(float lx, float ly) {
       brushBegin(px, py);
     return;
   }
+
+  if (sel >= 0 && partCount(sel) > 0 &&
+      std::holds_alternative<ObjectShape>(partAt(sel, selP).shape))
+  {
+    objectPress(lx, ly, false); // every press is a prompt, like a brush
+    return;
+  }
   // Tries part `j` of mask `i`; on a hit selects it and starts the matching
   // drag.
-  auto tryPart = [&](int i, int j, bool isSelected) -> bool {
+  auto tryPart = [&](int i, int j, bool isSelected) -> bool
+  {
     const MaskPart &m = partAt(i, j);
     int hit = kMaskHitNone;
     float shapeCx = 0, shapeCy = 0; // center, fraction of the picture
-    if (const auto rv = radialInView(m, frame)) {
+    if (const auto rv = radialInView(m, frame))
+    {
       hit = maskHit(*rv, px, py, isSelected);
       shapeCx = rv->cx;
       shapeCy = rv->cy;
-    } else if (const auto lv = linearInView(m, frame)) {
+    }
+    else if (const auto lv = linearInView(m, frame))
+    {
       hit = linearHit(*lv, px, py, isSelected);
       shapeCx = lv->cx;
       shapeCy = lv->cy;
-    } else if (const auto bv = brushInView(m, frame)) {
+    }
+    else if (const auto bv = brushInView(m, frame))
+    {
       // Nothing to grab on a brush: its pin only selects it.
       if (!brushPinHit(*bv, px, py))
         return false;
@@ -5611,15 +7110,24 @@ static void maskPress(float lx, float ly) {
       return false;
     state.maskSel = i;
     state.mask.part = j;
-    if (hit == kMaskHitX) {
+    if (hit == kMaskHitX)
+    {
       state.mask.drag = MaskUi::Drag::ResizeX;
-    } else if (hit == kMaskHitY) {
+    }
+    else if (hit == kMaskHitY)
+    {
       state.mask.drag = MaskUi::Drag::ResizeY;
-    } else if (hit == kMaskHitLinEnd) {
+    }
+    else if (hit == kMaskHitLinEnd)
+    {
       state.mask.drag = MaskUi::Drag::LinEnd;
-    } else if (hit == kMaskHitLinStart) {
+    }
+    else if (hit == kMaskHitLinStart)
+    {
       state.mask.drag = MaskUi::Drag::LinStart;
-    } else {
+    }
+    else
+    {
       state.mask.drag = MaskUi::Drag::Move;
       state.mask.grabX = px - shapeCx * state.docWidth();
       state.mask.grabY = py - shapeCy * state.docHeight();
@@ -5636,7 +7144,8 @@ static void maskPress(float lx, float ly) {
       if (j != selP && tryPart(sel, j, false))
         return;
   // Otherwise clicking inside another mask selects it (topmost first).
-  for (int i = nMasks - 1; i >= 0; --i) {
+  for (int i = nMasks - 1; i >= 0; --i)
+  {
     if (i == sel)
       continue;
     for (int j = partCount(i) - 1; j >= 0; --j)
@@ -5645,7 +7154,8 @@ static void maskPress(float lx, float ly) {
   }
 }
 
-static void maskDrag(float lx, float ly) {
+static void maskDrag(float lx, float ly)
+{
   if (!maskToolActive() || state.mask.drag == MaskUi::Drag::None)
     return;
   const int i = selMask();
@@ -5654,7 +7164,8 @@ static void maskDrag(float lx, float ly) {
   const float W = state.docWidth(), H = state.docHeight();
   const float px = lx / state.zoom, py = ly / state.zoom;
   const MaskUi::Drag d = state.mask.drag;
-  if (d == MaskUi::Drag::Paint) {
+  if (d == MaskUi::Drag::Paint)
+  {
     brushDragTo(px, py);
     return;
   }
@@ -5663,8 +7174,10 @@ static void maskDrag(float lx, float ly) {
   const size_t part = static_cast<size_t>(selPart());
   maskEdit(
       i,
-      [&](Mask &m) {
-        editRadialInView(m, part, frame, [&](RadialShape &r) {
+      [&](Mask &m)
+      {
+        editRadialInView(m, part, frame, [&](RadialShape &r)
+                         {
           if (d == MaskUi::Drag::Move) {
             r.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             r.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -5678,9 +7191,9 @@ static void maskDrag(float lx, float ly) {
             else
               r.ry = std::clamp(std::fabs(-dx * g.s + dy * g.c) / g.S,
                                 kMaskMinRadius, kMaskMaxRadius);
-          }
-        });
-        editLinearInView(m, part, frame, [&](LinearShape &l) {
+          } });
+        editLinearInView(m, part, frame, [&](LinearShape &l)
+                         {
           if (d == MaskUi::Drag::Move) {
             l.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             l.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -5695,14 +7208,13 @@ static void maskDrag(float lx, float ly) {
             l.len = std::clamp(dist / g.S, kMaskMinRadius, kMaskMaxRadius);
             if (dist > 1e-3f)
               l.angle = std::atan2(dy, dx) * (180.0f / 3.14159265358979f);
-          }
-        });
+          } });
       },
-      d == MaskUi::Drag::Move       ? kMaskCtlMove
-      : d == MaskUi::Drag::ResizeX  ? kMaskCtlResizeX
-      : d == MaskUi::Drag::ResizeY  ? kMaskCtlResizeY
-      : d == MaskUi::Drag::LinEnd   ? kMaskCtlLinEnd
-                                    : kMaskCtlLinStart);
+      d == MaskUi::Drag::Move      ? kMaskCtlMove
+      : d == MaskUi::Drag::ResizeX ? kMaskCtlResizeX
+      : d == MaskUi::Drag::ResizeY ? kMaskCtlResizeY
+      : d == MaskUi::Drag::LinEnd  ? kMaskCtlLinEnd
+                                   : kMaskCtlLinStart);
   enterDrag(false); // recompute on the cheap preview path while held
   state.markAdjustDirty();
   state.markDirty(); // the overlay follows the pointer
@@ -5710,7 +7222,8 @@ static void maskDrag(float lx, float ly) {
 
 // Red tint showing the mask's weight (1 = solid, 0 = clear) over the picture.
 static void paintRadialTint(CanvasContext &ctx, const RadialShape &r,
-                            bool invert) {
+                            bool invert)
+{
   const MaskGeom g = radialGeom(r);
   const float W = state.docWidth(), H = state.docHeight();
   const float inner = r.innerFrac();
@@ -5736,7 +7249,8 @@ static void paintRadialTint(CanvasContext &ctx, const RadialShape &r,
 // Outline of one radial mask; the selected one also gets its feather ring
 // and handles.
 static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
-                               bool selected) {
+                               bool selected)
+{
   const MaskGeom g = radialGeom(r);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
   constexpr float kTwoPi = 6.28318530717959f;
@@ -5756,7 +7270,8 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
   // Where the feather begins (skipped when it would sit on the outline or
   // collapse into the center).
   const float inner = r.innerFrac();
-  if (r.feather > 0.02f && inner > 0.02f) {
+  if (r.feather > 0.02f && inner > 0.02f)
+  {
     ctx.beginPath();
     ctx.ellipse(g.cx, g.cy, g.rx * inner, g.ry * inner, g.ang, 0.0f, kTwoPi);
     ctx.setLineDash({4.0f * px, 4.0f * px});
@@ -5775,7 +7290,8 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
   ctx.setFillColor(kColorWhite);
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < 4; ++k)
+  {
     ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
     ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
   }
@@ -5792,10 +7308,12 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
 // to the weight-0 line, with stops sampled from the same smoothstep the
 // renderer uses (the gradient itself is piecewise linear).
 static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
-                            bool invert) {
+                            bool invert)
+{
   const LinGeom g = linearGeom(l);
   const float W = state.docWidth(), H = state.docHeight();
-  const auto alphaAt = [invert](float t) -> Color {
+  const auto alphaAt = [invert](float t) -> Color
+  {
     float w = 1.0f - t * t * (3.0f - 2.0f * t);
     if (invert)
       w = 1.0f - w;
@@ -5803,7 +7321,8 @@ static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
   };
   CanvasGradient grad = CanvasGradient::linear(g.sx(), g.sy(), g.ex(), g.ey());
   constexpr int kStops = 8;
-  for (int k = 0; k <= kStops; ++k) {
+  for (int k = 0; k <= kStops; ++k)
+  {
     const float t = static_cast<float>(k) / kStops;
     grad.addColorStop(t, alphaAt(t));
   }
@@ -5816,20 +7335,23 @@ static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
 // Outline of one linear mask: the two lines of the ramp; the selected one
 // also gets the center line, the axis with an arrowhead, and its handles.
 static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
-                               bool selected) {
+                               bool selected)
+{
   const LinGeom g = linearGeom(l);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
   constexpr float kTwoPi = 6.28318530717959f;
   const float W = state.docWidth(), H = state.docHeight();
-  const float R = W + H;      // long enough to cross the document
+  const float R = W + H;             // long enough to cross the document
   const float vx = -g.uy, vy = g.ux; // along the lines
-  const auto line = [&](float ax, float ay) {
+  const auto line = [&](float ax, float ay)
+  {
     ctx.beginPath();
     ctx.moveTo(ax - vx * R, ay - vy * R);
     ctx.lineTo(ax + vx * R, ay + vy * R);
   };
   const auto strokeTwice = [&](float wOuter, float wInner, uint8_t a1,
-                               uint8_t a2) {
+                               uint8_t a2)
+  {
     ctx.setStrokeColor(Color{0, 0, 0, a1});
     ctx.setLineWidth(px * wOuter);
     ctx.stroke();
@@ -5849,7 +7371,8 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
   strokeTwice(3.0f, selected ? 1.5f : 1.0f, a1, a2);
   line(g.ex(), g.ey());
   strokeTwice(3.0f, selected ? 1.5f : 1.0f, a1, a2);
-  if (selected) {
+  if (selected)
+  {
     line(g.cx, g.cy); // the 50% line
     ctx.setLineDash({4.0f * px, 4.0f * px});
     ctx.setStrokeColor(Color{255, 255, 255, 170});
@@ -5884,7 +7407,8 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
   ctx.setFillColor(kColorWhite);
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (int k = 0; k < 2; ++k) {
+  for (int k = 0; k < 2; ++k)
+  {
     ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
     ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
   }
@@ -5903,7 +7427,8 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
 // gets adjusted. Cached until the strokes or the picture's size change (the
 // shape is compared, which is cheap next to rasterizing it).
 static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
-                                                   bool invert) {
+                                                   bool invert)
+{
   const float W = state.docWidth(), H = state.docHeight();
   const float sc =
       std::min(1.0f, static_cast<float>(kBrushTintEdge) / std::max(W, H));
@@ -5916,11 +7441,13 @@ static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
   const BrushEval ev = b.prepare(tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y) {
+  for (int y = 0; y < th; ++y)
+  {
     ev.rowWeights(y, 0, tw, wb.data());
     uint8_t *row = img->pixels.data() +
                    static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
-    for (int x = 0; x < tw; ++x) {
+    for (int x = 0; x < tw; ++x)
+    {
       float w = wb[static_cast<size_t>(x)];
       if (invert)
         w = 1.0f - w;
@@ -5938,7 +7465,8 @@ static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
 }
 
 static void paintBrushTint(CanvasContext &ctx, const BrushShape &b,
-                           bool invert) {
+                           bool invert)
+{
   if (b.strokes.empty() && !invert)
     return; // nothing painted yet
   const auto img = brushTintImage(b, invert);
@@ -5948,7 +7476,8 @@ static void paintBrushTint(CanvasContext &ctx, const BrushShape &b,
 // The pin marks where a brush mask's first stroke began (all a brush has
 // for an "outline"); the selected one is drawn solid.
 static void paintBrushPin(CanvasContext &ctx, const BrushShape &b,
-                          bool selected) {
+                          bool selected)
+{
   if (b.strokes.empty() || b.strokes.front().pts.empty())
     return;
   const BrushPt &p = b.strokes.front().pts.front();
@@ -5967,7 +7496,8 @@ static void paintBrushPin(CanvasContext &ctx, const BrushShape &b,
 
 // The brush's footprint at the pointer while painting: the rim, and where the
 // feather begins.
-static void paintBrushCursor(CanvasContext &ctx) {
+static void paintBrushCursor(CanvasContext &ctx)
+{
   const MaskUi &u = state.mask;
   const float px = 1.0f / state.zoom;
   constexpr float kTwoPi = 6.28318530717959f;
@@ -5982,7 +7512,8 @@ static void paintBrushCursor(CanvasContext &ctx) {
   ctx.setLineWidth(px * 1.5f);
   ctx.stroke();
   const float inner = std::clamp(1.0f - u.brushFeather, 0.0f, 0.99f);
-  if (u.brushFeather > 0.02f && inner > 0.02f) {
+  if (u.brushFeather > 0.02f && inner > 0.02f)
+  {
     ctx.beginPath();
     ctx.arc(u.curX, u.curY, r * inner, 0.0f, kTwoPi);
     ctx.setLineDash({4.0f * px, 4.0f * px});
@@ -5995,13 +7526,15 @@ static void paintBrushCursor(CanvasContext &ctx) {
 
 // ---- Luminosity overlay ----
 static bool sameOwner(const std::weak_ptr<CanvasImage> &a,
-                      const std::shared_ptr<CanvasImage> &b) {
+                      const std::shared_ptr<CanvasImage> &b)
+{
   return !a.owner_before(b) && !b.owner_before(a);
 }
 
 // state.source box-downsampled by an integer factor to at most
 // kLumTintEdge on its long side (the source itself when already that small).
-static std::shared_ptr<CanvasImage> lumTintBase() {
+static std::shared_ptr<CanvasImage> lumTintBase()
+{
   const std::shared_ptr<CanvasImage> src = state.source;
   if (!src || src->width <= 0 || src->height <= 0)
     return nullptr;
@@ -6011,16 +7544,19 @@ static std::shared_ptr<CanvasImage> lumTintBase() {
   const int longEdge = std::max(src->width, src->height);
   const int k = std::max(1, (longEdge + kLumTintEdge - 1) / kLumTintEdge);
   std::shared_ptr<CanvasImage> base = src;
-  if (k > 1) {
+  if (k > 1)
+  {
     const int w = src->width / k, h = src->height / k;
     if (w <= 0 || h <= 0)
       return nullptr;
     auto out = std::make_shared<CanvasImage>(w, h);
     const int area = k * k;
     for (int y = 0; y < h; ++y)
-      for (int x = 0; x < w; ++x) {
+      for (int x = 0; x < w; ++x)
+      {
         int sum[4] = {0, 0, 0, 0};
-        for (int dy = 0; dy < k; ++dy) {
+        for (int dy = 0; dy < k; ++dy)
+        {
           const uint8_t *row =
               &src->pixels[(static_cast<size_t>(y * k + dy) * src->width +
                             static_cast<size_t>(x * k)) *
@@ -6047,7 +7583,8 @@ static std::shared_ptr<CanvasImage> lumTintBase() {
 // selects). Cached until the shape, the picture's pixels or the mask's place in
 // the list change.
 static std::shared_ptr<CanvasImage>
-luminosityTintImage(const LuminosityShape &s, bool invert, int sel) {
+luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
+{
   MaskUi &u = state.mask;
   if (u.lumTint && u.lumSel == sel && u.lumInvert == invert &&
       u.lumShape == s && sameOwner(u.lumKeyImage, state.image) &&
@@ -6065,11 +7602,13 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel) {
   const LuminosityEval ev = s.prepare(tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y) {
+  for (int y = 0; y < th; ++y)
+  {
     const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
     ev.rowWeights(y, 0, tw, wb.data(), pre->pixels.data() + off);
     uint8_t *row = img->pixels.data() + off;
-    for (int x = 0; x < tw; ++x) {
+    for (int x = 0; x < tw; ++x)
+    {
       float w = wb[static_cast<size_t>(x)];
       if (invert)
         w = 1.0f - w;
@@ -6090,7 +7629,8 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel) {
 }
 
 static void paintLuminosityTint(CanvasContext &ctx, const LuminosityShape &s,
-                                bool invert, int sel) {
+                                bool invert, int sel)
+{
   if (const auto img = luminosityTintImage(s, invert, sel))
     ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
 }
@@ -6103,19 +7643,22 @@ static void paintLuminosityTint(CanvasContext &ctx, const LuminosityShape &s,
 // the bitmap is sized from the document. Cached on the parts in their in-view
 // form, so a rotate / crop / edit all rebuild it.
 static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
-                                                       int sel) {
+                                                       int sel)
+{
   MaskUi &u = state.mask;
   const GeoFrame frame = state.adjust.geoFrame();
   bool usesPix = false;
   std::vector<MaskPart> view;
   view.reserve(m.parts.size());
-  for (const MaskPart &p : m.parts) {
+  for (const MaskPart &p : m.parts)
+  {
     if (p.type() == MaskType::Luminosity)
       usesPix = true;
     view.push_back(MaskPart{maskShapeToSource(p.shape, frame), p.op});
   }
   int tw = 0, th = 0;
-  if (!usesPix) {
+  if (!usesPix)
+  {
     const float W = state.docWidth(), H = state.docHeight();
     const float sc = std::min(1.0f, static_cast<float>(kCompTintEdge) /
                                         std::max(W, H));
@@ -6130,7 +7673,8 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
     return u.compTint;
 
   std::shared_ptr<CanvasImage> pre;
-  if (usesPix) {
+  if (usesPix)
+  {
     const MaskSet &ms = state.adjust.masks();
     const auto base = lumTintBase();
     if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
@@ -6148,12 +7692,14 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
   const MaskComposite comp = prepareComposite(pp, tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw)), wb2(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y) {
+  for (int y = 0; y < th; ++y)
+  {
     const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
     comp.rowWeights(y, 0, tw, wb.data(),
                     pre ? pre->pixels.data() + off : nullptr, wb2.data());
     uint8_t *row = img->pixels.data() + off;
-    for (int x = 0; x < tw; ++x) {
+    for (int x = 0; x < tw; ++x)
+    {
       float w = wb[static_cast<size_t>(x)];
       if (m.invert)
         w = 1.0f - w;
@@ -6176,14 +7722,45 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
   return img;
 }
 
-static void paintCompositeTint(CanvasContext &ctx, const Mask &m, int sel) {
+static void paintCompositeTint(CanvasContext &ctx, const Mask &m, int sel)
+{
   if (const auto img = compositeTintImage(m, sel))
     ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
 }
 
+static void paintSelectedObjectPrompts(CanvasContext &ctx)
+{
+  const MaskPart *part = selectedPart();
+  if (!part || !std::holds_alternative<ObjectShape>(part->shape))
+    return;
+  const auto &stored = std::get<ObjectShape>(part->shape);
+  const auto &pend = state.mask.objPending;
+  const std::vector<ObjectPrompt> &src =
+      (pend.mask == selMask() && pend.part == selPart()) ? pend.prompts
+                                                         : stored.prompts;
+  const GeoFrame f = state.adjust.geoFrame();
+  const float W = state.docWidth(), H = state.docHeight();
+  const float px = 1.0f / state.zoom;
+  for (const ObjectPrompt &p : src)
+  {
+    double sx, sy;
+    f.toSrc(p.x * f.origW, p.y * f.origH, sx, sy);
+    const float cx = static_cast<float>(sx / f.srcW) * W;
+    const float cy = static_cast<float>(sy / f.srcH) * H;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5.0f * px, 0.0f, 6.28318530717959f);
+    ctx.setFillColor(p.fg ? Color{60, 220, 90, 255} : Color{80, 150, 255, 255});
+    ctx.fill();
+    ctx.setStrokeColor(kColorWhite);
+    ctx.setLineWidth(1.5f * px);
+    ctx.stroke();
+  }
+}
+
 // A part's outline / handles / pin (nothing for a luminosity range).
 static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
-                             const GeoFrame &frame, bool selected) {
+                             const GeoFrame &frame, bool selected)
+{
   if (const auto r = radialInView(p, frame))
     paintRadialOutline(ctx, *r, selected);
   else if (const auto l = linearInView(p, frame))
@@ -6192,13 +7769,15 @@ static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
     paintBrushPin(ctx, *b, selected);
 }
 
-static void paintMaskOverlay(CanvasContext &ctx) {
+static void paintMaskOverlay(CanvasContext &ctx)
+{
   const MaskSet &ms = state.adjust.masks();
   const int sel = selMask();
   const int selP = selPart();
   const GeoFrame frame = state.adjust.geoFrame();
   // Unselected masks first (faint), the selected one on top.
-  for (int i = 0; i < static_cast<int>(ms.size()); ++i) {
+  for (int i = 0; i < static_cast<int>(ms.size()); ++i)
+  {
     if (i == sel)
       continue;
     for (const MaskPart &p : ms[static_cast<size_t>(i)].parts)
@@ -6209,7 +7788,8 @@ static void paintMaskOverlay(CanvasContext &ctx) {
   const Mask &m = ms[static_cast<size_t>(sel)];
   if (m.parts.empty())
     return;
-  if (m.parts.size() > 1) {
+  if (m.parts.size() > 1)
+  {
     // Several parts: tint the combination, then the parts' own outlines
     // (the selected part's with its handles).
     if (state.maskShowTint)
@@ -6218,29 +7798,43 @@ static void paintMaskOverlay(CanvasContext &ctx) {
       if (j != selP)
         paintPartOutline(ctx, m.parts[static_cast<size_t>(j)], frame, false);
     paintPartOutline(ctx, m.parts[static_cast<size_t>(selP)], frame, true);
+    paintSelectedObjectPrompts(ctx);
     if (state.mask.drag == MaskUi::Drag::Paint && selectedIsBrush())
       paintBrushCursor(ctx);
     return;
   }
   const MaskPart &p = m.parts[0];
-  if (const auto r = radialInView(p, frame)) {
+  if (const auto r = radialInView(p, frame))
+  {
     if (state.maskShowTint)
       paintRadialTint(ctx, *r, m.invert);
     paintRadialOutline(ctx, *r, true);
-  } else if (const auto l = linearInView(p, frame)) {
+  }
+  else if (const auto l = linearInView(p, frame))
+  {
     if (state.maskShowTint)
       paintLinearTint(ctx, *l, m.invert);
     paintLinearOutline(ctx, *l, true);
-  } else if (const auto b = brushInView(p, frame)) {
+  }
+  else if (const auto b = brushInView(p, frame))
+  {
     if (state.mask.brushTint)
       paintBrushTint(ctx, *b, m.invert);
     paintBrushPin(ctx, *b, true);
     if (state.mask.drag == MaskUi::Drag::Paint)
       paintBrushCursor(ctx);
-  } else if (const auto lm = shapeInView<LuminosityShape>(p, frame)) {
+  }
+  else if (const auto lm = shapeInView<LuminosityShape>(p, frame))
+  {
     // No outline or handles: the tint is the whole overlay.
     if (state.maskShowTint)
       paintLuminosityTint(ctx, *lm, m.invert, sel);
+  }
+  else if (std::holds_alternative<ObjectShape>(p.shape))
+  {
+    if (state.maskShowTint)
+      paintCompositeTint(ctx, m, sel);
+    paintSelectedObjectPrompts(ctx);
   }
 }
 
@@ -6248,7 +7842,8 @@ static void paintMaskOverlay(CanvasContext &ctx) {
 
 // What a mask is called in the list: its first part's kind, then the next
 // one, then how many more ("Radial + Brush +1").
-static std::string maskLabel(const Mask &m) {
+static std::string maskLabel(const Mask &m)
+{
   if (m.parts.empty())
     return "Empty";
   std::string s = maskTypeName(m.parts[0].type());
@@ -6262,7 +7857,8 @@ static std::string maskLabel(const Mask &m) {
 // One row of the mask list: "1  Radial", highlighted when selected. There are
 // kMaxMasks of these, shown only for the masks that exist (the view tree is
 // built once, so the list is a fixed set of slots).
-static View buildMaskRow(size_t i) {
+static View buildMaskRow(size_t i)
+{
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -6271,17 +7867,18 @@ static View buildMaskRow(size_t i) {
   b.style.alignItems = Align::Center;
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([i] {
-    return i < state.adjust.masks().size() ? Display::Flex : Display::None;
-  });
-  const auto isSel = [i] { return selMask() == static_cast<int>(i); };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
-    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
-  });
+  b.style.display = std::function<Display()>([i]
+                                             { return i < state.adjust.masks().size() ? Display::Flex : Display::None; });
+  const auto isSel = [i]
+  { return selMask() == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
+                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
   b.style.borderWidth =
-      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel]
+                             { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [i] {
+  b.onClick = [i]
+  {
     if (state.maskSel != static_cast<int>(i))
       state.mask.part = 0; // a different mask: start on its first part
     state.maskSel = static_cast<int>(i);
@@ -6289,7 +7886,8 @@ static View buildMaskRow(size_t i) {
   };
 
   Text t;
-  t.label = std::function<std::string()>([i]() -> std::string {
+  t.label = std::function<std::string()>([i]() -> std::string
+                                         {
     const MaskSet &ms = state.adjust.masks();
     if (i >= ms.size())
       return std::string();
@@ -6299,8 +7897,7 @@ static View buildMaskRow(size_t i) {
       s += "  (inverted)";
     if (!m.enabled)
       s += "  (off)";
-    return s;
-  });
+    return s; });
   t.fontSize = 13.0f;
   t.color = kColorTextDark;
   b.addChild(std::move(t));
@@ -6310,7 +7907,8 @@ static View buildMaskRow(size_t i) {
 // One row of the selected mask's PART list: "1   Radial", "2   Subtract:
 // Brush". Shown only while the mask has more than one part (a one-part mask
 // looks exactly as it always did).
-static View buildPartRow(size_t j) {
+static View buildPartRow(size_t j)
+{
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(26);
@@ -6319,27 +7917,30 @@ static View buildPartRow(size_t j) {
   b.style.alignItems = Align::Center;
   b.style.padding = EdgeInsets{0, 10, 0, 18};
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([j] {
+  b.style.display = std::function<Display()>([j]
+                                             {
     const Mask *m = selectedMask();
     return m && m->parts.size() > 1 && j < m->parts.size() ? Display::Flex
-                                                           : Display::None;
-  });
-  const auto isSel = [j] {
+                                                           : Display::None; });
+  const auto isSel = [j]
+  {
     return selMask() >= 0 && static_cast<size_t>(selPart()) == j;
   };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
-    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
-  });
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
+                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
   b.style.borderWidth =
-      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel]
+                             { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [j] {
+  b.onClick = [j]
+  {
     state.mask.part = static_cast<int>(j);
     state.markDirty(); // move the handles to it
   };
 
   Text t;
-  t.label = std::function<std::string()>([j]() -> std::string {
+  t.label = std::function<std::string()>([j]() -> std::string
+                                         {
     const Mask *m = selectedMask();
     if (!m || j >= m->parts.size())
       return std::string();
@@ -6347,8 +7948,7 @@ static View buildPartRow(size_t j) {
     if (j > 0)
       s += std::string(maskOpName(m->parts[j].op)) + ": ";
     s += maskTypeName(m->parts[j].type());
-    return s;
-  });
+    return s; });
   t.fontSize = 12.0f;
   t.color = kColorTextDark;
   b.addChild(std::move(t));
@@ -6361,75 +7961,85 @@ template <class Shape>
 static SliderSpec maskShapeSlider(const char *name, float lo, float hi,
                                   std::function<float(const Shape &)> get,
                                   std::function<void(Shape &, float)> set,
-                                  int control) {
+                                  int control)
+{
   SliderSpec s;
   s.name = name;
   s.lo = lo;
   s.hi = hi;
   // The sliders show and edit the shape as it sits in the picture on screen.
-  s.get = [get] {
+  s.get = [get]
+  {
     const MaskPart *p = selectedPart();
     const auto r =
         p ? shapeInView<Shape>(*p, state.adjust.geoFrame()) : std::nullopt;
     return r ? get(*r) : 0.0f;
   };
-  s.set = [set, control](float v) {
+  s.set = [set, control](float v)
+  {
     const GeoFrame frame = state.adjust.geoFrame();
     const size_t part = static_cast<size_t>(selPart());
-    maskEdit(selMask(),
-             [&](Mask &m) {
-               editShapeInView<Shape>(m, part, frame,
-                                      [&](Shape &r) { set(r, v); });
-             },
-             control);
+    maskEdit(selMask(), [&](Mask &m)
+             { editShapeInView<Shape>(m, part, frame,
+                                      [&](Shape &r)
+                                      { set(r, v); }); }, control);
   };
-  s.format = [](float v) {
+  s.format = [](float v)
+  {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  s.onEnd = [] { state.adjust.endMaskEdit(); };
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
   return s;
 }
 static SliderSpec
 maskRadialSlider(const char *name, float lo, float hi,
                  std::function<float(const RadialShape &)> get,
-                 std::function<void(RadialShape &, float)> set, int control) {
+                 std::function<void(RadialShape &, float)> set, int control)
+{
   return maskShapeSlider<RadialShape>(name, lo, hi, std::move(get),
                                       std::move(set), control);
 }
 static SliderSpec
 maskLinearSlider(const char *name, float lo, float hi,
                  std::function<float(const LinearShape &)> get,
-                 std::function<void(LinearShape &, float)> set, int control) {
+                 std::function<void(LinearShape &, float)> set, int control)
+{
   return maskShapeSlider<LinearShape>(name, lo, hi, std::move(get),
                                       std::move(set), control);
 }
 
 // The mask's own copy of one Adjust slider (Exposure, Contrast, ...): one per
 // kAdjustmentSpecs entry, so a new global adjustment appears here too.
-static View buildMaskAdjustmentSlider(const AdjustmentSpec &spec) {
+static View buildMaskAdjustmentSlider(const AdjustmentSpec &spec)
+{
   const AdjId id = spec.id;
   SliderSpec s;
   s.name = spec.label;
   s.lo = spec.min;
   s.hi = spec.max;
-  s.get = [id] {
+  s.get = [id]
+  {
     const Mask *m = selectedMask();
     return m ? m->adj[static_cast<size_t>(id)] : 0.0f;
   };
-  s.set = [id](float v) {
-    maskEdit(selMask(),
-             [&](Mask &m) { m.adj[static_cast<size_t>(id)] = std::round(v); },
-             kMaskCtlAdj + static_cast<int>(id));
+  s.set = [id](float v)
+  {
+    maskEdit(selMask(), [&](Mask &m)
+             { m.adj[static_cast<size_t>(id)] = std::round(v); }, kMaskCtlAdj + static_cast<int>(id));
   };
-  s.format = [](float v) {
+  s.format = [](float v)
+  {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  s.onEnd = [] { state.adjust.endMaskEdit(); };
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 // END maskui
 
-static void paintCropOverlay(CanvasContext &ctx) {
+static void paintCropOverlay(CanvasContext &ctx)
+{
   const auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
@@ -6444,7 +8054,8 @@ static void paintCropOverlay(CanvasContext &ctx) {
   ctx.setLineWidth(px);
   ctx.setStrokeColor(Color{255, 255, 255, 110});
   ctx.beginPath();
-  for (int i = 1; i <= 2; ++i) {
+  for (int i = 1; i <= 2; ++i)
+  {
     const float x = c.l + sw * static_cast<float>(i) / 3.0f;
     const float y = c.t + sh * static_cast<float>(i) / 3.0f;
     ctx.moveTo(x, c.t);
@@ -6466,7 +8077,8 @@ static void paintCropOverlay(CanvasContext &ctx) {
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j) {
+    for (int j = 0; j < 3; ++j)
+    {
       if (i == 1 && j == 1)
         continue; // center: no handle
       if ((i == 1 && !midX) || (j == 1 && !midY))
@@ -6476,7 +8088,8 @@ static void paintCropOverlay(CanvasContext &ctx) {
     }
 }
 
-static void paintCanvas(CanvasContext &ctx) {
+static void paintCanvas(CanvasContext &ctx)
+{
   LITEUI_PROF_START(profAppPaint);
   ctx.setFillColor(state.image ? kColorWhite : kColorCanvasPlaceholderBg);
   ctx.fillRect(0, 0, ctx.width(), ctx.height());
@@ -6489,20 +8102,24 @@ static void paintCanvas(CanvasContext &ctx) {
   // below), so a plain ctx.scale(zoom, zoom) here is all that's needed.
   // A straightened image with "Keep full canvas" has transparent corners;
   // a neutral backdrop keeps them from reading as part of a white picture.
-  if (state.adjust.expand() && state.adjust.angle() != 0.0f) {
+  if (state.adjust.expand() && state.adjust.angle() != 0.0f)
+  {
     ctx.setFillColor(kColorEmptyCorner);
     ctx.fillRect(0, 0, ctx.width(), ctx.height());
   }
 
   ctx.save();
   ctx.scale(state.zoom, state.zoom);
-  if (state.showPreview()) {
+  if (state.showPreview())
+  {
     // Mid-drag (or awaiting the background full-res render) preview: smaller
     // image stretched to the full document size
     // (bilinear), so layout/zoom are unaffected by its lower resolution.
     ctx.drawImage(*state.previewImage, 0, 0, state.docWidth(),
                   state.docHeight());
-  } else {
+  }
+  else
+  {
     ctx.drawImage(*state.image, 0, 0);
   }
   if (cropToolActive())
@@ -6518,10 +8135,12 @@ static void paintCanvas(CanvasContext &ctx) {
 // histogram canvas both call it from their dirty polls, and whichever is
 // polled first (the sidebar, so usually the histogram) does the work — so the
 // histogram never lags a frame behind the picture.
-static void flushPendingAdjust() {
+static void flushPendingAdjust()
+{
   collectFullRender();  // a finished background render, if any
   collectGeometryJob(); // a finished background geometry rebuild, if any
   collectDecodeJob();   // a finished background file decode, if any
+  collectSegmentJob();
   if (!state.adjustDirty)
     return;
   state.adjustDirty = false;
@@ -6542,21 +8161,25 @@ static void refreshHistogramIfStale();
 // Rebuilds the R/G/B/luma histograms from the image currently on screen,
 // visiting at most ~kHistMaxSamples pixels on a regular grid. Fully
 // transparent pixels (straighten's empty corners) are skipped.
-static void computeHistogram() {
+static void computeHistogram()
+{
   state.histR.fill(0);
   state.histG.fill(0);
   state.histB.fill(0);
   state.histL.fill(0);
   const CanvasImage *img =
       state.showPreview() ? state.previewImage.get() : state.image.get();
-  if (img && img->width > 0 && img->height > 0) {
+  if (img && img->width > 0 && img->height > 0)
+  {
     const double total = static_cast<double>(img->width) * img->height;
     const int step =
         std::max(1, static_cast<int>(std::sqrt(total / kHistMaxSamples)));
     const uint8_t *p = img->pixels.data();
-    for (int y = 0; y < img->height; y += step) {
+    for (int y = 0; y < img->height; y += step)
+    {
       const uint8_t *row = p + static_cast<size_t>(y) * img->width * 4;
-      for (int x = 0; x < img->width; x += step) {
+      for (int x = 0; x < img->width; x += step)
+      {
         const uint8_t *px = row + static_cast<size_t>(x) * 4;
         if (px[3] == 0)
           continue;
@@ -6575,7 +8198,8 @@ static void computeHistogram() {
 // Luma as gray bars, R/G/B as thin colored outlines on top. Bar heights use
 // sqrt scaling and are normalized to the tallest bin among 1..254, so a pile
 // of clipped pixels in bin 0/255 doesn't flatten the rest of the graph.
-static void paintHistogram(CanvasContext &ctx) {
+static void paintHistogram(CanvasContext &ctx)
+{
   const float W = ctx.width(), H = ctx.height();
   ctx.setFillColor(Color{34, 34, 38, 255});
   ctx.fillRect(0, 0, W, H);
@@ -6586,23 +8210,27 @@ static void paintHistogram(CanvasContext &ctx) {
         {peak, state.histL[i], state.histR[i], state.histG[i], state.histB[i]});
   const float invPeak = 1.0f / std::sqrt(static_cast<float>(peak));
   const float binW = W / 256.0f;
-  auto heightOf = [&](uint32_t v) {
+  auto heightOf = [&](uint32_t v)
+  {
     return std::min(1.0f, std::sqrt(static_cast<float>(v)) * invPeak) *
            (H - 2.0f);
   };
 
   ctx.setFillColor(Color{170, 170, 175, 255});
-  for (int i = 0; i < 256; ++i) {
+  for (int i = 0; i < 256; ++i)
+  {
     const float h = heightOf(state.histL[i]);
     if (h > 0.0f)
       ctx.fillRect(static_cast<float>(i) * binW, H - h, binW + 0.5f, h);
   }
 
-  auto outline = [&](const std::array<uint32_t, 256> &bins, Color c) {
+  auto outline = [&](const std::array<uint32_t, 256> &bins, Color c)
+  {
     ctx.setStrokeColor(c);
     ctx.setLineWidth(1.0f);
     ctx.beginPath();
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < 256; ++i)
+    {
       const float x = (static_cast<float>(i) + 0.5f) * binW;
       const float y = H - heightOf(bins[i]);
       if (i == 0)
@@ -6617,7 +8245,8 @@ static void paintHistogram(CanvasContext &ctx) {
   outline(state.histB, Color{80, 130, 255, 200});
 }
 
-static void refreshHistogramIfStale() {
+static void refreshHistogramIfStale()
+{
   flushPendingAdjust();
   if (state.histStale)
     computeHistogram();
@@ -6627,28 +8256,33 @@ static void refreshHistogramIfStale() {
 // Mapping between canvas-local screen px and curve units (0..255, y up).
 static float curvePlotPx() { return kCurveSizePx - 2.0f * kCurvePadPx; }
 
-static CurvePoint curveFromLocal(float lx, float ly) {
+static CurvePoint curveFromLocal(float lx, float ly)
+{
   const float plot = curvePlotPx();
   return {
       std::clamp((lx - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f),
       std::clamp(255.0f - (ly - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f)};
 }
 
-static void curveToLocal(float x, float y, float &lx, float &ly) {
+static void curveToLocal(float x, float y, float &lx, float &ly)
+{
   const float plot = curvePlotPx();
   lx = kCurvePadPx + x / 255.0f * plot;
   ly = kCurvePadPx + (255.0f - y) / 255.0f * plot;
 }
 
 // Index of the point within kCurveHitPx of (lx, ly), nearest wins; -1 if none.
-static int curveHit(const CurvePoints &pts, float lx, float ly) {
+static int curveHit(const CurvePoints &pts, float lx, float ly)
+{
   int hit = -1;
   float best = kCurveHitPx * kCurveHitPx;
-  for (size_t i = 0; i < pts.size(); ++i) {
+  for (size_t i = 0; i < pts.size(); ++i)
+  {
     float px, py;
     curveToLocal(pts[i].x, pts[i].y, px, py);
     const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly);
-    if (d2 <= best) {
+    if (d2 <= best)
+    {
       best = d2;
       hit = static_cast<int>(i);
     }
@@ -6656,31 +8290,36 @@ static int curveHit(const CurvePoints &pts, float lx, float ly) {
   return hit;
 }
 
-static int gCurveActive = -1; // point being dragged, or -1
+static int gCurveActive = -1;                             // point being dragged, or -1
 static CurveChannel gCurveChannel = CurveChannel::Master; // curve being edited
 // Set by UI-only changes (channel switch, selecting a point) that don't
 // change the picture, so the curve canvas still repaints; consumed by its
 // dirty poll.
 static bool gCurveUiDirty = false;
 
-static const CurvePoints &curveActiveCurve() {
+static const CurvePoints &curveActiveCurve()
+{
   return state.adjust.curve(gCurveChannel);
 }
 // (point - mouse) in curve units at press, so a grabbed point doesn't jump
 // to the cursor's exact position.
 static float gCurveGrabDx = 0.0f, gCurveGrabDy = 0.0f;
 
-static void curvePress(float lx, float ly) {
+static void curvePress(float lx, float ly)
+{
   if (!state.original)
     return;
   CurvePoints pts = curveActiveCurve();
   int hit = curveHit(pts, lx, ly);
   gCurveGrabDx = gCurveGrabDy = 0.0f;
-  if (hit >= 0) {
+  if (hit >= 0)
+  {
     const CurvePoint m = curveFromLocal(lx, ly);
     gCurveGrabDx = pts[hit].x - m.x;
     gCurveGrabDy = pts[hit].y - m.y;
-  } else {
+  }
+  else
+  {
     if (pts.size() >= kCurveMaxPoints)
       return;
     const CurvePoint m = curveFromLocal(lx, ly);
@@ -6698,7 +8337,8 @@ static void curvePress(float lx, float ly) {
   gCurveUiDirty = true; // show the selected point
 }
 
-static void curveDrag(float lx, float ly) {
+static void curveDrag(float lx, float ly)
+{
   if (gCurveActive < 0 || !state.original)
     return;
   CurvePoints pts = curveActiveCurve();
@@ -6713,35 +8353,41 @@ static void curveDrag(float lx, float ly) {
   state.markAdjustDirty();
 }
 
-static void curveEnd() {
+static void curveEnd()
+{
   gCurveActive = -1;
   gCurveUiDirty = true;
   state.adjust.endCurveEdit();
-  if (state.dragging) { // leave preview mode: one full-resolution recompute
+  if (state.dragging)
+  { // leave preview mode: one full-resolution recompute
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
   }
 }
 
-static void curveRightPress(float lx, float ly) {
+static void curveRightPress(float lx, float ly)
+{
   if (!state.original)
     return;
   CurvePoints pts = curveActiveCurve();
-  if (curveRemove(pts, curveHit(pts, lx, ly))) {
+  if (curveRemove(pts, curveHit(pts, lx, ly)))
+  {
     state.adjust.setCurve(gCurveChannel, pts, false);
     state.markAdjustDirty();
   }
 }
 
-static void setCurveChannel(CurveChannel ch) {
+static void setCurveChannel(CurveChannel ch)
+{
   gCurveActive = -1;
   gCurveChannel = ch;
   gCurveUiDirty = true;
 }
 
 // Resets the curve being edited (one undo step).
-static void resetCurve() {
+static void resetCurve()
+{
   gCurveActive = -1;
   state.adjust.setCurve(gCurveChannel, identityCurve(), false);
   gCurveUiDirty = true;
@@ -6749,15 +8395,18 @@ static void resetCurve() {
 }
 
 // Resets all four curves (one undo step).
-static void resetAllCurves() {
+static void resetAllCurves()
+{
   gCurveActive = -1;
   state.adjust.resetAllCurves();
   gCurveUiDirty = true;
   state.markAdjustDirty();
 }
 
-static const char *curveChannelName(CurveChannel ch) {
-  switch (ch) {
+static const char *curveChannelName(CurveChannel ch)
+{
+  switch (ch)
+  {
   case CurveChannel::Red:
     return "Red";
   case CurveChannel::Green:
@@ -6770,8 +8419,10 @@ static const char *curveChannelName(CurveChannel ch) {
 }
 
 // Line/tint color for a curve: white for the master, channel color otherwise.
-static Color curveChannelColor(CurveChannel ch, uint8_t alpha) {
-  switch (ch) {
+static Color curveChannelColor(CurveChannel ch, uint8_t alpha)
+{
+  switch (ch)
+  {
   case CurveChannel::Red:
     return Color{235, 70, 70, alpha};
   case CurveChannel::Green:
@@ -6784,8 +8435,10 @@ static Color curveChannelColor(CurveChannel ch, uint8_t alpha) {
 }
 
 // The histogram that matches a curve: luma for the master, else that channel.
-static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch) {
-  switch (ch) {
+static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch)
+{
+  switch (ch)
+  {
   case CurveChannel::Red:
     return state.histR;
   case CurveChannel::Green:
@@ -6800,7 +8453,8 @@ static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch) {
 // Dark plot with the edited channel's histogram faintly behind it, a quarter
 // grid, the identity diagonal, every non-straight curve (the others dimmed in
 // their own color), and the edited curve's control points.
-static void paintCurve(CanvasContext &ctx) {
+static void paintCurve(CanvasContext &ctx)
+{
   const float W = ctx.width(), H = ctx.height();
   const float pad = kCurvePadPx, plot = curvePlotPx();
   ctx.setFillColor(Color{34, 34, 38, 255});
@@ -6812,7 +8466,8 @@ static void paintCurve(CanvasContext &ctx) {
     peak = std::max(peak, hist[i]);
   const float invPeak = 1.0f / std::sqrt(static_cast<float>(peak));
   ctx.setFillColor(curveChannelColor(gCurveChannel, 45));
-  for (int i = 0; i < 256; ++i) {
+  for (int i = 0; i < 256; ++i)
+  {
     const float hh =
         std::min(1.0f, std::sqrt(static_cast<float>(hist[i])) * invPeak) * plot;
     if (hh > 0.0f)
@@ -6823,7 +8478,8 @@ static void paintCurve(CanvasContext &ctx) {
   ctx.setLineWidth(1.0f);
   ctx.setStrokeColor(Color{255, 255, 255, 30});
   ctx.beginPath();
-  for (int q = 0; q <= 4; ++q) {
+  for (int q = 0; q <= 4; ++q)
+  {
     const float t = pad + plot * static_cast<float>(q) / 4.0f;
     ctx.moveTo(t, pad);
     ctx.lineTo(t, pad + plot);
@@ -6840,12 +8496,14 @@ static void paintCurve(CanvasContext &ctx) {
 
   // Draws one curve as a polyline. Non-edited, non-straight curves first (dim),
   // so the edited curve ends up on top.
-  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width) {
+  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width)
+  {
     const auto lut = curveToLut(state.adjust.curve(ch));
     ctx.setStrokeColor(curveChannelColor(ch, alpha));
     ctx.setLineWidth(width);
     ctx.beginPath();
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < 256; ++i)
+    {
       float lx, ly;
       curveToLocal(static_cast<float>(i), lut[i], lx, ly);
       if (i == 0)
@@ -6856,7 +8514,8 @@ static void paintCurve(CanvasContext &ctx) {
     ctx.stroke();
   };
   const CurvePoints straight = identityCurve();
-  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
+  {
     const auto ch = static_cast<CurveChannel>(c);
     if (ch != gCurveChannel && !(state.adjust.curve(ch) == straight))
       strokeCurve(ch, 110, 1.0f);
@@ -6865,7 +8524,8 @@ static void paintCurve(CanvasContext &ctx) {
 
   const CurvePoints &pts = curveActiveCurve();
   ctx.setLineWidth(1.0f);
-  for (size_t i = 0; i < pts.size(); ++i) {
+  for (size_t i = 0; i < pts.size(); ++i)
+  {
     float lx, ly;
     curveToLocal(pts[i].x, pts[i].y, lx, ly);
     const bool active = static_cast<int>(i) == gCurveActive;
@@ -6884,8 +8544,10 @@ static void paintCurve(CanvasContext &ctx) {
 // which aren't usable in constant expressions. So it's checked once at
 // startup instead, and a mistake aborts with a message naming the bad entry
 // rather than silently moving the wrong slider.
-static void verifyAdjustmentSpecs() {
-  for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i) {
+static void verifyAdjustmentSpecs()
+{
+  for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
+  {
     const AdjustmentSpec &s = kAdjustmentSpecs[i];
     const char *problem = nullptr;
     if (static_cast<size_t>(s.id) != i)
@@ -6895,21 +8557,28 @@ static void verifyAdjustmentSpecs() {
       problem = "has min >= max";
     else if (s.stage == AdjustmentSpec::Stage::Tone && !s.apply)
       problem = "is a Tone adjustment with no apply function";
-    if (problem) {
-      std::fprintf(stderr, "photoeditor: kAdjustmentSpecs[%zu] (\"%s\") %s\n",
+    if (problem)
+    {
+      std::fprintf(stderr, "literoom: kAdjustmentSpecs[%zu] (\"%s\") %s\n",
                    i, s.label.c_str(), problem);
       std::abort();
     }
   }
 }
 
-int main() {
+int main()
+{
   verifyAdjustmentSpecs();
-  LiteUI ui("Photo Editor", 1100, 700, /*hideTitlebar=*/true);
+  LiteUI ui("Literoom", -1, -1, /*hideTitlebar=*/true);
   // A finished background render wakes the (otherwise sleeping) event loop.
-  renderWorker.setNotify([&ui] { ui.wake(); });
-  geometryWorker.setNotify([&ui] { ui.wake(); });
-  decodeWorker.setNotify([&ui] { ui.wake(); });
+  renderWorker.setNotify([&ui]
+                         { ui.wake(); });
+  geometryWorker.setNotify([&ui]
+                           { ui.wake(); });
+  decodeWorker.setNotify([&ui]
+                         { ui.wake(); });
+  segmentWorker.setNotify([&ui]
+                          { ui.wake(); });
 
   // ---- Keyboard shortcuts ----
   // LiteUI's addShortcut is global: it fires whatever has focus, so these work
@@ -6917,7 +8586,8 @@ int main() {
   // Zoom uses the unshifted Ctrl+= / Ctrl+-: on Linux LiteUI reports shifted
   // symbols like '+' as Key::Unknown, so Ctrl+Shift+= can't be bound there.
   {
-    auto withMods = [](bool ctrl, bool shift) {
+    auto withMods = [](bool ctrl, bool shift)
+    {
       KeyModifiers m;
       m.ctrl = ctrl;
       m.shift = shift;
@@ -6928,46 +8598,60 @@ int main() {
     const KeyModifiers ctrlShift = withMods(true, true);
     // Edits and dialogs are ignored mid-drag (a slider or crop handle is
     // being held): changing the image under the drag would fight it.
-    auto idle = [](std::function<void()> fn) {
-      return [fn = std::move(fn)] {
+    auto idle = [](std::function<void()> fn)
+    {
+      return [fn = std::move(fn)]
+      {
         if (!state.dragging)
           fn();
       };
     };
-    auto zoomIn = [] { setZoom(state.zoom * kZoomStep); };
-    auto zoomOut = [] { setZoom(state.zoom / kZoomStep); };
+    auto zoomIn = []
+    { setZoom(state.zoom * kZoomStep); };
+    auto zoomOut = []
+    { setZoom(state.zoom / kZoomStep); };
 
     ui.addShortcut(ctrl, Key::Z, idle(undo));
     ui.addShortcut(ctrl, Key::Y, idle(redo));
     ui.addShortcut(ctrlShift, Key::Z, idle(redo));
     ui.addShortcut(ctrl, Key::O, idle(openImage));
     ui.addShortcut(ctrl, Key::E, idle(exportImage));
-    ui.addShortcut(ctrl, Key::Q, [&ui] { ui.requestClose(); });
+    ui.addShortcut(ctrl, Key::Q, [&ui]
+                   { ui.requestClose(); });
     ui.addShortcut(ctrl, Key::B, toggleSidebar);
     ui.addShortcut(ctrl, Key::Equal, zoomIn);
     ui.addShortcut(ctrlShift, Key::Equal,
                    zoomIn); // '+' on layouts that report it
     ui.addShortcut(ctrl, Key::Minus, zoomOut);
-    ui.addShortcut(ctrl, Key::N0, [] { setZoom(1.0f); });
+    ui.addShortcut(ctrl, Key::N0, []
+                   { setZoom(1.0f); });
     ui.addShortcut(ctrl, Key::LeftBracket,
-                   idle([] { applyGeoOp(GeoOp::RotateCCW); }));
+                   idle([]
+                        { applyGeoOp(GeoOp::RotateCCW); }));
     ui.addShortcut(ctrl, Key::RightBracket,
-                   idle([] { applyGeoOp(GeoOp::RotateCW); }));
-    ui.addShortcut(none, Key::Escape, [] { state.openMenu = -1; });
-    ui.addShortcut(none, Key::Delete, idle([] {
+                   idle([]
+                        { applyGeoOp(GeoOp::RotateCW); }));
+    ui.addShortcut(none, Key::Escape, []
+                   { state.openMenu = -1; });
+    ui.addShortcut(none, Key::Delete, idle([]
+                                           {
                      if (maskToolActive())
-                       deleteSelectedMask();
-                   }));
-    ui.addShortcut(none, Key::Enter, idle([] {
-                     if (cropToolActive())
-                       applyCrop(); // commit the selection, like the button
-                   }));
+                       deleteSelectedMask(); }));
+    ui.addShortcut(none, Key::Enter, idle([]
+                                          {
+                                            if (cropToolActive())
+                                              applyCrop(); // commit the selection, like the button
+                                          }));
   }
 
   const std::vector<Activity> activities = {
-      {0, "Info", "I"},      {1, "Adjust", "A"},        {4, "Curve", "~"},
-      {5, "Color Mix", "M"}, {6, "Color Grading", "G"},
-      {7, "Masks", "\u25D0"}, {2, "Crop", "C"},
+      {0, "Info", "I"},
+      {1, "Adjust", "A"},
+      {4, "Curve", "~"},
+      {5, "Color Mix", "M"},
+      {6, "Color Grading", "G"},
+      {7, "Masks", "\u25D0"},
+      {2, "Crop", "C"},
       {3, "Rotate", "R"},
   };
 
@@ -6989,13 +8673,14 @@ int main() {
   titlebar.style.borderWidth = 0.0f;
   // Empty space in the titlebar (i.e. not over a button) drags the
   // window, and also closes any open dropdown menu.
-  titlebar.onPressAt = [&](float, float) {
+  titlebar.onPressAt = [&](float, float)
+  {
     state.openMenu = -1;
     ui.requestMove();
   };
 
   Text appTitle;
-  appTitle.label = std::string("Photo Editor");
+  appTitle.label = std::string("Lite Room");
   appTitle.fontSize = 13.0f;
   appTitle.fontWeight = FontWeight::SemiBold;
   appTitle.color = kColorTextDark;
@@ -7007,14 +8692,18 @@ int main() {
                  {
                      {"Open Image...", openImage, "Ctrl+O"},
                      {"Export as PNG...", exportImage, "Ctrl+E"},
-                     {"Exit", [&] { ui.requestClose(); }, "Ctrl+Q"},
+                     {"Exit", [&]
+                      { ui.requestClose(); }, "Ctrl+Q"},
                  }));
   titlebar.addChild(menuButton(
       "View", 1,
       {
-          {"Zoom In", [] { setZoom(state.zoom * kZoomStep); }, "Ctrl+="},
-          {"Zoom Out", [] { setZoom(state.zoom / kZoomStep); }, "Ctrl+-"},
-          {"Actual Size (100%)", [] { setZoom(1.0f); }, "Ctrl+0"},
+          {"Zoom In", []
+           { setZoom(state.zoom * kZoomStep); }, "Ctrl+="},
+          {"Zoom Out", []
+           { setZoom(state.zoom / kZoomStep); }, "Ctrl+-"},
+          {"Actual Size (100%)", []
+           { setZoom(1.0f); }, "Ctrl+0"},
           {"Toggle Sidebar", toggleSidebar, "Ctrl+B"},
       }));
 
@@ -7022,11 +8711,15 @@ int main() {
       menuButton("Image", 2,
                  {
                      {"Rotate Left 90\u00B0",
-                      [] { applyGeoOp(GeoOp::RotateCCW); }, "Ctrl+["},
+                      []
+                      { applyGeoOp(GeoOp::RotateCCW); }, "Ctrl+["},
                      {"Rotate Right 90\u00B0",
-                      [] { applyGeoOp(GeoOp::RotateCW); }, "Ctrl+]"},
-                     {"Flip Horizontal", [] { applyGeoOp(GeoOp::FlipH); }},
-                     {"Flip Vertical", [] { applyGeoOp(GeoOp::FlipV); }},
+                      []
+                      { applyGeoOp(GeoOp::RotateCW); }, "Ctrl+]"},
+                     {"Flip Horizontal", []
+                      { applyGeoOp(GeoOp::FlipH); }},
+                     {"Flip Vertical", []
+                      { applyGeoOp(GeoOp::FlipV); }},
                  }));
 
   View undoRedoGap;
@@ -7034,9 +8727,11 @@ int main() {
   titlebar.addChild(std::move(undoRedoGap));
 
   titlebar.addChild(
-      titlebarIconBtn("\u21B6", undo, [] { return state.adjust.canUndo(); }));
+      titlebarIconBtn("\u21B6", undo, []
+                      { return state.adjust.canUndo(); }));
   titlebar.addChild(
-      titlebarIconBtn("\u21B7", redo, [] { return state.adjust.canRedo(); }));
+      titlebarIconBtn("\u21B7", redo, []
+                      { return state.adjust.canRedo(); }));
 
   View titlebarSpacer;
   titlebarSpacer.style.flexGrow = 1;
@@ -7044,13 +8739,15 @@ int main() {
   titlebar.addChild(std::move(titlebarSpacer));
 
   titlebar.addChild(
-      winButton("\u2500", kColorMenuHover, [&] { ui.requestMinimize(); }));
-  titlebar.addChild(winButton("\u25A1", kColorMenuHover, [&] {
+      winButton("\u2500", kColorMenuHover, [&]
+                { ui.requestMinimize(); }));
+  titlebar.addChild(winButton("\u25A1", kColorMenuHover, [&]
+                              {
     ui.requestMaximize();
-    state.maximized = !state.maximized;
-  }));
+    state.maximized = !state.maximized; }));
   titlebar.addChild(
-      winButton("\u00D7", kColorCloseHover, [&] { ui.requestClose(); }));
+      winButton("\u00D7", kColorCloseHover, [&]
+                { ui.requestClose(); }));
 
   root.addChild(std::move(titlebar));
 
@@ -7062,7 +8759,8 @@ int main() {
   workspace.style.flexGrow = 1;
   // Clicking anywhere in the workspace that isn't itself a button
   // (e.g. the canvas, or blank sidebar space) closes an open menu too.
-  workspace.onPressAt = [](float, float) { state.openMenu = -1; };
+  workspace.onPressAt = [](float, float)
+  { state.openMenu = -1; };
 
   // ---- Activity bar ----
   View activityBar;
@@ -7075,7 +8773,8 @@ int main() {
   activityBar.style.padding = EdgeInsets::all(6.0f);
   activityBar.style.gap = 10.0f;
 
-  for (const auto &item : activities) {
+  for (const auto &item : activities)
+  {
     View button;
     button.style.width = Size::pixel(32);
     button.style.height = Size::pixel(32);
@@ -7085,11 +8784,11 @@ int main() {
     button.style.hoverColor = kColorActivityHover;
 
     int id = item.id;
-    button.style.backgroundColor = std::function<Color()>([id] {
-      return state.activeActivity == id ? kColorActivityActive
-                                        : kColorActivityBarBg;
-    });
-    button.onClick = [id] {
+    button.style.backgroundColor = std::function<Color()>([id]
+                                                          { return state.activeActivity == id ? kColorActivityActive
+                                                                                              : kColorActivityBarBg; });
+    button.onClick = [id]
+    {
       state.activeActivity = (state.activeActivity == id) ? -1 : id;
       // The wheels are laid out for a minimum sidebar width.
       if (state.activeActivity == 6 && state.sidebarWidth < kGradePaneW)
@@ -7118,18 +8817,17 @@ int main() {
   sidebar.style.padding = EdgeInsets::all(12.0f);
   sidebar.style.overflowX = Overflow::Hidden;
   sidebar.style.overflowY = Overflow::Auto;
-  sidebar.style.width = std::function<Size()>([] {
-    return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f);
-  });
+  sidebar.style.width = std::function<Size()>([]
+                                              { return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f); });
 
   Text sidebarTitle;
   sidebarTitle.label =
-      std::function<std::string()>([activities]() -> std::string {
+      std::function<std::string()>([activities]() -> std::string
+                                   {
         for (const auto &a : activities)
           if (a.id == state.activeActivity)
             return a.title;
-        return "";
-      });
+        return ""; });
   sidebarTitle.fontSize = 12.0f;
   sidebarTitle.fontWeight = FontWeight::SemiBold;
   sidebarTitle.color = kColorTextMuted;
@@ -7142,33 +8840,32 @@ int main() {
   infoPane.style.width = Size::full();
   infoPane.style.gap = 6.0f;
   infoPane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 0 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 0 ? Display::Flex : Display::None; });
 
   Text infoName;
-  infoName.label = std::function<std::string()>([] {
-    return state.image ? ("File: " + baseName(state.imagePath))
-                       : std::string("No image open");
-  });
+  infoName.label = std::function<std::string()>([]
+                                                { return state.image ? ("File: " + baseName(state.imagePath))
+                                                                     : std::string("No image open"); });
   infoName.fontSize = 13.0f;
   infoName.color = kColorTextMid;
   infoPane.addChild(std::move(infoName));
 
   Text infoDims;
-  infoDims.label = std::function<std::string()>([] {
+  infoDims.label = std::function<std::string()>([]
+                                                {
     if (!state.image)
       return std::string();
     return "Size: " + std::to_string(state.image->width) + " x " +
-           std::to_string(state.image->height) + " px";
-  });
+           std::to_string(state.image->height) + " px"; });
   infoDims.fontSize = 13.0f;
   infoDims.color = kColorTextMid;
   infoPane.addChild(std::move(infoDims));
 
   Text infoZoom;
-  infoZoom.label = std::function<std::string()>([] {
-    return "Zoom: " +
-           std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
-  });
+  infoZoom.label = std::function<std::string()>([]
+                                                { return "Zoom: " +
+                                                         std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%"; });
   infoZoom.fontSize = 13.0f;
   infoZoom.color = kColorTextMid;
   infoPane.addChild(std::move(infoZoom));
@@ -7184,7 +8881,8 @@ int main() {
   adjustPane.style.direction = FlexDirection::Column;
   adjustPane.style.gap = 16.0f;
   adjustPane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 1 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 1 ? Display::Flex : Display::None; });
 
   // Histogram of the picture as currently shown (see computeHistogram).
   View histogram;
@@ -7192,8 +8890,10 @@ int main() {
   histogram.style.width = Size::full();
   histogram.style.height = Size::pixel(kHistHeightPx);
   histogram.style.flexShrink = 0;
-  histogram.onPaint = [](CanvasContext &ctx) { paintHistogram(ctx); };
-  histogram.canvasDirtySource = [] {
+  histogram.onPaint = [](CanvasContext &ctx)
+  { paintHistogram(ctx); };
+  histogram.canvasDirtySource = []
+  {
     static uint32_t lastPainted = 0;
     static int lastActivity = -2;
     // Sidebar is polled before the canvas: do the pending recompute now.
@@ -7209,7 +8909,8 @@ int main() {
   };
   adjustPane.addChild(std::move(histogram));
 
-  auto sectionLabel = [](const char *text) {
+  auto sectionLabel = [](const char *text)
+  {
     Text h;
     h.label = std::string(text);
     h.fontSize = 12.0f;
@@ -7218,8 +8919,10 @@ int main() {
   };
   bool colorHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
-  for (const auto &spec : kAdjustmentSpecs) {
-    if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color) {
+  for (const auto &spec : kAdjustmentSpecs)
+  {
+    if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
+    {
       adjustPane.addChild(sectionLabel("Color"));
       colorHeaderAdded = true;
     }
@@ -7238,7 +8941,8 @@ int main() {
   curvePane.style.direction = FlexDirection::Column;
   curvePane.style.gap = 8.0f;
   curvePane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 4 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 4 ? Display::Flex : Display::None; });
 
   // Channel tabs. A bullet after a name marks a curve that has been changed,
   // so an edit on a channel you've since switched away from isn't forgotten.
@@ -7247,7 +8951,8 @@ int main() {
   curveTabs.style.gap = 4.0f;
   curveTabs.style.width = Size::pixel(kCurveSizePx);
   curveTabs.style.flexShrink = 0;
-  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
+  {
     const auto ch = static_cast<CurveChannel>(c);
     View tab;
     tab.style.width = Size::pixel(kCurveTabW);
@@ -7257,24 +8962,25 @@ int main() {
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([ch]() -> Color {
-      return gCurveChannel == ch ? kColorDropdownRowHover : kColorActivityBarBg;
-    });
+    tab.style.backgroundColor = std::function<Color()>([ch]() -> Color
+                                                       { return gCurveChannel == ch ? kColorDropdownRowHover : kColorActivityBarBg; });
     tab.style.borderWidth = std::function<float()>(
-        [ch] { return gCurveChannel == ch ? 1.0f : 0.0f; });
+        [ch]
+        { return gCurveChannel == ch ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [ch] { setCurveChannel(ch); };
+    tab.onClick = [ch]
+    { setCurveChannel(ch); };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([ch]() -> std::string {
+    tabText.label = std::function<std::string()>([ch]() -> std::string
+                                                 {
       std::string name = ch == CurveChannel::Master  ? "RGB"
                          : ch == CurveChannel::Red   ? "R"
                          : ch == CurveChannel::Green ? "G"
                                                      : "B";
       if (!(state.adjust.curve(ch) == identityCurve()))
         name += " \u2022";
-      return name;
-    });
+      return name; });
     tabText.fontSize = 12.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = ch == CurveChannel::Master  ? kColorTextDark
@@ -7291,8 +8997,10 @@ int main() {
   curveCanvas.style.width = Size::pixel(kCurveSizePx);
   curveCanvas.style.height = Size::pixel(kCurveSizePx);
   curveCanvas.style.flexShrink = 0;
-  curveCanvas.onPaint = [](CanvasContext &ctx) { paintCurve(ctx); };
-  curveCanvas.canvasDirtySource = [] {
+  curveCanvas.onPaint = [](CanvasContext &ctx)
+  { paintCurve(ctx); };
+  curveCanvas.canvasDirtySource = []
+  {
     static uint32_t lastPainted = 0;
     static int lastActivity = -2;
     // Every image recompute bumps histVersion, which covers curve edits,
@@ -7307,16 +9015,21 @@ int main() {
     lastPainted = state.histVersion;
     return true;
   };
-  curveCanvas.onPressAt = [](float lx, float ly) { curvePress(lx, ly); };
-  curveCanvas.onDragTo = [](float lx, float ly) { curveDrag(lx, ly); };
-  curveCanvas.onDragEnd = [] { curveEnd(); };
-  curveCanvas.onRightPressAt = [](float lx, float ly) {
+  curveCanvas.onPressAt = [](float lx, float ly)
+  { curvePress(lx, ly); };
+  curveCanvas.onDragTo = [](float lx, float ly)
+  { curveDrag(lx, ly); };
+  curveCanvas.onDragEnd = []
+  { curveEnd(); };
+  curveCanvas.onRightPressAt = [](float lx, float ly)
+  {
     curveRightPress(lx, ly);
   };
   curvePane.addChild(std::move(curveCanvas));
 
   Text curveInfo;
-  curveInfo.label = std::function<std::string()>([]() -> std::string {
+  curveInfo.label = std::function<std::string()>([]() -> std::string
+                                                 {
     const auto &p = curveActiveCurve();
     const std::string name = curveChannelName(gCurveChannel);
     if (gCurveActive >= 0 && gCurveActive < static_cast<int>(p.size()))
@@ -7324,8 +9037,7 @@ int main() {
              std::to_string(static_cast<int>(std::lround(p[gCurveActive].x))) +
              "  Out " +
              std::to_string(static_cast<int>(std::lround(p[gCurveActive].y)));
-    return name + ": " + std::to_string(p.size()) + " points";
-  });
+    return name + ": " + std::to_string(p.size()) + " points"; });
   curveInfo.fontSize = 13.0f;
   curveInfo.color = kColorTextMid;
   curvePane.addChild(std::move(curveInfo));
@@ -7355,14 +9067,16 @@ int main() {
   mixPane.style.direction = FlexDirection::Column;
   mixPane.style.gap = 12.0f;
   mixPane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 5 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 5 ? Display::Flex : Display::None; });
 
   View mixTabs;
   mixTabs.style.direction = FlexDirection::Row;
   mixTabs.style.gap = 6.0f;
   mixTabs.style.width = Size::pixel(3.0f * kMixTabW + 2.0f * 6.0f);
   mixTabs.style.flexShrink = 0;
-  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
+  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
+  {
     const auto chan = static_cast<MixChan>(c);
     View tab;
     tab.style.width = Size::pixel(kMixTabW);
@@ -7372,23 +9086,24 @@ int main() {
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([chan]() -> Color {
-      return gMixChan == chan ? kColorDropdownRowHover : kColorActivityBarBg;
-    });
+    tab.style.backgroundColor = std::function<Color()>([chan]() -> Color
+                                                       { return gMixChan == chan ? kColorDropdownRowHover : kColorActivityBarBg; });
     tab.style.borderWidth = std::function<float()>(
-        [chan] { return gMixChan == chan ? 1.0f : 0.0f; });
+        [chan]
+        { return gMixChan == chan ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [chan] { gMixChan = chan; };
+    tab.onClick = [chan]
+    { gMixChan = chan; };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([chan]() -> std::string {
+    tabText.label = std::function<std::string()>([chan]() -> std::string
+                                                 {
       std::string name = chan == MixChan::Hue          ? "Hue"
                          : chan == MixChan::Saturation ? "Sat"
                                                        : "Lum";
       if (mixChanAnyNonZero(state.adjust.mixValues(), chan))
         name += " \u2022";
-      return name;
-    });
+      return name; });
     tabText.fontSize = 12.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = kColorTextDark;
@@ -7398,14 +9113,16 @@ int main() {
   mixPane.addChild(std::move(mixTabs));
 
   // One group of eight sliders per tab; only the selected tab's is displayed.
-  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
+  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
+  {
     const auto chan = static_cast<MixChan>(c);
     View group;
     group.style.width = Size::full();
     group.style.direction = FlexDirection::Column;
     group.style.gap = 12.0f;
     group.style.display = std::function<Display()>(
-        [chan] { return gMixChan == chan ? Display::Flex : Display::None; });
+        [chan]
+        { return gMixChan == chan ? Display::Flex : Display::None; });
     for (size_t band = 0; band < kMixBandCount; ++band)
       group.addChild(buildMixSlider(chan, band));
     mixPane.addChild(std::move(group));
@@ -7422,7 +9139,8 @@ int main() {
   gradePane.style.direction = FlexDirection::Column;
   gradePane.style.gap = 10.0f;
   gradePane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 6 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 6 ? Display::Flex : Display::None; });
 
   // Mode tabs: 3-Way | Shadows | Mid | High | Global. A bullet marks a range
   // that has been adjusted.
@@ -7430,7 +9148,8 @@ int main() {
   gradeTabs.style.direction = FlexDirection::Row;
   gradeTabs.style.gap = 4.0f;
   gradeTabs.style.flexShrink = 0;
-  for (int m = 0; m < 5; ++m) {
+  for (int m = 0; m < 5; ++m)
+  {
     View tab;
     tab.style.width = Size::pixel(kGradeTabW);
     tab.style.height = Size::pixel(26);
@@ -7439,27 +9158,28 @@ int main() {
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([m]() -> Color {
-      return gGradeMode == m ? kColorDropdownRowHover : kColorActivityBarBg;
-    });
+    tab.style.backgroundColor = std::function<Color()>([m]() -> Color
+                                                       { return gGradeMode == m ? kColorDropdownRowHover : kColorActivityBarBg; });
     tab.style.borderWidth =
-        std::function<float()>([m] { return gGradeMode == m ? 1.0f : 0.0f; });
+        std::function<float()>([m]
+                               { return gGradeMode == m ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [m] {
+    tab.onClick = [m]
+    {
       gGradeMode = m;
       if (m > 0)
         gGradeActive = m - 1;
     };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([m]() -> std::string {
+    tabText.label = std::function<std::string()>([m]() -> std::string
+                                                 {
       static const char *const names[5] = {"3-Way", "Shad", "Mid", "High",
                                            "Glob"};
       std::string name = names[m];
       if (m > 0 && !state.adjust.grade().wheel[m - 1].neutral())
         name += "\u2022";
-      return name;
-    });
+      return name; });
     tabText.fontSize = 11.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = kColorTextDark;
@@ -7470,7 +9190,8 @@ int main() {
 
   // H:13 S:72 L:+1 for the wheel touched last
   Text gradeReadout;
-  gradeReadout.label = std::function<std::string()>([]() -> std::string {
+  gradeReadout.label = std::function<std::string()>([]() -> std::string
+                                                    {
     const int r = gGradeMode > 0 ? gGradeMode - 1 : gGradeActive;
     const GradeWheel &w = state.adjust.grade().wheel[r];
     char buf[64];
@@ -7478,16 +9199,17 @@ int main() {
                   static_cast<int>(std::lround(w.hue)),
                   static_cast<int>(std::lround(w.sat)),
                   static_cast<int>(std::lround(w.lum)));
-    return buf;
-  });
+    return buf; });
   gradeReadout.fontSize = 12.0f;
   gradeReadout.color = kColorTextMid;
   gradePane.addChild(std::move(gradeReadout));
 
   // One body per mode; only the selected one is displayed.
-  auto modeBody = [](int m, View body) {
+  auto modeBody = [](int m, View body)
+  {
     body.style.display = std::function<Display()>(
-        [m] { return gGradeMode == m ? Display::Flex : Display::None; });
+        [m]
+        { return gGradeMode == m ? Display::Flex : Display::None; });
     return body;
   };
   gradePane.addChild(modeBody(0, buildGradeThreeWay()));
@@ -7499,25 +9221,34 @@ int main() {
   blending.name = "Blending";
   blending.lo = 0;
   blending.hi = 100;
-  blending.get = [] { return state.adjust.grade().blending; };
-  blending.set = [](float v) {
-    gradeEdit([&](ColorGrade &g) { g.blending = std::round(v); }, 16);
+  blending.get = []
+  { return state.adjust.grade().blending; };
+  blending.set = [](float v)
+  {
+    gradeEdit([&](ColorGrade &g)
+              { g.blending = std::round(v); }, 16);
   };
-  blending.format = [](float v) {
+  blending.format = [](float v)
+  {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  blending.onEnd = [] { state.adjust.endGradeEdit(); };
+  blending.onEnd = []
+  { state.adjust.endGradeEdit(); };
   gradePane.addChild(buildSliderRow(blending));
 
   SliderSpec balance = blending;
   balance.name = "Balance";
   balance.lo = -100;
   balance.hi = 100;
-  balance.get = [] { return state.adjust.grade().balance; };
-  balance.set = [](float v) {
-    gradeEdit([&](ColorGrade &g) { g.balance = std::round(v); }, 17);
+  balance.get = []
+  { return state.adjust.grade().balance; };
+  balance.set = [](float v)
+  {
+    gradeEdit([&](ColorGrade &g)
+              { g.balance = std::round(v); }, 17);
   };
-  balance.format = [](float v) {
+  balance.format = [](float v)
+  {
     const int i = static_cast<int>(std::lround(v));
     return i > 0 ? "+" + std::to_string(i) : std::to_string(i);
   };
@@ -7535,19 +9266,19 @@ int main() {
   maskPane.style.direction = FlexDirection::Column;
   maskPane.style.gap = 6.0f;
   maskPane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 7 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 7 ? Display::Flex : Display::None; });
 
   Text maskHint;
-  maskHint.label = std::function<std::string()>([]() -> std::string {
-    return state.image
-               ? "Add a mask, then adjust it. Drag the shape on the image to "
-                 "move it, or its square handles to resize (on a linear "
-                 "gradient they also turn it). With a brush, drag on the "
-                 "image to paint; pick another mask from the list. A "
-                 "luminosity range has no handles: set it with its sliders. "
-                 "Add parts to a mask to combine shapes."
-               : "Open an image to add masks.";
-  });
+  maskHint.label = std::function<std::string()>([]() -> std::string
+                                                { return state.image
+                                                             ? "Add a mask, then adjust it. Drag the shape on the image to "
+                                                               "move it, or its square handles to resize (on a linear "
+                                                               "gradient they also turn it). With a brush, drag on the "
+                                                               "image to paint; pick another mask from the list. A "
+                                                               "luminosity range has no handles: set it with its sliders. "
+                                                               "Add parts to a mask to combine shapes."
+                                                             : "Open an image to add masks."; });
   maskHint.fontSize = 12.0f;
   maskHint.color = kColorTextMuted;
   maskHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -7555,17 +9286,30 @@ int main() {
 
   // One button per kind of mask.
   maskPane.addChild(sidebarButton(
-      "+ Radial Gradient", [] { addMask(MaskType::Radial); }, {}, true,
-      [] { return state.original != nullptr; }));
+      "+ Radial Gradient", []
+      { addMask(MaskType::Radial); }, {}, true,
+      []
+      { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Linear Gradient", [] { addMask(MaskType::Linear); }, {}, true,
-      [] { return state.original != nullptr; }));
+      "+ Linear Gradient", []
+      { addMask(MaskType::Linear); }, {}, true,
+      []
+      { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Brush", [] { addMask(MaskType::Brush); }, {}, true,
-      [] { return state.original != nullptr; }));
+      "+ Brush", []
+      { addMask(MaskType::Brush); }, {}, true,
+      []
+      { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Luminosity Range", [] { addMask(MaskType::Luminosity); }, {}, true,
-      [] { return state.original != nullptr; }));
+      "+ Luminosity Range", []
+      { addMask(MaskType::Luminosity); }, {}, true,
+      []
+      { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Object", []
+      { addMask(MaskType::Object); }, {}, true,
+      []
+      { return state.original != nullptr; }));
 
   for (size_t i = 0; i < kMaxMasks; ++i)
     maskPane.addChild(buildMaskRow(i));
@@ -7577,30 +9321,39 @@ int main() {
   maskEditor.style.gap = 12.0f;
   maskEditor.style.margin = EdgeInsets{8, 0, 0, 0};
   maskEditor.style.display = std::function<Display()>(
-      [] { return selMask() >= 0 ? Display::Flex : Display::None; });
+      []
+      { return selMask() >= 0 ? Display::Flex : Display::None; });
 
   maskEditor.addChild(sidebarButton(
       "Enabled",
-      [] { maskEditDiscrete([](Mask &m) { m.enabled = !m.enabled; }); },
-      [] {
+      []
+      { maskEditDiscrete([](Mask &m)
+                         { m.enabled = !m.enabled; }); },
+      []
+      {
         const Mask *m = selectedMask();
         return m && m->enabled;
       }));
   maskEditor.addChild(sidebarButton(
       "Invert",
-      [] { maskEditDiscrete([](Mask &m) { m.invert = !m.invert; }); },
-      [] {
+      []
+      { maskEditDiscrete([](Mask &m)
+                         { m.invert = !m.invert; }); },
+      []
+      {
         const Mask *m = selectedMask();
         return m && m->invert;
       }));
   maskEditor.addChild(sidebarButton(
       "Show mask tint",
-      [] {
+      []
+      {
         bool &flag = tintFlag();
         flag = !flag;
         state.markDirty();
       },
-      [] { return tintFlag(); }));
+      []
+      { return tintFlag(); }));
 
   // Parts: combine several shapes into this mask. Each part after the first
   // is joined to the ones before it (Add / Subtract / Intersect); the rows
@@ -7617,29 +9370,40 @@ int main() {
   opRow.style.direction = FlexDirection::Column;
   opRow.style.gap = 6.0f;
   opRow.style.display = std::function<Display()>(
-      []() -> Display { return selPart() > 0 ? Display::Flex : Display::None; });
+      []() -> Display
+      { return selPart() > 0 ? Display::Flex : Display::None; });
   for (const MaskOp op : {MaskOp::Add, MaskOp::Subtract, MaskOp::Intersect})
     opRow.addChild(sidebarButton(
-        maskOpName(op), [op] { setPartOp(op); },
-        [op] {
+        maskOpName(op), [op]
+        { setPartOp(op); },
+        [op]
+        {
           const MaskPart *p = selectedPart();
           return p && selPart() > 0 && p->op == op;
         }));
   partsSec.addChild(std::move(opRow));
   partsSec.addChild(sidebarButton("+ Part: Radial",
-                                  [] { addPart(MaskType::Radial); }));
+                                  []
+                                  { addPart(MaskType::Radial); }));
   partsSec.addChild(sidebarButton("+ Part: Linear",
-                                  [] { addPart(MaskType::Linear); }));
+                                  []
+                                  { addPart(MaskType::Linear); }));
   partsSec.addChild(sidebarButton("+ Part: Brush",
-                                  [] { addPart(MaskType::Brush); }));
+                                  []
+                                  { addPart(MaskType::Brush); }));
   partsSec.addChild(sidebarButton("+ Part: Luminosity",
-                                  [] { addPart(MaskType::Luminosity); }));
+                                  []
+                                  { addPart(MaskType::Luminosity); }));
+  partsSec.addChild(sidebarButton("+ Part: Object",
+                                  []
+                                  { addPart(MaskType::Object); }));
+
   View removeRow;
   removeRow.style.width = Size::full();
-  removeRow.style.display = std::function<Display()>([]() -> Display {
+  removeRow.style.display = std::function<Display()>([]() -> Display
+                                                     {
     const Mask *m = selectedMask();
-    return m && m->parts.size() > 1 ? Display::Flex : Display::None;
-  });
+    return m && m->parts.size() > 1 ? Display::Flex : Display::None; });
   removeRow.addChild(sidebarButton("Remove Part", removeSelectedPart));
   partsSec.addChild(std::move(removeRow));
   maskEditor.addChild(std::move(partsSec));
@@ -7649,26 +9413,33 @@ int main() {
   radialShape.style.width = Size::full();
   radialShape.style.direction = FlexDirection::Column;
   radialShape.style.gap = 12.0f;
-  radialShape.style.display = std::function<Display()>([]() -> Display {
-    return selectedPartType() == MaskType::Radial ? Display::Flex
-                                                  : Display::None;
-  });
+  radialShape.style.display = std::function<Display()>([]() -> Display
+                                                       { return selectedPartType() == MaskType::Radial ? Display::Flex
+                                                                                                       : Display::None; });
   radialShape.addChild(sectionLabel("Shape"));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Width", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RadialShape &r) { return r.rx * 100.0f; },
-      [](RadialShape &r, float v) { r.rx = v / 100.0f; }, kMaskCtlWidth)));
+      [](const RadialShape &r)
+      { return r.rx * 100.0f; },
+      [](RadialShape &r, float v)
+      { r.rx = v / 100.0f; }, kMaskCtlWidth)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Height", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RadialShape &r) { return r.ry * 100.0f; },
-      [](RadialShape &r, float v) { r.ry = v / 100.0f; }, kMaskCtlHeight)));
+      [](const RadialShape &r)
+      { return r.ry * 100.0f; },
+      [](RadialShape &r, float v)
+      { r.ry = v / 100.0f; }, kMaskCtlHeight)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
-      "Angle", -90.0f, 90.0f, [](const RadialShape &r) { return r.angle; },
-      [](RadialShape &r, float v) { r.angle = v; }, kMaskCtlAngle)));
+      "Angle", -90.0f, 90.0f, [](const RadialShape &r)
+      { return r.angle; },
+      [](RadialShape &r, float v)
+      { r.angle = v; }, kMaskCtlAngle)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Feather", 0.0f, 100.0f,
-      [](const RadialShape &r) { return r.feather * 100.0f; },
-      [](RadialShape &r, float v) { r.feather = v / 100.0f; },
+      [](const RadialShape &r)
+      { return r.feather * 100.0f; },
+      [](RadialShape &r, float v)
+      { r.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskEditor.addChild(std::move(radialShape));
 
@@ -7676,18 +9447,21 @@ int main() {
   linearShape.style.width = Size::full();
   linearShape.style.direction = FlexDirection::Column;
   linearShape.style.gap = 12.0f;
-  linearShape.style.display = std::function<Display()>([]() -> Display {
-    return selectedPartType() == MaskType::Linear ? Display::Flex
-                                                  : Display::None;
-  });
+  linearShape.style.display = std::function<Display()>([]() -> Display
+                                                       { return selectedPartType() == MaskType::Linear ? Display::Flex
+                                                                                                       : Display::None; });
   linearShape.addChild(sectionLabel("Shape"));
   linearShape.addChild(buildSliderRow(maskLinearSlider(
       "Length", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const LinearShape &l) { return l.len * 100.0f; },
-      [](LinearShape &l, float v) { l.len = v / 100.0f; }, kMaskCtlLength)));
+      [](const LinearShape &l)
+      { return l.len * 100.0f; },
+      [](LinearShape &l, float v)
+      { l.len = v / 100.0f; }, kMaskCtlLength)));
   linearShape.addChild(buildSliderRow(maskLinearSlider(
-      "Angle", -180.0f, 180.0f, [](const LinearShape &l) { return l.angle; },
-      [](LinearShape &l, float v) { l.angle = v; }, kMaskCtlAngle)));
+      "Angle", -180.0f, 180.0f, [](const LinearShape &l)
+      { return l.angle; },
+      [](LinearShape &l, float v)
+      { l.angle = v; }, kMaskCtlAngle)));
   maskEditor.addChild(std::move(linearShape));
 
   // Luminosity range (shown for a luminosity mask): which brightnesses it
@@ -7696,25 +9470,30 @@ int main() {
   lumShape.style.width = Size::full();
   lumShape.style.direction = FlexDirection::Column;
   lumShape.style.gap = 12.0f;
-  lumShape.style.display = std::function<Display()>([]() -> Display {
-    return selectedPartType() == MaskType::Luminosity ? Display::Flex
-                                                      : Display::None;
-  });
+  lumShape.style.display = std::function<Display()>([]() -> Display
+                                                    { return selectedPartType() == MaskType::Luminosity ? Display::Flex
+                                                                                                        : Display::None; });
   lumShape.addChild(sectionLabel("Range"));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Min", 0.0f, 100.0f,
-      [](const LuminosityShape &l) { return l.lo * 100.0f; },
-      [](LuminosityShape &l, float v) { l.setLo(v / 100.0f); },
+      [](const LuminosityShape &l)
+      { return l.lo * 100.0f; },
+      [](LuminosityShape &l, float v)
+      { l.setLo(v / 100.0f); },
       kMaskCtlLumLo)));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Max", 0.0f, 100.0f,
-      [](const LuminosityShape &l) { return l.hi * 100.0f; },
-      [](LuminosityShape &l, float v) { l.setHi(v / 100.0f); },
+      [](const LuminosityShape &l)
+      { return l.hi * 100.0f; },
+      [](LuminosityShape &l, float v)
+      { l.setHi(v / 100.0f); },
       kMaskCtlLumHi)));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Smoothness", 0.0f, 100.0f,
-      [](const LuminosityShape &l) { return l.feather * 100.0f; },
-      [](LuminosityShape &l, float v) { l.feather = v / 100.0f; },
+      [](const LuminosityShape &l)
+      { return l.feather * 100.0f; },
+      [](LuminosityShape &l, float v)
+      { l.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskEditor.addChild(std::move(lumShape));
 
@@ -7722,14 +9501,16 @@ int main() {
   // strokes already painted keep the values they were painted with.
   const auto brushSlider = [](const char *name, float lo, float hi,
                               std::function<float()> get,
-                              std::function<void(float)> set) {
+                              std::function<void(float)> set)
+  {
     SliderSpec s;
     s.name = name;
     s.lo = lo;
     s.hi = hi;
     s.get = std::move(get);
     s.set = std::move(set);
-    s.format = [](float v) {
+    s.format = [](float v)
+    {
       return std::to_string(static_cast<int>(std::lround(v)));
     };
     s.affectsPixels = false;
@@ -7740,51 +9521,104 @@ int main() {
   brushShape.style.direction = FlexDirection::Column;
   brushShape.style.gap = 12.0f;
   brushShape.style.display = std::function<Display()>(
-      []() -> Display { return selectedIsBrush() ? Display::Flex : Display::None; });
+      []() -> Display
+      { return selectedIsBrush() ? Display::Flex : Display::None; });
   brushShape.addChild(sidebarButton(
       "Erase",
-      [] {
+      []
+      {
         state.mask.brushErase = !state.mask.brushErase;
         state.markDirty();
       },
-      [] { return state.mask.brushErase; }));
+      []
+      { return state.mask.brushErase; }));
   brushShape.addChild(brushSlider(
       "Size", 1.0f, kBrushMaxSize * 100.0f,
-      [] { return state.mask.brushSize * 100.0f; },
-      [](float v) {
+      []
+      { return state.mask.brushSize * 100.0f; },
+      [](float v)
+      {
         state.mask.brushSize =
             std::clamp(v / 100.0f, kBrushMinSize, kBrushMaxSize);
       }));
   brushShape.addChild(brushSlider(
-      "Feather", 0.0f, 100.0f, [] { return state.mask.brushFeather * 100.0f; },
-      [](float v) { state.mask.brushFeather = std::clamp(v / 100.0f, 0.0f, 1.0f); }));
+      "Feather", 0.0f, 100.0f, []
+      { return state.mask.brushFeather * 100.0f; },
+      [](float v)
+      { state.mask.brushFeather = std::clamp(v / 100.0f, 0.0f, 1.0f); }));
   brushShape.addChild(brushSlider(
-      "Density", 1.0f, 100.0f, [] { return state.mask.brushDensity * 100.0f; },
-      [](float v) { state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
-  brushShape.addChild(sidebarButton("Clear Strokes", [] {
+      "Density", 1.0f, 100.0f, []
+      { return state.mask.brushDensity * 100.0f; },
+      [](float v)
+      { state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
+  brushShape.addChild(sidebarButton("Clear Strokes", []
+                                    {
     const size_t part = static_cast<size_t>(selPart());
     maskEditDiscrete([part](Mask &m) {
       if (part < m.parts.size())
         if (auto *b = std::get_if<BrushShape>(&m.parts[part].shape))
           b->strokes.clear();
-    });
-  }));
+    }); }));
   maskEditor.addChild(std::move(brushShape));
+
+  View objectShape;
+  objectShape.style.width = Size::full();
+  objectShape.style.direction = FlexDirection::Column;
+  objectShape.style.gap = 12.0f;
+  objectShape.style.display = std::function<Display()>([]() -> Display
+                                                       { return selectedPartType() == MaskType::Object ? Display::Flex
+                                                                                                       : Display::None; });
+  objectShape.addChild(sidebarButton("Set test map (bright areas)", []
+                                     {
+  if (auto m = makeTestObjectMap())
+    setSelectedObjectMap(std::move(m)); }));
+  objectShape.addChild(buildSliderRow(maskShapeSlider<ObjectShape>(
+      "Feather", 0.0f, 100.0f,
+      [](const ObjectShape &o)
+      { return o.feather * 100.0f; },
+      [](ObjectShape &o, float v)
+      { o.feather = v / 100.0f; },
+      kMaskCtlFeather)));
+  objectShape.addChild(buildSliderRow(maskShapeSlider<ObjectShape>(
+      "Grow", -100.0f, 100.0f,
+      [](const ObjectShape &o)
+      { return o.grow * 100.0f; },
+      [](ObjectShape &o, float v)
+      { o.grow = v / 100.0f; },
+      kMaskCtlWidth)));
+  objectShape.addChild(sidebarButton(
+      "Click adds: Background",
+      []
+      { state.mask.objBg = !state.mask.objBg; state.markDirty(); },
+      []
+      { return state.mask.objBg; }));
+  objectShape.addChild(sidebarButton("Clear selection", clearSelectedObject));
+  {
+    Text segInfo;
+    segInfo.label = std::function<std::string()>([]
+                                                 { return getSegInfo(); });
+    segInfo.fontSize = 11.0f;
+    segInfo.color = kColorTextFaint;
+    objectShape.addChild(std::move(segInfo));
+  }
+  maskEditor.addChild(std::move(objectShape));
 
   // The mask's own adjustments: same table as the Adjust pane.
   bool maskColorHeaderAdded = false;
   maskEditor.addChild(sectionLabel("Tone"));
-  for (const auto &spec : kAdjustmentSpecs) {
-    if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color) {
+  for (const auto &spec : kAdjustmentSpecs)
+  {
+    if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
+    {
       maskEditor.addChild(sectionLabel("Color"));
       maskColorHeaderAdded = true;
     }
     maskEditor.addChild(buildMaskAdjustmentSlider(spec));
   }
 
-  maskEditor.addChild(sidebarButton("Reset Mask Sliders", [] {
-    maskEditDiscrete([](Mask &m) { m.adj.fill(0.0f); });
-  }));
+  maskEditor.addChild(sidebarButton("Reset Mask Sliders", []
+                                    { maskEditDiscrete([](Mask &m)
+                                                       { m.adj.fill(0.0f); }); }));
   maskEditor.addChild(sidebarButton("Delete Mask", deleteSelectedMask));
   maskPane.addChild(std::move(maskEditor));
 
@@ -7798,15 +9632,15 @@ int main() {
   cropPane.style.direction = FlexDirection::Column;
   cropPane.style.gap = 6.0f;
   cropPane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 2 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 2 ? Display::Flex : Display::None; });
 
   Text cropHint;
-  cropHint.label = std::function<std::string()>([]() -> std::string {
-    return state.image
-               ? "Drag on the image to choose an area. Drag the handles to "
-                 "resize, or the inside to move."
-               : "Open an image to crop it.";
-  });
+  cropHint.label = std::function<std::string()>([]() -> std::string
+                                                { return state.image
+                                                             ? "Drag on the image to choose an area. Drag the handles to "
+                                                               "resize, or the inside to move."
+                                                             : "Open an image to crop it."; });
   cropHint.fontSize = 12.0f;
   cropHint.color = kColorTextMuted;
   cropHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -7821,31 +9655,35 @@ int main() {
 
   for (size_t i = 0; i < kCropAspects.size(); ++i)
     cropPane.addChild(sidebarButton(
-        kCropAspects[i].label, [i] { setCropAspect(i); },
-        [i] { return state.crop.aspectIdx == i; }));
+        kCropAspects[i].label, [i]
+        { setCropAspect(i); },
+        [i]
+        { return state.crop.aspectIdx == i; }));
 
   Text cropInfo;
-  cropInfo.label = std::function<std::string()>([]() -> std::string {
+  cropInfo.label = std::function<std::string()>([]() -> std::string
+                                                {
     if (!state.image)
       return std::string();
     const int w = static_cast<int>(std::lround(state.crop.r - state.crop.l));
     const int h = static_cast<int>(std::lround(state.crop.b - state.crop.t));
     return "Selection: " + std::to_string(w) + " x " + std::to_string(h) +
-           " px";
-  });
+           " px"; });
   cropInfo.fontSize = 13.0f;
   cropInfo.color = kColorTextMid;
   cropInfo.style.margin = EdgeInsets{8, 0, 4, 0};
   cropPane.addChild(std::move(cropInfo));
 
   cropPane.addChild(sidebarButton("Apply Crop", applyCrop, {}, true,
-                                  [] { return !geometryBusy(); }));
-  cropPane.addChild(sidebarButton("Reset Selection", [] {
+                                  []
+                                  { return !geometryBusy(); }));
+  cropPane.addChild(sidebarButton("Reset Selection", []
+                                  {
     resetCropSelection();
-    state.markDirty();
-  }));
+    state.markDirty(); }));
   cropPane.addChild(sidebarButton("Remove Crop", removeCrop, {}, false,
-                                  [] { return !geometryBusy(); }));
+                                  []
+                                  { return !geometryBusy(); }));
 
   sidebar.addChild(std::move(cropPane));
 
@@ -7856,31 +9694,36 @@ int main() {
   rotatePane.style.direction = FlexDirection::Column;
   rotatePane.style.gap = 6.0f;
   rotatePane.style.display = std::function<Display()>(
-      [] { return state.activeActivity == 3 ? Display::Flex : Display::None; });
+      []
+      { return state.activeActivity == 3 ? Display::Flex : Display::None; });
 
   Text rotateHint;
-  rotateHint.label = std::function<std::string()>([]() -> std::string {
-    return state.image ? "Turn or flip the whole image, or straighten it with "
-                         "the angle slider. Straightening clears any crop."
-                       : "Open an image to rotate it.";
-  });
+  rotateHint.label = std::function<std::string()>([]() -> std::string
+                                                  { return state.image ? "Turn or flip the whole image, or straighten it with "
+                                                                         "the angle slider. Straightening clears any crop."
+                                                                       : "Open an image to rotate it."; });
   rotateHint.fontSize = 12.0f;
   rotateHint.color = kColorTextMuted;
   rotateHint.style.margin = EdgeInsets{0, 0, 6, 0};
   rotatePane.addChild(std::move(rotateHint));
 
-  const auto geoIdle = [] { return !geometryBusy(); };
+  const auto geoIdle = []
+  { return !geometryBusy(); };
   rotatePane.addChild(sidebarButton(
-      "\u21BA  Rotate Left 90\u00B0", [] { applyGeoOp(GeoOp::RotateCCW); }, {},
+      "\u21BA  Rotate Left 90\u00B0", []
+      { applyGeoOp(GeoOp::RotateCCW); }, {},
       false, geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u21BB  Rotate Right 90\u00B0", [] { applyGeoOp(GeoOp::RotateCW); }, {},
+      "\u21BB  Rotate Right 90\u00B0", []
+      { applyGeoOp(GeoOp::RotateCW); }, {},
       false, geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u2194  Flip Horizontal", [] { applyGeoOp(GeoOp::FlipH); }, {}, false,
+      "\u2194  Flip Horizontal", []
+      { applyGeoOp(GeoOp::FlipH); }, {}, false,
       geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u2195  Flip Vertical", [] { applyGeoOp(GeoOp::FlipV); }, {}, false,
+      "\u2195  Flip Vertical", []
+      { applyGeoOp(GeoOp::FlipV); }, {}, false,
       geoIdle));
   rotatePane.addChild(sidebarButton("Reset Turns & Flips", resetOrientation, {},
                                     false, geoIdle));
@@ -7898,9 +9741,11 @@ int main() {
   angleSlider.name = "Angle";
   angleSlider.lo = -kAngleMax;
   angleSlider.hi = kAngleMax;
-  angleSlider.get = [] { return state.adjust.angle(); };
+  angleSlider.get = []
+  { return state.adjust.angle(); };
   angleSlider.set = setAngleFromSlider;
-  angleSlider.format = [](float v) {
+  angleSlider.format = [](float v)
+  {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.1f\u00B0", static_cast<double>(v));
     return std::string(buf);
@@ -7910,7 +9755,8 @@ int main() {
 
   // Fine adjustment: the track is ~0.6 degrees per pixel, too coarse for
   // levelling a horizon, so step buttons sit right under it.
-  auto nudgeBtn = [](const std::string &label, float delta) {
+  auto nudgeBtn = [](const std::string &label, float delta)
+  {
     View v;
     v.style.width = Size::pixel(36);
     v.style.height = Size::pixel(26);
@@ -7920,7 +9766,8 @@ int main() {
     v.style.alignItems = Align::Center;
     v.style.backgroundColor = kColorActivityBarBg;
     v.style.hoverColor = kColorActivityHover;
-    v.onClick = [delta] { nudgeAngle(delta); };
+    v.onClick = [delta]
+    { nudgeAngle(delta); };
     Text t;
     t.label = label;
     t.fontSize = 11.0f;
@@ -7946,13 +9793,18 @@ int main() {
   rotatePane.addChild(std::move(cornersTitle));
 
   rotatePane.addChild(sidebarButton(
-      "Auto-crop empty corners", [] { setCornerMode(false); },
-      [] { return !state.adjust.expand(); }));
+      "Auto-crop empty corners", []
+      { setCornerMode(false); },
+      []
+      { return !state.adjust.expand(); }));
   rotatePane.addChild(sidebarButton(
-      "Keep full canvas", [] { setCornerMode(true); },
-      [] { return state.adjust.expand(); }));
+      "Keep full canvas", []
+      { setCornerMode(true); },
+      []
+      { return state.adjust.expand(); }));
   rotatePane.addChild(
-      sidebarButton("Reset Angle", [] { setAngleDiscrete(0.0f); }));
+      sidebarButton("Reset Angle", []
+                    { setAngleDiscrete(0.0f); }));
 
   sidebar.addChild(std::move(rotatePane));
 
@@ -7964,18 +9816,20 @@ int main() {
   vDivider.style.flexShrink = 0;
   vDivider.style.backgroundColor = kColorDivider;
   vDivider.style.hoverColor = kColorDividerHover;
-  vDivider.style.width = std::function<Size()>([] {
-    return Size::pixel(state.activeActivity != -1 ? kDividerW : 0.0f);
-  });
+  vDivider.style.width = std::function<Size()>([]
+                                               { return Size::pixel(state.activeActivity != -1 ? kDividerW : 0.0f); });
 
-  auto updateSidebarWidth = [](float localX) {
+  auto updateSidebarWidth = [](float localX)
+  {
     float next = state.sidebarWidth + localX - kDividerW / 2.0f;
     state.sidebarWidth = std::clamp(next, kMinSidebarW, kMaxSidebarW);
   };
-  vDivider.onPressAt = [updateSidebarWidth](float localX, float) {
+  vDivider.onPressAt = [updateSidebarWidth](float localX, float)
+  {
     updateSidebarWidth(localX);
   };
-  vDivider.onDragTo = [updateSidebarWidth](float localX, float) {
+  vDivider.onDragTo = [updateSidebarWidth](float localX, float)
+  {
     updateSidebarWidth(localX);
   };
 
@@ -7999,20 +9853,25 @@ int main() {
   // "no image" placeholder below is workspace's other child for that
   // same slot and shows exactly when this one doesn't.
   viewport.style.display = std::function<Display()>(
-      [] { return state.image ? Display::Flex : Display::None; });
+      []
+      { return state.image ? Display::Flex : Display::None; });
 
   View canvas;
   canvas.isCanvas = true;
   canvas.style.width = std::function<Size()>(
-      [] { return Size::pixel(state.docWidth() * state.zoom); });
+      []
+      { return Size::pixel(state.docWidth() * state.zoom); });
   canvas.style.height = std::function<Size()>(
-      [] { return Size::pixel(state.docHeight() * state.zoom); });
+      []
+      { return Size::pixel(state.docHeight() * state.zoom); });
   canvas.style.borderWidth = 1.0f;
   canvas.style.borderColor = kColorCanvasBorder;
   canvas.style.backgroundColor = kColorWhite;
 
-  canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx); };
-  canvas.canvasDirtySource = [] {
+  canvas.onPaint = [](CanvasContext &ctx)
+  { paintCanvas(ctx); };
+  canvas.canvasDirtySource = []
+  {
     // Polled once per frame (see liteui.hpp's checkForUpdates) — the right
     // place to do the deferred, expensive part of a slider drag exactly
     // once per frame, no matter how many onDragTo events fired since the
@@ -8024,21 +9883,29 @@ int main() {
   };
   // Crop-selection dragging (no-ops unless the Crop pane is open).
   // Each is a no-op unless its own pane is open (crop: 2, masks: 7).
-  canvas.onPressAt = [](float lx, float ly) {
+  canvas.onPressAt = [](float lx, float ly)
+  {
     cropPress(lx, ly);
     maskPress(lx, ly);
   };
-  canvas.onDragTo = [](float lx, float ly) {
+
+  canvas.onRightPressAt = [](float lx, float ly)
+  { objectPress(lx, ly, true); };
+  canvas.onDragTo = [](float lx, float ly)
+  {
     cropDrag(lx, ly);
     maskDrag(lx, ly);
   };
-  canvas.onDragEnd = [] {
+  canvas.onDragEnd = []
+  {
     state.crop.drag = CropUi::Drag::None;
     if (state.mask.drag != MaskUi::Drag::None)
       maskEndDrag();
   };
-  canvas.onScrollUp = [] { setZoom(state.zoom * kZoomStep); };
-  canvas.onScrollDown = [] { setZoom(state.zoom / kZoomStep); };
+  canvas.onScrollUp = []
+  { setZoom(state.zoom * kZoomStep); };
+  canvas.onScrollDown = []
+  { setZoom(state.zoom / kZoomStep); };
 
   viewport.addChild(std::move(canvas));
 
@@ -8051,7 +9918,8 @@ int main() {
   noImagePlaceholder.style.justifyContent = Justify::Center;
   noImagePlaceholder.style.alignItems = Align::Center;
   noImagePlaceholder.style.display = std::function<Display()>(
-      [] { return state.image ? Display::None : Display::Flex; });
+      []
+      { return state.image ? Display::None : Display::Flex; });
 
   Text noImageText;
   noImageText.label = std::string("No image selected");
@@ -8076,7 +9944,8 @@ int main() {
   statusBar.style.padding = EdgeInsets{0, 10, 0, 12};
 
   Text statusLeft;
-  statusLeft.label = std::function<std::string()>([] {
+  statusLeft.label = std::function<std::string()>([]
+                                                  {
     std::string s = state.image
                         ? baseName(state.imagePath) + "  —  " +
                               std::to_string(state.image->width) + " x " +
@@ -8084,17 +9953,18 @@ int main() {
                         : std::string("No image open");
     if (!state.statusMsg.empty())
       s += "     •     " + state.statusMsg;
-    return s;
-  });
+    return s; });
   statusLeft.fontSize = 12.0f;
   statusLeft.wrap = TextWrap::NoWrap; // one line, even with a long message
   statusLeft.color = std::function<Color()>(
-      [] { return state.statusIsError ? kColorStatusError : kColorWhite; });
+      []
+      { return state.statusIsError ? kColorStatusError : kColorWhite; });
   statusBar.addChild(std::move(statusLeft));
 
   // Right side of the status bar: zoom controls.
   auto statusGlyphBtn = [](const std::string &label,
-                           std::function<void()> onClick) {
+                           std::function<void()> onClick)
+  {
     View v;
     v.style.width = Size::pixel(20);
     v.style.height = Size::pixel(20);
@@ -8117,10 +9987,12 @@ int main() {
   zoomControls.style.gap = 4.0f;
 
   zoomControls.addChild(
-      statusGlyphBtn("-", [] { setZoom(state.zoom / kZoomStep); }));
+      statusGlyphBtn("-", []
+                     { setZoom(state.zoom / kZoomStep); }));
 
   Text zoomLabel;
-  zoomLabel.label = [] {
+  zoomLabel.label = []
+  {
     return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 12.0f;
@@ -8129,7 +10001,8 @@ int main() {
   zoomControls.addChild(std::move(zoomLabel));
 
   zoomControls.addChild(
-      statusGlyphBtn("+", [] { setZoom(state.zoom * kZoomStep); }));
+      statusGlyphBtn("+", []
+                     { setZoom(state.zoom * kZoomStep); }));
 
   View zoomResetSpacer;
   zoomResetSpacer.style.width = Size::pixel(6);
@@ -8141,7 +10014,8 @@ int main() {
   zoomResetBtn.style.hoverColor = kColorStatusHover;
   zoomResetBtn.style.borderRadius = 3.0f;
   zoomResetBtn.style.padding = EdgeInsets{2, 6, 2, 6};
-  zoomResetBtn.onClick = [] { setZoom(1.0f); };
+  zoomResetBtn.onClick = []
+  { setZoom(1.0f); };
   {
     Text t;
     t.label = std::string("100%");
@@ -8160,5 +10034,6 @@ int main() {
   renderWorker.shutdown();   // join the worker before `ui` goes out of scope
   geometryWorker.shutdown(); // ditto
   decodeWorker.shutdown();   // ditto (waits out a decode still running)
+  segmentWorker.shutdown();
   return 0;
 }

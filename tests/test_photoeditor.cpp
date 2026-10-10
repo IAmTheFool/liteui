@@ -1,4 +1,4 @@
-#ifdef PHOTOEDITOR_TESTS
+#ifdef LITEROOM_TESTS
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 using Catch::Approx;
@@ -65,4 +65,4 @@ TEST_CASE("four 90-degree rotations restore the image") {
   REQUIRE(r->width == 2);
   REQUIRE(r->pixels == img.pixels);
 }
-#endif // PHOTOEDITOR_TESTS
+#endif // LITEROOM_TESTS

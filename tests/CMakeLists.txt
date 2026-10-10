@@ -34,16 +34,16 @@ catch_discover_tests(liteui_tests)
 
 
 # # ---- photo editor tests ---------------------------------------------
-# # Same source file as the photoeditor example, built a second time with
-# # PHOTOEDITOR_TESTS so main() is replaced by Catch2's main.
-# set(PHOTOEDITOR_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../examples/photoeditor.cpp)
+# # Same source file as the literoom example, built a second time with
+# # LITEROOM_TESTS so main() is replaced by Catch2's main.
+# set(LITEROOM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../examples/literoom.cpp)
 
-# if(EXISTS ${PHOTOEDITOR_SOURCE})
-#     add_executable(photoeditor_tests ${PHOTOEDITOR_SOURCE})
-#     target_compile_definitions(photoeditor_tests PRIVATE PHOTOEDITOR_TESTS)
-#     target_link_libraries(photoeditor_tests PRIVATE liteui::liteui Catch2::Catch2WithMain)
-#     catch_discover_tests(photoeditor_tests)
+# if(EXISTS ${LITEROOM_SOURCE})
+#     add_executable(literoom_tests ${LITEROOM_SOURCE})
+#     target_compile_definitions(literoom_tests PRIVATE LITEROOM_TESTS)
+#     target_link_libraries(literoom_tests PRIVATE liteui::liteui Catch2::Catch2WithMain)
+#     catch_discover_tests(literoom_tests)
 # else()
-#     message(WARNING "tests: ${PHOTOEDITOR_SOURCE} not found, "
-#                     "skipping photoeditor_tests")
+#     message(WARNING "tests: ${LITEROOM_SOURCE} not found, "
+#                     "skipping literoom_tests")
 # endif()
