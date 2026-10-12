@@ -1,4 +1,4 @@
-add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp)
+add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
 if(MSVC)
@@ -52,12 +52,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/models)
         COMMENT "literoom: copying models/")
 endif()
 
-# ---- Unit tests for the JSON helper behind the edit sidecar (no UI needed) ----
+# ---- Unit tests for the header-only helpers (no UI needed) ----
 option(LITEROOM_TESTS "literoom: build unit tests" OFF)
 if(LITEROOM_TESTS)
-    add_executable(minijson_test tests/minijson_test.cpp)
-    target_include_directories(minijson_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(minijson_test PRIVATE cxx_std_20)
     enable_testing()
-    add_test(NAME minijson COMMAND minijson_test)
+    foreach(t minijson exif)
+        add_executable(${t}_test tests/${t}_test.cpp)
+        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(${t}_test PRIVATE cxx_std_20)
+        add_test(NAME ${t} COMMAND ${t}_test)
+    endforeach()
 endif()

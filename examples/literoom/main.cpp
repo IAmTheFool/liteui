@@ -2,13 +2,16 @@
 
 #include "liteui.hpp"
 #include "sam_segmenter.hpp"
+#include "exif.hpp"
 #include "minijson.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
+#include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -3327,7 +3330,6 @@ static bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH,
 }
 // END sidecar
 
-
 // Owns the live value of every slider, the committed crop and orientation,
 // their undo/redo history, and the logic to render them onto a copy of the
 // original image.
@@ -3545,7 +3547,6 @@ public:
   }
   const MaskSet &masks() const { return masks_; }
 
-
   // Bumped by every change to the edit state (an edit, undo, redo, reset).
   // The app compares it with its value at the last save / load to know
   // whether the sidecar file is stale. It is not part of the undo history.
@@ -3556,7 +3557,7 @@ public:
   mj::Json toJson() const
   {
     SidecarEdits e{values_, crop_, orient_, angle_, expand_,
-                   curves_, mix_,  grade_,  masks_};
+                   curves_, mix_, grade_, masks_};
     return sidecarEditsToJson(e);
   }
   // Replaces every edit with the saved ones in `j` (call after reset() and
@@ -4127,8 +4128,13 @@ struct EditorState
                                         // this is what's drawn and exported
   std::string imagePath;                // full path of the opened file
   float zoom = 1.0f;
-  AdjustmentSet adjust; // current slider values + their undo/redo history
+  AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
+
+  // Export pane settings.
+  bool exportJpeg = true;   // the format the Export dialog offers first
+  int jpegQuality = 92;     // 1..100
+  bool keepMetadata = true; // carry the photo's EXIF + ICC profile into a JPEG
   bool dirty = true;
 
   // Set by a slider drag (many events per second while held). The actual
@@ -5383,6 +5389,65 @@ static void redo()
   updateImageFromAdjustments();
 }
 
+// ---------------- Files: paths, byte prefixes, camera rotation ----------------
+static std::filesystem::path fsPath(const std::string &utf8)
+{
+  return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+
+static std::string fileExtLower(const std::string &path)
+{
+  const auto slash = path.find_last_of("/\\");
+  const auto dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+    return "";
+  std::string e = path.substr(dot + 1);
+  std::transform(e.begin(), e.end(), e.begin(),
+                 [](unsigned char c)
+                 { return static_cast<char>(std::tolower(c)); });
+  return e;
+}
+static bool isJpegPath(const std::string &path)
+{
+  const std::string e = fileExtLower(path);
+  return e == "jpg" || e == "jpeg";
+}
+
+// The first `maxBytes` of a file (all of it if smaller). False if unreadable.
+static bool readFilePrefix(const std::string &path, size_t maxBytes,
+                           std::vector<uint8_t> *out)
+{
+  std::ifstream f(fsPath(path), std::ios::binary);
+  if (!f)
+    return false;
+  out->resize(maxBytes);
+  f.read(reinterpret_cast<char *>(out->data()),
+         static_cast<std::streamsize>(maxBytes));
+  out->resize(static_cast<size_t>(f.gcount()));
+  return !out->empty();
+}
+
+// The rotation a camera recorded in a JPEG's EXIF data, as the Orient that
+// makes the picture upright (identity for anything else). The decoders hand
+// back the stored pixels, so a portrait shot would otherwise open on its
+// side. It is applied once, as the file is opened: the "original" the editor
+// (and its saved edits and masks) work on is the upright picture.
+static Orient exifOrientationOf(const std::string &path)
+{
+  Orient o;
+  if (!isJpegPath(path))
+    return o;
+  std::vector<uint8_t> head;
+  exif::JpegMeta meta;
+  if (!readFilePrefix(path, 256u << 10, &head) ||
+      !exif::readJpegMeta(head.data(), head.size(), &meta))
+    return o;
+  const exif::Transform t = exif::orientationToTransform(meta.orientation);
+  o.rot = t.rot;
+  o.flip = t.flip;
+  return o;
+}
+
 // ---------------- Opening a file (background decode) ----------------
 // Decoding a big PNG/JPEG takes long enough to freeze the window, so it runs
 // on its own thread. Same contract as RenderWorker / GeometryWorker: submit()
@@ -5488,6 +5553,18 @@ private:
       r.gen = job.gen;
       r.path = job.path;
       r.image = liteui_image::decodeFile(job.path, &r.error);
+
+      if (r.image)
+      { // a camera's rotation (EXIF) is applied here, once: from now on the
+        // picture is upright everywhere (editor, masks, saved edits, export)
+        const Orient o = exifOrientationOf(job.path);
+        if (!o.identity())
+        {
+          auto turned = orientImage(
+              std::make_shared<CanvasImage>(std::move(*r.image)), o);
+          r.image.emplace(std::move(*turned));
+        }
+      }
       {
         std::lock_guard lk(m_);
         if (latest_.load() != job.gen)
@@ -5948,10 +6025,7 @@ static void collectSegmentJob()
 // picture is ignored (the editor starts clean) and the status bar says so.
 // Opening a picture and touching nothing writes nothing. The undo history is
 // not saved.
-static std::filesystem::path fsPath(const std::string &utf8)
-{
-  return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
-}
+
 static std::filesystem::path sidecarPath(const std::string &imagePath)
 {
   return fsPath(imagePath + kSidecarExt);
@@ -6286,6 +6360,289 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
 
 #endif
 
+// ---------------- JPEG export ----------------
+// Same split as PNG above: WIC on Windows, libjpeg on Linux (the library
+// liteui.hpp already links for decoding). Both encode to memory so the
+// source photo's EXIF block and ICC profile can be spliced in before the file
+// is written (see exif.hpp). JPEG has no alpha, so transparent areas (the
+// corners left by Straighten) are flattened onto white.
+
+constexpr int kJpegQualityDefault = 92;
+constexpr int kJpegMaxSide = 65500;           // the format's limit is 65535
+constexpr size_t kMetaPrefixBytes = 8u << 20; // header search window
+
+// One row of the picture as packed 8-bit RGB (or BGR), alpha over white.
+static void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)
+{
+  const uint8_t *s = &img.pixels[static_cast<size_t>(y) * img.width * 4];
+  for (int x = 0; x < img.width; ++x, s += 4, dst += 3)
+  {
+    const int a = s[3];
+    int c[3];
+    for (int k = 0; k < 3; ++k)
+      c[k] = a == 255 ? s[k] : (s[k] * a + 255 * (255 - a) + 127) / 255;
+    dst[0] = static_cast<uint8_t>(bgr ? c[2] : c[0]);
+    dst[1] = static_cast<uint8_t>(c[1]);
+    dst[2] = static_cast<uint8_t>(bgr ? c[0] : c[2]);
+  }
+}
+
+// 4:4:4 (no chroma subsampling) from quality 90 up: keeps colored edges crisp.
+static bool jpegFullChroma(int quality) { return quality >= 90; }
+
+#if defined(_WIN32)
+
+static bool encodeJpegMemory(const CanvasImage &img, int quality,
+                             std::vector<uint8_t> *out, std::string *errorOut)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  bool weInitialized = coHr == S_OK;
+
+  IWICImagingFactory *factory = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    if (errorOut)
+      *errorOut = "WIC: CoCreateInstance failed";
+    return false;
+  }
+
+  IStream *stream = nullptr;
+  IWICBitmapEncoder *encoder = nullptr;
+  IWICBitmapFrameEncode *frame = nullptr;
+  IPropertyBag2 *props = nullptr;
+  bool ok = false;
+  do
+  {
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)))
+      break;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr,
+                                      &encoder)))
+      break;
+    if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache)))
+      break;
+    if (FAILED(encoder->CreateNewFrame(&frame, &props)))
+      break;
+
+    {
+      PROPBAG2 opt;
+      ZeroMemory(&opt, sizeof opt);
+      opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+      VARIANT v;
+      ZeroMemory(&v, sizeof v);
+      v.vt = VT_R4;
+      v.fltVal = static_cast<float>(quality) / 100.0f;
+      if (FAILED(props->Write(1, &opt, &v)))
+        break;
+    }
+    if (jpegFullChroma(quality))
+    { // best effort: an encoder without this option just keeps its default
+      PROPBAG2 opt;
+      ZeroMemory(&opt, sizeof opt);
+      opt.pstrName = const_cast<LPOLESTR>(L"JpegYCrCbSubsampling");
+      VARIANT v;
+      ZeroMemory(&v, sizeof v);
+      v.vt = VT_UI1;
+      v.bVal = 3; // WICJpegYCrCbSubsampling444
+      props->Write(1, &opt, &v);
+    }
+
+    if (FAILED(frame->Initialize(props)))
+      break;
+    if (FAILED(frame->SetSize(static_cast<UINT>(img.width),
+                              static_cast<UINT>(img.height))))
+      break;
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+    if (FAILED(frame->SetPixelFormat(&fmt)) ||
+        !IsEqualGUID(fmt, GUID_WICPixelFormat24bppBGR))
+      break;
+
+    constexpr int kChunkRows = 64;
+    const UINT stride = static_cast<UINT>(img.width) * 3;
+    std::vector<uint8_t> rows(static_cast<size_t>(stride) * kChunkRows);
+    bool wrote = true;
+    for (int y = 0; y < img.height && wrote; y += kChunkRows)
+    {
+      const int n = std::min(kChunkRows, img.height - y);
+      for (int r = 0; r < n; ++r)
+        flattenRow(img, y + r, &rows[static_cast<size_t>(r) * stride], true);
+      wrote = SUCCEEDED(frame->WritePixels(static_cast<UINT>(n), stride,
+                                           static_cast<UINT>(stride * n),
+                                           rows.data()));
+    }
+    if (!wrote)
+      break;
+    if (FAILED(frame->Commit()) || FAILED(encoder->Commit()))
+      break;
+
+    STATSTG st;
+    HGLOBAL hg = nullptr;
+    if (FAILED(stream->Stat(&st, STATFLAG_NONAME)) ||
+        FAILED(GetHGlobalFromStream(stream, &hg)) || !hg)
+      break;
+    const void *p = GlobalLock(hg);
+    if (!p)
+      break;
+    out->assign(static_cast<const uint8_t *>(p),
+                static_cast<const uint8_t *>(p) + st.cbSize.QuadPart);
+    GlobalUnlock(hg);
+    ok = true;
+  } while (false);
+
+  if (props)
+    props->Release();
+  if (frame)
+    frame->Release();
+  if (encoder)
+    encoder->Release();
+  if (stream)
+    stream->Release();
+  factory->Release();
+  if (weInitialized)
+    CoUninitialize();
+
+  if (!ok && errorOut)
+    *errorOut = "WIC: JPEG encode failed";
+  return ok;
+}
+
+#else // Linux
+
+struct JpegEncErr
+{
+  jpeg_error_mgr pub; // must be first: libjpeg hands back a jpeg_error_mgr*
+  jmp_buf jump;
+  char msg[JMSG_LENGTH_MAX] = {0};
+};
+static void jpegEncErrExit(j_common_ptr c)
+{
+  auto *e = reinterpret_cast<JpegEncErr *>(c->err);
+  (*c->err->format_message)(c, e->msg);
+  longjmp(e->jump, 1); // libjpeg's default would exit() the whole app
+}
+
+static bool encodeJpegMemory(const CanvasImage &img, int quality,
+                             std::vector<uint8_t> *out, std::string *errorOut)
+{
+  jpeg_compress_struct cinfo;
+  JpegEncErr jerr;
+  struct
+  {
+    unsigned char *buf = nullptr;
+    unsigned long size = 0;
+  } dest;
+  std::vector<uint8_t> row(static_cast<size_t>(img.width) * 3);
+
+  cinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = jpegEncErrExit;
+  if (setjmp(jerr.jump))
+  {
+    jpeg_destroy_compress(&cinfo);
+    std::free(dest.buf);
+    if (errorOut)
+      *errorOut = std::string("libjpeg: ") + jerr.msg;
+    return false;
+  }
+  jpeg_create_compress(&cinfo);
+  jpeg_mem_dest(&cinfo, &dest.buf, &dest.size);
+  cinfo.image_width = static_cast<JDIMENSION>(img.width);
+  cinfo.image_height = static_cast<JDIMENSION>(img.height);
+  cinfo.input_components = 3;
+  cinfo.in_color_space = JCS_RGB;
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality, TRUE);
+  if (jpegFullChroma(quality))
+  {
+    cinfo.comp_info[0].h_samp_factor = 1;
+    cinfo.comp_info[0].v_samp_factor = 1;
+  }
+  jpeg_start_compress(&cinfo, TRUE);
+  while (cinfo.next_scanline < cinfo.image_height)
+  {
+    flattenRow(img, static_cast<int>(cinfo.next_scanline), row.data(), false);
+    JSAMPROW rp = row.data();
+    jpeg_write_scanlines(&cinfo, &rp, 1);
+  }
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+  out->assign(dest.buf, dest.buf + dest.size);
+  std::free(dest.buf);
+  return true;
+}
+
+#endif
+
+// Writes `bytes` to `path` via a temp file + rename, so an interrupted export
+// never leaves a half-written picture over a good one.
+static bool writeFileAtomic(const std::string &path,
+                            const std::vector<uint8_t> &bytes,
+                            std::string *errorOut)
+{
+  const std::filesystem::path target = fsPath(path);
+  std::filesystem::path tmp = target;
+  tmp += ".tmp";
+  std::error_code ec;
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char *>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    f.flush();
+    if (!f)
+    {
+      f.close();
+      std::filesystem::remove(tmp, ec);
+      if (errorOut)
+        *errorOut = "couldn't write " + baseName(path);
+      return false;
+    }
+  }
+  std::filesystem::rename(tmp, target, ec); // replaces an existing file
+  if (ec)
+  {
+    std::error_code ignore;
+    std::filesystem::remove(tmp, ignore);
+    if (errorOut)
+      *errorOut = ec.message();
+    return false;
+  }
+  return true;
+}
+
+// Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the
+// opened photo's EXIF block and ICC profile ride along (orientation reset to
+// "upright", because the pixels already are; picture size updated).
+static bool saveJpegFile(const std::string &path, const CanvasImage &img,
+                         int quality, bool keepMetadata, std::string *errorOut)
+{
+  if (img.width <= 0 || img.height <= 0 || img.width > kJpegMaxSide ||
+      img.height > kJpegMaxSide)
+  {
+    if (errorOut)
+      *errorOut = "JPEG can't hold a picture this size";
+    return false;
+  }
+  std::vector<uint8_t> jpeg;
+  if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
+    return false;
+  if (keepMetadata)
+  {
+    std::vector<uint8_t> head;
+    exif::JpegMeta meta;
+    if (isJpegPath(state.imagePath) &&
+        readFilePrefix(state.imagePath, kMetaPrefixBytes, &head) &&
+        exif::readJpegMeta(head.data(), head.size(), &meta))
+      jpeg = exif::embed(jpeg, meta, img.width, img.height);
+  }
+  return writeFileAtomic(path, jpeg, errorOut);
+}
+
+// Exports the picture as you see it (every edit, crop and rotation applied).
+// The format follows the file name the user picks (.jpg / .jpeg / .png); the
+// Export pane's format choice only decides what the dialog offers first.
+
 static void exportImage()
 {
   if (!state.image)
@@ -6293,17 +6650,44 @@ static void exportImage()
   finishGeometryJob(); // never export the stale (pre-rebuild) picture
   finishFullRender();  // never export the stale frame of a pending render
 
-  auto path = saveFilePicker("Export as PNG", "export.png",
-                             {{"PNG Image", "*.png"}}, "png");
+  std::string stem = baseName(state.imagePath);
+  if (const auto dot = stem.find_last_of('.');
+      dot != std::string::npos && dot > 0)
+    stem.resize(dot);
+  if (stem.empty())
+    stem = "export";
+
+  const bool wantJpeg = state.exportJpeg;
+  auto path = wantJpeg
+                  ? saveFilePicker("Export as JPEG", stem + "-edit.jpg",
+                                   {{"JPEG Image", "*.jpg;*.jpeg"},
+                                    {"PNG Image", "*.png"}},
+                                   "jpg")
+                  : saveFilePicker("Export as PNG", stem + "-edit.png",
+                                   {{"PNG Image", "*.png"},
+                                    {"JPEG Image", "*.jpg;*.jpeg"}},
+                                   "png");
   if (!path)
     return; // user cancelled
 
+  std::string out = *path;
+  bool jpeg = isJpegPath(out);
+  if (!jpeg && fileExtLower(out) != "png")
+  { // no usable extension: use the pane's format and name the file for it
+    jpeg = wantJpeg;
+    out += jpeg ? ".jpg" : ".png";
+  }
+
   std::string err;
-  if (encodePngFile(*path, *state.image, &err))
-    setStatus("Exported " + baseName(*path), false);
+  const bool ok =
+      jpeg ? saveJpegFile(out, *state.image, state.jpegQuality,
+                          state.keepMetadata, &err)
+           : encodePngFile(out, *state.image, &err);
+  if (ok)
+    setStatus("Exported " + baseName(out), false);
   else
     setStatus("Export failed: " +
-                  (err.empty() ? "couldn't write " + baseName(*path) : err),
+                  (err.empty() ? "couldn't write " + baseName(out) : err),
               true);
 }
 
@@ -9391,6 +9775,7 @@ int main()
       {7, "Masks", "\u25D0"},
       {2, "Crop", "C"},
       {3, "Rotate", "R"},
+      {8, "Export", "E"},
   };
 
   View root;
@@ -9429,7 +9814,7 @@ int main()
       menuButton("File", 0,
                  {
                      {"Open Image...", openImage, "Ctrl+O"},
-                     {"Export as PNG...", exportImage, "Ctrl+E"},
+                     {"Export...", exportImage, "Ctrl+E"},
                      {"Exit", [&]
                       { ui.requestClose(); }, "Ctrl+Q"},
                  }));
@@ -10545,6 +10930,74 @@ int main()
                     { setAngleDiscrete(0.0f); }));
 
   sidebar.addChild(std::move(rotatePane));
+
+  // -- "Export" pane: format, JPEG quality, metadata, and the Export button.
+  // (The File menu's Export... and Ctrl+E use these same settings.)
+  View exportPane;
+  exportPane.style.width = Size::full();
+  exportPane.style.direction = FlexDirection::Column;
+  exportPane.style.gap = 6.0f;
+  exportPane.style.display = std::function<Display()>(
+      []
+      { return state.activeActivity == 8 ? Display::Flex : Display::None; });
+
+  Text exportHint;
+  exportHint.label = std::function<std::string()>([]() -> std::string
+                                                  { return state.image ? "Saves the picture as you see it, with every edit, "
+                                                                         "crop and rotation applied."
+                                                                       : "Open an image to export it."; });
+  exportHint.fontSize = 12.0f;
+  exportHint.color = kColorTextMuted;
+  exportHint.style.margin = EdgeInsets{0, 0, 6, 0};
+  exportPane.addChild(std::move(exportHint));
+
+  exportPane.addChild(sidebarButton(
+      "PNG  (lossless)", []
+      { state.exportJpeg = false; },
+      []
+      { return !state.exportJpeg; }));
+  exportPane.addChild(sidebarButton(
+      "JPEG", []
+      { state.exportJpeg = true; },
+      []
+      { return state.exportJpeg; }));
+
+  View jpegOptions;
+  jpegOptions.style.width = Size::full();
+  jpegOptions.style.direction = FlexDirection::Column;
+  jpegOptions.style.gap = 6.0f;
+  jpegOptions.style.margin = EdgeInsets{6, 0, 0, 0};
+  jpegOptions.style.display = std::function<Display()>(
+      []
+      { return state.exportJpeg ? Display::Flex : Display::None; });
+
+  SliderSpec qualitySlider;
+  qualitySlider.name = "Quality";
+  qualitySlider.lo = 1.0f;
+  qualitySlider.hi = 100.0f;
+  qualitySlider.get = []
+  { return static_cast<float>(state.jpegQuality); };
+  qualitySlider.set = [](float v)
+  { state.jpegQuality = std::clamp(static_cast<int>(std::lround(v)), 1, 100); };
+  qualitySlider.format = [](float v)
+  { return std::to_string(static_cast<int>(std::lround(v))); };
+  qualitySlider.affectsPixels = false; // a setting, not an edit: no re-render
+  jpegOptions.addChild(buildSliderRow(qualitySlider));
+
+  jpegOptions.addChild(sidebarButton(
+      "Keep EXIF & color profile", []
+      { state.keepMetadata = !state.keepMetadata; },
+      []
+      { return state.keepMetadata; }));
+  exportPane.addChild(std::move(jpegOptions));
+
+  View exportGap;
+  exportGap.style.height = Size::pixel(6);
+  exportPane.addChild(std::move(exportGap));
+  exportPane.addChild(sidebarButton(
+      "Export...", exportImage, {}, true, []
+      { return state.image != nullptr; }));
+  sidebar.addChild(std::move(exportPane));
 
   workspace.addChild(std::move(sidebar));
 
