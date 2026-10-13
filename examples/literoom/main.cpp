@@ -120,6 +120,9 @@ constexpr float kPlaceholderH = 600.0f;
 // dropped as new edits come in. (A drag on one slider is a single step.)
 constexpr size_t kMaxUndoSteps = 200;
 
+// Activity id of the History panel (see the activities list in main).
+constexpr int kHistoryActivity = 9;
+
 // Masks (local adjustments; see the "masks" block below). Radii are a
 // fraction of the picture's SHORTER side (the original's when stored, the
 // current picture's once mapped).
@@ -3660,6 +3663,27 @@ public:
     lastEdited_ = AdjId::Count;
   }
 
+  // ---- History panel ----
+  size_t historySize() const { return history_.size(); }
+  size_t historyIndex() const { return historyIndex_; }
+  // What step `i` changed compared with step i-1 ("Original" for step 0).
+  // Cached per version(), so polling it every frame is cheap.
+  const std::string &historyLabel(size_t i) const
+  {
+    refreshLabels();
+    static const std::string none;
+    return i < labels_.size() ? labels_[i] : none;
+  }
+  // Jumps to step `i`: the same as pressing Undo / Redo until you get there.
+  void goToHistory(size_t i)
+  {
+    if (i >= history_.size() || i == historyIndex_)
+      return;
+    historyIndex_ = i;
+    restore(history_[i]);
+    lastEdited_ = AdjId::Count; // next slider touch starts a new entry
+  }
+
   // Composes every non-zero adjustment's pointwise transform into a single
   // 256-entry lookup table, applied identically to R/G/B. Building the
   // table is O(256) regardless of image size — the expensive part of a
@@ -3761,6 +3785,109 @@ private:
     grade_ = s.grade;
     masks_ = s.masks;
   }
+
+  // ---- History panel labels ----
+  // A step is described by diffing it against the one before, so the
+  // setters don't need to know about labels, and a coalesced drag that
+  // overwrites a step can't leave a stale one behind.
+  static std::string signedNum(float v)
+  {
+    char buf[32];
+    if (std::fabs(v - std::round(v)) < 0.05f)
+      std::snprintf(buf, sizeof buf, "%+d", static_cast<int>(std::lround(v)));
+    else
+      std::snprintf(buf, sizeof buf, "%+.1f", v);
+    return buf;
+  }
+  static std::string describeStep(const Snapshot &a, const Snapshot &b)
+  {
+    for (const auto &s : kAdjustmentSpecs)
+    {
+      const size_t k = static_cast<size_t>(s.id);
+      if (a.values[k] != b.values[k])
+        return s.label + " " + signedNum(b.values[k]);
+    }
+    if (!(a.orient == b.orient))
+      return "Rotate / Flip";
+    if (a.angle != b.angle)
+    {
+      char buf[40];
+      std::snprintf(buf, sizeof buf, "Straighten %+.1f\xC2\xB0", b.angle);
+      return buf;
+    }
+    if (a.expand != b.expand)
+      return b.expand ? "Straighten: Keep Canvas" : "Straighten: Auto-Crop";
+    if (!(a.crop == b.crop))
+      return b.crop.empty() ? "Remove Crop" : "Crop";
+    static const char *const chn[kCurveChannelCount] = {"RGB", "Red", "Green", "Blue"};
+    for (size_t c = 0; c < kCurveChannelCount; ++c)
+      if (!(a.curves[c] == b.curves[c]))
+        return std::string("Tone Curve: ") + chn[c];
+    int mixDiffs = 0;
+    size_t mixIdx = 0;
+    for (size_t k = 0; k < b.mix.size(); ++k)
+      if (a.mix[k] != b.mix[k])
+      {
+        if (!mixDiffs)
+          mixIdx = k;
+        ++mixDiffs;
+      }
+    if (mixDiffs > 1)
+      return "Color Mix: Reset";
+    if (mixDiffs == 1)
+    {
+      static const char *const cn[kMixChanCount] = {"Hue", "Saturation", "Luminance"};
+      return std::string("Color Mix: ") + mixBandName(mixIdx % kMixBandCount) +
+             " " + cn[mixIdx / kMixBandCount] + " " + signedNum(b.mix[mixIdx]);
+    }
+    if (!(a.grade == b.grade))
+    {
+      static const char *const rn[kGradeRangeCount] = {"Shadows", "Midtones", "Highlights", "Global"};
+      for (size_t w = 0; w < kGradeRangeCount; ++w)
+        if (!(a.grade.wheel[w] == b.grade.wheel[w]))
+          return std::string("Color Grading: ") + rn[w];
+      return a.grade.blending != b.grade.blending ? "Color Grading: Blending"
+                                                  : "Color Grading: Balance";
+    }
+    if (b.masks.size() > a.masks.size())
+      return std::string("Add ") + maskTypeName(b.masks.back().type()) + " Mask";
+    if (b.masks.size() < a.masks.size())
+      return "Delete Mask";
+    for (size_t m = 0; m < b.masks.size(); ++m)
+    {
+      const Mask &x = a.masks[m], &y = b.masks[m];
+      if (x == y)
+        continue;
+      const std::string n = "Mask " + std::to_string(m + 1) + ": ";
+      for (const auto &s : kAdjustmentSpecs)
+      {
+        const size_t k = static_cast<size_t>(s.id);
+        if (x.adj[k] != y.adj[k])
+          return n + s.label + " " + signedNum(y.adj[k]);
+      }
+      if (x.enabled != y.enabled)
+        return n + (y.enabled ? "On" : "Off");
+      if (x.invert != y.invert)
+        return n + "Invert";
+      if (x.parts.size() != y.parts.size())
+        return n + "Parts";
+      return n + "Edit";
+    }
+    return "Edit";
+  }
+  // Rebuilds the label cache when anything changed since it was built.
+  // version_ moves on every snapshot / restore, so this covers edits,
+  // undo / redo, jumps, reset and trimming of the oldest steps.
+  void refreshLabels() const
+  {
+    if (labelsVersion_ == version_ && labels_.size() == history_.size())
+      return;
+    labels_.resize(history_.size());
+    for (size_t i = 0; i < history_.size(); ++i)
+      labels_[i] = i == 0 ? std::string("Original")
+                          : describeStep(history_[i - 1], history_[i]);
+    labelsVersion_ = version_;
+  }
   // The single place a new undo step is added: drops any redo tail, appends
   // the current state, and forgets the oldest steps beyond kMaxUndoSteps
   // (history_ holds the baseline plus at most that many steps). Leaves
@@ -3823,6 +3950,8 @@ private:
   std::vector<Snapshot> history_{Snapshot{}};
   size_t historyIndex_ = 0;
   mutable uint64_t version_ = 0;
+  mutable std::vector<std::string> labels_; // historyLabel() cache
+  mutable uint64_t labelsVersion_ = ~uint64_t{0};
   AdjId lastEdited_ = AdjId::Count;
 };
 
@@ -4281,7 +4410,6 @@ struct EditorState
   uint8_t histClipLo = 0, histClipHi = 0;
   bool clipPerChannel = false;
   std::shared_ptr<CanvasImage> clipOverlay;
-
 
   // RGB readout under the cursor (status bar). hoverValid is false while
   // the pointer isn't over a picture pixel.
@@ -9637,6 +9765,72 @@ static View buildMaskRow(size_t i)
   return b;
 }
 
+// ---------------- History panel ----------------
+// Row r shows step (n - 1 - r): newest at the top, the untouched picture at
+// the bottom. There are kMaxUndoSteps + 1 rows, shown only for steps that
+// exist (the view tree is built once, like the mask list).
+static size_t historyStepForRow(size_t r)
+{
+  const size_t n = state.adjust.historySize();
+  return r < n ? n - 1 - r : n; // n = "no such step"
+}
+
+static void jumpToHistory(size_t step)
+{
+  if (state.dragging || step >= state.adjust.historySize() ||
+      step == state.adjust.historyIndex())
+    return;
+  state.adjust.goToHistory(step);
+  updateImageFromAdjustments(); // same follow-up as undo() / redo()
+}
+
+static View buildHistoryRow(size_t r)
+{
+  View b;
+  b.style.width = Size::full();
+  b.style.height = Size::pixel(26);
+  b.style.flexShrink = 0;
+  b.style.borderRadius = 4.0f;
+  b.style.alignItems = Align::Center;
+  b.style.padding = EdgeInsets{0, 10, 0, 10};
+  b.style.overflowX = Overflow::Hidden;
+  b.style.hoverColor = kColorActivityHover;
+  b.style.display = std::function<Display()>([r]
+                                             { return state.activeActivity == kHistoryActivity &&
+                                                              r < state.adjust.historySize()
+                                                          ? Display::Flex
+                                                          : Display::None; });
+  const auto isCur = [r]
+  { return historyStepForRow(r) == state.adjust.historyIndex(); };
+  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color
+                                                   { return isCur() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.borderWidth =
+      std::function<float()>([isCur]
+                             { return isCur() ? 1.0f : 0.0f; });
+  b.style.borderColor = kColorDividerHover;
+  b.onClick = [r]
+  { jumpToHistory(historyStepForRow(r)); };
+
+  Text t;
+  t.label = std::function<std::string()>([r]() -> std::string
+                                         {
+    // Skip the diffing entirely while the pane is closed.
+    if (state.activeActivity != kHistoryActivity)
+      return std::string();
+    const size_t s = historyStepForRow(r);
+    return s < state.adjust.historySize() ? state.adjust.historyLabel(s)
+                                          : std::string(); });
+  t.fontSize = 13.0f;
+  t.wrap = TextWrap::NoWrap;
+  // Steps ahead of the current one (what Redo would bring back) are dimmed.
+  t.color = std::function<Color()>([r]() -> Color
+                                   { return historyStepForRow(r) > state.adjust.historyIndex()
+                                                ? kColorTextMuted
+                                                : kColorTextDark; });
+  b.addChild(std::move(t));
+  return b;
+}
+
 // One row of the selected mask's PART list: "1   Radial", "2   Subtract:
 // Brush". Shown only while the mask has more than one part (a one-part mask
 // looks exactly as it always did).
@@ -9985,7 +10179,6 @@ static void paintCanvas(CanvasContext &ctx)
     paintCompareOverlay(ctx); // labels and the split line (screen space)
   LITEUI_PROF_ADD(appPaint, profAppPaint);
 }
-
 
 // ---------------- RGB readout under the cursor ----------------
 // Both return true only when the readout changed, so LiteUI repaints only
@@ -10744,6 +10937,7 @@ int main()
 
   const std::vector<Activity> activities = {
       {0, "Info", "I"},
+      {kHistoryActivity, "History", "H"},
       {1, "Adjust", "A"},
       {4, "Curve", "~"},
       {5, "Color Mix", "M"},
@@ -11027,6 +11221,30 @@ int main()
   infoPane.addChild(std::move(infoZoom));
 
   sidebar.addChild(std::move(infoPane));
+
+  // -- "History" pane: every undo step, newest first. Click to jump.
+  View historyPane;
+  historyPane.style.width = Size::full();
+  historyPane.style.direction = FlexDirection::Column;
+  historyPane.style.gap = 2.0f;
+  historyPane.style.display = std::function<Display()>(
+      []
+      { return state.activeActivity == kHistoryActivity ? Display::Flex : Display::None; });
+
+  Text historyHint;
+  historyHint.label = std::function<std::string()>([]() -> std::string
+                                                   { return state.image
+                                                                ? "Click a step to go back to it. Dimmed steps are ahead of "
+                                                                  "you: a new edit discards them."
+                                                                : "Open an image to see its edit history."; });
+  historyHint.fontSize = 12.0f;
+  historyHint.color = kColorTextMuted;
+  historyHint.style.margin = EdgeInsets{0, 0, 6, 0};
+  historyPane.addChild(std::move(historyHint));
+
+  for (size_t r = 0; r < kMaxUndoSteps + 1; ++r)
+    historyPane.addChild(buildHistoryRow(r));
+  sidebar.addChild(std::move(historyPane));
 
   // -- "Adjust" pane: one slider row per entry in kAdjustmentSpecs. Adding
   // a new adjustment later is a one-line addition to that table — this
@@ -12281,7 +12499,6 @@ int main()
   rgbText.color = kColorWhite;
   rgbReadout.addChild(std::move(rgbText));
   zoomControls.addChild(std::move(rgbReadout));
-
 
   zoomControls.addChild(
       statusGlyphBtn("-", []
