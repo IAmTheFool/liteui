@@ -3192,6 +3192,8 @@ struct Canvas {
   // See View::onDragEnd's comment for exactly when this fires (and when
   // it deliberately doesn't).
   std::function<void()> onDragEnd;
+  std::function<bool(float localX, float localY)> onHoverAt;
+  std::function<bool()> onHoverEnd;
   std::function<void()> onScrollUp;
   std::function<void()> onScrollDown;
   std::function<bool()> canvasDirtySource;
@@ -3398,6 +3400,16 @@ public:
   // by then, so those paths null dragView_ directly instead of going
   // through endDrag() — same reasoning as onBlur being skipped there.
   std::function<void()> onDragEnd;
+
+  // Fired on every pointer move while the pointer is over this view, with
+  // the position local to the view (0,0 = its top-left, same space as
+  // onPressAt). Return true if the app state it drives visibly changed:
+  // LiteUI then re-polls dynamic values and repaints once. Return false
+  // for "nothing to redraw", so plain mouse movement stays cheap.
+  std::function<bool(float localX, float localY)> onHoverAt;
+  // Fired once when the pointer leaves this view (or the view is hidden
+  // while hovered). Same return convention as onHoverAt.
+  std::function<bool()> onHoverEnd;
 
   // Fired once per relayout(), right after placeNode() finalizes this
   // node's absolute on-screen box. Lets the app read a view's real
@@ -3732,6 +3744,8 @@ inline View View::toView(Canvas c) {
   v.onMiddleDragTo = std::move(c.onMiddleDragTo);
   v.onRightDragTo = std::move(c.onRightDragTo);
   v.onDragEnd = std::move(c.onDragEnd);
+  v.onHoverAt = std::move(c.onHoverAt);
+  v.onHoverEnd = std::move(c.onHoverEnd);
   v.onScrollUp = std::move(c.onScrollUp);
   v.onScrollDown = std::move(c.onScrollDown);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
@@ -7415,10 +7429,13 @@ private:
   // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
   // view is never marked hovered. Returns whether any flag actually
   // flipped, so callers only repaint when hover state visibly changes.
-  static bool updateHover(View &v, float x, float y, ClipRect clip) {
+  static bool updateHover(View &v, float x, float y, ClipRect clip,
+                          bool *needPoll = nullptr) {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden) {
       bool changed = v.computed.isHovered;
+      if (changed && v.onHoverEnd && v.onHoverEnd() && needPoll)
+        *needPoll = true;
       v.computed.isHovered = false; // scrolled-out/None already relied on
                                     // this same "force false" idiom
       return changed;
@@ -7430,13 +7447,18 @@ private:
       if (v.style.hoverColor)
         v.computed.dirty = true;
       changed = true;
+      if (!inside && v.onHoverEnd && v.onHoverEnd() && needPoll)
+        *needPoll = true;
     }
+    if (inside && v.onHoverAt &&
+        v.onHoverAt(x - v.computed.x, y - v.computed.y) && needPoll)
+      *needPoll = true;
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
     for (auto &c : v.children)
-      changed |= updateHover(c, x, y, childClip);
+      changed |= updateHover(c, x, y, childClip, needPoll);
     return changed;
   }
 
@@ -8012,10 +8034,16 @@ private:
         bool changed = self->updateScrollDrag(x, y);
         if (self->updateAllDrags(x, y))
           changed = true;
+        bool needPoll = false;
         if (self->hasRoot_ &&
-            LiteUI::updateHover(self->root_, x, y, ClipRect{}))
+            LiteUI::updateHover(self->root_, x, y, ClipRect{}, &needPoll))
           changed = true;
         self->updateTooltipHover(x, y);
+        if (needPoll)
+        {
+          self->pollAndRelayout(); // a hover handler changed app state
+          changed = true;
+        }
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
         LITEUI_PROF_ADD(move, profMove);
@@ -9062,13 +9090,19 @@ private:
     bool changed = updateScrollDrag(x, y);
     if (updateAllDrags(x, y))
       changed = true;
-    if (hasRoot_ && LiteUI::updateHover(root_, x, y, ClipRect{}))
+    bool needPoll = false;
+    if (hasRoot_ && LiteUI::updateHover(root_, x, y, ClipRect{}, &needPoll))
       changed = true;
 
     // arms/cancels/re-targets the tooltip timer. Handles its own
     // repaint scheduling internally (via requestTooltipRepaint), so it
     // doesn't need to participate in the `changed` flag above.
     updateTooltipHover(x, y);
+    if (needPoll)
+    {
+      pollAndRelayout(); // a hover handler changed app state
+      changed = true;
+    }
 
     if (changed)
       redraw();

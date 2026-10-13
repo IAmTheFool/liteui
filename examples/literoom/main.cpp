@@ -14,6 +14,7 @@
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -23,6 +24,7 @@
 #include <optional>
 #include <stop_token>
 #include <thread>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -87,6 +89,16 @@ constexpr float kMixTabW = 46.0f;        // Hue/Sat/Lum tab width (3 + gaps = 15
 // (strided grid), so it stays cheap on full-resolution images.
 constexpr int kHistMaxSamples = 300000;
 constexpr float kHistHeightPx = 80.0f;
+
+// Clipping warnings: corner triangles on the histogram + canvas overlay.
+constexpr float kHistTriPx = 9.0f;        // triangle leg length
+constexpr float kHistTriHitPx = 18.0f;    // click zone in each top corner
+constexpr int kClipOverlayMaxEdge = 2048; // overlay resolution cap (long edge)
+constexpr Color kColorClipShadow{60, 110, 255, 255};
+constexpr Color kColorClipHighlight{235, 50, 50, 255};
+
+// Channel bits for clipping masks.
+constexpr uint8_t kChanR = 1, kChanG = 2, kChanB = 4;
 
 // Tone curve editor (canvas is square, kCurveSizePx on a side; the plot area
 // is inset by kCurvePadPx so the end points aren't clipped).
@@ -4104,6 +4116,43 @@ struct MaskUi
   uint64_t encodedKey = 0; // imageSerial the segmenter has already analyzed
 };
 
+// ---------------- Filmstrip and Before / After state ----------------
+// One picture in the open folder, as the filmstrip shows it.
+struct FilmEntry
+{
+  std::string path;                         // full path (UTF-8)
+  std::string name;                         // file name only
+  std::shared_ptr<const CanvasImage> thumb; // null until made
+  bool failed = false;                      // couldn't be decoded: plain box
+  bool edited = false;                      // has saved edits (a sidecar file)
+};
+
+// The pictures of the folder the open picture lives in (JPEG / PNG, natural
+// name order), plus the strip's scroll position. UI thread only.
+struct FilmStrip
+{
+  std::vector<FilmEntry> files;
+  std::unordered_map<std::string, size_t> byName; // lower-case name -> index
+  std::string folder;
+  int current = -1;          // index of the picture that is open
+  int target = -1;           // the one last asked for (== current when idle)
+  float scrollX = 0.0f;      // pixels scrolled
+  float viewW = 0.0f;        // strip width at the last paint
+  bool visible = true;       // View > Toggle Filmstrip
+  bool dirty = true;         // repaint wanted
+  uint64_t thumbVersion = 0; // adjust.version() when the open picture's
+                             // thumbnail was last (re)made
+};
+
+// What the canvas shows: the edited picture, the same picture with every
+// edit switched off (crop and rotation stay), or both side by side.
+enum class CompareMode
+{
+  Off,
+  Before,
+  Split
+};
+
 struct EditorState
 {
   std::shared_ptr<CanvasImage> original; // untouched decoded pixels; null
@@ -4135,6 +4184,10 @@ struct EditorState
   bool exportJpeg = true;   // the format the Export dialog offers first
   int jpegQuality = 92;     // 1..100
   bool keepMetadata = true; // carry the photo's EXIF + ICC profile into a JPEG
+
+  FilmStrip film;                         // the open folder's pictures (bottom strip)
+  CompareMode compare = CompareMode::Off; // Before / After view
+  float splitPos = 0.5f;                  // Split view: line position, 0..1 of width
   bool dirty = true;
 
   // Set by a slider drag (many events per second while held). The actual
@@ -4217,6 +4270,23 @@ struct EditorState
   std::array<uint32_t, 256> histR{}, histG{}, histB{}, histL{};
   bool histStale = true;
   uint32_t histVersion = 0;
+
+  // Clipping warnings. The flags say which overlays are on; histClipLo/Hi
+  // are the channels (bit 0/1/2 = R/G/B) that have any clipped pixel in the
+  // shown picture (drives the triangle colors). clipPerChannel colors the
+  // overlay by clipped channel (Shift+J) instead of classic red/blue.
+  // clipOverlay is rebuilt by computeHistogram and is null while both
+  // overlays are off.
+  bool clipShadowsOn = false, clipHighlightsOn = false;
+  uint8_t histClipLo = 0, histClipHi = 0;
+  bool clipPerChannel = false;
+  std::shared_ptr<CanvasImage> clipOverlay;
+
+
+  // RGB readout under the cursor (status bar). hoverValid is false while
+  // the pointer isn't over a picture pixel.
+  bool hoverValid = false;
+  uint8_t hoverR = 0, hoverG = 0, hoverB = 0;
 };
 
 static EditorState state;
@@ -6014,6 +6084,8 @@ static void collectSegmentJob()
 }
 
 // Swaps a finished decode into the editor (UI thread only).
+static void filmMarkEdited(const std::string &path); // filmstrip (below)
+
 // ---------------- Saved edits: the sidecar file ----------------
 // photo.jpg's edits live in photo.jpg.literoom.json beside it. They are
 // written (temp file, then rename, so a crash can't leave half a file)
@@ -6075,6 +6147,8 @@ static void saveSidecar()
     std::filesystem::remove(tmp, ignore);
     setStatus("Couldn't save edits: " + ec.message(), true);
   }
+  else
+    filmMarkEdited(state.imagePath); // the strip's "has edits" dot
 }
 
 // Saves now if anything changed since the last save / load.
@@ -6151,6 +6225,540 @@ static void loadSidecar()
   setStatus("Restored saved edits", false);
 }
 
+// BEGIN filmstrip
+// ---------------- Filmstrip: the folder's pictures ----------------
+// A strip under the canvas with a thumbnail of every JPEG / PNG in the open
+// picture's folder. Click one (or press Left / Right) to open it; a dot marks
+// pictures that have saved edits. It is one canvas that paints only the cells
+// in view, so a folder of thousands costs nothing extra. Thumbnails are made
+// by a background thread, nearest-to-the-open-picture first, and the open
+// picture's thumbnail is refreshed (edits included) when you leave it.
+constexpr float kFilmH = 104.0f;
+constexpr float kFilmCellW = 108.0f;
+constexpr int kFilmThumbW = 96, kFilmThumbH = 72;
+constexpr size_t kFilmMaxFiles = 5000; // a bigger folder shows its first 5000
+
+static std::string filmLower(std::string s)
+{
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
+                 { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+// "IMG_2" before "IMG_10"; letters compare without case.
+static bool naturalLess(const std::string &a, const std::string &b)
+{
+  auto digit = [](char c)
+  { return c >= '0' && c <= '9'; };
+  size_t i = 0, j = 0;
+  while (i < a.size() && j < b.size())
+  {
+    if (digit(a[i]) && digit(b[j]))
+    {
+      size_t i2 = i, j2 = j;
+      while (i2 < a.size() && digit(a[i2]))
+        ++i2;
+      while (j2 < b.size() && digit(b[j2]))
+        ++j2;
+      size_t ia = i, jb = j; // skip leading zeros (keep one digit)
+      while (ia + 1 < i2 && a[ia] == '0')
+        ++ia;
+      while (jb + 1 < j2 && b[jb] == '0')
+        ++jb;
+      const size_t la = i2 - ia, lb = j2 - jb;
+      if (la != lb)
+        return la < lb;
+      if (const int c = a.compare(ia, la, b, jb, lb))
+        return c < 0;
+      i = i2;
+      j = j2;
+    }
+    else
+    {
+      const int ca = std::tolower(static_cast<unsigned char>(a[i]));
+      const int cb = std::tolower(static_cast<unsigned char>(b[j]));
+      if (ca != cb)
+        return ca < cb;
+      ++i;
+      ++j;
+    }
+  }
+  return (a.size() - i) < (b.size() - j);
+}
+
+// `src` scaled down (box average) to fit kFilmThumbW x kFilmThumbH; never
+// enlarged. Null for an empty picture.
+static std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)
+{
+  if (src.width <= 0 || src.height <= 0 ||
+      src.pixels.size() < static_cast<size_t>(src.width) * src.height * 4)
+    return nullptr;
+  const double s = std::min({1.0, static_cast<double>(kFilmThumbW) / src.width,
+                             static_cast<double>(kFilmThumbH) / src.height});
+  const int nw = std::max(1, static_cast<int>(std::lround(src.width * s)));
+  const int nh = std::max(1, static_cast<int>(std::lround(src.height * s)));
+  auto out = std::make_shared<CanvasImage>(nw, nh);
+  for (int y = 0; y < nh; ++y)
+  {
+    const int64_t y0 = static_cast<int64_t>(y) * src.height / nh;
+    const int64_t y1 =
+        std::max(y0 + 1, static_cast<int64_t>(y + 1) * src.height / nh);
+    for (int x = 0; x < nw; ++x)
+    {
+      const int64_t x0 = static_cast<int64_t>(x) * src.width / nw;
+      const int64_t x1 =
+          std::max(x0 + 1, static_cast<int64_t>(x + 1) * src.width / nw);
+      uint32_t sum[4] = {0, 0, 0, 0};
+      for (int64_t yy = y0; yy < y1; ++yy)
+      {
+        const uint8_t *p = &src.pixels[(static_cast<size_t>(yy) * src.width +
+                                        static_cast<size_t>(x0)) *
+                                       4];
+        for (int64_t xx = x0; xx < x1; ++xx, p += 4)
+        {
+          sum[0] += p[0];
+          sum[1] += p[1];
+          sum[2] += p[2];
+          sum[3] += p[3];
+        }
+      }
+      const uint32_t n = static_cast<uint32_t>((y1 - y0) * (x1 - x0));
+      uint8_t *o = &out->pixels[(static_cast<size_t>(y) * nw + x) * 4];
+      for (int k = 0; k < 4; ++k)
+        o[k] = static_cast<uint8_t>((sum[k] + n / 2) / n);
+    }
+  }
+  return out;
+}
+
+// Makes the thumbnails off the UI thread. setQueue() replaces what is still
+// to do (it is called again whenever the open picture changes, so the work
+// always starts next to it); collect() hands back what has been made.
+class ThumbWorker
+{
+public:
+  struct Result
+  {
+    std::string path;
+    std::shared_ptr<const CanvasImage> thumb; // null: couldn't be decoded
+    bool edited = false;                      // a sidecar file exists
+  };
+
+  ThumbWorker() = default;
+  ThumbWorker(const ThumbWorker &) = delete;
+  ThumbWorker &operator=(const ThumbWorker &) = delete;
+  ~ThumbWorker() { shutdown(); }
+
+  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
+
+  void shutdown()
+  {
+    {
+      std::lock_guard lk(m_);
+      queue_.clear();
+    }
+    if (thread_.joinable())
+    {
+      thread_.request_stop();
+      thread_.join();
+    }
+  }
+
+  void setQueue(std::vector<std::string> paths)
+  {
+    if (!thread_.joinable())
+      thread_ = std::jthread([this](std::stop_token st)
+                             { run(st); });
+    {
+      std::lock_guard lk(m_);
+      queue_.assign(std::make_move_iterator(paths.begin()),
+                    std::make_move_iterator(paths.end()));
+    }
+    cv_.notify_one();
+  }
+
+  std::vector<Result> collect()
+  {
+    std::lock_guard lk(m_);
+    std::vector<Result> out;
+    out.swap(results_);
+    return out;
+  }
+
+private:
+  void run(std::stop_token st)
+  {
+    for (;;)
+    {
+      std::string path;
+      {
+        std::unique_lock lk(m_);
+        if (!cv_.wait(lk, st, [this]
+                      { return !queue_.empty(); }))
+          return;
+        path = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      Result r;
+      r.path = path;
+      std::string err;
+      if (auto img = liteui_image::decodeFile(path, &err))
+      {
+        const Orient o = exifOrientationOf(path); // upright, like the editor
+        if (o.identity())
+          r.thumb = makeThumb(*img);
+        else
+        {
+          auto turned =
+              orientImage(std::make_shared<CanvasImage>(std::move(*img)), o);
+          r.thumb = makeThumb(*turned);
+        }
+      }
+      std::error_code ec;
+      r.edited = std::filesystem::exists(sidecarPath(path), ec) && !ec;
+      {
+        std::lock_guard lk(m_);
+        results_.push_back(std::move(r));
+      }
+      if (notify_)
+        notify_();
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable_any cv_;
+  std::deque<std::string> queue_;
+  std::vector<Result> results_;
+  std::function<void()> notify_;
+  std::jthread thread_; // last: joined first
+};
+
+static ThumbWorker thumbWorker;
+
+static std::string u8ToString(const std::filesystem::path &p)
+{
+  const auto u = p.u8string();
+  return std::string(u.begin(), u.end());
+}
+
+// Lists the JPEG / PNG files of `folder` into a new strip (not yet shown).
+static FilmStrip filmListFolder(const std::string &folder)
+{
+  FilmStrip f;
+  f.folder = folder;
+  const std::filesystem::path base = fsPath(folder);
+  std::vector<std::string> names;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(base, ec), end;
+       !ec && it != end && names.size() < kFilmMaxFiles; it.increment(ec))
+  {
+    std::error_code e2;
+    if (!it->is_regular_file(e2) || e2)
+      continue;
+    std::string name = u8ToString(it->path().filename());
+    const std::string ext = fileExtLower(name);
+    if (ext == "jpg" || ext == "jpeg" || ext == "png")
+      names.push_back(std::move(name));
+  }
+  std::sort(names.begin(), names.end(),
+            [](const std::string &a, const std::string &b)
+            {
+              return naturalLess(a, b) || (!naturalLess(b, a) && a < b);
+            });
+  for (auto &name : names)
+  {
+    FilmEntry e;
+    e.path = u8ToString(base / fsPath(name));
+    e.name = name;
+    f.byName[filmLower(name)] = f.files.size();
+    f.files.push_back(std::move(e));
+  }
+  return f;
+}
+
+static void filmClampScroll()
+{
+  FilmStrip &f = state.film;
+  const float total = static_cast<float>(f.files.size()) * kFilmCellW;
+  f.scrollX = std::clamp(f.scrollX, 0.0f, std::max(0.0f, total - f.viewW));
+}
+
+static void filmEnsureVisible(int i)
+{
+  FilmStrip &f = state.film;
+  if (i < 0)
+    return;
+  const float x0 = static_cast<float>(i) * kFilmCellW, x1 = x0 + kFilmCellW;
+  const float w = f.viewW > 0.0f ? f.viewW : 800.0f; // before the first paint
+  if (x0 < f.scrollX)
+    f.scrollX = x0;
+  else if (x1 > f.scrollX + w)
+    f.scrollX = x1 - w;
+  filmClampScroll();
+  f.dirty = true;
+}
+
+// Points the thumbnail worker at the pictures that still lack one, nearest
+// to the target first.
+static void filmQueueThumbs()
+{
+  const FilmStrip &f = state.film;
+  const int n = static_cast<int>(f.files.size());
+  std::vector<std::string> todo;
+  auto want = [&](int i)
+  {
+    const FilmEntry &e = f.files[static_cast<size_t>(i)];
+    if (!e.thumb && !e.failed)
+      todo.push_back(e.path);
+  };
+  const int mid = std::clamp(f.target >= 0 ? f.target : f.current, 0,
+                             std::max(0, n - 1));
+  if (n > 0)
+  {
+    want(mid);
+    for (int d = 1; mid - d >= 0 || mid + d < n; ++d)
+    {
+      if (mid + d < n)
+        want(mid + d);
+      if (mid - d >= 0)
+        want(mid - d);
+    }
+  }
+  thumbWorker.setQueue(std::move(todo));
+}
+
+// Makes the folder `folder` the filmstrip's. False (nothing changed) if it
+// holds no JPEG / PNG pictures.
+static bool filmAdoptFolder(const std::string &folder)
+{
+  FilmStrip next = filmListFolder(folder);
+  if (next.files.empty())
+    return false;
+  next.visible = state.film.visible;
+  state.film = std::move(next);
+  state.film.dirty = true;
+  return true;
+}
+
+// The open picture changed (or was just opened): follow it. Re-lists the
+// folder if it is a different one, selects the picture, scrolls to it and
+// re-aims the thumbnail worker. Call after loadSidecar().
+static void filmSync(const std::string &imagePath)
+{
+  FilmStrip &f = state.film;
+  const std::filesystem::path p = fsPath(imagePath);
+  std::string folder = u8ToString(p.parent_path());
+  if (folder.empty())
+    folder = ".";
+  bool same = false;
+  if (!f.folder.empty())
+  {
+    std::error_code ec;
+    same = std::filesystem::equivalent(fsPath(f.folder), fsPath(folder), ec) &&
+           !ec;
+  }
+  if (!same)
+    filmAdoptFolder(folder);
+  FilmStrip &g = state.film;
+  const auto it = g.byName.find(filmLower(u8ToString(p.filename())));
+  g.current = g.target = it == g.byName.end() ? -1 : static_cast<int>(it->second);
+  g.thumbVersion = state.adjust.version();
+  filmEnsureVisible(g.current);
+  filmQueueThumbs();
+  g.dirty = true;
+}
+
+// The open picture is about to be replaced: if it was edited, make its
+// thumbnail show the edits.
+static void filmLeave()
+{
+  FilmStrip &f = state.film;
+  if (f.current < 0 || static_cast<size_t>(f.current) >= f.files.size() ||
+      !state.image || state.adjust.version() == f.thumbVersion)
+    return;
+  FilmEntry &e = f.files[static_cast<size_t>(f.current)];
+  if (auto t = makeThumb(*state.image))
+  {
+    e.thumb = std::move(t);
+    e.failed = false;
+  }
+  e.edited = true;
+  f.dirty = true;
+}
+
+// Called when a sidecar file was written for `path`.
+static void filmMarkEdited(const std::string &path)
+{
+  FilmStrip &f = state.film;
+  const auto it = f.byName.find(filmLower(baseName(path)));
+  if (it == f.byName.end())
+    return;
+  FilmEntry &e = f.files[it->second];
+  if (!e.edited)
+  {
+    e.edited = true;
+    f.dirty = true;
+  }
+}
+
+// UI thread: takes in the thumbnails the worker has made.
+static void collectThumbJobs()
+{
+  for (auto &r : thumbWorker.collect())
+  {
+    FilmStrip &f = state.film;
+    const auto it = f.byName.find(filmLower(baseName(r.path)));
+    if (it == f.byName.end() || f.files[it->second].path != r.path)
+      continue; // from a folder we have left
+    FilmEntry &e = f.files[it->second];
+    if (r.thumb)
+    {
+      // The open picture's own thumbnail already shows its edits: keep that.
+      if (!(static_cast<int>(it->second) == f.current &&
+            state.adjust.version() != f.thumbVersion))
+        e.thumb = std::move(r.thumb);
+    }
+    else
+      e.failed = true;
+    e.edited = e.edited || r.edited;
+    f.dirty = true;
+  }
+}
+
+// Opens the picture at index `i` (same background decode as File > Open).
+static void filmOpenIndex(int i)
+{
+  FilmStrip &f = state.film;
+  if (i < 0 || static_cast<size_t>(i) >= f.files.size() || i == f.target ||
+      state.dragging)
+    return;
+  f.target = i;
+  f.dirty = true;
+  filmEnsureVisible(i);
+  setStatus("Opening " + f.files[static_cast<size_t>(i)].name + "...", false);
+  decodeWorker.submit(f.files[static_cast<size_t>(i)].path);
+  filmQueueThumbs();
+}
+
+// Left / Right: the previous / next picture (relative to the one asked for
+// last, so quick repeats keep moving).
+static void filmStep(int d)
+{
+  const FilmStrip &f = state.film;
+  if (f.files.empty())
+    return;
+  const int base = f.target >= 0 ? f.target : f.current;
+  filmOpenIndex(std::clamp(base + d, 0, static_cast<int>(f.files.size()) - 1));
+}
+
+static void filmScrollBy(float dx)
+{
+  state.film.scrollX += dx;
+  filmClampScroll();
+  state.film.dirty = true;
+}
+
+static void filmClick(float localX)
+{
+  const FilmStrip &f = state.film;
+  const int i = static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
+  filmOpenIndex(i);
+}
+
+static void toggleFilmstrip()
+{
+  state.film.visible = !state.film.visible;
+  state.film.dirty = true;
+}
+
+static bool filmstripShown()
+{
+  return state.film.visible && !state.film.files.empty();
+}
+
+// File > Open Folder: lists the folder and opens its first picture.
+static void openFolder()
+{
+  auto dir = openFolderPicker("Open Folder");
+  if (!dir)
+    return; // user cancelled
+  if (!filmAdoptFolder(*dir))
+  {
+    setStatus("No JPEG or PNG pictures in " + baseName(*dir), true);
+    return;
+  }
+  filmQueueThumbs();
+  filmOpenIndex(0);
+}
+
+static void paintFilmstrip(CanvasContext &ctx)
+{
+  FilmStrip &f = state.film;
+  const float W = ctx.width(), H = ctx.height();
+  f.viewW = W;
+  filmClampScroll();
+  ctx.setFillColor(kColorRootBg);
+  ctx.fillRect(0, 0, W, H);
+  if (f.files.empty())
+    return;
+
+  const int n = static_cast<int>(f.files.size());
+  const int first = std::max(0, static_cast<int>(f.scrollX / kFilmCellW));
+  const int last =
+      std::min(n - 1, static_cast<int>((f.scrollX + W) / kFilmCellW));
+  ctx.setFont("", 11.0f);
+  ctx.setTextAlign(TextAlign::Center);
+  ctx.setTextBaseline(TextBaseline::Top);
+  for (int i = first; i <= last; ++i)
+  {
+    const FilmEntry &e = f.files[static_cast<size_t>(i)];
+    const float cx = static_cast<float>(i) * kFilmCellW - f.scrollX;
+    const bool selected = i == f.target;
+    if (selected)
+    {
+      ctx.setFillColor(kColorActivityActive);
+      ctx.fillRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+    }
+    const float bx = cx + (kFilmCellW - kFilmThumbW) / 2.0f, by = 6.0f;
+    if (e.thumb)
+    {
+      const float x = bx + (kFilmThumbW - e.thumb->width) / 2.0f;
+      const float y = by + (kFilmThumbH - e.thumb->height) / 2.0f;
+      ctx.drawImage(*e.thumb, std::floor(x), std::floor(y));
+    }
+    else
+    {
+      ctx.setFillColor(kColorTrack);
+      ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
+    }
+    if (selected)
+    {
+      ctx.setStrokeColor(kColorAccent);
+      ctx.setLineWidth(2.0f);
+      ctx.strokeRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+    }
+    if (e.edited)
+    { // a dot in the thumbnail's bottom-right corner
+      ctx.setFillColor(kColorAccent);
+      ctx.beginPath();
+      ctx.roundRect(bx + kFilmThumbW - 12, by + kFilmThumbH - 12, 8, 8, 4);
+      ctx.fill();
+    }
+    std::string label = e.name;
+    constexpr size_t kMaxChars = 15;
+    if (label.size() > kMaxChars)
+    {
+      size_t cut = kMaxChars - 1; // never split a UTF-8 character
+      while (cut > 0 && (static_cast<unsigned char>(label[cut]) & 0xC0) == 0x80)
+        --cut;
+      label = label.substr(0, cut) + "\u2026";
+    }
+    ctx.setFillColor(selected ? kColorTextDark : kColorTextMuted);
+    ctx.fillText(label, cx + kFilmCellW / 2.0f, by + kFilmThumbH + 6.0f);
+  }
+}
+// END filmstrip
+
 static void adoptDecoded(DecodeWorker::Result &&r)
 {
   if (!r.image)
@@ -6160,11 +6768,14 @@ static void adoptDecoded(DecodeWorker::Result &&r)
                   (r.error.empty() ? std::string("unsupported or damaged image")
                                    : r.error),
               true);
+    state.film.target = state.film.current; // stay on the picture still open
+    state.film.dirty = true;
     state.markDirty();
     return;
   }
   clearStatus();
   flushSidecar(); // the picture being replaced keeps its latest edits
+  filmLeave();    // ...and its filmstrip thumbnail shows them
 
   // Anything still in flight belongs to the previous picture; its result
   // must never be adopted over the new one.
@@ -6181,7 +6792,8 @@ static void adoptDecoded(DecodeWorker::Result &&r)
   state.adjust.setOriginalSize(state.original->width, state.original->height);
   state.maskSel = -1;
   state.mask.part = 0;
-  loadSidecar(); // this picture's saved edits, if any (before syncSource: crop / rotation)
+  loadSidecar();             // this picture's saved edits, if any (before syncSource: crop / rotation)
+  filmSync(state.imagePath); // the strip follows: folder, selection, thumbnails
   state.dragging = false;
   state.dragIsAngle = false;
   state.image.reset();          // the old file's pixels: force the synchronous path
@@ -9209,6 +9821,90 @@ static void paintCropOverlay(CanvasContext &ctx)
     }
 }
 
+// BEGIN compare
+// ---------------- Before / After ----------------
+// "Before" is state.source: the picture with its crop and rotation but none
+// of the slider, curve, color or mask edits. Keeping the geometry means the
+// canvas doesn't change size, so the comparison is pixel for pixel.
+static void toggleBefore()
+{
+  if (!state.image)
+    return;
+  state.compare = state.compare == CompareMode::Before ? CompareMode::Off
+                                                       : CompareMode::Before;
+  state.markDirty();
+}
+static void toggleSplit()
+{
+  if (!state.image)
+    return;
+  state.compare = state.compare == CompareMode::Split ? CompareMode::Off
+                                                      : CompareMode::Split;
+  state.markDirty();
+}
+// Dragging in the canvas moves the split line.
+static void splitFromX(float localX)
+{
+  const float w = state.docWidth() * state.zoom;
+  if (w <= 0.0f)
+    return;
+  state.splitPos = std::clamp(localX / w, 0.02f, 0.98f);
+  state.markDirty();
+}
+
+// A small dark pill with `text`, its left (or, if alignRight, right) edge at x.
+static void paintCompareLabel(CanvasContext &ctx, const std::string &text,
+                              float x, float y, bool alignRight)
+{
+  ctx.setFont("", 12.0f, FontWeight::SemiBold);
+  const float w = ctx.measureText(text).width + 16.0f, h = 22.0f;
+  const float left = alignRight ? x - w : x;
+  ctx.setFillColor(Color{0, 0, 0, 160});
+  ctx.beginPath();
+  ctx.roundRect(left, y, w, h, 4.0f);
+  ctx.fill();
+  ctx.setFillColor(kColorWhite);
+  ctx.setTextAlign(TextAlign::Start);
+  ctx.setTextBaseline(TextBaseline::Middle);
+  ctx.fillText(text, left + 8.0f, y + h / 2.0f);
+}
+
+// Screen-space decoration over the canvas: labels and the split line.
+static void paintCompareOverlay(CanvasContext &ctx)
+{
+  const float W = state.docWidth() * state.zoom;
+  const float H = state.docHeight() * state.zoom;
+  if (state.compare == CompareMode::Before)
+  {
+    paintCompareLabel(ctx, "Before", 10.0f, 10.0f, false);
+    return;
+  }
+  const float x = std::floor(W * state.splitPos);
+  ctx.setStrokeColor(kColorWhite);
+  ctx.setLineWidth(2.0f);
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, H);
+  ctx.stroke();
+  paintCompareLabel(ctx, "Before", 10.0f, 10.0f, false);
+  paintCompareLabel(ctx, "After", W - 10.0f, 10.0f, true);
+}
+// END compare
+
+// Red/blue clipping warning over the edited picture. The overlay image is
+// in document space (stretched to docW x docH like the preview), so it
+// lines up at any zoom. computeHistogram builds it.
+static void computeHistogram();
+static void paintClipOverlay(CanvasContext &ctx, float docW, float docH)
+{
+  if (!state.clipShadowsOn && !state.clipHighlightsOn)
+    return;
+  if (state.histStale)
+    computeHistogram(); // also rebuilds the overlay
+  if (state.clipOverlay)
+    ctx.drawImage(*state.clipOverlay, 0, 0, docW, docH);
+}
+
 static void paintCanvas(CanvasContext &ctx)
 {
   LITEUI_PROF_START(profAppPaint);
@@ -9231,24 +9927,110 @@ static void paintCanvas(CanvasContext &ctx)
 
   ctx.save();
   ctx.scale(state.zoom, state.zoom);
-  if (state.showPreview())
+  const float docW = state.docWidth(), docH = state.docHeight();
+  // The picture as edited.
+  const auto drawAfter = [&]()
   {
-    // Mid-drag (or awaiting the background full-res render) preview: smaller
-    // image stretched to the full document size
-    // (bilinear), so layout/zoom are unaffected by its lower resolution.
-    ctx.drawImage(*state.previewImage, 0, 0, state.docWidth(),
-                  state.docHeight());
+    if (state.showPreview())
+    {
+      // Mid-drag (or awaiting the background full-res render) preview: smaller
+      // image stretched to the full document size
+      // (bilinear), so layout/zoom are unaffected by its lower resolution.
+      ctx.drawImage(*state.previewImage, 0, 0, docW, docH);
+    }
+    else
+    {
+      ctx.drawImage(*state.image, 0, 0);
+    }
+  };
+  // The same picture with every edit off (crop and rotation kept).
+  const auto drawBefore = [&]()
+  {
+    if (state.source)
+      ctx.drawImage(*state.source, 0, 0, docW, docH);
+    else
+      drawAfter();
+  };
+  if (state.compare == CompareMode::Before)
+  {
+    drawBefore();
+  }
+  else if (state.compare == CompareMode::Split)
+  {
+    const float x = docW * state.splitPos;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, x, docH);
+    ctx.clip();
+    drawBefore();
+    ctx.restore();
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, 0, docW - x, docH);
+    ctx.clip();
+    drawAfter();
+    ctx.restore();
   }
   else
   {
-    ctx.drawImage(*state.image, 0, 0);
+    drawAfter();
+    paintClipOverlay(ctx, docW, docH);
+    if (cropToolActive())
+      paintCropOverlay(ctx);
+    else if (maskToolActive())
+      paintMaskOverlay(ctx);
   }
-  if (cropToolActive())
-    paintCropOverlay(ctx);
-  else if (maskToolActive())
-    paintMaskOverlay(ctx);
   ctx.restore();
+  if (state.compare != CompareMode::Off)
+    paintCompareOverlay(ctx); // labels and the split line (screen space)
   LITEUI_PROF_ADD(appPaint, profAppPaint);
+}
+
+
+// ---------------- RGB readout under the cursor ----------------
+// Both return true only when the readout changed, so LiteUI repaints only
+// then (see View::onHoverAt).
+static bool hoverClear()
+{
+  const bool was = state.hoverValid;
+  state.hoverValid = false;
+  return was;
+}
+
+// Samples the picture the canvas is showing: the original in Before (or the
+// left half of Split), else the edited image / mid-drag preview.
+static bool hoverSample(float lx, float ly)
+{
+  if (state.dragging)
+    return false; // a drag is running: leave the readout alone
+  const float docW = state.docWidth(), docH = state.docHeight();
+  if (!state.image || docW <= 0.0f || docH <= 0.0f || state.zoom <= 0.0f)
+    return hoverClear();
+  const float dx = lx / state.zoom, dy = ly / state.zoom;
+  if (dx < 0.0f || dy < 0.0f || dx >= docW || dy >= docH)
+    return hoverClear();
+  const bool before =
+      state.compare == CompareMode::Before ||
+      (state.compare == CompareMode::Split && dx < docW * state.splitPos);
+  const CanvasImage *img =
+      (before && state.source)
+          ? state.source.get()
+          : (state.showPreview() ? state.previewImage.get() : state.image.get());
+  if (!img || img->width <= 0 || img->height <= 0)
+    return hoverClear();
+  const int ix = std::clamp(static_cast<int>(dx / docW * img->width), 0, img->width - 1);
+  const int iy = std::clamp(static_cast<int>(dy / docH * img->height), 0, img->height - 1);
+  const uint8_t *px =
+      img->pixels.data() + (static_cast<size_t>(iy) * img->width + ix) * 4;
+  if (px[3] == 0)
+    return hoverClear(); // straighten's empty corner
+  const bool changed = !state.hoverValid || state.hoverR != px[0] ||
+                       state.hoverG != px[1] || state.hoverB != px[2];
+  state.hoverValid = true;
+  state.hoverR = px[0];
+  state.hoverG = px[1];
+  state.hoverB = px[2];
+  return changed;
 }
 
 // Runs the deferred, expensive part of a slider drag (rebuilding the shown
@@ -9280,6 +10062,111 @@ static void flushPendingAdjust()
 // canvases poll this; only the first poll of a frame does any work.
 static void refreshHistogramIfStale();
 
+// Which of R/G/B (bit 0/1/2) equal `level` in this pixel.
+static inline uint8_t channelsAt(const uint8_t *px, uint8_t level)
+{
+  return static_cast<uint8_t>((px[0] == level ? kChanR : 0) |
+                              (px[1] == level ? kChanG : 0) |
+                              (px[2] == level ? kChanB : 0));
+}
+
+// Additive mix of the channels in `mask` (1=R, 2=G, 4=B). `pastel` lightens
+// it, so shadow clipping reads differently from highlight clipping. This
+// table is the one place to tweak the palette.
+static Color clipChannelColor(uint8_t mask, bool pastel)
+{
+  static constexpr Color kMix[8] = {
+      {0, 0, 0, 0},         // none
+      {235, 50, 50, 255},   // R
+      {50, 205, 80, 255},   // G
+      {245, 220, 40, 255},  // R+G  yellow
+      {70, 120, 255, 255},  // B
+      {235, 70, 220, 255},  // R+B  magenta
+      {40, 210, 235, 255},  // G+B  cyan
+      {235, 235, 235, 255}, // R+G+B
+  };
+  Color c = kMix[mask & 7];
+  if (pastel)
+  {
+    c.r = static_cast<uint8_t>((c.r + 255) / 2);
+    c.g = static_cast<uint8_t>((c.g + 255) / 2);
+    c.b = static_cast<uint8_t>((c.b + 255) / 2);
+  }
+  return c;
+}
+
+// Doc-sized RGBA overlay for the overlays that are on. Classic mode: red /
+// blue where any channel is 255 / 0. Per-channel mode: colored by exactly
+// which channels clip (pixels clipped in all three are left untinted).
+// Images above kClipOverlayMaxEdge are reduced by blocks: a block is marked
+// if ANY pixel in it is clipped, so small specular highlights don't vanish.
+static void buildClipOverlay(const CanvasImage *img)
+{
+  if ((!state.clipShadowsOn && !state.clipHighlightsOn) || !img ||
+      img->width <= 0 || img->height <= 0)
+  {
+    state.clipOverlay.reset();
+    return;
+  }
+  const int w = img->width, h = img->height;
+  const int step = std::max(
+      1, (std::max(w, h) + kClipOverlayMaxEdge - 1) / kClipOverlayMaxEdge);
+  const int ow = (w + step - 1) / step, oh = (h + step - 1) / step;
+  auto out = std::make_shared<CanvasImage>(ow, oh);
+  const uint8_t *src = img->pixels.data();
+  for (int oy = 0; oy < oh; ++oy)
+  {
+    const int y0 = oy * step, y1 = std::min(y0 + step, h);
+    for (int ox = 0; ox < ow; ++ox)
+    {
+      const int x0 = ox * step, x1 = std::min(x0 + step, w);
+      // Bit m set = some pixel in the block is clipped in exactly the
+      // channel set m (bit 0 = R, 1 = G, 2 = B; m = 0 means unclipped).
+      uint8_t hiSeen = 0, loSeen = 0;
+      for (int y = y0; y < y1; ++y)
+      {
+        const uint8_t *row = src + static_cast<size_t>(y) * w * 4;
+        for (int x = x0; x < x1; ++x)
+        {
+          const uint8_t *px = row + static_cast<size_t>(x) * 4;
+          if (px[3] == 0)
+            continue;
+          hiSeen |= static_cast<uint8_t>(1u << channelsAt(px, 255));
+          loSeen |= static_cast<uint8_t>(1u << channelsAt(px, 0));
+        }
+      }
+      Color col;
+      auto pick = [&](uint8_t seen, bool pastel, const Color &classic)
+      {
+        if (state.clipPerChannel)
+        {
+          const uint8_t partial = seen & 0x7E; // masks 1..6; 7 = all, skipped
+          if (!partial)
+            return false;
+          uint8_t m = 1;
+          while (!(partial & (1u << m)))
+            ++m; // lowest clipped-channel set present
+          col = clipChannelColor(m, pastel);
+          return true;
+        }
+        if (!(seen & 0xFE)) // any clipped channel at all
+          return false;
+        col = classic;
+        return true;
+      };
+      if (!(state.clipHighlightsOn && pick(hiSeen, false, kColorClipHighlight)) &&
+          !(state.clipShadowsOn && pick(loSeen, true, kColorClipShadow)))
+        continue;
+      uint8_t *o = out->pixels.data() + (static_cast<size_t>(oy) * ow + ox) * 4;
+      o[0] = col.r;
+      o[1] = col.g;
+      o[2] = col.b;
+      o[3] = 255;
+    }
+  }
+  state.clipOverlay = std::move(out);
+}
+
 // Rebuilds the R/G/B/luma histograms from the image currently on screen,
 // visiting at most ~kHistMaxSamples pixels on a regular grid. Fully
 // transparent pixels (straighten's empty corners) are skipped.
@@ -9289,6 +10176,7 @@ static void computeHistogram()
   state.histG.fill(0);
   state.histB.fill(0);
   state.histL.fill(0);
+
   const CanvasImage *img =
       state.showPreview() ? state.previewImage.get() : state.image.get();
   if (img && img->width > 0 && img->height > 0)
@@ -9313,9 +10201,21 @@ static void computeHistogram()
       }
     }
   }
+  // Channels with any clipped pixel, from the end bins of the histograms.
+  state.histClipLo = static_cast<uint8_t>((state.histR[0] ? kChanR : 0) |
+                                          (state.histG[0] ? kChanG : 0) |
+                                          (state.histB[0] ? kChanB : 0));
+  state.histClipHi = static_cast<uint8_t>((state.histR[255] ? kChanR : 0) |
+                                          (state.histG[255] ? kChanG : 0) |
+                                          (state.histB[255] ? kChanB : 0));
+
+  buildClipOverlay(img);
   state.histStale = false;
   ++state.histVersion;
 }
+
+// Width of the histogram canvas as last painted (for corner hit-testing).
+static float gHistCanvasW = 0.0f;
 
 // Luma as gray bars, R/G/B as thin colored outlines on top. Bar heights use
 // sqrt scaling and are normalized to the tallest bin among 1..254, so a pile
@@ -9323,6 +10223,7 @@ static void computeHistogram()
 static void paintHistogram(CanvasContext &ctx)
 {
   const float W = ctx.width(), H = ctx.height();
+  gHistCanvasW = W;
   ctx.setFillColor(Color{34, 34, 38, 255});
   ctx.fillRect(0, 0, W, H);
 
@@ -9365,6 +10266,36 @@ static void paintHistogram(CanvasContext &ctx)
   outline(state.histR, Color{235, 70, 70, 200});
   outline(state.histG, Color{70, 200, 90, 200});
   outline(state.histB, Color{80, 130, 255, 200});
+
+  // Clipping triangles. Dark: nothing clipped. Otherwise colored by which
+  // channels clip (white = all three). White outline: that overlay is on.
+  auto triangle = [&](bool left, uint8_t mask, bool overlayOn)
+  {
+    const float s = kHistTriPx, m = 3.0f;
+    const Color c = mask ? clipChannelColor(mask, false) : Color{90, 90, 95, 255};
+    const float x0 = left ? m : W - m;
+    const float dx = left ? s : -s;
+    auto path = [&]
+    {
+      ctx.beginPath();
+      ctx.moveTo(x0, m);
+      ctx.lineTo(x0 + dx, m);
+      ctx.lineTo(x0, m + s);
+      ctx.closePath();
+    };
+    path();
+    ctx.setFillColor(c);
+    ctx.fill();
+    if (overlayOn)
+    {
+      path();
+      ctx.setStrokeColor(kColorWhite);
+      ctx.setLineWidth(1.0f);
+      ctx.stroke();
+    }
+  };
+  triangle(true, state.histClipLo, state.clipShadowsOn);
+  triangle(false, state.histClipHi, state.clipHighlightsOn);
 }
 
 static void refreshHistogramIfStale()
@@ -9372,6 +10303,38 @@ static void refreshHistogramIfStale()
   flushPendingAdjust();
   if (state.histStale)
     computeHistogram();
+}
+
+// Turns the shadow / highlight overlays on or off. Recomputing right away
+// rebuilds the overlay, bumps histVersion (so the histogram repaints its
+// triangles) and the canvas is told to repaint.
+static void setClipping(bool shadows, bool highlights)
+{
+  state.clipShadowsOn = shadows;
+  state.clipHighlightsOn = highlights;
+  computeHistogram();
+  state.markDirty();
+}
+// J: both on, or both off if either is currently on.
+static void toggleClipping()
+{
+  if (!state.image)
+    return;
+  const bool on = !(state.clipShadowsOn || state.clipHighlightsOn);
+  setClipping(on, on);
+}
+
+// Shift+J: switch between classic red/blue and per-channel colors. If no
+// overlay is on yet, turn both on so the key always shows something.
+static void toggleChannelClipping()
+{
+  if (!state.image)
+    return;
+  state.clipPerChannel = !state.clipPerChannel;
+  if (!state.clipShadowsOn && !state.clipHighlightsOn)
+    state.clipShadowsOn = state.clipHighlightsOn = true;
+  computeHistogram(); // rebuild the overlay with the new coloring
+  state.markDirty();
 }
 
 // ---------------- Tone curve editor (canvas side) ----------------
@@ -9697,6 +10660,8 @@ int main()
                          { ui.wake(); });
   geometryWorker.setNotify([&ui]
                            { ui.wake(); });
+  thumbWorker.setNotify([&ui]
+                        { ui.wake(); });
   decodeWorker.setNotify([&ui]
                          { ui.wake(); });
   segmentWorker.setNotify([&ui]
@@ -9716,6 +10681,7 @@ int main()
       return m;
     };
     const KeyModifiers none = withMods(false, false);
+    const KeyModifiers shiftOnly = withMods(false, true);
     const KeyModifiers ctrl = withMods(true, false);
     const KeyModifiers ctrlShift = withMods(true, true);
     // Edits and dialogs are ignored mid-drag (a slider or crop handle is
@@ -9753,6 +10719,16 @@ int main()
     ui.addShortcut(ctrl, Key::RightBracket,
                    idle([]
                         { applyGeoOp(GeoOp::RotateCW); }));
+    ui.addShortcut(ctrlShift, Key::O, idle(openFolder));
+    ui.addShortcut(none, Key::Left, idle([]
+                                         { filmStep(-1); }));
+    ui.addShortcut(none, Key::Right, idle([]
+                                          { filmStep(1); }));
+    ui.addShortcut(none, Key::F6, toggleFilmstrip);
+    ui.addShortcut(none, Key::Backslash, idle(toggleBefore));       // Before / After
+    ui.addShortcut(none, Key::Y, idle(toggleSplit));                // split view
+    ui.addShortcut(none, Key::J, idle(toggleClipping));             // clipping warnings
+    ui.addShortcut(shiftOnly, Key::J, idle(toggleChannelClipping)); // per-channel colors
     ui.addShortcut(none, Key::Escape, []
                    { state.openMenu = -1; });
     ui.addShortcut(none, Key::Delete, idle([]
@@ -9814,6 +10790,7 @@ int main()
       menuButton("File", 0,
                  {
                      {"Open Image...", openImage, "Ctrl+O"},
+                     {"Open Folder...", openFolder, "Ctrl+Shift+O"},
                      {"Export...", exportImage, "Ctrl+E"},
                      {"Exit", [&]
                       { ui.requestClose(); }, "Ctrl+Q"},
@@ -9828,6 +10805,15 @@ int main()
           {"Actual Size (100%)", []
            { setZoom(1.0f); }, "Ctrl+0"},
           {"Toggle Sidebar", toggleSidebar, "Ctrl+B"},
+          {"Toggle Filmstrip", toggleFilmstrip, "F6"},
+          {"Previous Image", []
+           { filmStep(-1); }, "Left"},
+          {"Next Image", []
+           { filmStep(1); }, "Right"},
+          {"Before / After", toggleBefore, "\\"},
+          {"Before | After Split", toggleSplit, "Y"},
+          {"Clipping Warnings", toggleClipping, "J"},
+          {"Clipping: Per-Channel Colors", toggleChannelClipping, "Shift+J"},
       }));
 
   titlebar.addChild(
@@ -9932,16 +10918,27 @@ int main()
   workspace.addChild(std::move(activityBar));
 
   // ---- Sidebar (width driven by activeActivity: 0 when closed) ----
+  // Shell: owns width/background/padding and holds the pinned header
+  // (title + histogram). It does NOT scroll.
+  View sidebarShell;
+  sidebarShell.style.height = Size::full();
+  sidebarShell.style.flexShrink = 0;
+  sidebarShell.style.direction = FlexDirection::Column;
+  sidebarShell.style.backgroundColor = kColorPanelBg;
+  sidebarShell.style.padding = EdgeInsets::all(12.0f);
+  sidebarShell.style.overflowX = Overflow::Hidden;
+  sidebarShell.style.overflowY = Overflow::Hidden;
+  sidebarShell.style.width = std::function<Size()>([]
+                                                   { return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f); });
+
+  // Body: all the panes live here, and this is the part that scrolls.
   View sidebar;
-  sidebar.style.height = Size::full();
-  sidebar.style.flexShrink = 0;
+  sidebar.style.width = Size::full();
+  sidebar.style.flexGrow = 1;
+  sidebar.style.minHeight = 0;
   sidebar.style.direction = FlexDirection::Column;
-  sidebar.style.backgroundColor = kColorPanelBg;
-  sidebar.style.padding = EdgeInsets::all(12.0f);
   sidebar.style.overflowX = Overflow::Hidden;
   sidebar.style.overflowY = Overflow::Auto;
-  sidebar.style.width = std::function<Size()>([]
-                                              { return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f); });
 
   Text sidebarTitle;
   sidebarTitle.label =
@@ -9955,7 +10952,43 @@ int main()
   sidebarTitle.fontWeight = FontWeight::SemiBold;
   sidebarTitle.color = kColorTextMuted;
   sidebarTitle.style.margin = EdgeInsets{0, 0, 10, 0};
-  sidebar.addChild(std::move(sidebarTitle));
+  sidebarShell.addChild(std::move(sidebarTitle));
+
+  // Histogram of the picture as currently shown (see computeHistogram).
+  // Pinned above every pane, like Lightroom.
+  View histogram;
+  histogram.isCanvas = true;
+  histogram.style.width = Size::full();
+  histogram.style.height = Size::pixel(kHistHeightPx);
+  histogram.style.flexShrink = 0;
+  histogram.style.margin = EdgeInsets{0, 0, 12, 0};
+  histogram.onPaint = [](CanvasContext &ctx)
+  { paintHistogram(ctx); };
+  histogram.onPressAt = [](float lx, float ly)
+  {
+    if (!state.image || ly > kHistTriHitPx)
+      return;
+    if (lx <= kHistTriHitPx)
+      setClipping(!state.clipShadowsOn, state.clipHighlightsOn);
+    else if (lx >= gHistCanvasW - kHistTriHitPx)
+      setClipping(state.clipShadowsOn, !state.clipHighlightsOn);
+  };
+  histogram.canvasDirtySource = []
+  {
+    static uint32_t lastPainted = 0;
+    static int lastActivity = -2;
+    // Sidebar is polled before the canvas: do the pending recompute now.
+    refreshHistogramIfStale();
+    // Also repaint when the sidebar is switched or reopened, in case it
+    // was hidden while the picture changed.
+    const bool tabChanged = state.activeActivity != lastActivity;
+    lastActivity = state.activeActivity;
+    if (state.histVersion == lastPainted && !tabChanged)
+      return false;
+    lastPainted = state.histVersion;
+    return true;
+  };
+  sidebarShell.addChild(std::move(histogram));
 
   // -- "Info" pane: real data about the open image.
   View infoPane;
@@ -10006,31 +11039,6 @@ int main()
   adjustPane.style.display = std::function<Display()>(
       []
       { return state.activeActivity == 1 ? Display::Flex : Display::None; });
-
-  // Histogram of the picture as currently shown (see computeHistogram).
-  View histogram;
-  histogram.isCanvas = true;
-  histogram.style.width = Size::full();
-  histogram.style.height = Size::pixel(kHistHeightPx);
-  histogram.style.flexShrink = 0;
-  histogram.onPaint = [](CanvasContext &ctx)
-  { paintHistogram(ctx); };
-  histogram.canvasDirtySource = []
-  {
-    static uint32_t lastPainted = 0;
-    static int lastActivity = -2;
-    // Sidebar is polled before the canvas: do the pending recompute now.
-    refreshHistogramIfStale();
-    // Also repaint when this tab is (re)shown, in case it was hidden while
-    // the picture changed.
-    const bool tabChanged = state.activeActivity != lastActivity;
-    lastActivity = state.activeActivity;
-    if (state.histVersion == lastPainted && !tabChanged)
-      return false;
-    lastPainted = state.histVersion;
-    return true;
-  };
-  adjustPane.addChild(std::move(histogram));
 
   auto sectionLabel = [](const char *text)
   {
@@ -10999,7 +12007,8 @@ int main()
       { return state.image != nullptr; }));
   sidebar.addChild(std::move(exportPane));
 
-  workspace.addChild(std::move(sidebar));
+  sidebarShell.addChild(std::move(sidebar));
+  workspace.addChild(std::move(sidebarShell));
 
   // ---- Vertical divider — drag to resize the sidebar ----
   View vDivider;
@@ -11026,9 +12035,17 @@ int main()
 
   workspace.addChild(std::move(vDivider));
 
+  // ---- Center column: canvas viewport on top, filmstrip underneath ----
+  // Keeps the filmstrip under the picture only, so the sidebar keeps its
+  // full height.
+  View centerColumn;
+  centerColumn.style.direction = FlexDirection::Column;
+  centerColumn.style.height = Size::full();
+  centerColumn.style.flexGrow = 1;
+
   // ---- Scrollable canvas viewport ----
   View viewport;
-  viewport.style.height = Size::full();
+  viewport.style.width = Size::full();
   viewport.style.flexGrow = 1;
   viewport.style.backgroundColor = kColorViewportBg;
   viewport.style.overflowX = Overflow::Auto;
@@ -11072,18 +12089,38 @@ int main()
     state.dirty = false;
     return d;
   };
+  canvas.onHoverAt = [](float lx, float ly)
+  { return hoverSample(lx, ly); };
+  canvas.onHoverEnd = []
+  { return hoverClear(); };
   // Crop-selection dragging (no-ops unless the Crop pane is open).
   // Each is a no-op unless its own pane is open (crop: 2, masks: 7).
+  // While comparing, the canvas does nothing but move the split line.
   canvas.onPressAt = [](float lx, float ly)
   {
+    if (state.compare != CompareMode::Off)
+    {
+      if (state.compare == CompareMode::Split)
+        splitFromX(lx);
+      return;
+    }
     cropPress(lx, ly);
     maskPress(lx, ly);
   };
 
   canvas.onRightPressAt = [](float lx, float ly)
-  { objectPress(lx, ly, true); };
+  {
+    if (state.compare == CompareMode::Off)
+      objectPress(lx, ly, true);
+  };
   canvas.onDragTo = [](float lx, float ly)
   {
+    if (state.compare != CompareMode::Off)
+    {
+      if (state.compare == CompareMode::Split)
+        splitFromX(lx);
+      return;
+    }
     cropDrag(lx, ly);
     maskDrag(lx, ly);
   };
@@ -11100,10 +12137,10 @@ int main()
 
   viewport.addChild(std::move(canvas));
 
-  workspace.addChild(std::move(viewport));
+  centerColumn.addChild(std::move(viewport));
 
   View noImagePlaceholder;
-  noImagePlaceholder.style.height = Size::full();
+  noImagePlaceholder.style.width = Size::full();
   noImagePlaceholder.style.flexGrow = 1;
   noImagePlaceholder.style.backgroundColor = kColorViewportBg;
   noImagePlaceholder.style.justifyContent = Justify::Center;
@@ -11118,7 +12155,37 @@ int main()
   noImageText.color = kColorTextFaint;
   noImagePlaceholder.addChild(std::move(noImageText));
 
-  workspace.addChild(std::move(noImagePlaceholder));
+  centerColumn.addChild(std::move(noImagePlaceholder));
+
+  // Filmstrip: the open folder's pictures, under the canvas.
+  View filmstrip;
+  filmstrip.isCanvas = true;
+  filmstrip.style.width = Size::full();
+  filmstrip.style.flexShrink = 0;
+  filmstrip.style.height = std::function<Size()>(
+      []
+      { return Size::pixel(filmstripShown() ? kFilmH : 0.0f); });
+  filmstrip.style.display = std::function<Display()>(
+      []
+      { return filmstripShown() ? Display::Flex : Display::None; });
+  filmstrip.onPaint = [](CanvasContext &ctx)
+  { paintFilmstrip(ctx); };
+  filmstrip.canvasDirtySource = []
+  {
+    collectThumbJobs();
+    const bool d = state.film.dirty;
+    state.film.dirty = false;
+    return d;
+  };
+  filmstrip.onPressAt = [](float lx, float)
+  { filmClick(lx); };
+  filmstrip.onScrollUp = []
+  { filmScrollBy(-2.0f * kFilmCellW); };
+  filmstrip.onScrollDown = []
+  { filmScrollBy(2.0f * kFilmCellW); };
+  centerColumn.addChild(std::move(filmstrip));
+
+  workspace.addChild(std::move(centerColumn));
 
   root.addChild(std::move(workspace));
 
@@ -11142,6 +12209,10 @@ int main()
                               std::to_string(state.image->width) + " x " +
                               std::to_string(state.image->height) + " px"
                         : std::string("No image open");
+    if (state.image && state.compare == CompareMode::Before)
+      s += "     •     Before (press \\ to return)";
+    else if (state.image && state.compare == CompareMode::Split)
+      s += "     •     Before | After (Y to close, drag to move the line)";
     if (!state.statusMsg.empty())
       s += "     •     " + state.statusMsg;
     return s; });
@@ -11176,6 +12247,41 @@ int main()
   zoomControls.style.direction = FlexDirection::Row;
   zoomControls.style.alignItems = Align::Center;
   zoomControls.style.gap = 4.0f;
+
+  // RGB under the cursor: swatch + values. Fixed width so the zoom controls
+  // to its right never shift as the numbers change.
+  View rgbReadout;
+  rgbReadout.style.width = Size::pixel(176);
+  rgbReadout.style.direction = FlexDirection::Row;
+  rgbReadout.style.alignItems = Align::Center;
+  rgbReadout.style.gap = 6.0f;
+  rgbReadout.style.margin = EdgeInsets{0, 14, 0, 0};
+
+  View rgbSwatch;
+  rgbSwatch.style.width = Size::pixel(12);
+  rgbSwatch.style.height = Size::pixel(12);
+  rgbSwatch.style.flexShrink = 0;
+  rgbSwatch.style.borderRadius = 2.0f;
+  rgbSwatch.style.backgroundColor = std::function<Color()>([]() -> Color
+                                                           { return state.hoverValid
+                                                                        ? Color{state.hoverR, state.hoverG, state.hoverB, 255}
+                                                                        : Color{0, 0, 0, 0}; });
+  rgbReadout.addChild(std::move(rgbSwatch));
+
+  Text rgbText;
+  rgbText.label = std::function<std::string()>([]
+                                               {
+    if (!state.hoverValid)
+      return std::string();
+    return "R " + std::to_string(state.hoverR) + "  G " +
+           std::to_string(state.hoverG) + "  B " +
+           std::to_string(state.hoverB); });
+  rgbText.fontSize = 12.0f;
+  rgbText.wrap = TextWrap::NoWrap;
+  rgbText.color = kColorWhite;
+  rgbReadout.addChild(std::move(rgbText));
+  zoomControls.addChild(std::move(rgbReadout));
+
 
   zoomControls.addChild(
       statusGlyphBtn("-", []
@@ -11226,6 +12332,7 @@ int main()
   renderWorker.shutdown();   // join the worker before `ui` goes out of scope
   geometryWorker.shutdown(); // ditto
   decodeWorker.shutdown();   // ditto (waits out a decode still running)
+  thumbWorker.shutdown();    // ditto
   segmentWorker.shutdown();
   return 0;
 }
