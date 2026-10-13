@@ -38,6 +38,14 @@ constexpr float kDividerW = 4.0f;
 constexpr float kMinSidebarW = 180.0f;
 constexpr float kMaxSidebarW = 420.0f;
 
+// Right-hand panel of the Masks pane (the selected mask's controls).
+constexpr float kMinMaskPanelW = 300.0f;
+constexpr float kMaxMaskPanelW = 480.0f;
+constexpr float kMaskPanelPad = 12.0f; // panel padding, each side
+constexpr float kMaskTrackW = 240.0f;  // slider track length in that panel
+                                       // (kMinMaskPanelW - 2 * pad - scrollbar
+                                       // must stay >= this)
+
 // Zoom range/step.
 constexpr float kZoomMin = 0.1f;
 constexpr float kZoomMax = 8.0f;
@@ -78,12 +86,14 @@ constexpr int kToneMax = 100;
 // -100..+100 (0 = untouched). See the "colormix" block below.
 constexpr int kMixMin = -100;
 constexpr int kMixMax = 100;
-constexpr float kMixHueRangeDeg = 30.0f; // hue slider at +/-100 = +/-30 degrees
-constexpr float kMixLumAmount = 0.5f;    // luminance +100 = halfway to white
-constexpr float kMixChromaFull = 0.10f;  // chroma (0..1) at which a pixel is
-                                         // "colored enough" for full effect
-constexpr int kMixLutSize = 720;         // hue lookup resolution (0.5 degree)
-constexpr float kMixTabW = 46.0f;        // Hue/Sat/Lum tab width (3 + gaps = 150)
+constexpr float kMixHueRangeDeg = 30.0f;  // hue slider at +/-100 = +/-30 degrees
+constexpr float kMixLumAmount = 0.5f;     // luminance +100 = halfway to white
+constexpr float kHueShiftDegrees = 90.0f; // Hue slider +/-100 = +/- this many degrees
+constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction of the tint's chroma
+constexpr float kMixChromaFull = 0.10f;   // chroma (0..1) at which a pixel is
+                                          // "colored enough" for full effect
+constexpr int kMixLutSize = 720;          // hue lookup resolution (0.5 degree)
+constexpr float kMixTabW = 46.0f;         // Hue/Sat/Lum tab width (3 + gaps = 150)
 
 // Histogram: at most ~kHistMaxSamples pixels are visited per recompute
 // (strided grid), so it stays cheap on full-resolution images.
@@ -155,7 +165,11 @@ constexpr size_t kBrushCacheSize = 6;      // memoized coverage maps
 // Luminosity range masks.
 constexpr float kLumMaxRamp = 0.5f; // soft edge width at Smoothness = 100%,
                                     // as a fraction of the 0..1 luminance
-constexpr int kLumTintEdge = 512;   // long side of the on-canvas tint bitmap
+// Color Range: distance (in the opponent space of ColorRangeShape) that
+// Range = 100% reaches, and how much brightness differences count.
+constexpr float kColorRangeMaxDist = 0.75f;
+constexpr float kColorRangeLumWeight = 0.35f;
+constexpr int kLumTintEdge = 512; // long side of the on-canvas tint bitmap
 
 // Object masks
 constexpr int kObjectMapEdge = 1024;       // long side of a stored/warped map
@@ -257,6 +271,9 @@ enum class AdjId : int
   Tint,
   Vibrance,
   Saturation,
+  Hue,
+  ColorizeHue,
+  ColorizeAmount,
   Count
 };
 
@@ -364,6 +381,14 @@ static const std::array<AdjustmentSpec, static_cast<size_t>(AdjId::Count)>
          static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Color},
         {AdjId::Saturation, "Saturation", static_cast<float>(kToneMin),
          static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Color},
+        // Hue: rotates all colors around the gray axis. Colorize: adds a
+        // luma-neutral cast of ColorizeHue, strength ColorizeAmount (0 = off).
+        {AdjId::Hue, "Hue", static_cast<float>(kToneMin),
+         static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Color},
+        {AdjId::ColorizeHue, "Colorize Hue", 0.0f, 360.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::ColorizeAmount, "Colorize Amount", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
     }};
 
 // BEGIN colormix
@@ -629,28 +654,101 @@ static GradeLut buildGradeLut(const ColorGrade &g)
 // approximation for a first version.
 struct ColorPass
 {
-  bool active = false;       // false = skip the pass entirely (fast path)
-  float gain[3] = {1, 1, 1}; // per-channel white-balance gains (R,G,B)
-  float vibrance = 0.0f;     // -1..+1
-  float saturation = 1.0f;   // multiplier: 0 = gray, 1 = untouched, 2 = double
-  bool mix = false;          // Color Mixer stage enabled (mixLut is valid)
-  MixLut mixLut;             // only filled when `mix` is true
-  bool grade = false;        // Color Grading stage enabled (gradeLut is valid)
-  GradeLut gradeLut;         // only filled when `grade` is true
+  bool active = false;                         // false = skip the pass entirely (fast path)
+  float gain[3] = {1, 1, 1};                   // per-channel white-balance gains (R,G,B)
+  float vibrance = 0.0f;                       // -1..+1
+  float saturation = 1.0f;                     // multiplier: 0 = gray, 1 = untouched, 2 = double
+  bool hue = false;                            // Hue shift enabled (hueM is valid)
+  float hueM[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; // row-major RGB rotation about gray
+  bool colorize = false;                       // Colorize enabled (tintVec is valid)
+  float tintVec[3] = {0, 0, 0};                // luma-neutral RGB offset at full midtone weight
+  bool mix = false;                            // Color Mixer stage enabled (mixLut is valid)
+  MixLut mixLut;                               // only filled when `mix` is true
+  bool grade = false;                          // Color Grading stage enabled (gradeLut is valid)
+  GradeLut gradeLut;                           // only filled when `grade` is true
 };
 
 // UI values are the -100..+100 slider values.
 static ColorPass makeColorPass(float temperature, float tint, float vibrance,
                                float saturation, const MixValues &mix,
-                               const ColorGrade &grade)
+                               const ColorGrade &grade,
+                               float hueShift = 0.0f, float colorizeHue = 0.0f,
+                               float colorizeAmount = 0.0f)
 {
   ColorPass cp;
   cp.mix = mixAnyNonZero(mix);
   cp.grade = grade.anyActive();
-  cp.active = cp.mix || cp.grade || temperature != 0.0f || tint != 0.0f ||
-              vibrance != 0.0f || saturation != 0.0f;
+  cp.hue = hueShift != 0.0f;
+  cp.colorize = colorizeAmount > 0.0f;
+  cp.active = cp.mix || cp.grade || cp.hue || cp.colorize ||
+              temperature != 0.0f || tint != 0.0f || vibrance != 0.0f ||
+              saturation != 0.0f;
   if (!cp.active)
     return cp;
+  if (cp.hue)
+  {
+    // Rotation about the gray axis (the same matrix as SVG's hueRotate).
+    const float a = hueShift / 100.0f * kHueShiftDegrees * 0.017453292519943295f;
+    const float c = std::cos(a), s = std::sin(a);
+    cp.hueM[0] = 0.213f + c * 0.787f - s * 0.213f;
+    cp.hueM[1] = 0.715f - c * 0.715f - s * 0.715f;
+    cp.hueM[2] = 0.072f - c * 0.072f + s * 0.928f;
+    cp.hueM[3] = 0.213f - c * 0.213f + s * 0.143f;
+    cp.hueM[4] = 0.715f + c * 0.285f + s * 0.140f;
+    cp.hueM[5] = 0.072f - c * 0.072f - s * 0.283f;
+    cp.hueM[6] = 0.213f - c * 0.213f - s * 0.787f;
+    cp.hueM[7] = 0.715f - c * 0.715f + s * 0.715f;
+    cp.hueM[8] = 0.072f + c * 0.928f + s * 0.072f;
+  }
+  if (cp.colorize)
+  {
+    // The pure color of that hue (HSL s = 1, l = 0.5), then only its chroma:
+    // subtracting its own luma makes the offset luma-neutral.
+    float h = std::fmod(colorizeHue, 360.0f);
+    if (h < 0.0f)
+      h += 360.0f;
+    const float hp = h / 60.0f;
+    const int sector = std::min(5, static_cast<int>(hp));
+    const float f = hp - static_cast<float>(sector);
+    float t[3];
+    switch (sector)
+    {
+    case 0:
+      t[0] = 1;
+      t[1] = f;
+      t[2] = 0;
+      break;
+    case 1:
+      t[0] = 1 - f;
+      t[1] = 1;
+      t[2] = 0;
+      break;
+    case 2:
+      t[0] = 0;
+      t[1] = 1;
+      t[2] = f;
+      break;
+    case 3:
+      t[0] = 0;
+      t[1] = 1 - f;
+      t[2] = 1;
+      break;
+    case 4:
+      t[0] = f;
+      t[1] = 0;
+      t[2] = 1;
+      break;
+    default:
+      t[0] = 1;
+      t[1] = 0;
+      t[2] = 1 - f;
+      break;
+    }
+    const float lt = 0.299f * t[0] + 0.587f * t[1] + 0.114f * t[2];
+    const float k = colorizeAmount / 100.0f * kColorizeStrength * 255.0f;
+    for (int i = 0; i < 3; ++i)
+      cp.tintVec[i] = (t[i] - lt) * k;
+  }
   if (cp.mix)
     cp.mixLut = buildMixLut(mix);
   if (cp.grade)
@@ -687,6 +785,10 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
   const float gR = cp.gain[0], gG = cp.gain[1], gB = cp.gain[2];
   const bool doVib = cp.vibrance != 0.0f;
   const bool doSat = cp.saturation != 1.0f;
+  const bool doHue = cp.hue;
+  const bool doTint = cp.colorize;
+  const float *hm = cp.hueM;
+  const float tvR = cp.tintVec[0], tvG = cp.tintVec[1], tvB = cp.tintVec[2];
   const bool doMix = cp.mix;
   const bool doGrade = cp.grade;
   const float *gdR = cp.gradeLut[0].data();
@@ -720,6 +822,13 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
       r = l + (r - l) * sat;
       g = l + (g - l) * sat;
       b = l + (b - l) * sat;
+    }
+    if (doHue)
+    {
+      const float r0 = r, g0 = g, b0 = b;
+      r = hm[0] * r0 + hm[1] * g0 + hm[2] * b0;
+      g = hm[3] * r0 + hm[4] * g0 + hm[5] * b0;
+      b = hm[6] * r0 + hm[7] * g0 + hm[8] * b0;
     }
     if (doMix)
     {
@@ -824,6 +933,17 @@ static void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
         g = (g1 + m0) * 255.0f;
         b = (b1 + m0) * 255.0f;
       }
+    }
+    if (doTint)
+    {
+      // Weight 4 l (1 - l): strongest in the midtones, zero at pure black
+      // and white, so the cast can't push the ends out of range.
+      float l = (0.299f * r + 0.587f * g + 0.114f * b) * (1.0f / 255.0f);
+      l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+      const float w = 4.0f * l * (1.0f - l);
+      r += tvR * w;
+      g += tvG * w;
+      b += tvB * w;
     }
     if (doGrade)
     {
@@ -1078,6 +1198,7 @@ enum class MaskType : int
   Linear,
   Brush,
   Luminosity,
+  ColorRange,
   Object,
   Count
 };
@@ -1096,6 +1217,8 @@ static const char *maskTypeName(MaskType t)
     return "Luminosity";
   case MaskType::Object:
     return "Object";
+  case MaskType::ColorRange:
+    return "Color Range";
   default:
     return "Mask";
   }
@@ -1400,7 +1523,9 @@ struct LinearShape
 // small preview and the full-size image.
 //
 // One stroke's coverage is the MAX over its dabs (not a sum), so a stroke
-// that crosses itself does not double up; strokes then combine in order:
+// that crosses itself does not double up. With Flow < 1 the dabs instead
+// ACCUMULATE toward the stroke's density cap (so crossing itself does build
+// up); strokes then combine in order:
 //     paint:  m = m + (1 - m) * c        erase:  m = m * (1 - c)
 // where c is the stroke's coverage times its density.
 //
@@ -1421,6 +1546,8 @@ struct BrushStroke
   float size = kBrushDefaultSize; // radius, fraction of the SHORTER side
   float feather = 0.5f;           // 0 = hard edge .. 1 = fades from the center
   float density = 1.0f;           // 0..1, the most a stroke can add / remove
+  float flow = 1.0f;              // 0..1: 1 = a dab sets coverage (max), lower =
+                                  // dabs build up toward `density` (one pass ~ flow)
   std::vector<BrushPt> pts;
   bool operator==(const BrushStroke &) const = default;
 };
@@ -1613,6 +1740,8 @@ struct BrushShape
     const float fW = static_cast<float>(mw), fH = static_cast<float>(mh);
     std::vector<uint8_t> cov; // one stroke's coverage, over its bbox only
     std::array<uint8_t, kBrushLutSize + 1> lut{};
+    std::vector<float> covF;                     // Flow < 1: the same box, accumulated in float
+    std::array<float, kBrushLutSize + 1> lutA{}; // falloff * per-dab opacity
 
     for (size_t si = first; si < strokes.size(); ++si)
     {
@@ -1621,11 +1750,22 @@ struct BrushShape
         continue;
       const float rad = (st.size < kBrushMinSize ? kBrushMinSize : st.size) * S;
       const float r2 = rad * rad;
+      const float step = std::max(1.0f, rad * kBrushSpacing);
+
+      // Flow < 1: each dab adds (cap - cov) * falloff * aF. aF is chosen so
+      // that one straight pass (about 2 rad / step dabs across the center)
+      // adds up to ~flow, however the pointer happened to sample the path.
+      const float flow = std::clamp(st.flow, 0.01f, 1.0f);
+      const bool accum = flow < 0.999f;
+      const float passDabs = std::max(1.0f, 2.0f * rad / step);
+      const float aF =
+          accum ? 1.0f - std::pow(1.0f - flow, 1.0f / passDabs) : 0.0f;
 
       // Falloff over squared distance / r^2, density folded in: 1 inside
       // `inner`, easing (smoothstep) to 0 at the rim.
       const float inner = std::clamp(1.0f - st.feather, 0.0f, 0.99f);
       const float dens = std::clamp(st.density, 0.0f, 1.0f);
+      const float cap = 255.0f * dens; // accumulation ceiling (flow < 1)
       for (size_t i = 0; i <= kBrushLutSize; ++i)
       {
         const float d = std::sqrt(static_cast<float>(i) /
@@ -1645,6 +1785,7 @@ struct BrushShape
           w = 1.0f - t * t * (3.0f - 2.0f * t);
         }
         lut[i] = static_cast<uint8_t>(std::lround(255.0f * w * dens));
+        lutA[i] = w * aF;
       }
 
       // The stroke's bounding box (points +- radius), clamped to the map.
@@ -1672,8 +1813,10 @@ struct BrushShape
         continue;
       const int bw = cx1 - cx0, bh = cy1 - cy0;
       cov.assign(static_cast<size_t>(bw) * static_cast<size_t>(bh), 0);
+      if (accum)
+        covF.assign(cov.size(), 0.0f);
 
-      // Stamp one round dab: coverage = max(existing, falloff).
+      // Stamp one round dab: coverage = max(existing, falloff), or accumulate when flow < 1.
       const float lutScale = static_cast<float>(kBrushLutSize) / r2;
       const auto stamp = [&](float cx, float cy)
       {
@@ -1702,7 +1845,16 @@ struct BrushShape
             const float d2 = dx * dx + dy2;
             if (d2 >= r2)
               continue;
-            const uint8_t c = lut[static_cast<size_t>(d2 * lutScale)];
+            const size_t li = static_cast<size_t>(d2 * lutScale);
+            if (accum)
+            {
+              float &f = covF[static_cast<size_t>(y - cy0) *
+                                  static_cast<size_t>(bw) +
+                              static_cast<size_t>(x - cx0)];
+              f += (cap - f) * lutA[li];
+              continue;
+            }
+            const uint8_t c = lut[li];
             uint8_t &dst = crow[x - cx0];
             if (c > dst)
               dst = c;
@@ -1710,25 +1862,57 @@ struct BrushShape
         }
       };
 
-      // Walk the polyline in steps of a fraction of the radius.
-      const float step = std::max(1.0f, rad * kBrushSpacing);
       float px = st.pts[0].x * fW, py = st.pts[0].y * fH;
-      stamp(px, py);
-      for (size_t k = 1; k < st.pts.size(); ++k)
+      if (accum)
       {
-        const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
-        const float len = std::hypot(qx - px, qy - py);
-        const int n =
-            std::min(static_cast<int>(std::ceil(len / step)), 1 << 16);
-        for (int j = 1; j <= n; ++j)
+        // Dabs at an exact spacing along the path, carried across segments,
+        // so the build-up does not depend on how often points were recorded.
+        // A stationary click gets one pass worth of dabs.
+        const int reps =
+            st.pts.size() == 1 ? static_cast<int>(passDabs + 0.5f) : 1;
+        for (int r = 0; r < reps; ++r)
+          stamp(px, py);
+        float next = step; // distance from the last dab to the next one
+        for (size_t k = 1; k < st.pts.size(); ++k)
         {
-          const float t = static_cast<float>(j) / static_cast<float>(n);
-          stamp(px + (qx - px) * t, py + (qy - py) * t);
+          const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
+          const float len = std::hypot(qx - px, qy - py);
+          if (len > 0.0f)
+          {
+            float pos = next;
+            for (int guard = 0; pos <= len && guard < (1 << 16); ++guard)
+            {
+              const float t = pos / len;
+              stamp(px + (qx - px) * t, py + (qy - py) * t);
+              pos += step;
+            }
+            next = pos - len;
+          }
+          px = qx;
+          py = qy;
         }
-        px = qx;
-        py = qy;
+        for (size_t i = 0; i < cov.size(); ++i)
+          cov[i] = static_cast<uint8_t>(covF[i] + 0.5f);
       }
-
+      else
+      {
+        // Walk the polyline in steps of a fraction of the radius (as before).
+        stamp(px, py);
+        for (size_t k = 1; k < st.pts.size(); ++k)
+        {
+          const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
+          const float len = std::hypot(qx - px, qy - py);
+          const int n =
+              std::min(static_cast<int>(std::ceil(len / step)), 1 << 16);
+          for (int j = 1; j <= n; ++j)
+          {
+            const float t = static_cast<float>(j) / static_cast<float>(n);
+            stamp(px + (qx - px) * t, py + (qy - py) * t);
+          }
+          px = qx;
+          py = qy;
+        }
+      }
       // Fold this stroke into the mask, and widen the rows' spans.
       for (int y = 0; y < bh; ++y)
       {
@@ -1933,6 +2117,92 @@ struct LuminosityShape
       }
       e.lut[i] = w;
     }
+    return e;
+  }
+};
+
+// ---- Color Range mask ----
+// Selects pixels whose color is close to a sampled one. Like Luminosity it is
+// not spatial (no GeoFrame mapping) and reads the row's pixels as they are
+// when the mask is reached. Distance is measured in a cheap opponent space:
+//   y = luma, cb = b - y, cr = r - y   (all 0..1)
+// d = sqrt((wl*dy)^2 + dcb^2 + dcr^2). Full weight inside the inner radius,
+// smoothstep to 0 at the outer one.
+struct ColorRangeEval
+{
+  bool set = false;
+  float y0 = 0, cb0 = 0, cr0 = 0; // the sample
+  float inner = 0, outer = 0;     // distance where the falloff begins / ends
+  float invFall = 1;
+
+  bool rowSpan(int /*y*/, int W, int &x0, int &x1) const
+  {
+    x0 = 0;
+    x1 = W;
+    return set && W > 0;
+  }
+
+  void rowWeights(int /*y*/, int x0, int x1, float *out,
+                  const uint8_t *pix = nullptr) const
+  {
+    const int len = x1 - x0;
+    if (!pix || !set)
+    {
+      for (int i = 0; i < len; ++i)
+        out[i] = 0.0f;
+      return;
+    }
+    const float k = 1.0f / 255.0f;
+    for (int i = 0; i < len; ++i)
+    {
+      const uint8_t *p = pix + static_cast<size_t>(i) * 4;
+      const float r = p[0] * k, g = p[1] * k, b = p[2] * k;
+      const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+      const float dy = (y - y0) * kColorRangeLumWeight;
+      const float dcb = (b - y) - cb0;
+      const float dcr = (r - y) - cr0;
+      const float d = std::sqrt(dy * dy + dcb * dcb + dcr * dcr);
+      float w;
+      if (d <= inner)
+        w = 1.0f;
+      else if (d >= outer)
+        w = 0.0f;
+      else
+      {
+        const float t = (d - inner) * invFall;
+        w = 1.0f - t * t * (3.0f - 2.0f * t);
+      }
+      out[i] = w;
+    }
+  }
+};
+
+struct ColorRangeShape
+{
+  bool set = false;          // false until a color was clicked
+  float r = 0, g = 0, b = 0; // the sample, 0..1 (as it was when clicked)
+  float range = 0.30f;       // 0..1 tolerance
+  float feather = 0.5f;      // 0 = hard edge .. 1 = widest soft edge
+  bool operator==(const ColorRangeShape &) const = default;
+
+  ColorRangeShape toSource(const GeoFrame &) const { return *this; }
+  void applySourceEdit(const ColorRangeShape & /*before*/,
+                       const ColorRangeShape &after, const GeoFrame &)
+  {
+    *this = after;
+  }
+
+  ColorRangeEval prepare(int /*W*/, int /*H*/) const
+  {
+    ColorRangeEval e;
+    e.set = set;
+    const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    e.y0 = y;
+    e.cb0 = b - y;
+    e.cr0 = r - y;
+    e.outer = std::clamp(range, 0.0f, 1.0f) * kColorRangeMaxDist;
+    e.inner = e.outer * (1.0f - std::clamp(feather, 0.0f, 1.0f));
+    e.invFall = 1.0f / std::max(1e-4f, e.outer - e.inner);
     return e;
   }
 };
@@ -2209,9 +2479,16 @@ struct ObjectShape
 
 // ---- Shape variants: one alternative per MaskType ----
 using MaskShape = std::variant<RadialShape, LinearShape, BrushShape,
-                               LuminosityShape, ObjectShape>;
+                               LuminosityShape, ObjectShape, ColorRangeShape>;
 using MaskEval = std::variant<RadialEval, LinearEval, BrushEval,
-                              LuminosityEval, ObjectEval>;
+                              LuminosityEval, ObjectEval, ColorRangeEval>;
+
+// Masks whose weights read the picture's pixels (so the overlay must be built
+// from the picture just before them).
+static bool maskTypeUsesPixels(MaskType t)
+{
+  return t == MaskType::Luminosity || t == MaskType::ColorRange;
+}
 
 static MaskShape maskShapeToSource(const MaskShape &shape,
                                    const GeoFrame &f)
@@ -2393,14 +2670,47 @@ struct MaskPart
   bool operator==(const MaskPart &) const = default;
 };
 
+// ---- Curve types (used by the masks, so they live here) ----
+struct CurvePoint
+{
+  float x = 0.0f, y = 0.0f;
+  bool operator==(const CurvePoint &) const = default;
+};
+using CurvePoints = std::vector<CurvePoint>;
+
+static CurvePoints identityCurve() { return {{0.0f, 0.0f}, {255.0f, 255.0f}}; }
+
+// Which curve is being edited / stored. Master applies to all three channels
+// (first); Red/Green/Blue then apply to their own channel only.
+enum class CurveChannel : int
+{
+  Master,
+  Red,
+  Green,
+  Blue,
+  Count
+};
+constexpr size_t kCurveChannelCount = static_cast<size_t>(CurveChannel::Count);
+using CurveSet = std::array<CurvePoints, kCurveChannelCount>;
+
+static CurveSet identityCurves()
+{
+  return {identityCurve(), identityCurve(), identityCurve(), identityCurve()};
+}
+
 // One mask as the user sees it: its parts, whether it is on / inverted, and
 // its own slider values (indexed by AdjId, 0 = untouched).
 struct Mask
 {
   std::vector<MaskPart> parts; // never empty for a mask made by addMask
+  std::string name;            // the user's name for it; empty = show its kind
   bool enabled = true;
-  bool invert = false; // adjust everything OUTSIDE the shapes instead
+  bool invert = false;   // adjust everything OUTSIDE the shapes instead
+  float amount = 100.0f; // 0..100: how strongly the adjustments below apply
   AdjValues adj{};
+  MixValues mix{};                    // this mask's own Color Mixer
+  ColorGrade grade;                   // ...Color Grading
+  CurveSet curves = identityCurves(); // ...and tone curves (RGB, R, G, B)
   // The first part's kind: what a one-part mask is (the list names the rest).
   MaskType type() const
   {
@@ -2409,6 +2719,28 @@ struct Mask
   bool operator==(const Mask &) const = default;
 };
 using MaskSet = std::vector<Mask>;
+
+constexpr size_t kMaskNameMax = 32;
+// Printable ASCII only (the TextInput widget is ASCII / byte-cursor), capped.
+static std::string sanitizeMaskName(const std::string &s)
+{
+  std::string out;
+  for (const char ch : s)
+  {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c >= 0x20 && c < 0x7F && out.size() < kMaskNameMax)
+      out.push_back(ch);
+  }
+  return out;
+}
+static bool maskNameBlank(const std::string &s)
+{
+  return s.find_first_not_of(' ') == std::string::npos;
+}
+
+// Defined with the rest of the tone-curve code below.
+static std::array<float, 256> curveToLut(const CurvePoints &pts);
+static bool curveIsIdentity(const std::array<float, 256> &lut);
 
 // The Tone-stage sliders composed into one 256-entry table (per-channel, so
 // the same table serves R, G and B), with an optional curve table applied
@@ -2448,8 +2780,9 @@ struct MaskPass
 {
   std::vector<MaskPassPart> parts; // combined left to right (MaskComposite)
   bool invert = false;
-  bool tone = false; // any Tone slider non-zero (lut is valid)
-  std::array<uint8_t, 256> lut{};
+  float amount = 1.0f;                            // 0..1, multiplies the weight
+  bool tone = false;                              // any Tone slider or curve non-zero (luts is valid)
+  std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
   ColorPass color;
 };
 
@@ -2469,19 +2802,54 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
     for (const MaskPart &p : m.parts)
       mp.parts.push_back(MaskPassPart{maskShapeToSource(p.shape, frame), p.op});
     mp.invert = m.invert;
+    mp.amount = std::clamp(m.amount, 0.0f, 100.0f) / 100.0f;
+    if (mp.amount <= 0.0f)
+      continue; // Amount 0: the mask does nothing
     for (const auto &spec : kAdjustmentSpecs)
       if (spec.stage == AdjustmentSpec::Stage::Tone &&
           m.adj[static_cast<size_t>(spec.id)] != 0.0f)
         mp.tone = true;
+    // Curves: the master curve runs after the tone sliders, then each
+    // channel's own curve on top (same order as AdjustmentSet::buildChannelLuts).
+    const auto masterCurve = curveToLut(m.curves[0]);
+    const bool useMaster = !curveIsIdentity(masterCurve);
+    std::array<std::array<float, 256>, 3> chanCurve{};
+    bool useChan[3] = {false, false, false};
+    for (size_t c = 0; c < 3; ++c)
+    {
+      chanCurve[c] = curveToLut(m.curves[1 + c]);
+      useChan[c] = !curveIsIdentity(chanCurve[c]);
+      if (useChan[c])
+        mp.tone = true;
+    }
+    if (useMaster)
+      mp.tone = true;
     mp.color = makeColorPass(m.adj[static_cast<size_t>(AdjId::Temperature)],
                              m.adj[static_cast<size_t>(AdjId::Tint)],
                              m.adj[static_cast<size_t>(AdjId::Vibrance)],
                              m.adj[static_cast<size_t>(AdjId::Saturation)],
-                             MixValues{}, ColorGrade{});
+                             m.mix, m.grade,
+                             m.adj[static_cast<size_t>(AdjId::Hue)],
+                             m.adj[static_cast<size_t>(AdjId::ColorizeHue)],
+                             m.adj[static_cast<size_t>(AdjId::ColorizeAmount)]);
     if (!mp.tone && !mp.color.active)
       continue; // a mask with no adjustments does nothing
     if (mp.tone)
-      mp.lut = toneLutFromValues(m.adj, nullptr);
+    {
+      const auto base = toneLutFromValues(m.adj, useMaster ? &masterCurve : nullptr);
+      for (size_t c = 0; c < 3; ++c)
+      {
+        if (!useChan[c])
+        {
+          mp.luts[c] = base;
+          continue;
+        }
+        for (int k = 0; k < 256; ++k)
+          mp.luts[c][static_cast<size_t>(k)] = static_cast<uint8_t>(std::clamp(
+              static_cast<int>(std::lround(chanCurve[c][base[static_cast<size_t>(k)]])),
+              0, 255));
+      }
+    }
     out.push_back(std::move(mp));
   }
   return out;
@@ -2498,7 +2866,9 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
 {
   const size_t rowBytes = static_cast<size_t>(W) * 4;
   const int rows = static_cast<int>(n / rowBytes);
-  const uint8_t *lut = mp.lut.data();
+  const uint8_t *lr = mp.luts[0].data();
+  const uint8_t *lg = mp.luts[1].data();
+  const uint8_t *lb = mp.luts[2].data();
   for (int r = 0; r < rows; ++r)
   {
     int x0 = 0, x1 = W;
@@ -2518,9 +2888,9 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
     if (mp.tone)
       for (size_t i = 0; i + 3 < bytes; i += 4)
       {
-        scratch[i] = lut[scratch[i]];
-        scratch[i + 1] = lut[scratch[i + 1]];
-        scratch[i + 2] = lut[scratch[i + 2]];
+        scratch[i] = lr[scratch[i]];
+        scratch[i + 1] = lg[scratch[i + 1]];
+        scratch[i + 2] = lb[scratch[i + 2]];
       }
     applyColorPass(mp.color, scratch, bytes);
     for (int i = 0; i < len; ++i)
@@ -2528,6 +2898,7 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
       float w = wbuf[i];
       if (mp.invert)
         w = 1.0f - w;
+      w *= mp.amount;
       if (w <= 0.0f)
         continue;
       uint8_t *p = row + static_cast<size_t>(i) * 4;
@@ -2641,32 +3012,8 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
 // (Fritsch-Carlson / PCHIP): it passes through every point, never overshoots
 // between neighbors, and stays monotone wherever the points are — so dragging
 // a point can't make the curve ring or invert by accident.
-struct CurvePoint
-{
-  float x = 0.0f, y = 0.0f;
-  bool operator==(const CurvePoint &) const = default;
-};
-using CurvePoints = std::vector<CurvePoint>;
-
-static CurvePoints identityCurve() { return {{0.0f, 0.0f}, {255.0f, 255.0f}}; }
-
-// Which curve is being edited / stored. Master applies to all three channels
-// (first); Red/Green/Blue then apply to their own channel only.
-enum class CurveChannel : int
-{
-  Master,
-  Red,
-  Green,
-  Blue,
-  Count
-};
-constexpr size_t kCurveChannelCount = static_cast<size_t>(CurveChannel::Count);
-using CurveSet = std::array<CurvePoints, kCurveChannelCount>;
-
-static CurveSet identityCurves()
-{
-  return {identityCurve(), identityCurve(), identityCurve(), identityCurve()};
-}
+// (CurvePoint, CurvePoints, CurveChannel and CurveSet are defined further up,
+// before the masks block: a Mask holds its own CurveSet.)
 
 // Evaluates the curve at every input level 0..255 (unrounded, clamped).
 static std::array<float, 256> curveToLut(const CurvePoints &pts)
@@ -3052,6 +3399,8 @@ static mj::Json sidecarShapeToJson(const MaskShape &s)
       j.set("size", Json::num(st.size));
       j.set("feather", Json::num(st.feather));
       j.set("density", Json::num(st.density));
+      if (st.flow != 1.0f)
+        j.set("flow", Json::num(st.flow));
       Json pts = Json::array(); // x0, y0, x1, y1, ...
       for (const BrushPt &p : st.pts)
         pts.push(Json::num(p.x)).push(Json::num(p.y));
@@ -3066,6 +3415,16 @@ static mj::Json sidecarShapeToJson(const MaskShape &s)
     o.set("lo", Json::num(lu->lo));
     o.set("hi", Json::num(lu->hi));
     o.set("feather", Json::num(lu->feather));
+  }
+  else if (const auto *cr = std::get_if<ColorRangeShape>(&s))
+  {
+    o.set("type", Json::str("colorRange"));
+    o.set("set", Json::flag(cr->set));
+    o.set("r", Json::num(cr->r));
+    o.set("g", Json::num(cr->g));
+    o.set("b", Json::num(cr->b));
+    o.set("range", Json::num(cr->range));
+    o.set("feather", Json::num(cr->feather));
   }
   else if (const auto *ob = std::get_if<ObjectShape>(&s))
   {
@@ -3138,6 +3497,7 @@ static bool sidecarShapeFromJson(const mj::Json &o, MaskShape *out)
         st.size = sidecarNum(sj, "size", st.size, kBrushMinSize, kBrushMaxSize);
         st.feather = sidecarNum(sj, "feather", st.feather, 0.0f, 1.0f);
         st.density = sidecarNum(sj, "density", st.density, 0.0f, 1.0f);
+        st.flow = sidecarNum(sj, "flow", st.flow, 0.01f, 1.0f);
         const mj::Json *pj = sj.find("pts");
         if (pj && pj->isArray())
         {
@@ -3159,6 +3519,18 @@ static bool sidecarShapeFromJson(const mj::Json &o, MaskShape *out)
     LuminosityShape s;
     s.setLo(sidecarNum(o, "lo", s.lo, 0.0f, 1.0f));
     s.setHi(sidecarNum(o, "hi", s.hi, 0.0f, 1.0f));
+    s.feather = sidecarNum(o, "feather", s.feather, 0.0f, 1.0f);
+    *out = s;
+    return true;
+  }
+  if (ty == "colorRange")
+  {
+    ColorRangeShape s;
+    s.set = sidecarFlag(o, "set", false);
+    s.r = sidecarNum(o, "r", 0.0f, 0.0f, 1.0f);
+    s.g = sidecarNum(o, "g", 0.0f, 0.0f, 1.0f);
+    s.b = sidecarNum(o, "b", 0.0f, 0.0f, 1.0f);
+    s.range = sidecarNum(o, "range", s.range, 0.0f, 1.0f);
     s.feather = sidecarNum(o, "feather", s.feather, 0.0f, 1.0f);
     *out = s;
     return true;
@@ -3213,7 +3585,17 @@ static mj::Json sidecarMaskToJson(const Mask &m)
   mj::Json o = mj::Json::object();
   o.set("enabled", mj::Json::flag(m.enabled));
   o.set("invert", mj::Json::flag(m.invert));
+  if (!maskNameBlank(m.name))
+    o.set("name", mj::Json::str(m.name));
   o.set("adjust", sidecarAdjToJson(m.adj));
+  if (m.amount != 100.0f)
+    o.set("amount", mj::Json::num(m.amount));
+  if (mixAnyNonZero(m.mix))
+    o.set("colorMix", sidecarMixToJson(m.mix));
+  if (!(m.grade == ColorGrade{}))
+    o.set("colorGrading", sidecarGradeToJson(m.grade));
+  if (!(m.curves == identityCurves()))
+    o.set("curves", sidecarCurvesToJson(m.curves));
   mj::Json parts = mj::Json::array();
   for (const MaskPart &p : m.parts)
   {
@@ -3231,7 +3613,16 @@ static bool sidecarMaskFromJson(const mj::Json &o, Mask *out)
   Mask m;
   m.enabled = sidecarFlag(o, "enabled", true);
   m.invert = sidecarFlag(o, "invert", false);
+  if (const mj::Json *nm = o.find("name"); nm && nm->isString())
+    m.name = sanitizeMaskName(nm->asStr());
   m.adj = sidecarAdjFromJson(o.find("adjust"));
+  m.amount = sidecarNum(o, "amount", 100.0f, 0.0f, 100.0f);
+  m.mix = sidecarMixFromJson(o.find("colorMix"));
+  m.grade = sidecarGradeFromJson(o.find("colorGrading"));
+  if (const mj::Json *cs = o.find("curves"); cs && cs->isObject())
+    for (size_t c = 0; c < kCurveChannelCount; ++c)
+      if (const mj::Json *a = cs->find(kSidecarCurveKeys[c]))
+        m.curves[c] = sidecarCurveFromJson(*a);
   const mj::Json *parts = o.find("parts");
   if (!parts || !parts->isArray())
     return false;
@@ -3748,7 +4139,8 @@ public:
   {
     return makeColorPass(get(AdjId::Temperature), get(AdjId::Tint),
                          get(AdjId::Vibrance), get(AdjId::Saturation), mix_,
-                         grade_);
+                         grade_, get(AdjId::Hue), get(AdjId::ColorizeHue),
+                         get(AdjId::ColorizeAmount));
   }
 
 private:
@@ -3853,18 +4245,41 @@ private:
       return std::string("Add ") + maskTypeName(b.masks.back().type()) + " Mask";
     if (b.masks.size() < a.masks.size())
       return "Delete Mask";
+    // Reorder: exactly two positions differ and each mask now sits where the
+    // other was (moveSelectedMask swaps neighbors). Checked before the
+    // per-mask loop, which would blame the first differing mask's sliders.
+    {
+      size_t d[3] = {0, 0, 0};
+      size_t nd = 0;
+      for (size_t m = 0; m < b.masks.size() && nd < 3; ++m)
+        if (!(a.masks[m] == b.masks[m]))
+          d[nd++] = m;
+      if (nd == 2 && a.masks[d[0]] == b.masks[d[1]] &&
+          a.masks[d[1]] == b.masks[d[0]])
+        return "Reorder Masks";
+    }
     for (size_t m = 0; m < b.masks.size(); ++m)
     {
       const Mask &x = a.masks[m], &y = b.masks[m];
       if (x == y)
         continue;
       const std::string n = "Mask " + std::to_string(m + 1) + ": ";
+      if (x.name != y.name)
+        return n + "Rename";
       for (const auto &s : kAdjustmentSpecs)
       {
         const size_t k = static_cast<size_t>(s.id);
         if (x.adj[k] != y.adj[k])
           return n + s.label + " " + signedNum(y.adj[k]);
       }
+      if (x.amount != y.amount)
+        return n + "Amount " + std::to_string(static_cast<int>(std::lround(y.amount)));
+      if (!(x.mix == y.mix))
+        return n + "Color Mix";
+      if (!(x.grade == y.grade))
+        return n + "Color Grading";
+      if (!(x.curves == y.curves))
+        return n + "Curve";
       if (x.enabled != y.enabled)
         return n + (y.enabled ? "On" : "Off");
       if (x.invert != y.invert)
@@ -4195,6 +4610,7 @@ struct MaskUi
   float brushSize = kBrushDefaultSize;
   float brushFeather = 0.5f;
   float brushDensity = 1.0f;
+  float brushFlow = 1.0f;
   bool brushErase = false;
   bool brushTint = true;      // paint the selected brush's coverage in red
   float lastX = 0, lastY = 0; // Paint: last recorded point, document px
@@ -4349,8 +4765,11 @@ struct EditorState
 
   int activeActivity = 0; // -1 = sidebar closed
   float sidebarWidth = 220.0f;
-  int openMenu = -1;      // -1 = no dropdown open, else its menu id
-  bool maximized = false; // mirrors our own toggle (no getter in LiteUI)
+  float maskPanelW = 300.0f; // right-hand mask panel (Masks pane only)
+  int maskTab = 0;           // its tab: 0 Effect, 1 Shape, 2 Parts
+  int maskFx = 0;            // Effect tab: 0 Basic, 1 Mix, 2 Grade, 3 Curve
+  int openMenu = -1;         // -1 = no dropdown open, else its menu id
+  bool maximized = false;    // mirrors our own toggle (no getter in LiteUI)
 
   // One-line message shown in the status bar after the image info: open and
   // export failures, and export success. Cleared by the next open, export or
@@ -8224,16 +8643,27 @@ constexpr int kMaskCtlLinStart = 94;
 constexpr int kMaskCtlBrush = 95; // one stroke = one undo step
 constexpr int kMaskCtlLumLo = 96;
 constexpr int kMaskCtlLumHi = 97;
+constexpr int kMaskCtlRange = 84;
 constexpr int kMaskCtlFeather = 1;
 constexpr int kMaskCtlAngle = 2;
 constexpr int kMaskCtlWidth = 3;
 constexpr int kMaskCtlHeight = 4;
 constexpr int kMaskCtlLength = 5;
 constexpr int kMaskCtlAdj = 10; // + AdjId
+constexpr int kMaskCtlName = 86;
 
 static bool maskToolActive()
 {
   return state.activeActivity == 7 && state.image != nullptr;
+}
+
+// Width of one of `n` equal chips / tabs sharing a row of the mask panel.
+static float maskChipW(int n)
+{
+  const float inner =
+      state.maskPanelW - 2.0f * kMaskPanelPad - kScrollbarThickness;
+  return std::max(20.0f, (inner - 4.0f * static_cast<float>(n - 1)) /
+                             static_cast<float>(n));
 }
 
 // The selected mask's index, or -1. Clamped here instead of at every place
@@ -8380,6 +8810,51 @@ static void maskEditDiscrete(const std::function<void(Mask &)> &fn)
     return;
   maskEdit(i, fn, -1);
   updateImageFromAdjustments();
+  state.markDirty();
+}
+
+// ---- Mask name field ----
+// The TextInput keeps its text in a shared state; we hold a pointer to it so
+// the field can follow the selected mask (selection change, undo / redo).
+static std::shared_ptr<TextInputState> gMaskNameState;
+
+// True while the name field has keyboard focus: the global shortcuts that
+// would also fire on plain keys (Y, J, Left, Right, Delete...) must stand
+// down, or typing a name would toggle views and Delete would delete the mask.
+static bool typingInTextField()
+{
+  return gMaskNameState && gMaskNameState->focused;
+}
+
+// Makes the field show the selected mask's name. Cheap; polled from the
+// field's display lambda, so it also catches undo / redo.
+static void syncMaskNameField()
+{
+  if (!gMaskNameState)
+    return;
+  const Mask *m = selectedMask();
+  const std::string want = m ? m->name : std::string();
+  TextInputState &t = *gMaskNameState;
+  if (t.text == want)
+    return;
+  t.text = want;
+  t.cursor = want.size();
+  t.scrollOffset = 0.0f;
+  t.dirty = true;
+}
+
+static void renameSelectedMask(const std::string &typed)
+{
+  const std::string s = sanitizeMaskName(typed);
+  if (gMaskNameState && gMaskNameState->text != s)
+  { // the cap (or a stripped character) changed what was typed
+    gMaskNameState->text = s;
+    gMaskNameState->cursor = std::min(gMaskNameState->cursor, s.size());
+    gMaskNameState->dirty = true;
+  }
+  // Typing folds into one undo step (until Enter / another edit).
+  maskEdit(selMask(), [&](Mask &m)
+           { m.name = s; }, kMaskCtlName);
   state.markDirty();
 }
 
@@ -8556,6 +9031,8 @@ static std::optional<MaskShape> newMaskShape(MaskType t)
     return LuminosityShape{}; // not spatial: nothing to place
   case MaskType::Object:
     return ObjectShape{};
+  case MaskType::ColorRange:
+    return ColorRangeShape{}; // nothing selected until a color is clicked
   default:
     return std::nullopt;
   }
@@ -8601,6 +9078,83 @@ static void deleteSelectedMask()
   state.mask.part = 0;
   updateImageFromAdjustments();
   state.markDirty();
+}
+
+// ---- Mask list operations: duplicate, reorder, copy / paste effects ----
+// A copy of the selected mask (shapes and effects) right after it, selected.
+static void duplicateSelectedMask()
+{
+  const int i = selMask();
+  if (i < 0)
+    return;
+  MaskSet ms = state.adjust.masks();
+  if (ms.size() >= kMaxMasks)
+  {
+    setStatus("Mask limit reached (" + std::to_string(kMaxMasks) + ")", true);
+    return;
+  }
+  Mask copy = ms[static_cast<size_t>(i)];
+  if (!maskNameBlank(copy.name))
+    copy.name = sanitizeMaskName(copy.name + " copy");
+  ms.insert(ms.begin() + i + 1, copy);
+  state.adjust.setMasks(ms, -1);
+  state.maskSel = i + 1;
+  state.mask.part = 0;
+  updateImageFromAdjustments();
+  state.markDirty();
+}
+
+// Masks apply in list order (later ones on top, and a luminosity range sees
+// the result of the masks before it), so order matters. dir = -1 up, +1 down.
+static void moveSelectedMask(int dir)
+{
+  const int i = selMask();
+  const int j = i + dir;
+  MaskSet ms = state.adjust.masks();
+  if (i < 0 || j < 0 || j >= static_cast<int>(ms.size()))
+    return;
+  std::swap(ms[static_cast<size_t>(i)], ms[static_cast<size_t>(j)]);
+  state.adjust.setMasks(ms, -1);
+  state.maskSel = j;
+  updateImageFromAdjustments();
+  state.markDirty();
+}
+
+// What Copy / Paste Effects moves between masks: everything but the shape.
+struct MaskEffects
+{
+  float amount = 100.0f;
+  AdjValues adj{};
+  MixValues mix{};
+  ColorGrade grade;
+  CurveSet curves = identityCurves();
+};
+static std::optional<MaskEffects> gMaskEffectsClip;
+
+static void copyMaskEffects()
+{
+  const Mask *m = selectedMask();
+  if (!m)
+    return;
+  gMaskEffectsClip = MaskEffects{m->amount, m->adj, m->mix, m->grade, m->curves};
+  setStatus("Mask effects copied", false);
+}
+
+static void pasteMaskEffects()
+{
+  if (!gMaskEffectsClip)
+  {
+    setStatus("Copy a mask's effects first", true);
+    return;
+  }
+  const MaskEffects fx = *gMaskEffectsClip;
+  maskEditDiscrete([&](Mask &m)
+                   {
+    m.amount = fx.amount;
+    m.adj = fx.adj;
+    m.mix = fx.mix;
+    m.grade = fx.grade;
+    m.curves = fx.curves; });
 }
 
 // ---- Parts: combining shapes inside the selected mask ----
@@ -8813,6 +9367,7 @@ static void brushBegin(float px, float py)
   st.size = BrushShape::sizeFromSource(u.brushSize, frame);
   st.feather = u.brushFeather;
   st.density = u.brushDensity;
+  st.flow = u.brushFlow;
   st.pts.push_back(BrushShape::pointFromSource(BrushPt{px / W, py / H}, frame));
   bool full = false;
   maskEdit(
@@ -8888,6 +9443,62 @@ static void brushDragTo(float px, float py)
   state.markDirty(); // the cursor ring follows the pointer
 }
 
+static std::shared_ptr<CanvasImage> lumTintBase(); // defined with the luminosity overlay below
+
+// Color of the picture at (fx, fy) (fractions of the picture on screen) as
+// it stands just BEFORE mask `sel`: the same pixels ColorRangeEval sees.
+static std::optional<std::array<float, 3>> samplePreMaskColor(int sel,
+                                                              float fx, float fy)
+{
+  const MaskSet &ms = state.adjust.masks();
+  const auto base = lumTintBase();
+  if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
+    return std::nullopt;
+  RenderParams rp = state.adjust.buildRenderParams();
+  rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
+                             state.adjust.geoFrame());
+  const auto pre = renderWith(*base, rp);
+  const int x = std::clamp(static_cast<int>(fx * pre->width), 0, pre->width - 1);
+  const int y = std::clamp(static_cast<int>(fy * pre->height), 0, pre->height - 1);
+  // Average a 5x5 patch so one noisy pixel doesn't pick the color.
+  float sum[3] = {0, 0, 0};
+  int n = 0;
+  for (int dy = -2; dy <= 2; ++dy)
+    for (int dx = -2; dx <= 2; ++dx)
+    {
+      const int xx = std::clamp(x + dx, 0, pre->width - 1);
+      const int yy = std::clamp(y + dy, 0, pre->height - 1);
+      const uint8_t *p =
+          &pre->pixels[(static_cast<size_t>(yy) * pre->width + xx) * 4];
+      for (int c = 0; c < 3; ++c)
+        sum[c] += p[c];
+      ++n;
+    }
+  return std::array<float, 3>{sum[0] / (255.0f * n), sum[1] / (255.0f * n),
+                              sum[2] / (255.0f * n)};
+}
+
+static void colorRangePress(float px, float py)
+{
+  const float W = state.docWidth(), H = state.docHeight();
+  if (W <= 0 || H <= 0)
+    return;
+  const auto c = samplePreMaskColor(selMask(), px / W, py / H);
+  if (!c)
+    return;
+  const size_t part = static_cast<size_t>(selPart());
+  maskEditDiscrete([&](Mask &m)
+                   {
+    if (part < m.parts.size())
+      if (auto *s = std::get_if<ColorRangeShape>(&m.parts[part].shape))
+      {
+        s->set = true;
+        s->r = (*c)[0];
+        s->g = (*c)[1];
+        s->b = (*c)[2];
+      } });
+}
+
 static void maskPress(float lx, float ly)
 {
   if (!maskToolActive())
@@ -8936,6 +9547,13 @@ static void maskPress(float lx, float ly)
       std::holds_alternative<ObjectShape>(partAt(sel, selP).shape))
   {
     objectPress(lx, ly, false); // every press is a prompt, like a brush
+    return;
+  }
+  // Color Range: every press samples a new color (like a brush, no handles).
+  if (sel >= 0 && partCount(sel) > 0 &&
+      std::holds_alternative<ColorRangeShape>(partAt(sel, selP).shape))
+  {
+    colorRangePress(px, py);
     return;
   }
   // Tries part `j` of mask `i`; on a hit selects it and starts the matching
@@ -9513,7 +10131,7 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
   view.reserve(m.parts.size());
   for (const MaskPart &p : m.parts)
   {
-    if (p.type() == MaskType::Luminosity)
+    if (maskTypeUsesPixels(p.type()))
       usesPix = true;
     view.push_back(MaskPart{maskShapeToSource(p.shape, frame), p.op});
   }
@@ -9697,6 +10315,13 @@ static void paintMaskOverlay(CanvasContext &ctx)
       paintCompositeTint(ctx, m, sel);
     paintSelectedObjectPrompts(ctx);
   }
+  else if (std::holds_alternative<ColorRangeShape>(p.shape))
+  {
+    // Not spatial: the tint (built from the picture before this mask) is
+    // the whole overlay.
+    if (state.maskShowTint)
+      paintCompositeTint(ctx, m, sel);
+  }
 }
 
 // ---- Masks pane widgets ----
@@ -9707,6 +10332,8 @@ static std::string maskLabel(const Mask &m)
 {
   if (m.parts.empty())
     return "Empty";
+  if (!maskNameBlank(m.name))
+    return m.name;
   std::string s = maskTypeName(m.parts[0].type());
   if (m.parts.size() >= 2)
     s += std::string(" + ") + maskTypeName(m.parts[1].type());
@@ -9894,6 +10521,7 @@ static SliderSpec maskShapeSlider(const char *name, float lo, float hi,
   s.name = name;
   s.lo = lo;
   s.hi = hi;
+  s.trackW = kMaskTrackW;
   // The sliders show and edit the shape as it sits in the picture on screen.
   s.get = [get]
   {
@@ -9945,6 +10573,7 @@ static View buildMaskAdjustmentSlider(const AdjustmentSpec &spec)
   s.name = spec.label;
   s.lo = spec.min;
   s.hi = spec.max;
+  s.trackW = kMaskTrackW;
   s.get = [id]
   {
     const Mask *m = selectedMask();
@@ -10816,6 +11445,376 @@ static void paintCurve(CanvasContext &ctx)
   }
 }
 
+// ---------------- Mask effects: Amount, Color Mix, Grading, Curve ----------
+// The Effect tab of the right-hand mask panel. Everything here edits the
+// SELECTED mask through maskEdit, so it is undoable and a drag folds into one
+// step. The ids below are the "control" part of that undo key: they must stay
+// below 100 and differ from the kMaskCtl* ids above.
+constexpr int kMaskCtlAmount = 6;
+constexpr int kMaskCtlMix = 30;   // + chan * kMixBandCount + band   (30..53)
+constexpr int kMaskCtlGrade = 60; // + field * 4 + range             (60..71)
+constexpr int kMaskCtlBlend = 72;
+constexpr int kMaskCtlBalance = 73;
+constexpr int kMaskCtlCurve = 80; // + channel                       (80..83)
+constexpr float kMaskCurveSizePx = 240.0f;
+
+static MixChan gMaskMixChan = MixChan::Hue;              // Mix: Hue / Sat / Lum
+static int gMaskGradeRange = 1;                          // Grade: 0..3 (Midtones)
+static CurveChannel gMaskCurveCh = CurveChannel::Master; // Curve: channel
+static int gMaskCurveActive = -1;                        // point being dragged
+static bool gMaskCurveUiDirty = false;                   // repaint-only change
+static float gMaskCurveGrabDx = 0.0f, gMaskCurveGrabDy = 0.0f;
+
+static std::string maskIntText(float v)
+{
+  return std::to_string(static_cast<int>(std::lround(v)));
+}
+static std::string maskSignedText(float v)
+{
+  const int i = static_cast<int>(std::lround(v));
+  return i > 0 ? "+" + std::to_string(i) : std::to_string(i);
+}
+
+// Amount: how strongly all of this mask's adjustments apply (Lightroom's
+// mask "Amount"). 100 = full, 0 = the mask does nothing.
+static View buildMaskAmountSlider()
+{
+  SliderSpec s;
+  s.name = "Amount";
+  s.lo = 0.0f;
+  s.hi = 100.0f;
+  s.trackW = kMaskTrackW;
+  s.get = []
+  {
+    const Mask *m = selectedMask();
+    return m ? m->amount : 100.0f;
+  };
+  s.set = [](float v)
+  {
+    maskEdit(selMask(), [&](Mask &m)
+             { m.amount = std::round(v); }, kMaskCtlAmount);
+  };
+  s.format = maskIntText;
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
+  return buildSliderRow(s);
+}
+
+// One Color Mixer slider (a band's Hue / Saturation / Luminance) of the mask.
+static View buildMaskMixSlider(MixChan chan, size_t band)
+{
+  SliderSpec s;
+  s.name = mixBandName(band);
+  s.lo = static_cast<float>(kMixMin);
+  s.hi = static_cast<float>(kMixMax);
+  s.trackW = kMaskTrackW;
+  s.get = [chan, band]
+  {
+    const Mask *m = selectedMask();
+    return m ? m->mix[mixIndex(chan, band)] : 0.0f;
+  };
+  s.set = [chan, band](float v)
+  {
+    maskEdit(selMask(), [&](Mask &m)
+             { m.mix[mixIndex(chan, band)] = std::round(v); }, kMaskCtlMix + static_cast<int>(chan) * static_cast<int>(kMixBandCount) + static_cast<int>(band));
+  };
+  s.format = maskSignedText;
+  s.hasAccent = true;
+  s.accent = mixBandColor(band);
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
+  return buildSliderRow(s);
+}
+
+// One hue / saturation / luminance slider of one grading range of the mask.
+// fieldIdx (0 hue, 1 sat, 2 lum) only keeps the undo keys apart.
+static View buildMaskGradeSlider(const char *name, int range,
+                                 float GradeWheel::*field, int fieldIdx,
+                                 float lo, float hi, bool isSigned)
+{
+  SliderSpec s;
+  s.name = name;
+  s.lo = lo;
+  s.hi = hi;
+  s.trackW = kMaskTrackW;
+  s.get = [range, field]
+  {
+    const Mask *m = selectedMask();
+    return m ? m->grade.wheel[static_cast<size_t>(range)].*field : 0.0f;
+  };
+  s.set = [range, field, fieldIdx](float v)
+  {
+    maskEdit(selMask(), [&](Mask &m)
+             { m.grade.wheel[static_cast<size_t>(range)].*field = std::round(v); }, kMaskCtlGrade + fieldIdx * 4 + range);
+  };
+  s.format = [isSigned](float v)
+  { return isSigned ? maskSignedText(v) : maskIntText(v); };
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
+  return buildSliderRow(s);
+}
+
+// Blending (0..100) or Balance (-100..100), shared by the mask's ranges.
+static View buildMaskGradeShared(bool balance)
+{
+  SliderSpec s;
+  s.name = balance ? "Balance" : "Blending";
+  s.lo = balance ? -100.0f : 0.0f;
+  s.hi = 100.0f;
+  s.trackW = kMaskTrackW;
+  s.get = [balance]
+  {
+    const Mask *m = selectedMask();
+    if (!m)
+      return 0.0f;
+    return balance ? m->grade.balance : m->grade.blending;
+  };
+  s.set = [balance](float v)
+  {
+    maskEdit(selMask(), [&](Mask &m)
+             {
+      if (balance)
+        m.grade.balance = std::round(v);
+      else
+        m.grade.blending = std::round(v); }, balance ? kMaskCtlBalance : kMaskCtlBlend);
+  };
+  s.format = [balance](float v)
+  { return balance ? maskSignedText(v) : maskIntText(v); };
+  s.onEnd = []
+  { state.adjust.endMaskEdit(); };
+  return buildSliderRow(s);
+}
+
+// ---- Mask tone curve editor (canvas side) ----
+// Same behavior as the Curve pane (click = add point, drag = move,
+// right-click = delete) but on the selected mask's own curves, and a bit
+// larger (kMaskCurveSizePx).
+static float mcPlotPx() { return kMaskCurveSizePx - 2.0f * kCurvePadPx; }
+static CurvePoint mcFromLocal(float lx, float ly)
+{
+  const float plot = mcPlotPx();
+  return {
+      std::clamp((lx - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f),
+      std::clamp(255.0f - (ly - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f)};
+}
+static void mcToLocal(float x, float y, float &lx, float &ly)
+{
+  const float plot = mcPlotPx();
+  lx = kCurvePadPx + x / 255.0f * plot;
+  ly = kCurvePadPx + (255.0f - y) / 255.0f * plot;
+}
+static int mcHit(const CurvePoints &pts, float lx, float ly)
+{
+  int hit = -1;
+  float best = kCurveHitPx * kCurveHitPx;
+  for (size_t i = 0; i < pts.size(); ++i)
+  {
+    float px, py;
+    mcToLocal(pts[i].x, pts[i].y, px, py);
+    const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly);
+    if (d2 <= best)
+    {
+      best = d2;
+      hit = static_cast<int>(i);
+    }
+  }
+  return hit;
+}
+
+// The curve being edited, copied (empty list if no mask is selected).
+static CurvePoints maskCurveCopy()
+{
+  const Mask *m = selectedMask();
+  return m ? m->curves[static_cast<size_t>(gMaskCurveCh)] : CurvePoints{};
+}
+// coalesce = true folds a drag into one undo step; false = its own step.
+static void maskCurveCommit(const CurvePoints &pts, bool coalesce)
+{
+  const CurveChannel ch = gMaskCurveCh;
+  maskEdit(selMask(), [&](Mask &m)
+           { m.curves[static_cast<size_t>(ch)] = pts; }, coalesce ? kMaskCtlCurve + static_cast<int>(ch) : -1);
+}
+
+static void maskCurvePress(float lx, float ly)
+{
+  if (!state.original || !selectedMask())
+    return;
+  CurvePoints pts = maskCurveCopy();
+  int hit = mcHit(pts, lx, ly);
+  gMaskCurveGrabDx = gMaskCurveGrabDy = 0.0f;
+  if (hit >= 0)
+  {
+    const CurvePoint m = mcFromLocal(lx, ly);
+    gMaskCurveGrabDx = pts[static_cast<size_t>(hit)].x - m.x;
+    gMaskCurveGrabDy = pts[static_cast<size_t>(hit)].y - m.y;
+  }
+  else
+  {
+    if (pts.size() >= kCurveMaxPoints)
+      return;
+    const CurvePoint m = mcFromLocal(lx, ly);
+    hit = curveInsert(pts, m.x, m.y);
+    if (hit < 0)
+      return;
+    maskCurveCommit(pts, true); // the drag that follows folds into this step
+    state.markAdjustDirty();
+  }
+  gMaskCurveActive = hit;
+  gMaskCurveUiDirty = true;
+}
+
+static void maskCurveDrag(float lx, float ly)
+{
+  if (gMaskCurveActive < 0 || !state.original || !selectedMask())
+    return;
+  CurvePoints pts = maskCurveCopy();
+  if (gMaskCurveActive >= static_cast<int>(pts.size()))
+    return;
+  const CurvePoint m = mcFromLocal(lx, ly);
+  const CurvePoints before = pts;
+  curveMovePoint(pts, gMaskCurveActive, m.x + gMaskCurveGrabDx,
+                 m.y + gMaskCurveGrabDy);
+  if (pts == before)
+    return;
+  maskCurveCommit(pts, true);
+  enterDrag(false); // switches recompute+paint to the preview path
+  state.markAdjustDirty();
+}
+
+static void maskCurveEnd()
+{
+  gMaskCurveActive = -1;
+  gMaskCurveUiDirty = true;
+  state.adjust.endMaskEdit();
+  if (state.dragging)
+  { // leave preview mode: one full-resolution recompute
+    state.dragging = false;
+    state.dragIsAngle = false;
+    state.markAdjustDirty();
+  }
+}
+
+static void maskCurveRightPress(float lx, float ly)
+{
+  if (!state.original || !selectedMask())
+    return;
+  CurvePoints pts = maskCurveCopy();
+  if (curveRemove(pts, mcHit(pts, lx, ly)))
+  {
+    maskCurveCommit(pts, false);
+    state.markAdjustDirty();
+  }
+}
+
+static void paintMaskCurve(CanvasContext &ctx)
+{
+  const float W = ctx.width(), H = ctx.height();
+  const float pad = kCurvePadPx, plot = mcPlotPx();
+  ctx.setFillColor(Color{34, 34, 38, 255});
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.setLineWidth(1.0f);
+  ctx.setStrokeColor(Color{255, 255, 255, 30});
+  ctx.beginPath();
+  for (int q = 0; q <= 4; ++q)
+  {
+    const float t = pad + plot * static_cast<float>(q) / 4.0f;
+    ctx.moveTo(t, pad);
+    ctx.lineTo(t, pad + plot);
+    ctx.moveTo(pad, t);
+    ctx.lineTo(pad + plot, t);
+  }
+  ctx.stroke();
+  ctx.setStrokeColor(Color{255, 255, 255, 70});
+  ctx.beginPath();
+  ctx.moveTo(pad, pad + plot);
+  ctx.lineTo(pad + plot, pad);
+  ctx.stroke();
+
+  const Mask *m = selectedMask();
+  if (!m)
+    return;
+  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width)
+  {
+    const auto lut = curveToLut(m->curves[static_cast<size_t>(ch)]);
+    ctx.setStrokeColor(curveChannelColor(ch, alpha));
+    ctx.setLineWidth(width);
+    ctx.beginPath();
+    for (int i = 0; i < 256; ++i)
+    {
+      float lx, ly;
+      mcToLocal(static_cast<float>(i), lut[static_cast<size_t>(i)], lx, ly);
+      if (i == 0)
+        ctx.moveTo(lx, ly);
+      else
+        ctx.lineTo(lx, ly);
+    }
+    ctx.stroke();
+  };
+  const CurvePoints straight = identityCurve();
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
+  {
+    const auto ch = static_cast<CurveChannel>(c);
+    if (ch != gMaskCurveCh && !(m->curves[static_cast<size_t>(c)] == straight))
+      strokeCurve(ch, 110, 1.0f);
+  }
+  strokeCurve(gMaskCurveCh, 255, 1.75f);
+
+  const CurvePoints &pts = m->curves[static_cast<size_t>(gMaskCurveCh)];
+  ctx.setLineWidth(1.0f);
+  for (size_t i = 0; i < pts.size(); ++i)
+  {
+    float lx, ly;
+    mcToLocal(pts[i].x, pts[i].y, lx, ly);
+    const bool active = static_cast<int>(i) == gMaskCurveActive;
+    ctx.setFillColor(active ? kColorDividerHover : kColorWhite);
+    ctx.setStrokeColor(Color{20, 20, 20, 255});
+    ctx.fillRect(lx - kCurvePointPx / 2.0f, ly - kCurvePointPx / 2.0f,
+                 kCurvePointPx, kCurvePointPx);
+    ctx.strokeRect(lx - kCurvePointPx / 2.0f, ly - kCurvePointPx / 2.0f,
+                   kCurvePointPx, kCurvePointPx);
+  }
+}
+
+static View buildMaskCurveCanvas()
+{
+  View c;
+  c.isCanvas = true;
+  c.style.width = Size::pixel(kMaskCurveSizePx);
+  c.style.height = Size::pixel(kMaskCurveSizePx);
+  c.style.flexShrink = 0;
+  c.onPaint = [](CanvasContext &ctx)
+  { paintMaskCurve(ctx); };
+  c.canvasDirtySource = []
+  {
+    // Repaint on any edit (the version moves with every change, undo and
+    // redo too), a different mask / tab, or a UI-only change (channel,
+    // selected point).
+    static uint64_t lastVer = ~0ull;
+    static int lastSel = -2, lastTabs = -2;
+    const uint64_t ver = state.adjust.version();
+    const int sel = selMask();
+    const int tabs = state.maskTab * 10 + state.maskFx;
+    const bool ui = gMaskCurveUiDirty;
+    gMaskCurveUiDirty = false;
+    if (ver == lastVer && sel == lastSel && tabs == lastTabs && !ui)
+      return false;
+    lastVer = ver;
+    lastSel = sel;
+    lastTabs = tabs;
+    return true;
+  };
+  c.onPressAt = [](float lx, float ly)
+  { maskCurvePress(lx, ly); };
+  c.onDragTo = [](float lx, float ly)
+  { maskCurveDrag(lx, ly); };
+  c.onDragEnd = []
+  { maskCurveEnd(); };
+  c.onRightPressAt = [](float lx, float ly)
+  { maskCurveRightPress(lx, ly); };
+  return c;
+}
+
 // The pipeline indexes kAdjustmentSpecs by AdjId (AdjustmentSet::buildLut, the
 // sidebar loop, the color pass), so entry i must describe AdjId i. This can't
 // be a static_assert: the table holds std::function and std::string members,
@@ -10845,6 +11844,7 @@ static void verifyAdjustmentSpecs()
 }
 
 int main()
+try
 {
   verifyAdjustmentSpecs();
   LiteUI ui("Literoom", -1, -1, /*hideTitlebar=*/true);
@@ -10887,6 +11887,15 @@ int main()
           fn();
       };
     };
+    // Plain-key shortcuts must not fire while the mask name field is being
+    // typed in (see typingInTextField).
+    auto notTyping = [idle](std::function<void()> fn)
+    {
+      return idle([fn = std::move(fn)]
+                  {
+        if (!typingInTextField())
+          fn(); });
+    };
     auto zoomIn = []
     { setZoom(state.zoom * kZoomStep); };
     auto zoomOut = []
@@ -10913,19 +11922,19 @@ int main()
                    idle([]
                         { applyGeoOp(GeoOp::RotateCW); }));
     ui.addShortcut(ctrlShift, Key::O, idle(openFolder));
-    ui.addShortcut(none, Key::Left, idle([]
-                                         { filmStep(-1); }));
-    ui.addShortcut(none, Key::Right, idle([]
-                                          { filmStep(1); }));
+    ui.addShortcut(none, Key::Left, notTyping([]
+                                              { filmStep(-1); }));
+    ui.addShortcut(none, Key::Right, notTyping([]
+                                               { filmStep(1); }));
     ui.addShortcut(none, Key::F6, toggleFilmstrip);
-    ui.addShortcut(none, Key::Backslash, idle(toggleBefore));       // Before / After
-    ui.addShortcut(none, Key::Y, idle(toggleSplit));                // split view
-    ui.addShortcut(none, Key::J, idle(toggleClipping));             // clipping warnings
-    ui.addShortcut(shiftOnly, Key::J, idle(toggleChannelClipping)); // per-channel colors
+    ui.addShortcut(none, Key::Backslash, notTyping(toggleBefore));       // Before / After
+    ui.addShortcut(none, Key::Y, notTyping(toggleSplit));                // split view
+    ui.addShortcut(none, Key::J, notTyping(toggleClipping));             // clipping warnings
+    ui.addShortcut(shiftOnly, Key::J, notTyping(toggleChannelClipping)); // per-channel colors
     ui.addShortcut(none, Key::Escape, []
                    { state.openMenu = -1; });
-    ui.addShortcut(none, Key::Delete, idle([]
-                                           {
+    ui.addShortcut(none, Key::Delete, notTyping([]
+                                                {
                      if (maskToolActive())
                        deleteSelectedMask(); }));
     ui.addShortcut(none, Key::Enter, idle([]
@@ -11121,7 +12130,7 @@ int main()
   sidebarShell.style.backgroundColor = kColorPanelBg;
   sidebarShell.style.padding = EdgeInsets::all(12.0f);
   sidebarShell.style.overflowX = Overflow::Hidden;
-  sidebarShell.style.overflowY = Overflow::Hidden;
+  sidebarShell.style.overflowY = Overflow::Visible;
   sidebarShell.style.width = std::function<Size()>([]
                                                    { return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f); });
 
@@ -11146,6 +12155,7 @@ int main()
   sidebarTitle.fontWeight = FontWeight::SemiBold;
   sidebarTitle.color = kColorTextMuted;
   sidebarTitle.style.margin = EdgeInsets{0, 0, 10, 0};
+  sidebarTitle.style.flexShrink = 0;
   sidebarShell.addChild(std::move(sidebarTitle));
 
   // Histogram of the picture as currently shown (see computeHistogram).
@@ -11621,12 +12631,11 @@ int main()
   Text maskHint;
   maskHint.label = std::function<std::string()>([]() -> std::string
                                                 { return state.image
-                                                             ? "Add a mask, then adjust it. Drag the shape on the image to "
-                                                               "move it, or its square handles to resize (on a linear "
-                                                               "gradient they also turn it). With a brush, drag on the "
-                                                               "image to paint; pick another mask from the list. A "
-                                                               "luminosity range has no handles: set it with its sliders. "
-                                                               "Add parts to a mask to combine shapes."
+                                                             ? "Add a mask, then adjust it in the panel on the right. "
+                                                               "Drag the shape on the image to move it, or its square "
+                                                               "handles to resize (on a linear gradient they also turn "
+                                                               "it). With a brush, drag on the image to paint. Pick "
+                                                               "another mask from the list."
                                                              : "Open an image to add masks."; });
   maskHint.fontSize = 12.0f;
   maskHint.color = kColorTextMuted;
@@ -11659,22 +12668,74 @@ int main()
       { addMask(MaskType::Object); }, {}, true,
       []
       { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Color Range", []
+      { addMask(MaskType::ColorRange); }, {}, true,
+      []
+      { return state.original != nullptr; }));
 
   for (size_t i = 0; i < kMaxMasks; ++i)
     maskPane.addChild(buildMaskRow(i));
 
   // Everything below applies to the selected mask and is hidden without one.
+  // It is shown in the RIGHT-HAND panel (built after the canvas, see
+  // maskPanel below): On / Invert / Tint chips, the brush settings, then
+  // three tabs: Effect (the sliders), Shape and Parts.
   View maskEditor;
   maskEditor.style.width = Size::full();
   maskEditor.style.direction = FlexDirection::Column;
   maskEditor.style.gap = 12.0f;
-  maskEditor.style.margin = EdgeInsets{8, 0, 0, 0};
   maskEditor.style.display = std::function<Display()>(
       []
       { return selMask() >= 0 ? Display::Flex : Display::None; });
 
-  maskEditor.addChild(sidebarButton(
-      "Enabled",
+  // Equal-width chip / tab: `n` of them share a row of the panel.
+  const auto maskChipFn = [](std::function<std::string()> label, int n,
+                             std::function<void()> onClick,
+                             std::function<bool()> selected)
+  {
+    View c;
+    c.style.width = std::function<Size()>([n]
+                                          { return Size::pixel(maskChipW(n)); });
+    c.style.height = Size::pixel(26);
+    c.style.flexShrink = 0;
+    c.style.borderRadius = 4.0f;
+    c.style.justifyContent = Justify::Center;
+    c.style.alignItems = Align::Center;
+    c.style.hoverColor = kColorActivityHover;
+    c.style.backgroundColor = std::function<Color()>([selected]() -> Color
+                                                     { return selected() ? kColorDropdownRowHover : kColorActivityBarBg; });
+    c.style.borderWidth = std::function<float()>(
+        [selected]
+        { return selected() ? 1.0f : 0.0f; });
+    c.style.borderColor = kColorDividerHover;
+    c.onClick = std::move(onClick);
+    Text t;
+    t.label = std::move(label);
+    t.fontSize = 12.0f;
+    t.fontWeight = FontWeight::SemiBold;
+    t.color = kColorTextDark;
+    c.addChild(std::move(t));
+    return c;
+  };
+
+  // Same chip with a fixed label.
+  const auto maskChip = [maskChipFn](const char *label, int n,
+                                     std::function<void()> onClick,
+                                     std::function<bool()> selected)
+  {
+    const std::string text = label;
+    return maskChipFn([text]
+                      { return text; },
+                      n, std::move(onClick), std::move(selected));
+  };
+
+  View maskFlags;
+  maskFlags.style.direction = FlexDirection::Row;
+  maskFlags.style.gap = 4.0f;
+  maskFlags.style.flexShrink = 0;
+  maskFlags.addChild(maskChip(
+      "On", 3,
       []
       { maskEditDiscrete([](Mask &m)
                          { m.enabled = !m.enabled; }); },
@@ -11683,8 +12744,8 @@ int main()
         const Mask *m = selectedMask();
         return m && m->enabled;
       }));
-  maskEditor.addChild(sidebarButton(
-      "Invert",
+  maskFlags.addChild(maskChip(
+      "Invert", 3,
       []
       { maskEditDiscrete([](Mask &m)
                          { m.invert = !m.invert; }); },
@@ -11693,8 +12754,8 @@ int main()
         const Mask *m = selectedMask();
         return m && m->invert;
       }));
-  maskEditor.addChild(sidebarButton(
-      "Show mask tint",
+  maskFlags.addChild(maskChip(
+      "Tint", 3,
       []
       {
         bool &flag = tintFlag();
@@ -11703,6 +12764,55 @@ int main()
       },
       []
       { return tintFlag(); }));
+
+  // Name field. TextInput is Canvas-backed and wires up the caret, click to
+  // place it, arrows, Backspace / Delete, Ctrl+V and Enter itself.
+  View maskNameRow;
+  maskNameRow.style.width = Size::full();
+  maskNameRow.style.flexShrink = 0;
+  maskNameRow.style.display = std::function<Display()>([]() -> Display
+                                                       {
+    syncMaskNameField(); // polled every cycle: follows selection and undo
+    return Display::Flex; });
+  {
+    TextInput ti;
+    ti.placeholder = "Name this mask";
+    ti.fontSize = 13.0f;
+    ti.textColor = kColorTextDark;
+    ti.placeholderColor = kColorTextMuted;
+    ti.caretColor = kColorTextDark;
+    ti.borderColor = kColorDividerHover;
+    ti.focusedBorderColor = Color{90, 150, 235, 255};
+    ti.style.width = Size::full();
+    ti.style.height = Size::pixel(28);
+    ti.style.borderWidth = 1.0f;
+    ti.style.borderRadius = 4.0f;
+    ti.style.backgroundColor = kColorActivityBarBg;
+    ti.onChange = [](const std::string &s)
+    { renameSelectedMask(s); };
+    ti.onSubmit = [](const std::string &)
+    { state.adjust.endMaskEdit(); }; // Enter closes the undo step
+    gMaskNameState = ti.state;
+    maskNameRow.addChild(std::move(ti));
+  }
+  maskEditor.addChild(std::move(maskNameRow));
+
+  maskEditor.addChild(std::move(maskFlags));
+
+  // The three tab bodies. Only the one picked in state.maskTab is shown.
+  const auto maskTabView = [](int tab)
+  {
+    View v;
+    v.style.width = Size::full();
+    v.style.direction = FlexDirection::Column;
+    v.style.gap = 12.0f;
+    v.style.display = std::function<Display()>([tab]() -> Display
+                                               { return state.maskTab == tab ? Display::Flex : Display::None; });
+    return v;
+  };
+  View maskTabEffect = maskTabView(0);
+  View maskTabShape = maskTabView(1);
+  View maskTabParts = maskTabView(2);
 
   // Parts: combine several shapes into this mask. Each part after the first
   // is joined to the ones before it (Add / Subtract / Intersect); the rows
@@ -11746,6 +12856,9 @@ int main()
   partsSec.addChild(sidebarButton("+ Part: Object",
                                   []
                                   { addPart(MaskType::Object); }));
+  partsSec.addChild(sidebarButton("+ Part: Color Range",
+                                  []
+                                  { addPart(MaskType::ColorRange); }));
 
   View removeRow;
   removeRow.style.width = Size::full();
@@ -11755,7 +12868,7 @@ int main()
     return m && m->parts.size() > 1 ? Display::Flex : Display::None; });
   removeRow.addChild(sidebarButton("Remove Part", removeSelectedPart));
   partsSec.addChild(std::move(removeRow));
-  maskEditor.addChild(std::move(partsSec));
+  maskTabParts.addChild(std::move(partsSec));
 
   // Shape sliders, per mask type (shown only for that type).
   View radialShape;
@@ -11790,7 +12903,7 @@ int main()
       [](RadialShape &r, float v)
       { r.feather = v / 100.0f; },
       kMaskCtlFeather)));
-  maskEditor.addChild(std::move(radialShape));
+  maskTabShape.addChild(std::move(radialShape));
 
   View linearShape;
   linearShape.style.width = Size::full();
@@ -11811,7 +12924,7 @@ int main()
       { return l.angle; },
       [](LinearShape &l, float v)
       { l.angle = v; }, kMaskCtlAngle)));
-  maskEditor.addChild(std::move(linearShape));
+  maskTabShape.addChild(std::move(linearShape));
 
   // Luminosity range (shown for a luminosity mask): which brightnesses it
   // selects. Min can never pass Max, nor Max go below Min.
@@ -11844,7 +12957,44 @@ int main()
       [](LuminosityShape &l, float v)
       { l.feather = v / 100.0f; },
       kMaskCtlFeather)));
-  maskEditor.addChild(std::move(lumShape));
+  maskTabShape.addChild(std::move(lumShape));
+
+  View crShape;
+  crShape.style.width = Size::full();
+  crShape.style.direction = FlexDirection::Column;
+  crShape.style.gap = 12.0f;
+  crShape.style.display = std::function<Display()>([]() -> Display
+                                                   { return selectedPartType() == MaskType::ColorRange ? Display::Flex
+                                                                                                       : Display::None; });
+  crShape.addChild(sectionLabel("Color Range"));
+  {
+    View hint;
+    Text t;
+    t.label = std::function<std::string()>([]() -> std::string
+                                           {
+      const MaskPart *p = selectedPart();
+      const auto *s = p ? std::get_if<ColorRangeShape>(&p->shape) : nullptr;
+      return s && s->set ? "Click the picture to pick another color"
+                         : "Click the picture to pick a color"; });
+    t.fontSize = 12.0f;
+    t.color = kColorTextMuted;
+    crShape.addChild(std::move(t));
+  }
+  crShape.addChild(buildSliderRow(maskShapeSlider<ColorRangeShape>(
+      "Range", 0.0f, 100.0f,
+      [](const ColorRangeShape &s)
+      { return s.range * 100.0f; },
+      [](ColorRangeShape &s, float v)
+      { s.range = v / 100.0f; },
+      kMaskCtlRange)));
+  crShape.addChild(buildSliderRow(maskShapeSlider<ColorRangeShape>(
+      "Smoothness", 0.0f, 100.0f,
+      [](const ColorRangeShape &s)
+      { return s.feather * 100.0f; },
+      [](ColorRangeShape &s, float v)
+      { s.feather = v / 100.0f; },
+      kMaskCtlFeather)));
+  maskTabShape.addChild(std::move(crShape));
 
   // Brush settings (shown for a brush mask). They apply to the NEXT stroke;
   // strokes already painted keep the values they were painted with.
@@ -11863,6 +13013,7 @@ int main()
       return std::to_string(static_cast<int>(std::lround(v)));
     };
     s.affectsPixels = false;
+    s.trackW = kMaskTrackW;
     return buildSliderRow(s);
   };
   View brushShape;
@@ -11900,6 +13051,11 @@ int main()
       { return state.mask.brushDensity * 100.0f; },
       [](float v)
       { state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
+  brushShape.addChild(brushSlider(
+      "Flow", 1.0f, 100.0f, []
+      { return state.mask.brushFlow * 100.0f; },
+      [](float v)
+      { state.mask.brushFlow = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
   brushShape.addChild(sidebarButton("Clear Strokes", []
                                     {
     const size_t part = static_cast<size_t>(selPart());
@@ -11908,7 +13064,8 @@ int main()
         if (auto *b = std::get_if<BrushShape>(&m.parts[part].shape))
           b->strokes.clear();
     }); }));
-  maskEditor.addChild(std::move(brushShape));
+  maskEditor.addChild(std::move(brushShape)); // pinned above the tabs: size/feather
+                                              // are used while painting
 
   View objectShape;
   objectShape.style.width = Size::full();
@@ -11950,26 +13107,283 @@ int main()
     segInfo.color = kColorTextFaint;
     objectShape.addChild(std::move(segInfo));
   }
-  maskEditor.addChild(std::move(objectShape));
+  maskTabShape.addChild(std::move(objectShape));
 
-  // The mask's own adjustments: same table as the Adjust pane.
+  // ---- Effect tab ----
+  // A second row of chips picks Basic / Mix / Grade / Curve; a bullet marks
+  // a section that has been changed for this mask.
+  const auto chipRow = []
+  {
+    View r;
+    r.style.direction = FlexDirection::Row;
+    r.style.gap = 4.0f;
+    r.style.flexShrink = 0;
+    return r;
+  };
+  const auto maskFxView = [](int fx)
+  {
+    View v;
+    v.style.width = Size::full();
+    v.style.direction = FlexDirection::Column;
+    v.style.gap = 12.0f;
+    v.style.display = std::function<Display()>([fx]() -> Display
+                                               { return state.maskFx == fx ? Display::Flex : Display::None; });
+    return v;
+  };
+  View fxBasic = maskFxView(0);
+  View fxMix = maskFxView(1);
+  View fxGrade = maskFxView(2);
+  View fxCurve = maskFxView(3);
+
+  // Basic: Amount plus the same table as the Adjust pane.
+  fxBasic.addChild(buildMaskAmountSlider());
   bool maskColorHeaderAdded = false;
-  maskEditor.addChild(sectionLabel("Tone"));
+  fxBasic.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
     if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
     {
-      maskEditor.addChild(sectionLabel("Color"));
+      fxBasic.addChild(sectionLabel("Color"));
       maskColorHeaderAdded = true;
     }
-    maskEditor.addChild(buildMaskAdjustmentSlider(spec));
+    fxBasic.addChild(buildMaskAdjustmentSlider(spec));
+  }
+  fxBasic.addChild(sidebarButton("Reset Basic", []
+                                 { maskEditDiscrete([](Mask &m)
+                                                    { m.adj.fill(0.0f);
+                                                      m.amount = 100.0f; }); }));
+
+  // Mix: Hue / Sat / Lum chips, eight band sliders each.
+  {
+    View chanRow = chipRow();
+    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
+    {
+      const auto chan = static_cast<MixChan>(c);
+      chanRow.addChild(maskChipFn(
+          [chan]() -> std::string
+          {
+            std::string name = chan == MixChan::Hue          ? "Hue"
+                               : chan == MixChan::Saturation ? "Sat"
+                                                             : "Lum";
+            const Mask *m = selectedMask();
+            if (m && mixChanAnyNonZero(m->mix, chan))
+              name += " \u2022";
+            return name;
+          },
+          3, [chan]
+          { gMaskMixChan = chan; },
+          [chan]
+          { return gMaskMixChan == chan; }));
+    }
+    fxMix.addChild(std::move(chanRow));
+    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
+    {
+      const auto chan = static_cast<MixChan>(c);
+      View group;
+      group.style.width = Size::full();
+      group.style.direction = FlexDirection::Column;
+      group.style.gap = 12.0f;
+      group.style.display = std::function<Display()>([chan]() -> Display
+                                                     { return gMaskMixChan == chan ? Display::Flex : Display::None; });
+      for (size_t band = 0; band < kMixBandCount; ++band)
+        group.addChild(buildMaskMixSlider(chan, band));
+      fxMix.addChild(std::move(group));
+    }
+    fxMix.addChild(sidebarButton("Reset Color Mix", []
+                                 { maskEditDiscrete([](Mask &m)
+                                                    { m.mix.fill(0.0f); }); }));
   }
 
-  maskEditor.addChild(sidebarButton("Reset Mask Sliders", []
-                                    { maskEditDiscrete([](Mask &m)
-                                                       { m.adj.fill(0.0f); }); }));
+  // Grade: one chip per range, Hue / Saturation / Luminance sliders for the
+  // picked range, then Blending and Balance for all of them.
+  {
+    static const char *const rangeShort[kGradeRangeCount] = {"Shad", "Mid",
+                                                             "High", "Glob"};
+    View rangeRow = chipRow();
+    for (int r = 0; r < static_cast<int>(kGradeRangeCount); ++r)
+      rangeRow.addChild(maskChipFn(
+          [r]() -> std::string
+          {
+            std::string name = rangeShort[r];
+            const Mask *m = selectedMask();
+            if (m && !m->grade.wheel[static_cast<size_t>(r)].neutral())
+              name += " \u2022";
+            return name;
+          },
+          4, [r]
+          { gMaskGradeRange = r; },
+          [r]
+          { return gMaskGradeRange == r; }));
+    fxGrade.addChild(std::move(rangeRow));
+    for (int r = 0; r < static_cast<int>(kGradeRangeCount); ++r)
+    {
+      View group;
+      group.style.width = Size::full();
+      group.style.direction = FlexDirection::Column;
+      group.style.gap = 12.0f;
+      group.style.display = std::function<Display()>([r]() -> Display
+                                                     { return gMaskGradeRange == r ? Display::Flex : Display::None; });
+      group.addChild(buildMaskGradeSlider("Hue", r, &GradeWheel::hue, 0, 0.0f, 359.0f, false));
+      group.addChild(buildMaskGradeSlider("Saturation", r, &GradeWheel::sat, 1, 0.0f, 100.0f, false));
+      group.addChild(buildMaskGradeSlider("Luminance", r, &GradeWheel::lum, 2, -100.0f, 100.0f, true));
+      fxGrade.addChild(std::move(group));
+    }
+    fxGrade.addChild(buildMaskGradeShared(false));
+    fxGrade.addChild(buildMaskGradeShared(true));
+    fxGrade.addChild(sidebarButton("Reset Color Grading", []
+                                   { maskEditDiscrete([](Mask &m)
+                                                      { m.grade = ColorGrade{}; }); }));
+  }
+
+  // Curve: RGB / R / G / B chips, the plot, a readout and resets.
+  {
+    View chRow = chipRow();
+    for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
+    {
+      const auto ch = static_cast<CurveChannel>(c);
+      chRow.addChild(maskChipFn(
+          [ch]() -> std::string
+          {
+            std::string name = ch == CurveChannel::Master  ? "RGB"
+                               : ch == CurveChannel::Red   ? "R"
+                               : ch == CurveChannel::Green ? "G"
+                                                           : "B";
+            const Mask *m = selectedMask();
+            if (m && !(m->curves[static_cast<size_t>(ch)] == identityCurve()))
+              name += " \u2022";
+            return name;
+          },
+          4, [ch]
+          {
+            gMaskCurveActive = -1;
+            gMaskCurveCh = ch;
+            gMaskCurveUiDirty = true; },
+          [ch]
+          { return gMaskCurveCh == ch; }));
+    }
+    fxCurve.addChild(std::move(chRow));
+    fxCurve.addChild(buildMaskCurveCanvas());
+
+    Text curveInfo;
+    curveInfo.label = std::function<std::string()>([]() -> std::string
+                                                   {
+      const CurvePoints p = maskCurveCopy();
+      const std::string name = curveChannelName(gMaskCurveCh);
+      if (gMaskCurveActive >= 0 && gMaskCurveActive < static_cast<int>(p.size()))
+        return name + ": In " +
+               std::to_string(static_cast<int>(std::lround(p[static_cast<size_t>(gMaskCurveActive)].x))) +
+               "  Out " +
+               std::to_string(static_cast<int>(std::lround(p[static_cast<size_t>(gMaskCurveActive)].y)));
+      return name + ": " + std::to_string(p.size()) + " points"; });
+    curveInfo.fontSize = 13.0f;
+    curveInfo.color = kColorTextMid;
+    fxCurve.addChild(std::move(curveInfo));
+
+    Text curveHint;
+    curveHint.label = std::string("Click: add   Drag: move   Right-click: delete");
+    curveHint.fontSize = 11.0f;
+    curveHint.color = kColorTextFaint;
+    fxCurve.addChild(std::move(curveHint));
+
+    fxCurve.addChild(sidebarButton("Reset Curve", []
+                                   {
+      gMaskCurveActive = -1;
+      gMaskCurveUiDirty = true;
+      maskEditDiscrete([](Mask &m)
+                       { m.curves[static_cast<size_t>(gMaskCurveCh)] = identityCurve(); }); }));
+    fxCurve.addChild(sidebarButton("Reset All Curves", []
+                                   {
+      gMaskCurveActive = -1;
+      gMaskCurveUiDirty = true;
+      maskEditDiscrete([](Mask &m)
+                       { m.curves = identityCurves(); }); }));
+  }
+
+  View fxTabs = chipRow();
+  {
+    static const char *const fxNames[4] = {"Basic", "Mix", "Grade", "Curve"};
+    for (int t = 0; t < 4; ++t)
+      fxTabs.addChild(maskChipFn(
+          [t]() -> std::string
+          {
+            std::string name = fxNames[t];
+            const Mask *m = selectedMask();
+            bool changed = false;
+            if (m)
+              switch (t)
+              {
+              case 0:
+                changed = m->amount != 100.0f;
+                for (float v : m->adj)
+                  changed = changed || v != 0.0f;
+                break;
+              case 1:
+                changed = mixAnyNonZero(m->mix);
+                break;
+              case 2:
+                changed = !(m->grade == ColorGrade{});
+                break;
+              default:
+                changed = !(m->curves == identityCurves());
+                break;
+              }
+            if (changed)
+              name += " \u2022";
+            return name;
+          },
+          4, [t]
+          { state.maskFx = t; },
+          [t]
+          { return state.maskFx == t; }));
+  }
+  maskTabEffect.addChild(std::move(fxTabs));
+  maskTabEffect.addChild(std::move(fxBasic));
+  maskTabEffect.addChild(std::move(fxMix));
+  maskTabEffect.addChild(std::move(fxGrade));
+  maskTabEffect.addChild(std::move(fxCurve));
+
+  // Tab bar, then the tab bodies, then the always-visible Delete.
+  View maskTabs;
+  maskTabs.style.direction = FlexDirection::Row;
+  maskTabs.style.gap = 4.0f;
+  maskTabs.style.flexShrink = 0;
+  {
+    const char *const tabNames[3] = {"Effect", "Shape", "Parts"};
+    for (int t = 0; t < 3; ++t)
+      maskTabs.addChild(maskChip(
+          tabNames[t], 3, [t]
+          { state.maskTab = t; },
+          [t]
+          { return state.maskTab == t; }));
+  }
+  maskEditor.addChild(std::move(maskTabs));
+  maskEditor.addChild(std::move(maskTabEffect));
+  maskEditor.addChild(std::move(maskTabShape));
+  maskEditor.addChild(std::move(maskTabParts));
+  // Mask list operations. Order matters: masks apply top to bottom.
+  View maskOps1 = chipRow();
+  maskOps1.addChild(maskChip(
+      "Duplicate", 3, duplicateSelectedMask, []
+      { return false; }));
+  maskOps1.addChild(maskChip(
+      "Move Up", 3, []
+      { moveSelectedMask(-1); }, []
+      { return false; }));
+  maskOps1.addChild(maskChip(
+      "Move Down", 3, []
+      { moveSelectedMask(+1); }, []
+      { return false; }));
+  maskEditor.addChild(std::move(maskOps1));
+  View maskOps2 = chipRow();
+  maskOps2.addChild(maskChip(
+      "Copy Effects", 2, copyMaskEffects, []
+      { return false; }));
+  maskOps2.addChild(maskChip(
+      "Paste Effects", 2, pasteMaskEffects, []
+      { return false; }));
+  maskEditor.addChild(std::move(maskOps2));
   maskEditor.addChild(sidebarButton("Delete Mask", deleteSelectedMask));
-  maskPane.addChild(std::move(maskEditor));
+  // maskEditor is added to the right-hand panel below (after the canvas).
 
   sidebar.addChild(std::move(maskPane));
 
@@ -12405,6 +13819,71 @@ int main()
 
   workspace.addChild(std::move(centerColumn));
 
+  // ---- Right-hand panel: the selected mask's controls ----
+  // Only on the Masks pane with a mask selected, so every other pane keeps
+  // the full canvas width. Drag its divider to resize.
+  const auto maskPanelShown = []
+  { return maskToolActive() && selMask() >= 0; };
+
+  View rDivider;
+  rDivider.style.height = Size::full();
+  rDivider.style.flexShrink = 0;
+  rDivider.style.backgroundColor = kColorDivider;
+  rDivider.style.hoverColor = kColorDividerHover;
+  rDivider.style.width = Size::pixel(kDividerW);
+  rDivider.style.display = std::function<Display()>([maskPanelShown]() -> Display
+                                                    { return maskPanelShown() ? Display::Flex : Display::None; });
+  const auto updateMaskPanelWidth = [](float localX)
+  {
+    // The panel sits to the right, so it grows as the divider moves LEFT.
+    const float next = state.maskPanelW - (localX - kDividerW / 2.0f);
+    state.maskPanelW = std::clamp(next, kMinMaskPanelW, kMaxMaskPanelW);
+  };
+  rDivider.onPressAt = [updateMaskPanelWidth](float localX, float)
+  { updateMaskPanelWidth(localX); };
+  rDivider.onDragTo = [updateMaskPanelWidth](float localX, float)
+  { updateMaskPanelWidth(localX); };
+  workspace.addChild(std::move(rDivider));
+
+  View maskPanel;
+  maskPanel.style.height = Size::full();
+  maskPanel.style.flexShrink = 0;
+  maskPanel.style.direction = FlexDirection::Column;
+  maskPanel.style.backgroundColor = kColorPanelBg;
+  maskPanel.style.padding = EdgeInsets::all(kMaskPanelPad);
+  maskPanel.style.overflowX = Overflow::Hidden;
+  maskPanel.style.overflowY = Overflow::Visible;
+  maskPanel.style.width = std::function<Size()>([]
+                                                { return Size::pixel(state.maskPanelW); });
+  maskPanel.style.display = std::function<Display()>([maskPanelShown]() -> Display
+                                                     { return maskPanelShown() ? Display::Flex : Display::None; });
+
+  Text maskPanelTitle;
+  maskPanelTitle.label = std::function<std::string()>([]() -> std::string
+                                                      {
+    const Mask *m = selectedMask();
+    if (!m)
+      return std::string();
+    return "MASK " + std::to_string(selMask() + 1) + "  " + maskLabel(*m); });
+  maskPanelTitle.fontSize = 12.0f;
+  maskPanelTitle.fontWeight = FontWeight::SemiBold;
+  maskPanelTitle.color = kColorTextMuted;
+  maskPanelTitle.style.margin = EdgeInsets{0, 0, 10, 0};
+  maskPanelTitle.style.flexShrink = 0;
+  maskPanel.addChild(std::move(maskPanelTitle));
+
+  // Scrolling body, like the left sidebar's.
+  View maskPanelBody;
+  maskPanelBody.style.width = Size::full();
+  maskPanelBody.style.flexGrow = 1;
+  maskPanelBody.style.minHeight = 0;
+  maskPanelBody.style.direction = FlexDirection::Column;
+  maskPanelBody.style.overflowX = Overflow::Hidden;
+  maskPanelBody.style.overflowY = Overflow::Auto;
+  maskPanelBody.addChild(std::move(maskEditor));
+  maskPanel.addChild(std::move(maskPanelBody));
+  workspace.addChild(std::move(maskPanel));
+
   root.addChild(std::move(workspace));
 
   // Status bar: image info on the left, zoom controls on the right.
@@ -12552,4 +14031,10 @@ int main()
   thumbWorker.shutdown();    // ditto
   segmentWorker.shutdown();
   return 0;
+}
+catch (const std::exception &e)
+{
+  std::fprintf(stderr, "literoom: fatal: %s\n", e.what());
+  MessageBoxA(nullptr, e.what(), "literoom", MB_ICONERROR);
+  return 1;
 }
