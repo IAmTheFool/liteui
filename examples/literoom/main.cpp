@@ -4,6 +4,8 @@
 #include "sam_segmenter.hpp"
 #include "exif.hpp"
 #include "minijson.hpp"
+#include "detail_layer.hpp"
+#include "neighbor_fx.hpp"
 
 #include <algorithm>
 #include <array>
@@ -274,6 +276,13 @@ enum class AdjId : int
   Hue,
   ColorizeHue,
   ColorizeAmount,
+  Texture,
+  Clarity,
+  Sharpness,
+  Dehaze,
+  NoiseLuma,
+  NoiseColor,
+  Blur,
   Count
 };
 
@@ -292,13 +301,18 @@ enum class AdjId : int
 //                  unused (null); these are consumed by the float per-pixel
 //                  pass built in ColorPass / applyColorPass below, which runs
 //                  after the LUT and rounds to 8 bits only once at the end.
-// The slider UI, undo/coalescing, and preview path treat both stages alike.
+//   Stage::Detail — needs neighbor pixels (Texture, Clarity, Sharpness).
+//                  `apply` is unused (null) here too: these are consumed by
+//                  detail_layer::addPixels (detail_layer.hpp), which adds a share of
+//                  "pixel minus its blur" after the color pass.
+// The slider UI, undo/coalescing, and preview path treat all stages alike.
 struct AdjustmentSpec
 {
   enum class Stage
   {
     Tone,
-    Color
+    Color,
+    Detail
   };
   AdjId id;
   std::string label;
@@ -389,6 +403,25 @@ static const std::array<AdjustmentSpec, static_cast<size_t>(AdjId::Count)>
          AdjustmentSpec::Stage::Color},
         {AdjId::ColorizeAmount, "Colorize Amount", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
+        // Detail stage (see detail_layer.hpp). Texture and Clarity soften when
+        // negative; Sharpness only sharpens.
+        {AdjId::Texture, "Texture", static_cast<float>(kToneMin),
+         static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Detail},
+        {AdjId::Clarity, "Clarity", static_cast<float>(kToneMin),
+         static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Detail},
+        {AdjId::Sharpness, "Sharpness", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Detail},
+        // Dehaze removes (+) or adds (-) atmospheric haze; see neighbor_fx.hpp.
+        {AdjId::Dehaze, "Dehaze", static_cast<float>(kToneMin),
+         static_cast<float>(kToneMax), nullptr, AdjustmentSpec::Stage::Detail},
+        // Noise reduction: luminance (grain) and color (blotches), 0..100.
+        {AdjId::NoiseLuma, "Noise Reduction", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Detail},
+        {AdjId::NoiseColor, "Color Noise", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Detail},
+        // Blur: a color blur from none to very soft, 0..100 (mostly for masks).
+        {AdjId::Blur, "Blur", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Detail},
     }};
 
 // BEGIN colormix
@@ -2784,6 +2817,7 @@ struct MaskPass
   bool tone = false;                              // any Tone slider or curve non-zero (luts is valid)
   std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
   ColorPass color;
+  neighbor_fx::Gains fx; // this mask's Texture / Clarity / Sharpness (+ Dehaze, Noise, Blur)
 };
 
 // Only masks that are on AND would change something are included. Shapes are
@@ -2832,7 +2866,15 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
                              m.adj[static_cast<size_t>(AdjId::Hue)],
                              m.adj[static_cast<size_t>(AdjId::ColorizeHue)],
                              m.adj[static_cast<size_t>(AdjId::ColorizeAmount)]);
-    if (!mp.tone && !mp.color.active)
+    mp.fx = neighbor_fx::gainsFromValues(
+        m.adj[static_cast<size_t>(AdjId::Texture)],
+        m.adj[static_cast<size_t>(AdjId::Clarity)],
+        m.adj[static_cast<size_t>(AdjId::Sharpness)],
+        m.adj[static_cast<size_t>(AdjId::Dehaze)],
+        m.adj[static_cast<size_t>(AdjId::NoiseLuma)],
+        m.adj[static_cast<size_t>(AdjId::NoiseColor)],
+        m.adj[static_cast<size_t>(AdjId::Blur)]);
+    if (!mp.tone && !mp.color.active && !mp.fx.any())
       continue; // a mask with no adjustments does nothing
     if (mp.tone)
     {
@@ -2860,9 +2902,17 @@ static std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
 // it to `scratch`, run the mask's own LUT + color pass on the copy, and blend
 // the result back by the weights. `scratch` holds one row of RGBA, `wbuf` one
 // row of weights, `wbuf2` a second one for combining parts.
+// The mask's neighbor effects (Texture, Clarity, Sharpness, Dehaze, Noise
+// Reduction, Blur: neighbor_fx.hpp) are part of "the mask's own adjustment":
+// applied to `scratch` after the color pass from the whole-image planes `dp`
+// (so they have all the neighbors they need, whatever the span), then blended
+// by weight like everything else. `ref` holds the SOURCE pixels of the same
+// rows as `q`; the effects measure themselves against those.
 static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
                              uint8_t *q, size_t n, int y0, int W,
-                             uint8_t *scratch, float *wbuf, float *wbuf2)
+                             uint8_t *scratch, float *wbuf, float *wbuf2,
+                             const uint8_t *ref,
+                             const neighbor_fx::Planes &dp)
 {
   const size_t rowBytes = static_cast<size_t>(W) * 4;
   const int rows = static_cast<int>(n / rowBytes);
@@ -2893,6 +2943,14 @@ static void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
         scratch[i + 2] = lb[scratch[i + 2]];
       }
     applyColorPass(mp.color, scratch, bytes);
+    if (mp.fx.any())
+      neighbor_fx::apply(
+          dp, mp.fx,
+          ref + static_cast<size_t>(r) * rowBytes + static_cast<size_t>(x0) * 4,
+          scratch, static_cast<size_t>(len),
+          static_cast<size_t>(y0 + r) * static_cast<size_t>(W) +
+              static_cast<size_t>(x0),
+          W);
     for (int i = 0; i < len; ++i)
     {
       float w = wbuf[i];
@@ -2925,6 +2983,7 @@ struct RenderParams
 {
   std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
   ColorPass color;                                // float pass, after the LUTs
+  neighbor_fx::Gains fx;                          // Texture / Clarity / Sharpness / Dehaze / Noise / Blur (neighbor_fx.hpp), after the color pass
   std::vector<MaskPass> masks;                    // local adjustments, applied after all of it
 };
 
@@ -2935,6 +2994,14 @@ struct RenderParams
 // invalidate() superseded this one) the function stops and returns null.
 // With no `latest` it always runs to completion, which is the synchronous
 // path. Each pixel is independent, so blocking does not change the result.
+//
+// Order per pixel: tone LUTs -> color pass -> neighbor effects (Dehaze,
+// Texture / Clarity / Sharpness, Noise Reduction, Blur) -> masks, each mask
+// doing the same three steps on its own copy.
+// The detail layers need neighbors, which the 128-row blocks don't have, so
+// they come from whole-image blurred planes built once per picture (see
+// detail_layer.hpp) instead of from halo rows; `src` stays untouched, which
+// is what keeps those planes valid.
 //
 // Raw pointers and no std:: helpers in the inner loops, same Debug-build
 // reason as applyColorPass.
@@ -2968,6 +3035,17 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
     maskWeights2.resize(static_cast<size_t>(img->width));
   }
 
+  // Neighbor effects: fetch (or build, the first time) the planes this render
+  // needs. A cancelled build means this render is superseded.
+  neighbor_fx::Planes fxPlanes;
+  uint32_t fxNeed = rp.fx.need();
+  for (const MaskPass &m : rp.masks)
+    fxNeed |= m.fx.need(); // masks use the same planes
+  if (fxNeed != 0 &&
+      !neighbor_fx::acquire(fxPlanes, src.pixels.data(), src.width, src.height,
+                            fxNeed, latest, gen))
+    return nullptr;
+
   for (size_t off = 0; off < total; off += blockBytes)
   {
     if (latest && latest->load(std::memory_order_relaxed) != gen)
@@ -2993,11 +3071,15 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
       }
     }
     applyColorPass(rp.color, q, n); // no-op when all four color sliders are 0
+    if (rp.fx.any()) // blocks are whole rows, so pixels are contiguous
+      neighbor_fx::apply(fxPlanes, rp.fx, src.pixels.data() + off, q, n / 4,
+                         off / 4, img->width);
     for (size_t k = 0; k < maskEvals.size(); ++k)
       applyMaskToBlock(rp.masks[k], maskEvals[k], q, n,
                        static_cast<int>(off / rowBytes), img->width,
                        maskScratch.data(), maskWeights.data(),
-                       maskWeights2.data());
+                       maskWeights2.data(), src.pixels.data() + off,
+                       fxPlanes);
   }
   return img;
 }
@@ -4121,6 +4203,11 @@ public:
     RenderParams rp;
     rp.luts = buildChannelLuts();
     rp.color = buildColorPass();
+    rp.fx = neighbor_fx::gainsFromValues(get(AdjId::Texture), get(AdjId::Clarity),
+                                         get(AdjId::Sharpness), get(AdjId::Dehaze),
+                                         get(AdjId::NoiseLuma),
+                                         get(AdjId::NoiseColor),
+                                         get(AdjId::Blur));
     if (!masks_.empty())
       rp.masks = buildMaskPasses(masks_, geoFrame());
     return rp;
@@ -12276,7 +12363,7 @@ try
     h.color = kColorTextMuted;
     return h;
   };
-  bool colorHeaderAdded = false;
+  bool colorHeaderAdded = false, detailHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
@@ -12284,6 +12371,11 @@ try
     {
       adjustPane.addChild(sectionLabel("Color"));
       colorHeaderAdded = true;
+    }
+    if (!detailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
+    {
+      adjustPane.addChild(sectionLabel("Detail"));
+      detailHeaderAdded = true;
     }
     adjustPane.addChild(buildAdjustmentSlider(spec));
   }
@@ -13137,14 +13229,20 @@ try
 
   // Basic: Amount plus the same table as the Adjust pane.
   fxBasic.addChild(buildMaskAmountSlider());
-  bool maskColorHeaderAdded = false;
+  bool maskColorHeaderAdded = false, maskDetailHeaderAdded = false;
   fxBasic.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
+
     if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
     {
       fxBasic.addChild(sectionLabel("Color"));
       maskColorHeaderAdded = true;
+    }
+    if (!maskDetailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
+    {
+      fxBasic.addChild(sectionLabel("Detail"));
+      maskDetailHeaderAdded = true;
     }
     fxBasic.addChild(buildMaskAdjustmentSlider(spec));
   }

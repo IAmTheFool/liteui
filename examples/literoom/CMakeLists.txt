@@ -1,4 +1,4 @@
-add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp)
+add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_layer.hpp neighbor_fx.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
 if(MSVC)
@@ -58,10 +58,30 @@ endif()
 option(LITEROOM_TESTS "literoom: build unit tests" OFF)
 if(LITEROOM_TESTS)
     enable_testing()
-    foreach(t minijson exif)
+    foreach(t minijson exif detail_layer)
         add_executable(${t}_test tests/${t}_test.cpp)
         target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
+
+    # ---- Golden render test: the refactoring safety net ----
+    # Compiles main.cpp itself (main() renamed) and fingerprints ~180 renders.
+    # One golden file per configuration, because float results can differ
+    # between compilers and flags:
+    #   cmake --build . --config Release --target golden_record   (once, BEFORE refactoring)
+    #   ctest -C Release -R golden_render                         (after every step)
+    add_executable(golden_render_test tests/golden_render_test.cpp)
+    target_include_directories(golden_render_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(golden_render_test PRIVATE cxx_std_20)
+    target_link_libraries(golden_render_test PRIVATE liteui::liteui)
+    if(MSVC)
+        target_compile_options(golden_render_test PRIVATE /utf-8)
+    endif()
+    set(GOLDEN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/render_$<CONFIG>.txt)
+    add_test(NAME golden_render COMMAND golden_render_test ${GOLDEN_FILE})
+    add_custom_target(golden_record
+        COMMAND golden_render_test --record ${GOLDEN_FILE}
+        DEPENDS golden_render_test
+        COMMENT "golden: recording ${GOLDEN_FILE}")
 endif()
