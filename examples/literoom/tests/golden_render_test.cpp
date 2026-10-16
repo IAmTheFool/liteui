@@ -19,7 +19,6 @@
 //
 // Exit code: 0 = every scenario matches and every invariant holds.
 
-
 #ifdef GOLDEN_USE_ENGINE_HEADERS
 #include "engine/all.hpp"
 #else
@@ -152,18 +151,7 @@ namespace golden
   {
     detail_layer::cache().clear();
     neighbor_fx::clearCaches();
-    {
-      std::lock_guard<std::mutex> l(gBrushCacheMutex);
-      gBrushCache.clear();
-    }
-    {
-      std::lock_guard<std::mutex> l(gObjWarpMutex);
-      gObjWarpCache.clear();
-    }
-    {
-      std::lock_guard<std::mutex> l(gObjEvalMutex);
-      gObjEvalCache.clear();
-    }
+    clearMaskCaches();
   }
 
   // --------------------------------------------------------- synthetic image

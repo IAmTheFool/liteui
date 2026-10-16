@@ -1,4 +1,8 @@
-add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_layer.hpp neighbor_fx.hpp)
+add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_layer.hpp neighbor_fx.hpp
+    pixel_math.hpp adjustments.hpp color_mix.hpp color_grade.hpp color_pass.hpp
+    geometry.hpp curves.hpp raster_ops.hpp
+    mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
+    mask.hpp seg_basic.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
 if(MSVC)
@@ -58,10 +62,25 @@ endif()
 option(LITEROOM_TESTS "literoom: build unit tests" OFF)
 if(LITEROOM_TESTS)
     enable_testing()
-    foreach(t minijson exif detail_layer)
+    foreach(t minijson exif detail_layer
+              pixel_math adjustments color_mix color_grade color_pass geometry curves
+              mask_geom mask_raster mask_brush mask_range mask_object mask)
         add_executable(${t}_test tests/${t}_test.cpp)
         target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
+        add_test(NAME ${t} COMMAND ${t}_test)
+    endforeach()
+
+    # raster_ops.hpp and seg_basic.hpp take liteui's CanvasImage, so their tests
+    # link liteui like the app does.
+    foreach(t raster_ops seg_basic)
+        add_executable(${t}_test tests/${t}_test.cpp)
+        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(${t}_test PRIVATE cxx_std_20)
+        target_link_libraries(${t}_test PRIVATE liteui::liteui)
+        if(MSVC)
+            target_compile_options(${t}_test PRIVATE /utf-8)
+        endif()
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
 
