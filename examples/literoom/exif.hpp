@@ -1,10 +1,20 @@
 // exif.hpp - JPEG metadata helpers with no dependencies:
 //   * the EXIF orientation tag (what camera rotation a photo was shot with),
 //   * carrying a source JPEG's EXIF block and ICC profile into a re-encoded
-//     JPEG, with the orientation reset (the pixels are already upright) and
-//     the picture's new size filled in.
+//     JPEG, with the orientation reset (the pixels are already upright), the
+//     embedded thumbnail erased, and the picture's new size filled in.
 // Everything works on byte buffers and bounds-checks every read, so a damaged
 // or hostile file can't read out of range; it just yields "no metadata".
+//
+// Not carried over: XMP and IPTC (so captions, copyright fields and any
+// develop settings stored in XMP are dropped), and thumbnails/previews stored
+// anywhere other than IFD1 (e.g. inside a MakerNote). GPS data in the EXIF
+// block IS carried over verbatim; strip it yourself for "remove location"
+// exports.
+//
+// Embedding the source ICC profile is only right if the pixels are still in
+// that profile's color space. If the pipeline converts to sRGB (or any working
+// space) before encoding, don't embed the source profile.
 #pragma once
 #include <algorithm>
 #include <cstddef>
@@ -53,16 +63,21 @@ namespace exif
     {
         int orientation = 1; // 1..8 as stored in the file (1 if absent or invalid)
         // The EXIF APP1 payload ("Exif\0\0" + TIFF data) as it should be written to
-        // an upright re-encode: orientation set to 1 and the thumbnail unlinked.
-        // Empty if the file had none.
+        // an upright re-encode: orientation set to 1 and the thumbnail erased and
+        // unlinked. Empty if the file had none.
         std::vector<uint8_t> exif;
-        // Every ICC profile APP2 payload ("ICC_PROFILE\0" + chunk header + data),
-        // verbatim and in file order. Empty if none.
+        // The ICC profile APP2 payloads ("ICC_PROFILE\0" + chunk header + data),
+        // verbatim, in sequence order. Empty if the file had none, or if its
+        // chunks were incomplete, inconsistent or oversized (a broken profile is
+        // worse than none).
         std::vector<std::vector<uint8_t>> icc;
     };
 
     namespace detail
     {
+
+        // Upper bound on the total ICC data we are willing to carry.
+        constexpr size_t kMaxIccBytes = size_t{16} << 20;
 
         // A bounds-checked, endian-aware view over a TIFF block.
         struct Tiff
@@ -118,10 +133,20 @@ namespace exif
                 }
                 return true;
             }
+            // Zeroes [off, off+len) if it lies inside the block.
+            void zero(uint64_t off, uint64_t len)
+            {
+                if (!ok(off, len))
+                    return;
+                std::fill_n(b.begin() + static_cast<std::ptrdiff_t>(off),
+                            static_cast<std::ptrdiff_t>(len), uint8_t{0});
+            }
         };
 
         // Finds `tag` in the IFD at `ifd`. On success *entry is the offset of its
-        // 12-byte entry, and (if asked) *count / *end describe the IFD.
+        // 12-byte entry. *count / *end (if asked) describe the IFD and are filled
+        // in whenever the IFD itself is readable, even if the tag is absent;
+        // *end is where the "next IFD" pointer lives.
         inline bool findEntry(const Tiff &t, uint32_t ifd, uint16_t tag, uint64_t *entry,
                               uint16_t *count = nullptr, uint64_t *end = nullptr)
         {
@@ -131,7 +156,7 @@ namespace exif
             if (count)
                 *count = n;
             if (end)
-                *end = uint64_t{ifd} + 2 + uint64_t{n} * 12; // where "next IFD" lives
+                *end = uint64_t{ifd} + 2 + uint64_t{n} * 12;
             for (uint16_t i = 0; i < n; ++i)
             {
                 const uint64_t off = uint64_t{ifd} + 2 + uint64_t{i} * 12;
@@ -157,61 +182,133 @@ namespace exif
             else
                 return false;
             uint16_t magic;
-            return t.rd16(2, &magic) && magic == 42 && t.rd32(4, ifd0);
+            // An IFD can't overlap the 8-byte header (writes there would clobber it).
+            return t.rd16(2, &magic) && magic == 42 && t.rd32(4, ifd0) && *ifd0 >= 8;
         }
 
-        // Sets the orientation to 1, unlinks IFD1 (the thumbnail, whose own
-        // orientation we'd otherwise have to fix), and returns the original value.
+        // Erases the thumbnail that IFD1 describes (its JPEG data and its IFD) and
+        // unlinks IFD1. Merely unlinking would leave the original, uncropped
+        // thumbnail sitting in the file for anyone to extract.
+        // `nextIfdPtr` is the offset of IFD0's "next IFD" field.
+        inline void dropThumbnail(Tiff &t, uint64_t nextIfdPtr)
+        {
+            uint32_t ifd1;
+            if (!t.rd32(nextIfdPtr, &ifd1) || ifd1 == 0)
+                return;
+            if (ifd1 >= 8)
+            {
+                // Read everything we need before zeroing anything.
+                uint64_t e = 0, ifdEnd = 0;
+                uint32_t off = 0, len = 0;
+                bool haveThumb = findEntry(t, ifd1, 0x0201, &e, nullptr, &ifdEnd) &&
+                                 t.rd32(e + 8, &off) && off >= 8;
+                if (haveThumb)
+                {
+                    uint64_t e2 = 0;
+                    haveThumb = findEntry(t, ifd1, 0x0202, &e2) && t.rd32(e2 + 8, &len);
+                }
+                if (haveThumb)
+                    t.zero(off, len);
+                if (ifdEnd != 0)
+                    t.zero(ifd1, ifdEnd + 4 - ifd1); // IFD1's entries + its next pointer
+            }
+            t.wr32(nextIfdPtr, 0); // IFD0's "next IFD" -> none
+        }
+
+        // Sets the orientation to 1, erases and unlinks IFD1 (the thumbnail, whose
+        // own orientation we'd otherwise have to fix), and returns the original
+        // orientation value. The thumbnail is dropped whether or not an
+        // orientation tag exists.
         inline int resetOrientation(Tiff &t, uint32_t ifd0)
         {
             int original = 1;
-            uint64_t entry, end;
-            uint16_t count;
-            if (!findEntry(t, ifd0, 0x0112, &entry, &count, &end))
-                return original;
-            uint16_t type;
-            uint32_t cnt;
-            uint16_t v;
-            if (t.rd16(entry + 2, &type) && type == 3 && t.rd32(entry + 4, &cnt) &&
-                cnt == 1 && t.rd16(entry + 8, &v))
+            uint64_t entry = 0, end = 0;
+            uint16_t count = 0;
+            if (findEntry(t, ifd0, 0x0112, &entry, &count, &end))
             {
-                if (v >= 1 && v <= 8)
-                    original = v;
-                t.wr16(entry + 8, 1);
+                uint16_t type;
+                uint32_t cnt;
+                uint16_t v;
+                if (t.rd16(entry + 2, &type) && type == 3 && t.rd32(entry + 4, &cnt) &&
+                    cnt == 1 && t.rd16(entry + 8, &v))
+                {
+                    if (v >= 1 && v <= 8)
+                        original = v;
+                    t.wr16(entry + 8, 1);
+                }
             }
-            t.wr32(end, 0); // IFD0's "next IFD" -> none
+            if (end != 0) // IFD0 was readable, tag or not
+                dropThumbnail(t, end);
             return original;
         }
 
-        // Writes the picture's size into the EXIF sub-IFD's PixelXDimension /
-        // PixelYDimension, if present.
-        inline void setDimensions(Tiff &t, uint32_t ifd0, uint32_t w, uint32_t h)
+        // Rewrites the entry for `tag` in the IFD at `ifd` (if present) as a single
+        // LONG holding `value`. Entries are 12 bytes with the value stored inline,
+        // so changing the type in place is always safe.
+        inline void setLong(Tiff &t, uint32_t ifd, uint16_t tag, uint32_t value)
         {
             uint64_t e;
-            uint32_t sub;
-            if (!findEntry(t, ifd0, 0x8769, &e) || !t.rd32(e + 8, &sub))
-                return;
-            const struct
+            if (findEntry(t, ifd, tag, &e))
             {
-                uint16_t tag;
-                uint32_t value;
-            } dims[2] = {{0xA002, w}, {0xA003, h}};
-            for (const auto &d : dims)
-                if (findEntry(t, sub, d.tag, &e))
-                {
-                    t.wr16(e + 2, 4); // LONG: room for any size
-                    t.wr32(e + 4, 1); // count
-                    t.wr32(e + 8, d.value);
-                }
+                t.wr16(e + 2, 4); // LONG: room for any size
+                t.wr32(e + 4, 1); // count
+                t.wr32(e + 8, value);
+            }
+        }
+
+        // Writes the picture's size into IFD0's ImageWidth / ImageLength and the
+        // EXIF sub-IFD's PixelXDimension / PixelYDimension, where present.
+        inline void setDimensions(Tiff &t, uint32_t ifd0, uint32_t w, uint32_t h)
+        {
+            setLong(t, ifd0, 0x0100, w);
+            setLong(t, ifd0, 0x0101, h);
+
+            uint64_t e;
+            uint16_t type;
+            uint32_t cnt, sub;
+            if (findEntry(t, ifd0, 0x8769, &e) && t.rd16(e + 2, &type) && type == 4 &&
+                t.rd32(e + 4, &cnt) && cnt == 1 && t.rd32(e + 8, &sub) && sub >= 8)
+            {
+                setLong(t, sub, 0xA002, w);
+                setLong(t, sub, 0xA003, h);
+            }
         }
 
         inline bool isExifPayload(const uint8_t *p, size_t n)
         {
-            return n > 14 && std::memcmp(p, "Exif\0\0", 6) == 0;
+            return p && n > 14 && std::memcmp(p, "Exif\0\0", 6) == 0;
         }
         inline bool isIccPayload(const uint8_t *p, size_t n)
         {
-            return n > 14 && std::memcmp(p, "ICC_PROFILE\0", 12) == 0;
+            return p && n > 14 && std::memcmp(p, "ICC_PROFILE\0", 12) == 0;
+        }
+
+        // Checks that the ICC chunks form one complete profile: every chunk agrees
+        // on the count, and the sequence numbers are exactly 1..count, each once.
+        // On success the chunks are put in sequence order. On failure returns false.
+        inline bool normalizeIcc(std::vector<std::vector<uint8_t>> &icc)
+        {
+            const size_t n = icc.size();
+            if (n == 0)
+                return true;
+            if (n > 255)
+                return false;
+            std::vector<const std::vector<uint8_t> *> slot(n, nullptr);
+            for (const auto &c : icc)
+            {
+                if (!isIccPayload(c.data(), c.size()))
+                    return false;
+                const size_t seq = c[12], cnt = c[13];
+                if (cnt != n || seq < 1 || seq > n || slot[seq - 1])
+                    return false;
+                slot[seq - 1] = &c;
+            }
+            std::vector<std::vector<uint8_t>> sorted;
+            sorted.reserve(n);
+            for (const auto *c : slot)
+                sorted.push_back(*c);
+            icc = std::move(sorted);
+            return true;
         }
 
     } // namespace detail
@@ -226,6 +323,7 @@ namespace exif
             return false;
         size_t i = 2;
         size_t iccBytes = 0;
+        bool iccBad = false;
         while (i + 4 <= size)
         {
             if (data[i] != 0xFF) // lost sync: stop with what we have
@@ -261,25 +359,43 @@ namespace exif
                     out->exif = std::move(block);
                 }
             }
-            else if (marker == 0xE2 && detail::isIccPayload(payload, plen) &&
-                     (iccBytes += plen) <= (16u << 20))
+            else if (marker == 0xE2 && !iccBad && detail::isIccPayload(payload, plen))
             {
-                out->icc.emplace_back(payload, payload + plen);
+                iccBytes += plen;
+                if (iccBytes > detail::kMaxIccBytes)
+                    iccBad = true; // truncating would leave a broken profile
+                else
+                    out->icc.emplace_back(payload, payload + plen);
             }
             i += 2 + len;
         }
+        if (iccBad || !detail::normalizeIcc(out->icc))
+            out->icc.clear();
         return true;
     }
 
     // Returns `jpeg` with the EXIF block (sized for a w x h picture) and ICC
-    // profile of `meta` inserted right after the SOI marker. A buffer that isn't
-    // a JPEG, or an EXIF block too big for one segment, is left out / unchanged.
+    // profile of `meta` inserted after the SOI marker (and after a JFIF APP0 if
+    // the JPEG starts with one, as the JFIF spec requires). A buffer that isn't a
+    // JPEG is returned unchanged. The EXIF segment is left out when `meta.exif`
+    // is malformed or w/h aren't positive (its size fields would be stale), and
+    // invalid ICC chunks are skipped.
     inline std::vector<uint8_t> embed(const std::vector<uint8_t> &jpeg,
                                       const JpegMeta &meta, int w, int h)
     {
         if (jpeg.size() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
             return jpeg;
-        std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + 2);
+
+        // Insert point: right after SOI, or after a leading JFIF APP0.
+        size_t at = 2;
+        if (jpeg.size() >= 6 && jpeg[2] == 0xFF && jpeg[3] == 0xE0)
+        {
+            const size_t len = (static_cast<size_t>(jpeg[4]) << 8) | jpeg[5];
+            if (len >= 2 && 4 + len <= jpeg.size())
+                at = 4 + len;
+        }
+
+        std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + static_cast<std::ptrdiff_t>(at));
         auto segment = [&out](uint8_t marker, const std::vector<uint8_t> &payload)
         {
             if (payload.size() + 2 > 0xFFFF)
@@ -291,23 +407,26 @@ namespace exif
             out.push_back(static_cast<uint8_t>(len));
             out.insert(out.end(), payload.begin(), payload.end());
         };
-        if (!meta.exif.empty())
+
+        if (detail::isExifPayload(meta.exif.data(), meta.exif.size()) && w > 0 && h > 0)
         {
             std::vector<uint8_t> block = meta.exif;
             std::vector<uint8_t> tiffBytes(block.begin() + 6, block.end());
             detail::Tiff t{tiffBytes};
             uint32_t ifd0;
-            if (detail::tiffHeader(t, &ifd0) && w > 0 && h > 0)
+            if (detail::tiffHeader(t, &ifd0))
             {
                 detail::setDimensions(t, ifd0, static_cast<uint32_t>(w),
                                       static_cast<uint32_t>(h));
                 std::copy(tiffBytes.begin(), tiffBytes.end(), block.begin() + 6);
+                segment(0xE1, block);
             }
-            segment(0xE1, block);
         }
         for (const auto &chunk : meta.icc)
-            segment(0xE2, chunk);
-        out.insert(out.end(), jpeg.begin() + 2, jpeg.end());
+            if (detail::isIccPayload(chunk.data(), chunk.size()))
+                segment(0xE2, chunk);
+
+        out.insert(out.end(), jpeg.begin() + static_cast<std::ptrdiff_t>(at), jpeg.end());
         return out;
     }
 

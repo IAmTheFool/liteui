@@ -535,7 +535,7 @@ static mj::Json sidecarAdjToJson(const AdjValues &v)
   {
     const float x = v[static_cast<size_t>(spec.id)];
     if (x != 0.0f)
-      o.set(spec.label, mj::Json::num(x));
+      o.set(std::string(spec.label), mj::Json::num(x));
   }
   return o;
 }
@@ -546,7 +546,7 @@ static AdjValues sidecarAdjFromJson(const mj::Json *j)
     return v;
   for (const auto &spec : kAdjustmentSpecs)
     v[static_cast<size_t>(spec.id)] =
-        sidecarNum(*j, spec.label.c_str(), 0.0f, spec.min, spec.max);
+        sidecarNum(*j, spec.label.data(), 0.0f, spec.min, spec.max);
   return v;
 }
 
@@ -1537,7 +1537,7 @@ private:
     {
       const size_t k = static_cast<size_t>(s.id);
       if (a.values[k] != b.values[k])
-        return s.label + " " + signedNum(b.values[k]);
+        return std::string(s.label) + " " + signedNum(b.values[k]);
     }
     if (!(a.orient == b.orient))
       return "Rotate / Flip";
@@ -1610,7 +1610,7 @@ private:
       {
         const size_t k = static_cast<size_t>(s.id);
         if (x.adj[k] != y.adj[k])
-          return n + s.label + " " + signedNum(y.adj[k]);
+          return n + std::string(s.label) + " " + signedNum(y.adj[k]);
       }
       if (x.amount != y.amount)
         return n + "Amount " + std::to_string(static_cast<int>(std::lround(y.amount)));
@@ -8782,7 +8782,7 @@ static void verifyAdjustmentSpecs()
     if (problem)
     {
       std::fprintf(stderr, "literoom: kAdjustmentSpecs[%zu] (\"%s\") %s\n",
-                   i, s.label.c_str(), problem);
+                   i, s.label.data(), problem);
       std::abort();
     }
   }
