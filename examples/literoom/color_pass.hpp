@@ -17,10 +17,13 @@ constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction
 // Runs on the LUT's 8-bit output. Everything here is computed in float and
 // rounded/clamped once at the end, so stacking Temperature + Vibrance +
 // Saturation doesn't accumulate 8-bit rounding the way chained LUT stages do.
-// Order: white balance gains -> vibrance -> saturation -> color mixer -> color
-// grading. Works on
-// the gamma-encoded values directly (no linearization) — a standard, cheap
-// approximation for a first version.
+// Order: white balance gains -> vibrance -> saturation -> hue -> color mixer ->
+// colorize -> color grading. Works on the gamma-encoded values directly (no
+// linearization) — a standard, cheap approximation for a first version.
+//
+// makeColorPass sanitizes every slider value (clamped to its range, NaN/inf
+// treated as 0), so the per-pixel loop only ever sees finite values and its
+// table indices (mixer hue, grade luma) are always in range.
 struct ColorPass
 {
   bool active = false;                         // false = skip the pass entirely (fast path)
@@ -34,18 +37,35 @@ struct ColorPass
   bool mix = false;                            // Color Mixer stage enabled (mixLut is valid)
   MixLut mixLut;                               // only filled when `mix` is true
   bool grade = false;                          // Color Grading stage enabled (gradeLut is valid)
-  GradeLut gradeLut;                           // only filled when `grade` is true
+  GradeLut gradeLut{};                         // only filled when `grade` is true
 };
 
-// UI values are the -100..+100 slider values.
+// UI values are the -100..+100 slider values (Colorize Hue is 0..360 degrees,
+// Colorize Amount 0..100).
 inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
                                float saturation, const MixValues &mix,
                                const ColorGrade &grade,
                                float hueShift = 0.0f, float colorizeHue = 0.0f,
                                float colorizeAmount = 0.0f)
 {
+  // Sanitize first: NaN/inf -> 0, everything else clamped to its range. A NaN
+  // here would otherwise reach static_cast<int> and then a table index.
+  auto sane = [](float v, float lo, float hi)
+  { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
+  temperature = sane(temperature, -100.0f, 100.0f);
+  tint = sane(tint, -100.0f, 100.0f);
+  vibrance = sane(vibrance, -100.0f, 100.0f);
+  saturation = sane(saturation, -100.0f, 100.0f);
+  hueShift = sane(hueShift, -100.0f, 100.0f);
+  colorizeHue = std::isfinite(colorizeHue) ? colorizeHue : 0.0f;
+  colorizeAmount = sane(colorizeAmount, 0.0f, 100.0f);
+  MixValues mixv = mix;
+  for (float &v : mixv)
+    v = mixClamped(v);
+  // `grade` is sanitized inside buildGradeLut.
+
   ColorPass cp;
-  cp.mix = mixAnyNonZero(mix);
+  cp.mix = mixAnyNonZero(mixv);
   cp.grade = grade.anyActive();
   cp.hue = hueShift != 0.0f;
   cp.colorize = colorizeAmount > 0.0f;
@@ -57,7 +77,7 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   if (cp.hue)
   {
     // Rotation about the gray axis (the same matrix as SVG's hueRotate).
-    const float a = hueShift / 100.0f * kHueShiftDegrees * 0.017453292519943295f;
+    const float a = hueShift / 100.0f * kHueShiftDegrees * static_cast<float>(kDegToRad);
     const float c = std::cos(a), s = std::sin(a);
     cp.hueM[0] = 0.213f + c * 0.787f - s * 0.213f;
     cp.hueM[1] = 0.715f - c * 0.715f - s * 0.715f;
@@ -73,53 +93,15 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   {
     // The pure color of that hue (HSL s = 1, l = 0.5), then only its chroma:
     // subtracting its own luma makes the offset luma-neutral.
-    float h = std::fmod(colorizeHue, 360.0f);
-    if (h < 0.0f)
-      h += 360.0f;
-    const float hp = h / 60.0f;
-    const int sector = std::min(5, static_cast<int>(hp));
-    const float f = hp - static_cast<float>(sector);
-    float t[3];
-    switch (sector)
-    {
-    case 0:
-      t[0] = 1;
-      t[1] = f;
-      t[2] = 0;
-      break;
-    case 1:
-      t[0] = 1 - f;
-      t[1] = 1;
-      t[2] = 0;
-      break;
-    case 2:
-      t[0] = 0;
-      t[1] = 1;
-      t[2] = f;
-      break;
-    case 3:
-      t[0] = 0;
-      t[1] = 1 - f;
-      t[2] = 1;
-      break;
-    case 4:
-      t[0] = f;
-      t[1] = 0;
-      t[2] = 1;
-      break;
-    default:
-      t[0] = 1;
-      t[1] = 0;
-      t[2] = 1 - f;
-      break;
-    }
-    const float lt = 0.299f * t[0] + 0.587f * t[1] + 0.114f * t[2];
+    float cz[3];
+    gradeHueToRgb(colorizeHue, cz);
+    const float lt = kGradeLumaR * cz[0] + kGradeLumaG * cz[1] + kGradeLumaB * cz[2];
     const float k = colorizeAmount / 100.0f * kColorizeStrength * 255.0f;
     for (int i = 0; i < 3; ++i)
-      cp.tintVec[i] = (t[i] - lt) * k;
+      cp.tintVec[i] = (cz[i] - lt) * k;
   }
   if (cp.mix)
-    cp.mixLut = buildMixLut(mix);
+    cp.mixLut = buildMixLut(mixv);
   if (cp.grade)
     cp.gradeLut = buildGradeLut(grade);
   const float t = temperature / 100.0f, n = tint / 100.0f;
@@ -128,8 +110,9 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   const float gG = 1.0f - 0.2f * n;
   const float gB = (1.0f - 0.3f * t) * (1.0f + 0.1f * n);
   // Normalize by the gains' luma so a white-balance shift changes color, not
-  // overall brightness.
-  const float gl = 0.299f * gR + 0.587f * gG + 0.114f * gB;
+  // overall brightness. (Within the clamped ranges every gain is > 0.6, so gl
+  // is never near zero.)
+  const float gl = kGradeLumaR * gR + kGradeLumaG * gG + kGradeLumaB * gB;
   cp.gain[0] = gR / gl;
   cp.gain[1] = gG / gl;
   cp.gain[2] = gB / gl;
@@ -141,7 +124,7 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched). Raw pointers
 // and no std::clamp/min/max calls in the loop, for the same Debug-build
 // reason as AdjustmentSet::applyTo.
-inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
+inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
 {
   if (!cp.active)
     return;
@@ -161,7 +144,7 @@ inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
   const float *lutHue = cp.mixLut.hueShift.data();
   const float *lutSat = cp.mixLut.satMul.data();
   const float *lutLum = cp.mixLut.lumAdj.data();
-  for (size_t i = 0; i + 3 < n; i += 4)
+  for (std::size_t i = 0; i + 3 < n; i += 4)
   {
     float r = static_cast<float>(p[i]) * gR;
     float g = static_cast<float>(p[i + 1]) * gG;
@@ -174,14 +157,14 @@ inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
       const float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
       const float s = mx > 0.0f ? (mx - mn) / mx : 0.0f;
       const float k = vib > 0.0f ? 1.0f + vib * (1.0f - s) : 1.0f + vib * s;
-      const float l = 0.299f * r + 0.587f * g + 0.114f * b;
+      const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
       r = l + (r - l) * k;
       g = l + (g - l) * k;
       b = l + (b - l) * k;
     }
     if (doSat)
     {
-      const float l = 0.299f * r + 0.587f * g + 0.114f * b;
+      const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
       r = l + (r - l) * sat;
       g = l + (g - l) * sat;
       b = l + (b - l) * sat;
@@ -221,7 +204,7 @@ inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
         }
         h *= 60.0f; // degrees
         int li = static_cast<int>(h * (kMixLutSize / 360.0f) + 0.5f);
-        if (li >= kMixLutSize)
+        if (li >= kMixLutSize) // hue just below 360 rounds up to the table size
           li -= kMixLutSize;
 
         // Near-grays have an unstable hue; fade the effect in with chroma so
@@ -301,7 +284,7 @@ inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
     {
       // Weight 4 l (1 - l): strongest in the midtones, zero at pure black
       // and white, so the cast can't push the ends out of range.
-      float l = (0.299f * r + 0.587f * g + 0.114f * b) * (1.0f / 255.0f);
+      float l = (kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b) * (1.0f / 255.0f);
       l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
       const float w = 4.0f * l * (1.0f - l);
       r += tvR * w;
@@ -314,8 +297,8 @@ inline void applyColorPass(const ColorPass &cp, uint8_t *p, size_t n)
       r = r < 0.0f ? 0.0f : (r > 255.0f ? 255.0f : r);
       g = g < 0.0f ? 0.0f : (g > 255.0f ? 255.0f : g);
       b = b < 0.0f ? 0.0f : (b > 255.0f ? 255.0f : b);
-      const int yi =
-          static_cast<int>(0.299f * r + 0.587f * g + 0.114f * b + 0.5f);
+      const int yi = static_cast<int>(
+          kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b + 0.5f);
       r += gdR[yi];
       g += gdG[yi];
       b += gdB[yi];

@@ -8,8 +8,10 @@
 #include <cstddef>
 #include <vector>
 
+#include "pixel_math.hpp"
+
 constexpr float kCurveMinGap = 2.0f;  // min x distance between points (0..255)
-constexpr size_t kCurveMaxPoints = 16;
+constexpr std::size_t kCurveMaxPoints = 16;
 
 // ---- Curve types (used by the masks, so they live here) ----
 struct CurvePoint
@@ -31,7 +33,7 @@ enum class CurveChannel : int
   Blue,
   Count
 };
-constexpr size_t kCurveChannelCount = static_cast<size_t>(CurveChannel::Count);
+constexpr std::size_t kCurveChannelCount = static_cast<std::size_t>(CurveChannel::Count);
 using CurveSet = std::array<CurvePoints, kCurveChannelCount>;
 
 inline CurveSet identityCurves()
@@ -47,22 +49,38 @@ inline CurveSet identityCurves()
 // (Fritsch-Carlson / PCHIP): it passes through every point, never overshoots
 // between neighbors, and stays monotone wherever the points are — so dragging
 // a point can't make the curve ring or invert by accident.
-// (CurvePoint, CurvePoints, CurveChannel and CurveSet are defined further up,
-// before the masks block: a Mask holds its own CurveSet.)
+
+// True if the points can be evaluated: at least two, all finite, x strictly
+// increasing. (The edit operations below and the sidecar loader keep stricter
+// invariants; this is the minimum curveToLut needs to produce a sane table.)
+inline bool curveEvaluable(const CurvePoints &pts)
+{
+  if (pts.size() < 2)
+    return false;
+  for (std::size_t i = 0; i < pts.size(); ++i)
+  {
+    if (!std::isfinite(pts[i].x) || !std::isfinite(pts[i].y))
+      return false;
+    if (i > 0 && !(pts[i].x > pts[i - 1].x))
+      return false;
+  }
+  return true;
+}
 
 // Evaluates the curve at every input level 0..255 (unrounded, clamped).
+// Points that can't be evaluated (see curveEvaluable) give the identity table.
 inline std::array<float, 256> curveToLut(const CurvePoints &pts)
 {
   std::array<float, 256> lut{};
-  const size_t n = pts.size();
-  if (n < 2)
+  const std::size_t n = pts.size();
+  if (!curveEvaluable(pts))
   {
-    for (int i = 0; i < 256; ++i)
+    for (std::size_t i = 0; i < 256; ++i)
       lut[i] = static_cast<float>(i);
     return lut;
   }
   std::vector<float> h(n - 1), d(n - 1), m(n);
-  for (size_t k = 0; k + 1 < n; ++k)
+  for (std::size_t k = 0; k + 1 < n; ++k)
   {
     h[k] = std::max(pts[k + 1].x - pts[k].x, 1e-3f);
     d[k] = (pts[k + 1].y - pts[k].y) / h[k];
@@ -73,7 +91,7 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
   }
   else
   {
-    for (size_t k = 1; k + 1 < n; ++k)
+    for (std::size_t k = 1; k + 1 < n; ++k)
     {
       if (d[k - 1] * d[k] <= 0.0f)
       {
@@ -99,8 +117,8 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
     m[0] = endSlope(h[0], h[1], d[0], d[1]);
     m[n - 1] = endSlope(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
   }
-  size_t k = 0;
-  for (int i = 0; i < 256; ++i)
+  std::size_t k = 0;
+  for (std::size_t i = 0; i < 256; ++i)
   {
     const float x = static_cast<float>(i);
     float v;
@@ -128,22 +146,29 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
 }
 
 // True when rounding the curve to 8 bits gives the identity mapping — the
-// pipeline skips the curve stage entirely then (exactly equivalent).
+// pipeline skips the curve stage entirely then. That is only exactly
+// equivalent if this uses the SAME rounding as the code that applies the
+// curve, so it uses toU8Clamped (pixel_math.hpp), the pipeline's one rounding
+// rule. Anything that turns a curve table into bytes must use it too.
 inline bool curveIsIdentity(const std::array<float, 256> &lut)
 {
-  for (int i = 0; i < 256; ++i)
-    if (std::lround(lut[i]) != i)
+  for (std::size_t i = 0; i < 256; ++i)
+    if (static_cast<std::size_t>(toU8Clamped(lut[i])) != i)
       return false;
   return true;
 }
 
 // Inserts an interior point at (x, y), keeping the list sorted. Returns its
-// index, or -1 if it would sit on/next to an existing point or an end.
+// index, or -1 if the values aren't finite, the list is already at
+// kCurveMaxPoints, or the point would sit on/next to an existing point or an
+// end.
 inline int curveInsert(CurvePoints &pts, float x, float y)
 {
+  if (!std::isfinite(x) || !std::isfinite(y) || pts.size() >= kCurveMaxPoints)
+    return -1;
   x = std::clamp(x, 0.0f, 255.0f);
   y = std::clamp(y, 0.0f, 255.0f);
-  size_t i = 0;
+  std::size_t i = 0;
   while (i < pts.size() && pts[i].x < x)
     ++i;
   if (i == 0 || i >= pts.size())
@@ -156,9 +181,12 @@ inline int curveInsert(CurvePoints &pts, float x, float y)
 
 // Moves point `idx`. End points keep their x; interior points stay strictly
 // between their neighbors (kCurveMinGap apart), so order never changes.
+// Non-finite coordinates are ignored.
 inline void curveMovePoint(CurvePoints &pts, int idx, float x, float y)
 {
   if (idx < 0 || idx >= static_cast<int>(pts.size()))
+    return;
+  if (!std::isfinite(x) || !std::isfinite(y))
     return;
   pts[idx].y = std::clamp(y, 0.0f, 255.0f);
   if (idx == 0 || idx == static_cast<int>(pts.size()) - 1)

@@ -37,6 +37,9 @@
 // Order inside apply(): Dehaze (it rescales the pixel, so it goes first), then
 // the detail layers, then noise reduction, then blur (last, so it wins).
 //
+// Slider values are sanitized in gainsFromValues (clamped to their ranges,
+// NaN/inf treated as 0), so the per-pixel code only ever sees finite values.
+//
 // Like detail_layer.hpp this has no UI dependency and is unit-tested alone
 // (tests/neighbor_fx_test.cpp).
 
@@ -181,6 +184,8 @@ private:
   size_t maxBytes_, maxEntries_;
 };
 
+// Note: with detail_layer's own cache (384 MB) these add up to a worst case of
+// about 700 MB of cached planes on very large pictures.
 inline Store<dl::Plane> &chromaStore()
 {
   static Store<dl::Plane> s(256u * 1024u * 1024u, 6); // full-size planes
@@ -381,8 +386,10 @@ inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
       }
       const uint32_t cnt = static_cast<uint32_t>((y1 - y0) * (x1 - x0));
       for (int c = 0; c < 3; ++c)
+        // 64-bit: sum * 16 would overflow 32 bits for blocks over ~1M pixels.
         ch[static_cast<size_t>(c)][static_cast<size_t>(ry) * rw + rx] =
-            static_cast<uint16_t>((sum[c] * 16 + cnt / 2) / cnt);
+            static_cast<uint16_t>(
+                (static_cast<uint64_t>(sum[c]) * 16 + cnt / 2) / cnt);
     }
   }
   const int r = boxRadiusForSigma(std::max(0.8f, sigma / static_cast<float>(f)));
@@ -469,17 +476,21 @@ struct Gains
   bool operator==(const Gains &) const = default;
 };
 
-// UI values: texture / clarity / dehaze in -100..100, the rest 0..100.
+// UI values: texture / clarity / dehaze in -100..100, the rest 0..100. Each is
+// clamped to its range and NaN/inf count as 0 (untouched), so every gain is
+// finite: a NaN would otherwise turn into a NaN pixel and an undefined cast.
 inline Gains gainsFromValues(float texture, float clarity, float sharpness,
                              float dehaze = 0.0f, float noiseLuma = 0.0f,
                              float noiseColor = 0.0f, float blur = 0.0f)
 {
+  auto sane = [](float v, float lo, float hi)
+  { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
   Gains g;
   g.detail = dl::gainsFromValues(texture, clarity, sharpness);
-  g.dehaze = std::clamp(dehaze, -100.0f, 100.0f) / 100.0f;
-  g.nrLuma = std::clamp(noiseLuma, 0.0f, 100.0f) / 100.0f;
-  g.nrColor = std::clamp(noiseColor, 0.0f, 100.0f) / 100.0f;
-  g.blur = std::clamp(blur, 0.0f, 100.0f) / 100.0f;
+  g.dehaze = sane(dehaze, -100.0f, 100.0f) / 100.0f;
+  g.nrLuma = sane(noiseLuma, 0.0f, 100.0f) / 100.0f;
+  g.nrColor = sane(noiseColor, 0.0f, 100.0f) / 100.0f;
+  g.blur = sane(blur, 0.0f, 100.0f) / 100.0f;
   return g;
 }
 
@@ -494,11 +505,12 @@ struct Planes
 };
 
 // Fetches (or builds, the first time) what `need` asks for. False = cancelled.
+// (No pixels or a non-positive size means nothing to do: true, planes null.)
 inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
                     uint32_t need, const std::atomic<uint64_t> *latest,
                     uint64_t gen)
 {
-  if (w <= 0 || h <= 0)
+  if (!rgba || w <= 0 || h <= 0)
     return true;
   if (!dl::acquire(out.luma, rgba, w, h, need & 7u, latest, gen))
     return false;
@@ -538,13 +550,26 @@ inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
 
 // ---- applying ----
 
+// Rounds and clamps to a byte: the same rule as toU8Clamped in pixel_math.hpp
+// (NaN -> 0, +/-inf saturate, halfway rounds up), written without std:: calls
+// for the same Debug-build reason as the other per-pixel loops.
 inline uint8_t toU8(float v)
 {
-  v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+  if (!(v >= 0.0f)) // also true for NaN
+    return 0;
+  if (v > 255.0f)
+    return 255;
   return static_cast<uint8_t>(v + 0.5f);
 }
 
+// True when plane `p` covers pixels [first, first + count).
+inline bool covers(const dl::Plane *p, size_t first, size_t count)
+{
+  return p && first <= p->size() && count <= p->size() - first;
+}
+
 // Steps through consecutive pixels of a picture W wide, keeping (x, y).
+// W must be positive.
 struct Walker
 {
   int W, x, y;
@@ -598,7 +623,7 @@ inline void dehazePass(const Map *veil, float amount, uint8_t *dst,
 inline void nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src,
                        uint8_t *dst, size_t count, size_t first)
 {
-  if (!sharp)
+  if (!covers(sharp, first, count))
     return;
   const uint16_t *b = sharp->data() + first;
   const float T = kNrLumaTMin + (kNrLumaTMax - kNrLumaTMin) * s;
@@ -606,7 +631,7 @@ inline void nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src,
   for (size_t i = 0; i < count; ++i)
   {
     const uint8_t *p = src + i * 4;
-    const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
+    const int l = (dl::kLumaR * p[0] + dl::kLumaG * p[1] + dl::kLumaB * p[2] + 128) >> 8;
     const float d = (static_cast<float>(l << 4) - static_cast<float>(b[i])) * (1.0f / 16.0f);
     const float k = -s * d / (1.0f + d * d * invT2);
     uint8_t *o = dst + i * 4;
@@ -620,20 +645,23 @@ inline void nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s,
                         const uint8_t *src, uint8_t *dst, size_t count,
                         size_t first)
 {
-  if (!cr || !cb)
+  if (!covers(cr, first, count) || !covers(cb, first, count))
     return;
   const uint16_t *br = cr->data() + first;
   const uint16_t *bb = cb->data() + first;
   const float invT2 = 1.0f / (kNrColorT * kNrColorT);
+  const float wR = static_cast<float>(dl::kLumaR);
+  const float wB = static_cast<float>(dl::kLumaB);
+  const float invWG = 1.0f / static_cast<float>(dl::kLumaG);
   for (size_t i = 0; i < count; ++i)
   {
     const uint8_t *p = src + i * 4;
-    const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
+    const int l = (dl::kLumaR * p[0] + dl::kLumaG * p[1] + dl::kLumaB * p[2] + 128) >> 8;
     // Move toward the blurred chroma. dg follows from dr and db because the
-    // luma weights (54, 183, 19) of the three chroma moves must sum to zero.
+    // luma weights of the three chroma moves must sum to zero.
     const float dr = static_cast<float>(br[i]) * (1.0f / 16.0f) - 255.0f - static_cast<float>(p[0] - l);
     const float db = static_cast<float>(bb[i]) * (1.0f / 16.0f) - 255.0f - static_cast<float>(p[2] - l);
-    const float dg = -(54.0f * dr + 19.0f * db) * (1.0f / 183.0f);
+    const float dg = -(wR * dr + wB * db) * invWG;
     const float w = s / (1.0f + (dr * dr + db * db + dg * dg) * invT2);
     uint8_t *o = dst + i * 4;
     o[0] = toU8(static_cast<float>(o[0]) + w * dr);
@@ -674,10 +702,13 @@ inline void blurPass(const MapPtr *levels, float amount, const uint8_t *src,
 
 // All the neighbor effects for `count` consecutive pixels of `dst` (RGBA8,
 // alpha untouched). `src` holds the SOURCE pixels for the same positions and
-// `first` is their index in the whole picture of width W.
+// `first` is their index in the whole picture of width W (which must be
+// positive; otherwise nothing is done).
 inline void apply(const Planes &pl, const Gains &g, const uint8_t *src,
                   uint8_t *dst, size_t count, size_t first, int W)
 {
+  if (W <= 0)
+    return;
   if (g.dehaze != 0.0f)
     dehazePass(pl.veil.get(), g.dehaze, dst, count, first, W);
   dl::addPixels(pl.luma, g.detail, src, dst, count, first);

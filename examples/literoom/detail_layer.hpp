@@ -30,8 +30,10 @@
 //    it per channel would shift hues along edges (color fringes).
 //
 //  * Blur sizes are fractions of the picture's long edge, so the 1024 px drag
-//    preview and the full-resolution render blur the same *part of the
-//    picture* and look alike.
+//    preview and the full-resolution render blur roughly the same *part of the
+//    picture* and look alike. (Roughly: the box radius is an integer >= 1, so
+//    the smallest blurs, notably Sharpness on anything under ~6000 px, are
+//    wider than their nominal sigma and don't shrink any further. See boxRadius.)
 //
 // This header has no dependency on the UI library: it works on plain RGBA8
 // pointers, so it can be unit-tested on its own (tests/detail_layer_test.cpp).
@@ -75,20 +77,30 @@ constexpr float kGain[kKindCount] = {0.8f, 1.0f, 1.5f};
 constexpr float kClarityLimit = 64.0f;
 
 constexpr int kMaxBoxRadius = 1000; // keeps every running sum exact in float
+// (a box sums at most 2 * 1000 + 1 values of at most 255 * 16 = 4080, i.e. about
+// 8.2 million, below the 2^24 float can hold exactly)
 
 // One blurred luma plane: width * height values, each luma * 16 (4 fractional
 // bits, so the blur isn't rounded to whole levels before it is subtracted).
 using Plane = std::vector<uint16_t>;
 
-// Same weights (54, 183, 19) / 256 as the rest of the app's 8-bit luma.
+// 8-bit luma weights, /256. They sum to exactly 256, so the result is 0..255.
+// Used both to build the blurred plane and to measure each pixel's own luma;
+// the two must agree, hence one set of constants.
+constexpr int kLumaR = 54, kLumaG = 183, kLumaB = 19;
+static_assert(kLumaR + kLumaG + kLumaB == 256, "luma weights must sum to 256");
+
 inline int lumaOf(const uint8_t *p)
 {
-  return (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
+  return (kLumaR * p[0] + kLumaG * p[1] + kLumaB * p[2] + 128) >> 8;
 }
 
 // Three passes of a box blur approximate a Gaussian. For n passes of width w
 // the variance is n (w^2 - 1) / 12, so for n = 3: w = sqrt(4 sigma^2 + 1).
 // Returns the box radius (w = 2r + 1) for this layer on a w x h picture.
+// The radius is rounded to an integer and is at least 1 (sigma about 1.41), so
+// requested sigmas below that are widened, and the effective sigma only changes
+// in coarse steps.
 inline int boxRadius(int kind, int w, int h)
 {
   const float longEdge = static_cast<float>(std::max(w, h));
@@ -107,6 +119,8 @@ inline bool cancelled(const std::atomic<uint64_t> *latest, uint64_t gen)
 // so a flat picture stays exactly flat. `pad` has room for W + 2r values.
 inline void hboxRow(uint16_t *row, size_t W, int r, uint16_t *pad, float inv)
 {
+  if (W == 0)
+    return;
   const size_t R = static_cast<size_t>(r);
   for (size_t i = 0; i < R; ++i)
     pad[i] = row[0];
@@ -164,10 +178,13 @@ inline bool vbox(const uint16_t *in, uint16_t *out, size_t W, size_t H, int r,
 
 // Blurs the luma of an RGBA8 picture (3 box passes each way). Returns false
 // if `latest` stopped matching `gen` part-way (the same cancellation contract
-// as renderWith); `out` is then garbage and must not be used.
+// as renderWith), or if the size or radius is invalid; `out` is then garbage
+// and must not be used.
 inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
                      const std::atomic<uint64_t> *latest, uint64_t gen)
 {
+  if (!rgba || w <= 0 || h <= 0 || r < 1)
+    return false;
   const size_t W = static_cast<size_t>(w), H = static_cast<size_t>(h);
   out.resize(W * H);
   for (size_t y = 0; y < H; ++y)
@@ -197,8 +214,10 @@ inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
   return true;
 }
 
-// A few hundred bytes spread over the picture: cheap, and different for any
-// two pictures that differ in more than a handful of pixels.
+// About 1024 bytes spread over the picture: cheap, and two different pictures
+// will almost surely differ at some sampled byte. It is NOT a full hash: a
+// small edit that falls between the samples goes unnoticed, which is why the
+// Cache below assumes pixels are never edited in place.
 inline uint64_t fingerprint(const uint8_t *rgba, int w, int h)
 {
   uint64_t hash = 1469598103934665603ULL ^
@@ -226,15 +245,20 @@ inline uint64_t fingerprint(const uint8_t *rgba, int w, int h)
 //
 // ASSUMPTION: a CanvasImage's pixels are not edited in place once it is being
 // rendered (the app builds a new image for every orient / straighten / crop).
+// An in-place edit (a retouch brush, say) would leave stale planes: call
+// clear() after one.
 class Cache
 {
 public:
   using PlanePtr = std::shared_ptr<const Plane>;
 
-  // Null when cancelled (nothing is cached then).
+  // Null when cancelled (nothing is cached then) or when the arguments are
+  // invalid (no pixels, non-positive size, unknown kind).
   PlanePtr get(const uint8_t *rgba, int w, int h, int kind,
                const std::atomic<uint64_t> *latest, uint64_t gen)
   {
+    if (!rgba || w <= 0 || h <= 0 || kind < 0 || kind >= kKindCount)
+      return nullptr;
     const uint64_t fp = fingerprint(rgba, w, h);
     {
       std::lock_guard<std::mutex> lock(m_);
@@ -344,13 +368,17 @@ struct Gains
   bool operator==(const Gains &) const = default;
 };
 
-// UI values: texture / clarity in -100..100, sharpness in 0..100.
+// UI values: texture / clarity in -100..100, sharpness in 0..100. Values are
+// clamped to those ranges and NaN/inf count as 0 (untouched), so the gains are
+// always finite: a NaN gain would turn into a NaN pixel and an undefined cast.
 inline Gains gainsFromValues(float texture, float clarity, float sharpness)
 {
+  auto sane = [](float v, float lo, float hi)
+  { return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f; };
   Gains r;
-  r.g[Texture] = texture / 100.0f * kGain[Texture];
-  r.g[Clarity] = clarity / 100.0f * kGain[Clarity];
-  r.g[Sharpness] = std::max(0.0f, sharpness) / 100.0f * kGain[Sharpness];
+  r.g[Texture] = sane(texture, -100.0f, 100.0f) / 100.0f * kGain[Texture];
+  r.g[Clarity] = sane(clarity, -100.0f, 100.0f) / 100.0f * kGain[Clarity];
+  r.g[Sharpness] = sane(sharpness, 0.0f, 100.0f) / 100.0f * kGain[Sharpness];
   return r;
 }
 
@@ -361,14 +389,16 @@ struct Planes
 };
 
 // Fetches the planes in `need` for the picture at `rgba`. False = cancelled.
+// (No pixels or a non-positive size means there is nothing to do: true, with
+// the planes left null.)
 inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
                     unsigned need, const std::atomic<uint64_t> *latest,
                     uint64_t gen)
 {
-  if (w <= 0 || h <= 0)
+  if (!rgba || w <= 0 || h <= 0)
     return true;
   for (int k = 0; k < kKindCount; ++k)
-    if (need >> k & 1u)
+    if ((need >> k) & 1u)
     {
       out.p[k] = cache().get(rgba, w, h, k, latest, gen);
       if (!out.p[k])
@@ -397,15 +427,23 @@ inline const float *midWeights()
 // Adds the detail term to `count` consecutive pixels of `dst` (RGBA8, alpha
 // untouched). `src` holds the SOURCE pixels for the same positions (they give
 // each pixel's own luma) and `first` is the index, in the whole picture, of
-// the first of them (the planes are indexed y * width + x). Raw pointers and
-// no std:: helpers in the loop: same Debug-build reason as applyColorPass.
+// the first of them (the planes are indexed y * width + x). A plane that
+// doesn't cover [first, first + count) (built for a different picture size,
+// say) is skipped instead of being read out of range. Raw pointers and no
+// std:: helpers in the loop: same Debug-build reason as applyColorPass.
 inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src,
                       uint8_t *dst, size_t count, size_t first)
 {
-  const uint16_t *b0 = pl.p[Texture] ? pl.p[Texture]->data() + first : nullptr;
-  const uint16_t *b1 = pl.p[Clarity] ? pl.p[Clarity]->data() + first : nullptr;
-  const uint16_t *b2 =
-      pl.p[Sharpness] ? pl.p[Sharpness]->data() + first : nullptr;
+  auto usable = [&](int k) -> const uint16_t *
+  {
+    const Cache::PlanePtr &p = pl.p[k];
+    return (p && first <= p->size() && count <= p->size() - first)
+               ? p->data() + first
+               : nullptr;
+  };
+  const uint16_t *b0 = usable(Texture);
+  const uint16_t *b1 = usable(Clarity);
+  const uint16_t *b2 = usable(Sharpness);
   const float g0 = b0 ? gn.g[Texture] : 0.0f;
   const float g1 = b1 ? gn.g[Clarity] : 0.0f;
   const float g2 = b2 ? gn.g[Sharpness] : 0.0f;
@@ -417,7 +455,7 @@ inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src,
   for (size_t i = 0; i < count; ++i)
   {
     const uint8_t *s = src + i * 4;
-    const int l = (54 * s[0] + 183 * s[1] + 19 * s[2] + 128) >> 8;
+    const int l = (kLumaR * s[0] + kLumaG * s[1] + kLumaB * s[2] + 128) >> 8;
     const float l16 = static_cast<float>(l << 4);
     float k = 0.0f;
     if (g0 != 0.0f)

@@ -48,9 +48,13 @@ struct Dims
 // Both formulas are symmetric in (w, h), so a picture that is later turned a
 // further quarter-turn gets exactly the transposed size — which is what
 // lets a crop rectangle follow a 90-degree turn by simple index math.
+// A non-positive size is returned as at least 1 x 1, and a NaN/infinite angle
+// counts as 0 (no turn).
 inline Dims rotatedDims(int w, int h, float deg, bool expand)
 {
-  if (deg == 0.0f)
+  if (w <= 0 || h <= 0)
+    return {std::max(1, w), std::max(1, h)};
+  if (deg == 0.0f || !std::isfinite(deg))
     return {w, h};
   const double rad = static_cast<double>(deg) * kDegToRad;
   const double c = std::abs(std::cos(rad)), sn = std::abs(std::sin(rad));
@@ -100,13 +104,25 @@ struct GeoFrame
   }
   // Direction of an axis (degrees, clockwise) in the original -> in the
   // source. An axis has no head or tail, so the result is kept in [-90, 90].
+  // Any finite angle is accepted (a NaN/infinite one gives 0). This used to be
+  // a subtract-180 loop, which never terminated for huge or infinite angles.
   static float wrapAxis(float a)
   {
-    while (a > 90.0f)
+    if (!std::isfinite(a))
+      return 0.0f;
+    a = std::fmod(a, 180.0f); // now in (-180, 180)
+    if (a > 90.0f)
       a -= 180.0f;
-    while (a < -90.0f)
+    else if (a < -90.0f)
       a += 180.0f;
-    return a;
+    return a == 0.0f ? 0.0f : a; // never -0
+  }
+  // An arrow's direction kept in (-180, 180]; NaN/infinite gives 0.
+  static float wrapDir(float a)
+  {
+    if (!std::isfinite(a))
+      return 0.0f;
+    return a <= -180.0f ? 180.0f : a;
   }
   float axisToSrc(float deg) const
   {
@@ -126,28 +142,32 @@ struct GeoFrame
   {
     const double a = static_cast<double>(deg) * kDegToRad;
     const double vx = std::cos(a), vy = std::sin(a);
-    return static_cast<float>(
-        std::atan2(m10 * vx + m11 * vy, m00 * vx + m01 * vy) / kDegToRad);
+    return wrapDir(static_cast<float>(
+        std::atan2(m10 * vx + m11 * vy, m00 * vx + m01 * vy) / kDegToRad));
   }
   float dirToOrig(float deg) const
   {
     const double a = static_cast<double>(deg) * kDegToRad;
     const double vx = std::cos(a), vy = std::sin(a), d = det();
-    return static_cast<float>(
+    return wrapDir(static_cast<float>(
         std::atan2((-m10 * vx + m00 * vy) / d, (m11 * vx - m01 * vy) / d) /
-        kDegToRad);
+        kDegToRad));
   }
 };
 
 // Builds the frame for a picture of ow x oh with this geometry. With no
 // original size known yet (ow <= 0) the frame is the identity and masks pass
-// through unchanged.
+// through unchanged. `o.rot` is taken modulo 4 and a NaN/infinite angle counts
+// as 0, so no input can reach an undefined conversion.
 inline GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
                              bool expand, const CropRect &crop)
 {
   GeoFrame f;
   if (ow <= 0 || oh <= 0)
     return f;
+  if (!std::isfinite(angle))
+    angle = 0.0f;
+  const int rot = ((o.rot % 4) + 4) % 4;
   f.origW = ow;
   f.origH = oh;
   int w = ow, h = oh;
@@ -165,7 +185,7 @@ inline GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
   };
   if (o.flip) // orientImage: mirror first...
     post(-1, 0, 0, 1, w, 0);
-  for (int i = 0; i < o.rot; ++i)
+  for (int i = 0; i < rot; ++i)
   {                          // ...then clockwise quarter turns
     post(0, -1, 1, 0, h, 0); // (x, y) -> (h - y, x)
     std::swap(w, h);
@@ -180,10 +200,13 @@ inline GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle,
     w = d.w, h = d.h;
   }
   if (!crop.empty())
-  { // cropImage's clamping, exactly
+  { // cropImage's clamping, exactly (the sums are done in 64 bits so a huge
+    // crop can't overflow int)
     const int x0 = std::clamp(crop.x, 0, w), y0 = std::clamp(crop.y, 0, h);
-    const int x1 = std::clamp(crop.x + crop.w, x0, w);
-    const int y1 = std::clamp(crop.y + crop.h, y0, h);
+    const long long sx = static_cast<long long>(crop.x) + crop.w;
+    const long long sy = static_cast<long long>(crop.y) + crop.h;
+    const int x1 = static_cast<int>(std::min<long long>(std::max<long long>(sx, x0), w));
+    const int y1 = static_cast<int>(std::min<long long>(std::max<long long>(sy, y0), h));
     post(1, 0, 0, 1, -x0, -y0);
     w = x1 - x0, h = y1 - y0;
   }
@@ -214,6 +237,7 @@ enum class GeoOp
 inline void geoStep(Orient &o, float &angle, CropRect &c, int &W, int &H,
                     GeoOp op)
 {
+  o.rot = ((o.rot % 4) + 4) % 4; // tolerate an out-of-range rot
   switch (op)
   {
   case GeoOp::RotateCW:
@@ -247,9 +271,12 @@ inline void geoStep(Orient &o, float &angle, CropRect &c, int &W, int &H,
   }
 }
 
-// Angles are kept to 0.1 degree, and to exactly 0 near zero.
+// Angles are kept to 0.1 degree, and to exactly 0 near zero. A NaN/infinite
+// angle becomes 0.
 inline float snapAngle(float deg)
 {
+  if (!std::isfinite(deg))
+    return 0.0f;
   deg = std::clamp(std::round(deg * 10.0f) / 10.0f, -kAngleMax, kAngleMax);
   return deg == 0.0f ? 0.0f : deg;
 }
