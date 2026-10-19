@@ -3,6 +3,7 @@
 #include "check.hpp"
 
 #include <set>
+#include <string>
 
 static constexpr size_t N = static_cast<size_t>(AdjId::Count);
 
@@ -20,7 +21,7 @@ static void testTable()
     CHECK(static_cast<size_t>(s.id) == i);        // indexed by AdjId
     CHECK(s.min < s.max);
     CHECK(s.min <= 0.0f && 0.0f <= s.max);        // 0 (untouched) is always valid
-    CHECK(!s.label.empty() && labels.insert(s.label).second);
+    CHECK(!s.label.empty() && labels.insert(std::string(s.label)).second);
     CHECK(static_cast<int>(s.stage) >= stage);
     stage = static_cast<int>(s.stage);
     // Only Tone sliders carry a per-channel function; the others are consumed

@@ -161,9 +161,10 @@ static void testHiddenWheelAndTuning()
   d.balance = 100.0f;
   CHECK(buildGradeLut(c)[0][128] < buildGradeLut(d)[0][128]);
   // Blending widens the overlap: with more blending the shadows wheel reaches
-  // further into the mids.
+  // further into the mids. (lum 30, not 100: at +100 with Blending 0 the
+  // monotonic clamp holds the curve on a plateau and masks the difference.)
   ColorGrade lo, hi;
-  lo.wheel[S].lum = hi.wheel[S].lum = 100.0f;
+  lo.wheel[S].lum = hi.wheel[S].lum = 30.0f;
   lo.blending = 0.0f;
   hi.blending = 100.0f;
   CHECK(buildGradeLut(hi)[0][110] > buildGradeLut(lo)[0][110]);

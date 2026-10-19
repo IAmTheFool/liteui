@@ -19,6 +19,13 @@
 //
 // Exit code: 0 = every scenario matches and every invariant holds.
 
+// ---------------------------------------------------------------------------
+// What is under test. Phase 0 (today): main.cpp itself, compiled as part of
+// this translation unit with its main() renamed - everything in it is static,
+// so this is the only way to reach it. After the split, build with
+// -DGOLDEN_USE_ENGINE_HEADERS and point the include at the new aggregate
+// header; nothing else in this file should need to change.
+// ---------------------------------------------------------------------------
 #ifdef GOLDEN_USE_ENGINE_HEADERS
 #include "engine/all.hpp"
 #else
@@ -345,13 +352,13 @@ namespace golden
                                                      bool expectChange = true)
   {
     resetAllCaches();
-    auto a = s.applyTo(src);
+    auto a = renderAdjusted(s, src);
     if (!a)
     {
       fail(name, "render returned null");
       return nullptr;
     }
-    auto b = s.applyTo(src);
+    auto b = renderAdjusted(s, src);
     if (!b || a->pixels != b->pixels)
       fail(name, "warm-cache render differs from the cold render");
     if (a->width != src.width || a->height != src.height ||
@@ -497,7 +504,7 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-      std::string label = sp.label;
+      std::string label(sp.label);
       std::replace(label.begin(), label.end(), ' ', '_');
       // dir 0: up, 1: down, 2: barely moved, 3: full range both ends. Small
       // and extreme values reach different branches (clamps, minimum radii).
@@ -936,7 +943,7 @@ namespace golden
     if (t.toJson().dump() != text)
       note("sidecar", "dump(load(dump)) is not identical to the first dump");
     resetAllCaches();
-    auto back = t.applyTo(img);
+    auto back = renderAdjusted(t, img);
     if (!back || back->pixels != ref->pixels)
       note("sidecar", "render after a save/load round trip differs from the original render");
   }
