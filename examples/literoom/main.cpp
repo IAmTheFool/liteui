@@ -32,6 +32,8 @@
 
 // Engine headers: pure logic with no UI, each covered by its own unit
 // test in tests/ (see CMakeLists.txt).
+#include "file_utils.hpp"
+#include "image_meta.hpp"
 #include "pixel_math.hpp"
 #include "adjustments.hpp"
 #include "color_mix.hpp"
@@ -690,12 +692,6 @@ static void clearStatus()
 {
   state.statusMsg.clear();
   state.statusIsError = false;
-}
-
-static std::string baseName(const std::string &path)
-{
-  size_t slash = path.find_last_of("/\\");
-  return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
 static void setZoom(float z)
@@ -1566,65 +1562,6 @@ static void redo()
   updateImageFromAdjustments();
 }
 
-// ---------------- Files: paths, byte prefixes, camera rotation ----------------
-static std::filesystem::path fsPath(const std::string &utf8)
-{
-  return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
-}
-
-static std::string fileExtLower(const std::string &path)
-{
-  const auto slash = path.find_last_of("/\\");
-  const auto dot = path.find_last_of('.');
-  if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-    return "";
-  std::string e = path.substr(dot + 1);
-  std::transform(e.begin(), e.end(), e.begin(),
-                 [](unsigned char c)
-                 { return static_cast<char>(std::tolower(c)); });
-  return e;
-}
-static bool isJpegPath(const std::string &path)
-{
-  const std::string e = fileExtLower(path);
-  return e == "jpg" || e == "jpeg";
-}
-
-// The first `maxBytes` of a file (all of it if smaller). False if unreadable.
-static bool readFilePrefix(const std::string &path, size_t maxBytes,
-                           std::vector<uint8_t> *out)
-{
-  std::ifstream f(fsPath(path), std::ios::binary);
-  if (!f)
-    return false;
-  out->resize(maxBytes);
-  f.read(reinterpret_cast<char *>(out->data()),
-         static_cast<std::streamsize>(maxBytes));
-  out->resize(static_cast<size_t>(f.gcount()));
-  return !out->empty();
-}
-
-// The rotation a camera recorded in a JPEG's EXIF data, as the Orient that
-// makes the picture upright (identity for anything else). The decoders hand
-// back the stored pixels, so a portrait shot would otherwise open on its
-// side. It is applied once, as the file is opened: the "original" the editor
-// (and its saved edits and masks) work on is the upright picture.
-static Orient exifOrientationOf(const std::string &path)
-{
-  Orient o;
-  if (!isJpegPath(path))
-    return o;
-  std::vector<uint8_t> head;
-  exif::JpegMeta meta;
-  if (!readFilePrefix(path, 256u << 10, &head) ||
-      !exif::readJpegMeta(head.data(), head.size(), &meta))
-    return o;
-  const exif::Transform t = exif::orientationToTransform(meta.orientation);
-  o.rot = t.rot;
-  o.flip = t.flip;
-  return o;
-}
-
 // ---------------- Opening a file (background decode) ----------------
 // Decoding a big PNG/JPEG takes long enough to freeze the window, so it runs
 // on its own thread. Same contract as RenderWorker / GeometryWorker: submit()
@@ -2218,54 +2155,6 @@ constexpr float kFilmCellW = 108.0f;
 constexpr int kFilmThumbW = 96, kFilmThumbH = 72;
 constexpr size_t kFilmMaxFiles = 5000; // a bigger folder shows its first 5000
 
-static std::string filmLower(std::string s)
-{
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
-                 { return static_cast<char>(std::tolower(c)); });
-  return s;
-}
-
-// "IMG_2" before "IMG_10"; letters compare without case.
-static bool naturalLess(const std::string &a, const std::string &b)
-{
-  auto digit = [](char c)
-  { return c >= '0' && c <= '9'; };
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size())
-  {
-    if (digit(a[i]) && digit(b[j]))
-    {
-      size_t i2 = i, j2 = j;
-      while (i2 < a.size() && digit(a[i2]))
-        ++i2;
-      while (j2 < b.size() && digit(b[j2]))
-        ++j2;
-      size_t ia = i, jb = j; // skip leading zeros (keep one digit)
-      while (ia + 1 < i2 && a[ia] == '0')
-        ++ia;
-      while (jb + 1 < j2 && b[jb] == '0')
-        ++jb;
-      const size_t la = i2 - ia, lb = j2 - jb;
-      if (la != lb)
-        return la < lb;
-      if (const int c = a.compare(ia, la, b, jb, lb))
-        return c < 0;
-      i = i2;
-      j = j2;
-    }
-    else
-    {
-      const int ca = std::tolower(static_cast<unsigned char>(a[i]));
-      const int cb = std::tolower(static_cast<unsigned char>(b[j]));
-      if (ca != cb)
-        return ca < cb;
-      ++i;
-      ++j;
-    }
-  }
-  return (a.size() - i) < (b.size() - j);
-}
-
 // `src` scaled down (box average) to fit kFilmThumbW x kFilmThumbH; never
 // enlarged. Null for an empty picture.
 static std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)
@@ -2415,37 +2304,13 @@ private:
 
 static ThumbWorker thumbWorker;
 
-static std::string u8ToString(const std::filesystem::path &p)
-{
-  const auto u = p.u8string();
-  return std::string(u.begin(), u.end());
-}
-
 // Lists the JPEG / PNG files of `folder` into a new strip (not yet shown).
 static FilmStrip filmListFolder(const std::string &folder)
 {
   FilmStrip f;
   f.folder = folder;
   const std::filesystem::path base = fsPath(folder);
-  std::vector<std::string> names;
-  std::error_code ec;
-  for (std::filesystem::directory_iterator it(base, ec), end;
-       !ec && it != end && names.size() < kFilmMaxFiles; it.increment(ec))
-  {
-    std::error_code e2;
-    if (!it->is_regular_file(e2) || e2)
-      continue;
-    std::string name = u8ToString(it->path().filename());
-    const std::string ext = fileExtLower(name);
-    if (ext == "jpg" || ext == "jpeg" || ext == "png")
-      names.push_back(std::move(name));
-  }
-  std::sort(names.begin(), names.end(),
-            [](const std::string &a, const std::string &b)
-            {
-              return naturalLess(a, b) || (!naturalLess(b, a) && a < b);
-            });
-  for (auto &name : names)
+  for (auto &name : listImageFiles(folder, kFilmMaxFiles))
   {
     FilmEntry e;
     e.path = u8ToString(base / fsPath(name));
@@ -2960,8 +2825,7 @@ static bool encodePngFile(const std::string &path, const CanvasImage &img,
 // corners left by Straighten) are flattened onto white.
 
 constexpr int kJpegQualityDefault = 92;
-constexpr int kJpegMaxSide = 65500;           // the format's limit is 65535
-constexpr size_t kMetaPrefixBytes = 8u << 20; // header search window
+constexpr int kJpegMaxSide = 65500; // the format's limit is 65535
 
 // One row of the picture as packed 8-bit RGB (or BGR), alpha over white.
 static void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)
@@ -3167,47 +3031,13 @@ static bool encodeJpegMemory(const CanvasImage &img, int quality,
 
 #endif
 
-// Writes `bytes` to `path` via a temp file + rename, so an interrupted export
-// never leaves a half-written picture over a good one.
-static bool writeFileAtomic(const std::string &path,
-                            const std::vector<uint8_t> &bytes,
-                            std::string *errorOut)
-{
-  const std::filesystem::path target = fsPath(path);
-  std::filesystem::path tmp = target;
-  tmp += ".tmp";
-  std::error_code ec;
-  {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    f.write(reinterpret_cast<const char *>(bytes.data()),
-            static_cast<std::streamsize>(bytes.size()));
-    f.flush();
-    if (!f)
-    {
-      f.close();
-      std::filesystem::remove(tmp, ec);
-      if (errorOut)
-        *errorOut = "couldn't write " + baseName(path);
-      return false;
-    }
-  }
-  std::filesystem::rename(tmp, target, ec); // replaces an existing file
-  if (ec)
-  {
-    std::error_code ignore;
-    std::filesystem::remove(tmp, ignore);
-    if (errorOut)
-      *errorOut = ec.message();
-    return false;
-  }
-  return true;
-}
-
 // Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the
-// opened photo's EXIF block and ICC profile ride along (orientation reset to
-// "upright", because the pixels already are; picture size updated).
+// EXIF block and ICC profile of the photo at `sourcePath` ride along
+// (orientation reset to "upright", because the pixels already are; picture
+// size updated; see embedSourceMetadata).
 static bool saveJpegFile(const std::string &path, const CanvasImage &img,
-                         int quality, bool keepMetadata, std::string *errorOut)
+                         int quality, bool keepMetadata,
+                         const std::string &sourcePath, std::string *errorOut)
 {
   if (img.width <= 0 || img.height <= 0 || img.width > kJpegMaxSide ||
       img.height > kJpegMaxSide)
@@ -3220,14 +3050,7 @@ static bool saveJpegFile(const std::string &path, const CanvasImage &img,
   if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
     return false;
   if (keepMetadata)
-  {
-    std::vector<uint8_t> head;
-    exif::JpegMeta meta;
-    if (isJpegPath(state.imagePath) &&
-        readFilePrefix(state.imagePath, kMetaPrefixBytes, &head) &&
-        exif::readJpegMeta(head.data(), head.size(), &meta))
-      jpeg = exif::embed(jpeg, meta, img.width, img.height);
-  }
+    embedSourceMetadata(&jpeg, sourcePath, img.width, img.height);
   return writeFileAtomic(path, jpeg, errorOut);
 }
 
@@ -3273,7 +3096,7 @@ static void exportImage()
   std::string err;
   const bool ok =
       jpeg ? saveJpegFile(out, *state.image, state.jpegQuality,
-                          state.keepMetadata, &err)
+                          state.keepMetadata, state.imagePath, &err)
            : encodePngFile(out, *state.image, &err);
   if (ok)
     setStatus("Exported " + baseName(out), false);

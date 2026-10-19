@@ -3,10 +3,11 @@ add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_
     geometry.hpp curves.hpp raster_ops.hpp
     mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
     mask.hpp seg_basic.hpp
-    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp)
+    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp
+    file_utils.hpp image_meta.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
-if(MSVC) 
+if(MSVC)
     target_compile_options(literoom PRIVATE /utf-8)
     # Need to split main in small build functions this is temporary but works
     target_link_options(literoom PRIVATE /STACK:8388608) 
@@ -66,7 +67,7 @@ if(LITEROOM_TESTS)
     foreach(t minijson exif detail_layer
               pixel_math adjustments color_mix color_grade color_pass geometry curves
               mask_geom mask_raster mask_brush mask_range mask_object mask
-              sidecar render_params adjustment_set)
+              sidecar render_params adjustment_set file_utils image_meta)
         add_executable(${t}_test tests/${t}_test.cpp)
         target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
