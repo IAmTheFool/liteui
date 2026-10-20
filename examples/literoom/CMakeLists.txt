@@ -3,7 +3,7 @@ add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_
     geometry.hpp curves.hpp raster_ops.hpp
     mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
     mask.hpp seg_basic.hpp
-    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp
+    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp latest_worker.hpp
     file_utils.hpp image_meta.hpp image_codec.hpp histogram.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
@@ -73,6 +73,16 @@ if(LITEROOM_TESTS)
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
+
+    # latest_worker.hpp has no liteui dependency but runs a std::jthread, so its
+    # test links the platform thread library (a no-op on MSVC). Run it in a loop
+    # to shake out timing flakiness:  ctest -C Release -R latest_worker --repeat until-fail:50
+    find_package(Threads REQUIRED)
+    add_executable(latest_worker_test tests/latest_worker_test.cpp)
+    target_include_directories(latest_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(latest_worker_test PRIVATE cxx_std_20)
+    target_link_libraries(latest_worker_test PRIVATE Threads::Threads)
+    add_test(NAME latest_worker COMMAND latest_worker_test)
 
     # raster_ops.hpp, seg_basic.hpp, render.hpp, image_codec.hpp and histogram.hpp take liteui's CanvasImage, so
     # their tests link liteui like the app does.

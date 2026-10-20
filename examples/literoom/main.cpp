@@ -48,6 +48,7 @@
 #include "seg_basic.hpp"
 #include "adjustment_set.hpp"
 #include "render.hpp"
+#include "latest_worker.hpp"
 
 constexpr float kSamSoftness = 2.0f; // logit -> coverage steepness (edge softness)
 
@@ -213,162 +214,34 @@ static Color mixBandColor(size_t band)
 // (see renderWith) so it abandons itself within a few milliseconds of being
 // superseded. Only the newest request can win, so jobs are never queued up:
 // a newer submit simply replaces one still waiting.
-class RenderWorker
+// The thread, the generation protocol and the parking slot live in
+// latest_worker.hpp (LatestWorker, tested on its own); what is specific to
+// rendering is just the job below.
+struct RenderJob
 {
-public:
-  struct Result
-  {
-    uint64_t gen = 0;
-    std::shared_ptr<CanvasImage> image;
-  };
-
-  RenderWorker() = default;
-  RenderWorker(const RenderWorker &) = delete;
-  RenderWorker &operator=(const RenderWorker &) = delete;
-
-  ~RenderWorker()
-  {
-    // Makes a render in progress bail at its next block; thread_ (declared
-    // last, so destroyed first) then requests stop and joins.
-    latest_.store(kShutdown);
-  }
-
-  // Called from the worker thread each time a result has been parked, so the
-  // UI thread can be woken to collect it (main() wires this to LiteUI::wake,
-  // the one LiteUI call that is safe off the UI thread). Set it before the
-  // first submit(): the thread is created by submit, so it then sees the
-  // value without further synchronization.
-  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
-
-  // Stops the worker and joins it; afterwards notify_ will never run again.
-  // This worker is a static and so outlives main()'s LiteUI — call this
-  // before that LiteUI is destroyed, or a late notify would wake a dead
-  // window.
-  void shutdown()
-  {
-    latest_.store(kShutdown); // a render in progress bails at its next block
-    if (thread_.joinable())
-    {
-      thread_.request_stop(); // also wakes a worker sleeping for a job
-      thread_.join();
-    }
-  }
-
-  // Queues a render of `src` and supersedes any earlier one. `src` must never
-  // be modified afterwards (the editor's source images are replaced, never
-  // edited in place).
-  void submit(std::shared_ptr<const CanvasImage> src,
-              const RenderParams &params)
-  {
-    if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
-    const uint64_t gen = ++counter_;
-    latest_.store(gen);
-    outstanding_ = true;
-    {
-      std::lock_guard lk(m_);
-      pending_ = Job{gen, std::move(src), params};
-      done_.reset();
-    }
-    workCv_.notify_one();
-  }
-
-  // Forgets whatever is waiting or running; its result will never be taken.
-  void invalidate()
-  {
-    latest_.store(++counter_);
-    outstanding_ = false;
-    std::lock_guard lk(m_);
-    pending_.reset();
-    done_.reset();
-  }
-
-  // True from submit() until its result has been taken or invalidate().
-  bool outstanding() const { return outstanding_; }
-
-  // Non-blocking: the finished result of the newest request, if it is ready.
-  std::optional<Result> collect()
-  {
-    if (!outstanding_)
-      return std::nullopt;
-    std::lock_guard lk(m_);
-    if (done_ && done_->gen != latest_.load())
-      done_.reset(); // stale (defensive: run() already filters these)
-    if (!done_)
-      return std::nullopt;
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
-  // Blocking: waits for the newest request to finish. Only call while
-  // outstanding() (nothing else could ever wake it).
-  Result waitForLatest()
-  {
-    std::unique_lock lk(m_);
-    doneCv_.wait(lk, [this]
-                 { return done_.has_value(); });
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
-private:
-  struct Job
-  {
-    uint64_t gen = 0;
-    std::shared_ptr<const CanvasImage> src;
-    RenderParams params;
-  };
-  static constexpr uint64_t kShutdown = ~uint64_t{0};
-
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
-      Job job;
-      {
-        std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this]
-                          { return pending_.has_value(); }))
-          return; // stop requested and nothing waiting
-        job = std::move(*pending_);
-        pending_.reset();
-      }
-      auto img = renderWith(*job.src, job.params, &latest_, job.gen);
-      if (!img)
-        continue; // abandoned part-way: superseded
-      {
-        std::lock_guard lk(m_);
-        // Re-check under the lock: if invalidate() ran while we finished, it
-        // has already cleared the slot, and must not be refilled.
-        if (latest_.load() != job.gen)
-          continue;
-        done_ = Result{job.gen, std::move(img)};
-      }
-      doneCv_.notify_all();
-      if (notify_)
-        notify_(); // outside the lock: it must not be able to deadlock on m_
-    }
-  }
-
-  std::mutex m_;                       // guards pending_ and done_
-  std::condition_variable_any workCv_; // "a job is waiting" (stop-aware)
-  std::condition_variable doneCv_;     // "a result is parked"
-  std::optional<Job> pending_;
-  std::optional<Result> done_;
-  std::function<void()> notify_;    // see setNotify; read by the worker
-  std::atomic<uint64_t> latest_{0}; // newest generation; read by the worker
-  uint64_t counter_ = 0;            // UI thread only
-  bool outstanding_ = false;        // UI thread only
-  std::jthread thread_;             // keep last: joined first on destruction
+  std::shared_ptr<const CanvasImage> src;
+  RenderParams params;
 };
+struct RenderResult
+{
+  std::shared_ptr<CanvasImage> image;
+};
+
+// Worker thread only.
+static std::optional<RenderResult> runRenderJob(RenderJob &&job, WorkerCancel c)
+{
+  auto img = renderWith(*job.src, job.params, c.latest, c.gen);
+  if (!img)
+    return std::nullopt; // abandoned part-way: superseded
+  return RenderResult{std::move(img)};
+}
+
+// `src` in a submitted RenderJob must never be modified afterwards (the
+// editor's source images are replaced, never edited in place).
+using RenderWorker = LatestWorker<RenderJob, RenderResult>;
 // END renderworker
 
-static RenderWorker renderWorker;
+static RenderWorker renderWorker{runRenderJob};
 
 // ---------------- Crop tool state ----------------
 
@@ -791,7 +664,7 @@ static void updateImageFromAdjustments()
   if (canDefer)
   {
     updatePreviewFromAdjustments(); // cheap stand-in, shown immediately
-    renderWorker.submit(state.source, state.adjust.buildRenderParams());
+    renderWorker.submit(RenderJob{state.source, state.adjust.buildRenderParams()});
     return;
   }
   state.image = renderAdjusted(state.adjust, *state.source);
@@ -938,210 +811,92 @@ static void syncSource(bool force)
 // only the crop is edited afterwards, but keeps a job a pure function of
 // its five inputs, with nothing that can drift out of sync — and the extra
 // work only costs latency on a background thread, never a UI freeze.
-class GeometryWorker
+// The thread and the generation protocol live in latest_worker.hpp; this is
+// the job. `original` must never be modified afterwards (the editor's images
+// are replaced, never edited in place - the same rule RenderJob::src relies on).
+
+// Exactly the geometry-derived EditorState fields, adopted as one atomic swap
+// on the UI thread (see adoptGeometryBundle) so the picture, its document
+// size, and the crop selection always change together.
+struct GeometryBundle
 {
-public:
-  // Exactly the geometry-derived EditorState fields, adopted as one atomic
-  // swap on the UI thread (see adoptGeometryBundle) so the picture, its
-  // document size, and the crop selection always change together.
-  struct Bundle
-  {
-    std::shared_ptr<CanvasImage> oriented;
-    Orient orientedFor;
-    std::shared_ptr<CanvasImage> orientedPreview;
-    std::shared_ptr<CanvasImage> rotated;
-    float rotatedAngle = 0.0f;
-    bool rotatedExpand = false;
-    std::shared_ptr<CanvasImage> source;
-    CropRect sourceCrop;
-    std::shared_ptr<CanvasImage> previewBase;
-    std::shared_ptr<CanvasImage> image;
-  };
-  struct Result
-  {
-    uint64_t gen = 0;
-    Bundle bundle;
-  };
-
-  GeometryWorker() = default;
-  GeometryWorker(const GeometryWorker &) = delete;
-  GeometryWorker &operator=(const GeometryWorker &) = delete;
-  ~GeometryWorker() { latest_.store(kShutdown); }
-
-  // See RenderWorker::setNotify / ::shutdown — same contract.
-  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
-  void shutdown()
-  {
-    latest_.store(kShutdown);
-    if (thread_.joinable())
-    {
-      thread_.request_stop();
-      thread_.join();
-    }
-  }
-
-  // Queues one full rebuild, superseding any earlier one. `original` must
-  // never be modified afterwards (the editor's images are replaced, never
-  // edited in place — the same rule RenderWorker::submit relies on).
-  void submit(std::shared_ptr<CanvasImage> original, const Orient &orient,
-              float angle, bool expand, const CropRect &crop,
-              const RenderParams &renderParams)
-  {
-    if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
-    const uint64_t gen = ++counter_;
-    latest_.store(gen);
-    outstanding_ = true;
-    {
-      std::lock_guard lk(m_);
-      pending_ = Job{gen, std::move(original), orient, angle, expand,
-                     crop, renderParams};
-      done_.reset();
-    }
-    workCv_.notify_one();
-  }
-
-  void invalidate()
-  {
-    latest_.store(++counter_);
-    outstanding_ = false;
-    std::lock_guard lk(m_);
-    pending_.reset();
-    done_.reset();
-  }
-
-  bool outstanding() const { return outstanding_; }
-
-  std::optional<Result> collect()
-  {
-    if (!outstanding_)
-      return std::nullopt;
-    std::lock_guard lk(m_);
-    if (done_ && done_->gen != latest_.load())
-      done_.reset(); // stale (defensive: run() already filters these)
-    if (!done_)
-      return std::nullopt;
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
-  Result waitForLatest()
-  {
-    std::unique_lock lk(m_);
-    doneCv_.wait(lk, [this]
-                 { return done_.has_value(); });
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
-private:
-  struct Job
-  {
-    uint64_t gen = 0;
-    // Non-const, unlike RenderWorker::Job::src: orientImage (identity case)
-    // and the rest of this pipeline are written in terms of the same
-    // shared_ptr<CanvasImage> type `state.original` already is, so this
-    // just carries that type through — never a license to mutate it.
-    std::shared_ptr<CanvasImage> original;
-    Orient orient;
-    float angle = 0.0f;
-    bool expand = false;
-    CropRect crop;
-    RenderParams renderParams;
-  };
-  static constexpr uint64_t kShutdown = ~uint64_t{0};
-
-  // The pipeline itself. Checked for cancellation between every stage, and
-  // by row/block inside the two per-pixel passes (rotateArbitrary,
-  // renderWith) — so a job superseded mid-straighten or mid-render abandons
-  // within a few milliseconds rather than finishing unwanted work.
-  std::optional<Bundle> buildBundle(const Job &job)
-  {
-    auto cancelled = [&]
-    { return latest_.load() != job.gen; };
-    if (cancelled())
-      return std::nullopt;
-    Bundle b;
-    b.oriented = orientImage(job.original, job.orient); // identity: no copy
-    b.orientedFor = job.orient;
-    if (cancelled())
-      return std::nullopt;
-    b.orientedPreview = makePreviewBase(*b.oriented);
-    if (cancelled())
-      return std::nullopt;
-    if (job.angle == 0.0f)
-    {
-      b.rotated = b.oriented;
-    }
-    else
-    {
-      b.rotated = rotateArbitrary(*b.oriented, job.angle, job.expand, &latest_,
-                                  job.gen);
-      if (!b.rotated)
-        return std::nullopt; // abandoned mid-straighten
-    }
-    b.rotatedAngle = job.angle;
-    b.rotatedExpand = job.expand;
-    if (cancelled())
-      return std::nullopt;
-    b.sourceCrop = job.crop;
-    b.source = job.crop.empty() ? b.rotated : cropImage(*b.rotated, job.crop);
-    if (cancelled())
-      return std::nullopt;
-    b.previewBase = makePreviewBase(*b.source);
-    b.image = renderWith(*b.source, job.renderParams, &latest_, job.gen);
-    if (!b.image)
-      return std::nullopt; // abandoned mid-render
-    return b;
-  }
-
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
-      Job job;
-      {
-        std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this]
-                          { return pending_.has_value(); }))
-          return; // stop requested and nothing waiting
-        job = std::move(*pending_);
-        pending_.reset();
-      }
-      auto bundle = buildBundle(job);
-      if (!bundle)
-        continue; // abandoned part-way: superseded
-      {
-        std::lock_guard lk(m_);
-        if (latest_.load() != job.gen)
-          continue; // invalidate() ran while we finished
-        done_ = Result{job.gen, std::move(*bundle)};
-      }
-      doneCv_.notify_all();
-      if (notify_)
-        notify_();
-    }
-  }
-
-  std::mutex m_;
-  std::condition_variable_any workCv_;
-  std::condition_variable doneCv_;
-  std::optional<Job> pending_;
-  std::optional<Result> done_;
-  std::function<void()> notify_;
-  std::atomic<uint64_t> latest_{0};
-  uint64_t counter_ = 0;
-  bool outstanding_ = false;
-  std::jthread thread_; // keep last: joined first on destruction
+  std::shared_ptr<CanvasImage> oriented;
+  Orient orientedFor;
+  std::shared_ptr<CanvasImage> orientedPreview;
+  std::shared_ptr<CanvasImage> rotated;
+  float rotatedAngle = 0.0f;
+  bool rotatedExpand = false;
+  std::shared_ptr<CanvasImage> source;
+  CropRect sourceCrop;
+  std::shared_ptr<CanvasImage> previewBase;
+  std::shared_ptr<CanvasImage> image;
 };
+struct GeometryResult
+{
+  GeometryBundle bundle;
+};
+struct GeometryJob
+{
+  // Non-const, unlike RenderJob::src: orientImage (identity case) and the rest
+  // of this pipeline are written in terms of the same shared_ptr<CanvasImage>
+  // type `state.original` already is, so this just carries that type through -
+  // never a license to mutate it.
+  std::shared_ptr<CanvasImage> original;
+  Orient orient;
+  float angle = 0.0f;
+  bool expand = false;
+  CropRect crop;
+  RenderParams renderParams;
+};
+
+// The pipeline itself (worker thread only). Checked for cancellation between
+// every stage, and by row/block inside the two per-pixel passes
+// (rotateArbitrary, renderWith) - so a job superseded mid-straighten or
+// mid-render abandons within a few milliseconds rather than finishing
+// unwanted work.
+static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
+                                                    WorkerCancel c)
+{
+  if (c.cancelled())
+    return std::nullopt;
+  GeometryBundle b;
+  b.oriented = orientImage(job.original, job.orient); // identity: no copy
+  b.orientedFor = job.orient;
+  if (c.cancelled())
+    return std::nullopt;
+  b.orientedPreview = makePreviewBase(*b.oriented);
+  if (c.cancelled())
+    return std::nullopt;
+  if (job.angle == 0.0f)
+  {
+    b.rotated = b.oriented;
+  }
+  else
+  {
+    b.rotated = rotateArbitrary(*b.oriented, job.angle, job.expand, c.latest,
+                                c.gen);
+    if (!b.rotated)
+      return std::nullopt; // abandoned mid-straighten
+  }
+  b.rotatedAngle = job.angle;
+  b.rotatedExpand = job.expand;
+  if (c.cancelled())
+    return std::nullopt;
+  b.sourceCrop = job.crop;
+  b.source = job.crop.empty() ? b.rotated : cropImage(*b.rotated, job.crop);
+  if (c.cancelled())
+    return std::nullopt;
+  b.previewBase = makePreviewBase(*b.source);
+  b.image = renderWith(*b.source, job.renderParams, c.latest, c.gen);
+  if (!b.image)
+    return std::nullopt; // abandoned mid-render
+  return GeometryResult{std::move(b)};
+}
+
+using GeometryWorker = LatestWorker<GeometryJob, GeometryResult>;
 // END geometryworker
 
-static GeometryWorker geometryWorker;
+static GeometryWorker geometryWorker{runGeometryJob};
 
 // True when state.adjust's committed orientation/angle/expand/crop hasn't
 // been rendered into state.oriented/rotated/source yet — mirrors syncSource's
@@ -1171,9 +926,10 @@ static bool geometryDirty()
 
 static void submitGeometryJob()
 {
-  geometryWorker.submit(state.original, state.adjust.orient(),
-                        state.adjust.angle(), state.adjust.expand(),
-                        state.adjust.crop(), state.adjust.buildRenderParams());
+  geometryWorker.submit(GeometryJob{
+      state.original, state.adjust.orient(), state.adjust.angle(),
+      state.adjust.expand(), state.adjust.crop(),
+      state.adjust.buildRenderParams()});
   setStatus("Applying changes...", /*isError=*/false);
 }
 
@@ -1182,7 +938,7 @@ static void submitGeometryJob()
 // combination that belonged to two different requests.
 static void adoptGeometryBundle(GeometryWorker::Result &&r)
 {
-  GeometryWorker::Bundle &b = r.bundle;
+  GeometryBundle &b = r.bundle;
   state.oriented = std::move(b.oriented);
   state.orientedFor = b.orientedFor;
   state.orientedPreview = std::move(b.orientedPreview);
@@ -1568,133 +1324,57 @@ static void redo()
 // A decode already running can't be interrupted (the image libraries have no
 // cancel hook), so opening a second file queues behind it and the first
 // file's result is simply dropped when it finishes.
-class DecodeWorker
+struct DecodeJob
 {
-public:
-  struct Result
-  {
-    uint64_t gen = 0;
-    std::string path;
-    std::optional<CanvasImage> image; // empty on failure
-    std::string error;                // library message when image is empty
-  };
+  std::string path;
+};
+struct DecodeResult
+{
+  std::string path;
+  std::optional<CanvasImage> image; // empty on failure
+  std::string error;                // library message when image is empty
+};
 
-  DecodeWorker() = default;
-  DecodeWorker(const DecodeWorker &) = delete;
-  DecodeWorker &operator=(const DecodeWorker &) = delete;
-  ~DecodeWorker() { latest_.store(kShutdown); }
+// Worker thread only. Always returns a value (a failure is an empty `image`
+// plus `error`): a decode can't be cancelled part-way.
+static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel)
+{
+  DecodeResult r;
+  r.path = job.path;
+  r.image = liteui_image::decodeFile(job.path, &r.error);
 
-  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
-  // Joins the thread; blocks until a decode already in progress finishes.
-  void shutdown()
-  {
-    latest_.store(kShutdown);
-    if (thread_.joinable())
+  if (r.image)
+  { // a camera's rotation (EXIF) is applied here, once: from now on the
+    // picture is upright everywhere (editor, masks, saved edits, export)
+    const Orient o = exifOrientationOf(job.path);
+    if (!o.identity())
     {
-      thread_.request_stop();
-      thread_.join();
+      auto turned = orientImage(
+          std::make_shared<CanvasImage>(std::move(*r.image)), o);
+      r.image.emplace(std::move(*turned));
     }
   }
+  return r;
+}
+
+// LatestWorker plus the UI-thread bookkeeping of which file is being decoded.
+class DecodeWorker : public LatestWorker<DecodeJob, DecodeResult>
+{
+public:
+  DecodeWorker() : LatestWorker<DecodeJob, DecodeResult>(runDecodeJob) {}
 
   void submit(std::string path)
   {
-    if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
-    const uint64_t gen = ++counter_;
-    latest_.store(gen);
-    outstanding_ = true;
     pendingPath_ = path;
-    {
-      std::lock_guard lk(m_);
-      pending_ = Job{gen, std::move(path)};
-      done_.reset();
-    }
-    workCv_.notify_one();
+    LatestWorker<DecodeJob, DecodeResult>::submit(DecodeJob{std::move(path)});
   }
 
-  // True from submit() until its result has been taken.
-  bool outstanding() const { return outstanding_; }
   // The file the newest request is decoding (UI thread; valid while
   // outstanding()).
   const std::string &pendingPath() const { return pendingPath_; }
 
-  // Non-blocking: the newest request's result, if it has finished.
-  std::optional<Result> collect()
-  {
-    if (!outstanding_)
-      return std::nullopt;
-    std::lock_guard lk(m_);
-    if (done_ && done_->gen != latest_.load())
-      done_.reset(); // stale (defensive: run() already filters these)
-    if (!done_)
-      return std::nullopt;
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
 private:
-  struct Job
-  {
-    uint64_t gen = 0;
-    std::string path;
-  };
-  static constexpr uint64_t kShutdown = ~uint64_t{0};
-
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
-      Job job;
-      {
-        std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this]
-                          { return pending_.has_value(); }))
-          return; // stop requested and nothing waiting
-        job = std::move(*pending_);
-        pending_.reset();
-      }
-      if (latest_.load() != job.gen)
-        continue; // superseded while queued: don't even start
-      Result r;
-      r.gen = job.gen;
-      r.path = job.path;
-      r.image = liteui_image::decodeFile(job.path, &r.error);
-
-      if (r.image)
-      { // a camera's rotation (EXIF) is applied here, once: from now on the
-        // picture is upright everywhere (editor, masks, saved edits, export)
-        const Orient o = exifOrientationOf(job.path);
-        if (!o.identity())
-        {
-          auto turned = orientImage(
-              std::make_shared<CanvasImage>(std::move(*r.image)), o);
-          r.image.emplace(std::move(*turned));
-        }
-      }
-      {
-        std::lock_guard lk(m_);
-        if (latest_.load() != job.gen)
-          continue; // a newer open (or shutdown) overtook this one
-        done_ = std::move(r);
-      }
-      if (notify_)
-        notify_(); // outside the lock: it must not be able to deadlock on m_
-    }
-  }
-
-  std::mutex m_; // guards pending_ and done_
-  std::condition_variable_any workCv_;
-  std::optional<Job> pending_;
-  std::optional<Result> done_;
-  std::function<void()> notify_;
-  std::atomic<uint64_t> latest_{0};
-  uint64_t counter_ = 0;     // UI thread only
-  bool outstanding_ = false; // UI thread only
-  std::string pendingPath_;  // UI thread only
-  std::jthread thread_;      // keep last: joined first on destruction
+  std::string pendingPath_; // UI thread only
 };
 
 static DecodeWorker decodeWorker;
@@ -1822,126 +1502,29 @@ segmentObject(const CanvasImage &img, uint64_t key,
   return m;
 }
 
-// Same thread model as DecodeWorker / RenderWorker (see there).
-class SegmentWorker
+struct SegmentResult
 {
-public:
-  struct Result
-  {
-    uint64_t gen = 0;
-    SegmentRequest req;                   // image dropped; prompts + target kept
-    std::shared_ptr<const ObjectMap> map; // null on failure
-    std::string error;
-  };
-
-  SegmentWorker() = default;
-  SegmentWorker(const SegmentWorker &) = delete;
-  SegmentWorker &operator=(const SegmentWorker &) = delete;
-  ~SegmentWorker() { latest_.store(kShutdown); }
-
-  void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
-  void shutdown()
-  {
-    latest_.store(kShutdown);
-    if (thread_.joinable())
-    {
-      thread_.request_stop();
-      thread_.join();
-    }
-  }
-
-  void submit(SegmentRequest req)
-  {
-    if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
-    const uint64_t gen = ++counter_;
-    latest_.store(gen);
-    outstanding_ = true;
-    {
-      std::lock_guard lk(m_);
-      pending_ = Job{gen, std::move(req)};
-      done_.reset();
-    }
-    workCv_.notify_one();
-  }
-  void invalidate()
-  {
-    latest_.store(++counter_);
-    outstanding_ = false;
-    std::lock_guard lk(m_);
-    pending_.reset();
-    done_.reset();
-  }
-  bool outstanding() const { return outstanding_; }
-
-  std::optional<Result> collect()
-  {
-    if (!outstanding_)
-      return std::nullopt;
-    std::lock_guard lk(m_);
-    if (done_ && done_->gen != latest_.load())
-      done_.reset();
-    if (!done_)
-      return std::nullopt;
-    Result r = std::move(*done_);
-    done_.reset();
-    outstanding_ = false;
-    return r;
-  }
-
-private:
-  struct Job
-  {
-    uint64_t gen = 0;
-    SegmentRequest req;
-  };
-  static constexpr uint64_t kShutdown = ~uint64_t{0};
-
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
-      Job job;
-      {
-        std::unique_lock lk(m_);
-        if (!workCv_.wait(lk, st, [this]
-                          { return pending_.has_value(); }))
-          return;
-        job = std::move(*pending_);
-        pending_.reset();
-      }
-      if (latest_.load() != job.gen)
-        continue;
-      Result r;
-      r.gen = job.gen;
-      r.map = segmentObject(*job.req.image, job.req.imageKey, job.req.prompts,
-                            &r.error, &latest_, job.gen);
-      r.req = std::move(job.req);
-      r.req.image.reset();
-      {
-        std::lock_guard lk(m_);
-        if (latest_.load() != job.gen)
-          continue; // superseded or shut down while running
-        done_ = std::move(r);
-      }
-      if (notify_)
-        notify_();
-    }
-  }
-
-  std::mutex m_;
-  std::condition_variable_any workCv_;
-  std::optional<Job> pending_;
-  std::optional<Result> done_;
-  std::function<void()> notify_;
-  std::atomic<uint64_t> latest_{0};
-  uint64_t counter_ = 0;
-  bool outstanding_ = false;
-  std::jthread thread_;
+  SegmentRequest req;                   // image dropped; prompts + target kept
+  std::shared_ptr<const ObjectMap> map; // null on failure
+  std::string error;
 };
 
-static SegmentWorker segmentWorker;
+// Worker thread only. Always returns a value (null `map` + `error` on failure).
+static std::optional<SegmentResult> runSegmentJob(SegmentRequest &&req,
+                                                  WorkerCancel c)
+{
+  SegmentResult r;
+  r.map = segmentObject(*req.image, req.imageKey, req.prompts, &r.error,
+                        c.latest, c.gen);
+  r.req = std::move(req);
+  r.req.image.reset();
+  return r;
+}
+
+// Same protocol as RenderWorker / DecodeWorker (see latest_worker.hpp).
+using SegmentWorker = LatestWorker<SegmentRequest, SegmentResult>;
+
+static SegmentWorker segmentWorker{runSegmentJob};
 
 // UI thread: commits a finished segmentation. Prompts and map land in ONE
 // undo step. A result for a mask/part that is gone (deleted, undone away) is
