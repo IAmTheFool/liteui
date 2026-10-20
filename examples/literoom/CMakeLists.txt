@@ -3,7 +3,7 @@ add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_
     geometry.hpp curves.hpp raster_ops.hpp
     mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
     mask.hpp seg_basic.hpp
-    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp latest_worker.hpp
+    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp latest_worker.hpp thumb_worker.hpp
     file_utils.hpp image_meta.hpp image_codec.hpp histogram.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
@@ -83,6 +83,17 @@ if(LITEROOM_TESTS)
     target_compile_features(latest_worker_test PRIVATE cxx_std_20)
     target_link_libraries(latest_worker_test PRIVATE Threads::Threads)
     add_test(NAME latest_worker COMMAND latest_worker_test)
+
+    # thumb_worker.hpp decodes real files (liteui's decoder, the app's encoders in
+    # the test) on a std::jthread, so it needs both liteui and the thread library.
+    add_executable(thumb_worker_test tests/thumb_worker_test.cpp)
+    target_include_directories(thumb_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(thumb_worker_test PRIVATE cxx_std_20)
+    target_link_libraries(thumb_worker_test PRIVATE liteui::liteui Threads::Threads)
+    if(MSVC)
+        target_compile_options(thumb_worker_test PRIVATE /utf-8)
+    endif()
+    add_test(NAME thumb_worker COMMAND thumb_worker_test)
 
     # raster_ops.hpp, seg_basic.hpp, render.hpp, image_codec.hpp and histogram.hpp take liteui's CanvasImage, so
     # their tests link liteui like the app does.

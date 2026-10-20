@@ -31,6 +31,11 @@
 // couldn't reach. The undo history is not saved.
 constexpr int kSidecarVersion = 1;
 constexpr const char *kSidecarExt = ".literoom.json";
+// The sidecar file's name for a picture: "photo.jpg" -> "photo.jpg.literoom.json".
+inline std::string sidecarFileOf(const std::string &imagePath)
+{
+  return imagePath + kSidecarExt;
+}
 constexpr size_t kSidecarMaxPrompts = 256;
 constexpr int64_t kSidecarMaxMapPixels = int64_t{1} << 26; // 8192 x 8192
 
