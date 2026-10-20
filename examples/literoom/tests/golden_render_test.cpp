@@ -1008,6 +1008,145 @@ namespace golden
       fail("preview/small", "makePreviewBase returned a preview for a small picture");
   }
 
+  // ------------------------------------------------ histogram and clip overlay
+  // computeHistogram() (main.cpp) reads the editor state, so these scenarios
+  // drive it through `state`: the picture on screen, the overlay switches, the
+  // mid-drag preview. They fingerprint the four histograms, the clip bits and
+  // the overlay picture, i.e. everything histogram.hpp produces.
+  static std::string histogramText()
+  {
+    std::string t;
+    auto row = [&t](const char *tag, const std::array<uint32_t, 256> &a)
+    {
+      t += tag;
+      for (uint32_t v : a)
+        t += ' ' + std::to_string(v);
+      t += '\n';
+    };
+    row("R", state.histR);
+    row("G", state.histG);
+    row("B", state.histB);
+    row("L", state.histL);
+    t += "clipLo=" + std::to_string(static_cast<int>(state.histClipLo)) +
+         " clipHi=" + std::to_string(static_cast<int>(state.histClipHi)) + "\n";
+    return t;
+  }
+
+  static void histogramRecord(const std::string &name)
+  {
+    putText(name + "/counts", histogramText());
+    if (state.clipOverlay)
+      putImage(name + "/overlay", *state.clipOverlay);
+    else
+      putText(name + "/overlay", "null");
+  }
+
+  // flags: bit 0 shadows, bit 1 highlights, bit 2 per-channel
+  static void histogramShot(const std::string &name, const CanvasImage &img, int flags)
+  {
+    state.image = std::make_shared<CanvasImage>(img);
+    state.previewImage.reset();
+    state.dragging = false;
+    state.clipShadowsOn = (flags & 1) != 0;
+    state.clipHighlightsOn = (flags & 2) != 0;
+    state.clipPerChannel = (flags & 4) != 0;
+    state.histStale = true;
+    computeHistogram();
+    histogramRecord(name);
+  }
+
+  // Every combination of clipped channels (columns 0..7 = channel set 0..7):
+  // rows 0..7 clip high, rows 8..15 clip low, rows 16..19 are fully transparent
+  // copies of the highs; column 8 holds a pixel that clips both ways.
+  static CanvasImage clipPatterns()
+  {
+    CanvasImage p(72, 20);
+    for (int y = 0; y < p.height; ++y)
+      for (int x = 0; x < p.width; ++x)
+      {
+        uint8_t *q = &p.pixels[(static_cast<size_t>(y) * p.width + x) * 4];
+        q[0] = q[1] = q[2] = 100;
+        q[3] = y >= 16 ? 0 : 255;
+        if (x >= 64)
+        {
+          if (y < 8)
+          {
+            q[0] = 255;
+            q[2] = 0;
+          }
+          continue;
+        }
+        const int m = x / 8;
+        const uint8_t level = (y < 8 || y >= 16) ? 255 : 0;
+        if (m & 1)
+          q[0] = level;
+        if (m & 2)
+          q[1] = level;
+        if (m & 4)
+          q[2] = level;
+      }
+    return p;
+  }
+
+  static void histogramScenarios(const CanvasImage &img)
+  {
+    const char *flagNames[] = {"off", "shadows", "highlights", "both", "perchannel_off", "perchannel_shadows",
+                               "perchannel_highlights", "perchannel_both"};
+    const int flagSets[] = {0, 1, 2, 3, 4, 5, 6, 7};
+    for (int i = 0; i < 8; ++i)
+    {
+      histogramShot(std::string("histogram/scene_") + flagNames[i], img, flagSets[i]);
+      histogramShot(std::string("histogram/patterns_") + flagNames[i], clipPatterns(), flagSets[i]);
+    }
+
+    // Larger than the 300000-sample budget: strided counting (stride 2). A
+    // clipped pixel off the grid is missed by the histogram, not by the overlay.
+    CanvasImage big = makeScene(1300, 1000, 7);
+    for (int i = 0; i < 4; ++i)
+    {
+      uint8_t *q = &big.pixels[(static_cast<size_t>(1 + i * 40) * big.width + 1 + i * 40) * 4];
+      q[0] = 255;
+      q[1] = 0;
+      q[2] = 128; // (1,1), (41,41), ...: odd coordinates, off the stride-2 grid
+    }
+    histogramShot("histogram/big_both", big, 3);
+    histogramShot("histogram/big_perchannel", big, 7);
+
+    // 768000 pixels: sqrt(768000 / 300000) = 1.6 truncates to stride 1.
+    histogramShot("histogram/stride1_both", makeScene(1024, 750, 6), 3);
+
+    // Wider than the 2048-pixel overlay cap: block reduction (2x2) as well.
+    const CanvasImage wide = makeScene(2600, 600, 8);
+    histogramShot("histogram/wide_both", wide, 3);
+    histogramShot("histogram/wide_perchannel", wide, 7);
+
+    // Nothing to count.
+    histogramShot("histogram/empty_image", CanvasImage(), 3);
+    state.image.reset();
+    state.histStale = true;
+    state.clipShadowsOn = state.clipHighlightsOn = true;
+    computeHistogram();
+    histogramRecord("histogram/no_image");
+
+    // While a drag is in progress the preview stands in for the picture.
+    state.image = std::make_shared<CanvasImage>(img);
+    state.previewImage = std::make_shared<CanvasImage>(makeScene(100, 75, 9));
+    state.dragging = true;
+    state.clipShadowsOn = state.clipHighlightsOn = true;
+    state.clipPerChannel = false;
+    state.histStale = true;
+    computeHistogram();
+    histogramRecord("histogram/preview_dragging");
+
+    // Leave the shared state as the other scenarios expect it.
+    state.image.reset();
+    state.previewImage.reset();
+    state.dragging = false;
+    state.clipShadowsOn = state.clipHighlightsOn = state.clipPerChannel = false;
+    state.clipOverlay.reset();
+    state.histStale = true;
+  }
+
   static void runAll()
   {
     const int W = 200, H = 150; // 150 rows = two render blocks (128 + 22)
@@ -1022,6 +1161,7 @@ namespace golden
     history(img, W, H);
     helpers();
     resampling(img);
+    histogramScenarios(img);
 
     // A second, odd-sized picture: radii, blocks and maps that don't divide evenly.
     const int W2 = 97, H2 = 71;

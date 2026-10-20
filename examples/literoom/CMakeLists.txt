@@ -4,7 +4,7 @@ add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_
     mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
     mask.hpp seg_basic.hpp
     sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp
-    file_utils.hpp image_meta.hpp)
+    file_utils.hpp image_meta.hpp image_codec.hpp histogram.hpp)
 target_link_libraries(literoom PRIVATE liteui::liteui)
 
 if(MSVC)
@@ -74,9 +74,9 @@ if(LITEROOM_TESTS)
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
 
-    # raster_ops.hpp, seg_basic.hpp and render.hpp take liteui's CanvasImage, so
+    # raster_ops.hpp, seg_basic.hpp, render.hpp, image_codec.hpp and histogram.hpp take liteui's CanvasImage, so
     # their tests link liteui like the app does.
-    foreach(t raster_ops seg_basic render)
+    foreach(t raster_ops seg_basic render image_codec histogram)
         add_executable(${t}_test tests/${t}_test.cpp)
         target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${t}_test PRIVATE cxx_std_20)

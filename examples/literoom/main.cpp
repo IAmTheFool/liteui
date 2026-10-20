@@ -34,6 +34,8 @@
 // test in tests/ (see CMakeLists.txt).
 #include "file_utils.hpp"
 #include "image_meta.hpp"
+#include "image_codec.hpp"
+#include "histogram.hpp"
 #include "pixel_math.hpp"
 #include "adjustments.hpp"
 #include "color_mix.hpp"
@@ -79,20 +81,13 @@ constexpr float kCropHitPx = 10.0f;   // handle grab tolerance, screen px
 // Color Mixer tab width (the engine constants live in color_mix.hpp).
 constexpr float kMixTabW = 46.0f;         // Hue/Sat/Lum tab width (3 + gaps = 150)
 
-// Histogram: at most ~kHistMaxSamples pixels are visited per recompute
-// (strided grid), so it stays cheap on full-resolution images.
-constexpr int kHistMaxSamples = 300000;
+// Histogram canvas height (the counting constants live in histogram.hpp).
 constexpr float kHistHeightPx = 80.0f;
 
-// Clipping warnings: corner triangles on the histogram + canvas overlay.
-constexpr float kHistTriPx = 9.0f;        // triangle leg length
-constexpr float kHistTriHitPx = 18.0f;    // click zone in each top corner
-constexpr int kClipOverlayMaxEdge = 2048; // overlay resolution cap (long edge)
-constexpr Color kColorClipShadow{60, 110, 255, 255};
-constexpr Color kColorClipHighlight{235, 50, 50, 255};
-
-// Channel bits for clipping masks.
-constexpr uint8_t kChanR = 1, kChanG = 2, kChanB = 4;
+// Clipping warnings: corner triangles on the histogram (the canvas overlay's
+// constants live in histogram.hpp too).
+constexpr float kHistTriPx = 9.0f;     // triangle leg length
+constexpr float kHistTriHitPx = 18.0f; // click zone in each top corner
 
 // Tone curve editor (canvas is square, kCurveSizePx on a side; the plot area
 // is inset by kCurvePadPx so the end points aren't clipped).
@@ -2662,374 +2657,6 @@ static void openImage()
   setStatus("Opening " + baseName(*path) + "...", /*isError=*/false);
   decodeWorker.submit(*path);
 }
-
-// ---------------- PNG export ----------------
-// liteui.hpp only ships image *decoding* (see liteui_image::decodeFile
-// above) — no encoder — so exporting is a small amount of platform code
-// here, using the same libraries liteui.hpp already links in for us
-// (libpng on Linux via CMakeLists' PkgConfig::PNG, WIC on Windows).
-
-#if defined(_WIN32)
-
-static bool encodePngFile(const std::string &path, const CanvasImage &img,
-                          std::string *errorOut)
-{
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr))
-  {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return false;
-  }
-
-  IWICStream *stream = nullptr;
-  IWICBitmapEncoder *encoder = nullptr;
-  IWICBitmapFrameEncode *frame = nullptr;
-  bool ok = false;
-  do
-  {
-    if (FAILED(factory->CreateStream(&stream)))
-      break;
-    if (FAILED(stream->InitializeFromFilename(toWide(path).c_str(),
-                                              GENERIC_WRITE)))
-      break;
-    if (FAILED(
-            factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)))
-      break;
-    if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache)))
-      break;
-    if (FAILED(encoder->CreateNewFrame(&frame, nullptr)))
-      break;
-    if (FAILED(frame->Initialize(nullptr)))
-      break;
-    if (FAILED(frame->SetSize(static_cast<UINT>(img.width),
-                              static_cast<UINT>(img.height))))
-      break;
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
-    if (FAILED(frame->SetPixelFormat(&fmt)))
-      break;
-
-    const BYTE *src = img.pixels.data();
-    std::vector<BYTE> swizzled;
-
-    if (IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA))
-    {
-      // Encoder substituted BGRA — swap R and B.
-      swizzled.resize(img.pixels.size());
-      for (size_t i = 0; i < img.pixels.size(); i += 4)
-      {
-        swizzled[i + 0] = img.pixels[i + 2]; // B
-        swizzled[i + 1] = img.pixels[i + 1]; // G
-        swizzled[i + 2] = img.pixels[i + 0]; // R
-        swizzled[i + 3] = img.pixels[i + 3]; // A
-      }
-      src = swizzled.data();
-    }
-    else if (!IsEqualGUID(fmt, GUID_WICPixelFormat32bppRGBA))
-    {
-      break; // some other format we don't handle
-    }
-
-    if (FAILED(frame->WritePixels(
-            static_cast<UINT>(img.height), static_cast<UINT>(img.width) * 4,
-            static_cast<UINT>(img.pixels.size()), const_cast<BYTE *>(src))))
-      break;
-    if (FAILED(frame->Commit()))
-      break;
-    ok = SUCCEEDED(encoder->Commit());
-  } while (false);
-
-  if (frame)
-    frame->Release();
-  if (encoder)
-    encoder->Release();
-  if (stream)
-    stream->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (!ok && errorOut)
-    *errorOut = "WIC: PNG encode failed";
-  return ok;
-}
-
-#else // Linux
-
-static bool encodePngFile(const std::string &path, const CanvasImage &img,
-                          std::string *errorOut)
-{
-  FILE *fp = fopen(path.c_str(), "wb");
-  if (!fp)
-  {
-    if (errorOut)
-      *errorOut = "failed to open file for writing";
-    return false;
-  }
-
-  png_structp png =
-      png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-  png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info)
-  {
-    if (png)
-      png_destroy_write_struct(&png, nullptr);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng: failed to create write struct";
-    return false;
-  }
-
-  if (setjmp(png_jmpbuf(png)))
-  {
-    png_destroy_write_struct(&png, &info);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng: error during write";
-    return false;
-  }
-
-  png_init_io(png, fp);
-  png_set_IHDR(png, info, static_cast<png_uint_32>(img.width),
-               static_cast<png_uint_32>(img.height), 8, PNG_COLOR_TYPE_RGBA,
-               PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
-               PNG_FILTER_TYPE_DEFAULT);
-  png_write_info(png, info);
-
-  std::vector<png_bytep> rows(img.height);
-  for (int y = 0; y < img.height; ++y)
-    rows[y] = const_cast<png_bytep>(img.pixels.data() +
-                                    static_cast<size_t>(y) * img.width * 4);
-  png_write_image(png, rows.data());
-  png_write_end(png, nullptr);
-
-  png_destroy_write_struct(&png, &info);
-  fclose(fp);
-  return true;
-}
-
-#endif
-
-// ---------------- JPEG export ----------------
-// Same split as PNG above: WIC on Windows, libjpeg on Linux (the library
-// liteui.hpp already links for decoding). Both encode to memory so the
-// source photo's EXIF block and ICC profile can be spliced in before the file
-// is written (see exif.hpp). JPEG has no alpha, so transparent areas (the
-// corners left by Straighten) are flattened onto white.
-
-constexpr int kJpegQualityDefault = 92;
-constexpr int kJpegMaxSide = 65500; // the format's limit is 65535
-
-// One row of the picture as packed 8-bit RGB (or BGR), alpha over white.
-static void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)
-{
-  const uint8_t *s = &img.pixels[static_cast<size_t>(y) * img.width * 4];
-  for (int x = 0; x < img.width; ++x, s += 4, dst += 3)
-  {
-    const int a = s[3];
-    int c[3];
-    for (int k = 0; k < 3; ++k)
-      c[k] = a == 255 ? s[k] : (s[k] * a + 255 * (255 - a) + 127) / 255;
-    dst[0] = static_cast<uint8_t>(bgr ? c[2] : c[0]);
-    dst[1] = static_cast<uint8_t>(c[1]);
-    dst[2] = static_cast<uint8_t>(bgr ? c[0] : c[2]);
-  }
-}
-
-// 4:4:4 (no chroma subsampling) from quality 90 up: keeps colored edges crisp.
-static bool jpegFullChroma(int quality) { return quality >= 90; }
-
-#if defined(_WIN32)
-
-static bool encodeJpegMemory(const CanvasImage &img, int quality,
-                             std::vector<uint8_t> *out, std::string *errorOut)
-{
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr))
-  {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return false;
-  }
-
-  IStream *stream = nullptr;
-  IWICBitmapEncoder *encoder = nullptr;
-  IWICBitmapFrameEncode *frame = nullptr;
-  IPropertyBag2 *props = nullptr;
-  bool ok = false;
-  do
-  {
-    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)))
-      break;
-    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr,
-                                      &encoder)))
-      break;
-    if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache)))
-      break;
-    if (FAILED(encoder->CreateNewFrame(&frame, &props)))
-      break;
-
-    {
-      PROPBAG2 opt;
-      ZeroMemory(&opt, sizeof opt);
-      opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
-      VARIANT v;
-      ZeroMemory(&v, sizeof v);
-      v.vt = VT_R4;
-      v.fltVal = static_cast<float>(quality) / 100.0f;
-      if (FAILED(props->Write(1, &opt, &v)))
-        break;
-    }
-    if (jpegFullChroma(quality))
-    { // best effort: an encoder without this option just keeps its default
-      PROPBAG2 opt;
-      ZeroMemory(&opt, sizeof opt);
-      opt.pstrName = const_cast<LPOLESTR>(L"JpegYCrCbSubsampling");
-      VARIANT v;
-      ZeroMemory(&v, sizeof v);
-      v.vt = VT_UI1;
-      v.bVal = 3; // WICJpegYCrCbSubsampling444
-      props->Write(1, &opt, &v);
-    }
-
-    if (FAILED(frame->Initialize(props)))
-      break;
-    if (FAILED(frame->SetSize(static_cast<UINT>(img.width),
-                              static_cast<UINT>(img.height))))
-      break;
-    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
-    if (FAILED(frame->SetPixelFormat(&fmt)) ||
-        !IsEqualGUID(fmt, GUID_WICPixelFormat24bppBGR))
-      break;
-
-    constexpr int kChunkRows = 64;
-    const UINT stride = static_cast<UINT>(img.width) * 3;
-    std::vector<uint8_t> rows(static_cast<size_t>(stride) * kChunkRows);
-    bool wrote = true;
-    for (int y = 0; y < img.height && wrote; y += kChunkRows)
-    {
-      const int n = std::min(kChunkRows, img.height - y);
-      for (int r = 0; r < n; ++r)
-        flattenRow(img, y + r, &rows[static_cast<size_t>(r) * stride], true);
-      wrote = SUCCEEDED(frame->WritePixels(static_cast<UINT>(n), stride,
-                                           static_cast<UINT>(stride * n),
-                                           rows.data()));
-    }
-    if (!wrote)
-      break;
-    if (FAILED(frame->Commit()) || FAILED(encoder->Commit()))
-      break;
-
-    STATSTG st;
-    HGLOBAL hg = nullptr;
-    if (FAILED(stream->Stat(&st, STATFLAG_NONAME)) ||
-        FAILED(GetHGlobalFromStream(stream, &hg)) || !hg)
-      break;
-    const void *p = GlobalLock(hg);
-    if (!p)
-      break;
-    out->assign(static_cast<const uint8_t *>(p),
-                static_cast<const uint8_t *>(p) + st.cbSize.QuadPart);
-    GlobalUnlock(hg);
-    ok = true;
-  } while (false);
-
-  if (props)
-    props->Release();
-  if (frame)
-    frame->Release();
-  if (encoder)
-    encoder->Release();
-  if (stream)
-    stream->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (!ok && errorOut)
-    *errorOut = "WIC: JPEG encode failed";
-  return ok;
-}
-
-#else // Linux
-
-struct JpegEncErr
-{
-  jpeg_error_mgr pub; // must be first: libjpeg hands back a jpeg_error_mgr*
-  jmp_buf jump;
-  char msg[JMSG_LENGTH_MAX] = {0};
-};
-static void jpegEncErrExit(j_common_ptr c)
-{
-  auto *e = reinterpret_cast<JpegEncErr *>(c->err);
-  (*c->err->format_message)(c, e->msg);
-  longjmp(e->jump, 1); // libjpeg's default would exit() the whole app
-}
-
-static bool encodeJpegMemory(const CanvasImage &img, int quality,
-                             std::vector<uint8_t> *out, std::string *errorOut)
-{
-  jpeg_compress_struct cinfo;
-  JpegEncErr jerr;
-  struct
-  {
-    unsigned char *buf = nullptr;
-    unsigned long size = 0;
-  } dest;
-  std::vector<uint8_t> row(static_cast<size_t>(img.width) * 3);
-
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpegEncErrExit;
-  if (setjmp(jerr.jump))
-  {
-    jpeg_destroy_compress(&cinfo);
-    std::free(dest.buf);
-    if (errorOut)
-      *errorOut = std::string("libjpeg: ") + jerr.msg;
-    return false;
-  }
-  jpeg_create_compress(&cinfo);
-  jpeg_mem_dest(&cinfo, &dest.buf, &dest.size);
-  cinfo.image_width = static_cast<JDIMENSION>(img.width);
-  cinfo.image_height = static_cast<JDIMENSION>(img.height);
-  cinfo.input_components = 3;
-  cinfo.in_color_space = JCS_RGB;
-  jpeg_set_defaults(&cinfo);
-  jpeg_set_quality(&cinfo, quality, TRUE);
-  if (jpegFullChroma(quality))
-  {
-    cinfo.comp_info[0].h_samp_factor = 1;
-    cinfo.comp_info[0].v_samp_factor = 1;
-  }
-  jpeg_start_compress(&cinfo, TRUE);
-  while (cinfo.next_scanline < cinfo.image_height)
-  {
-    flattenRow(img, static_cast<int>(cinfo.next_scanline), row.data(), false);
-    JSAMPROW rp = row.data();
-    jpeg_write_scanlines(&cinfo, &rp, 1);
-  }
-  jpeg_finish_compress(&cinfo);
-  jpeg_destroy_compress(&cinfo);
-  out->assign(dest.buf, dest.buf + dest.size);
-  std::free(dest.buf);
-  return true;
-}
-
-#endif
 
 // Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the
 // EXIF block and ICC profile of the photo at `sourcePath` ride along
@@ -6140,154 +5767,23 @@ static void flushPendingAdjust()
 // canvases poll this; only the first poll of a frame does any work.
 static void refreshHistogramIfStale();
 
-// Which of R/G/B (bit 0/1/2) equal `level` in this pixel.
-static inline uint8_t channelsAt(const uint8_t *px, uint8_t level)
-{
-  return static_cast<uint8_t>((px[0] == level ? kChanR : 0) |
-                              (px[1] == level ? kChanG : 0) |
-                              (px[2] == level ? kChanB : 0));
-}
-
-// Additive mix of the channels in `mask` (1=R, 2=G, 4=B). `pastel` lightens
-// it, so shadow clipping reads differently from highlight clipping. This
-// table is the one place to tweak the palette.
-static Color clipChannelColor(uint8_t mask, bool pastel)
-{
-  static constexpr Color kMix[8] = {
-      {0, 0, 0, 0},         // none
-      {235, 50, 50, 255},   // R
-      {50, 205, 80, 255},   // G
-      {245, 220, 40, 255},  // R+G  yellow
-      {70, 120, 255, 255},  // B
-      {235, 70, 220, 255},  // R+B  magenta
-      {40, 210, 235, 255},  // G+B  cyan
-      {235, 235, 235, 255}, // R+G+B
-  };
-  Color c = kMix[mask & 7];
-  if (pastel)
-  {
-    c.r = static_cast<uint8_t>((c.r + 255) / 2);
-    c.g = static_cast<uint8_t>((c.g + 255) / 2);
-    c.b = static_cast<uint8_t>((c.b + 255) / 2);
-  }
-  return c;
-}
-
-// Doc-sized RGBA overlay for the overlays that are on. Classic mode: red /
-// blue where any channel is 255 / 0. Per-channel mode: colored by exactly
-// which channels clip (pixels clipped in all three are left untinted).
-// Images above kClipOverlayMaxEdge are reduced by blocks: a block is marked
-// if ANY pixel in it is clipped, so small specular highlights don't vanish.
-static void buildClipOverlay(const CanvasImage *img)
-{
-  if ((!state.clipShadowsOn && !state.clipHighlightsOn) || !img ||
-      img->width <= 0 || img->height <= 0)
-  {
-    state.clipOverlay.reset();
-    return;
-  }
-  const int w = img->width, h = img->height;
-  const int step = std::max(
-      1, (std::max(w, h) + kClipOverlayMaxEdge - 1) / kClipOverlayMaxEdge);
-  const int ow = (w + step - 1) / step, oh = (h + step - 1) / step;
-  auto out = std::make_shared<CanvasImage>(ow, oh);
-  const uint8_t *src = img->pixels.data();
-  for (int oy = 0; oy < oh; ++oy)
-  {
-    const int y0 = oy * step, y1 = std::min(y0 + step, h);
-    for (int ox = 0; ox < ow; ++ox)
-    {
-      const int x0 = ox * step, x1 = std::min(x0 + step, w);
-      // Bit m set = some pixel in the block is clipped in exactly the
-      // channel set m (bit 0 = R, 1 = G, 2 = B; m = 0 means unclipped).
-      uint8_t hiSeen = 0, loSeen = 0;
-      for (int y = y0; y < y1; ++y)
-      {
-        const uint8_t *row = src + static_cast<size_t>(y) * w * 4;
-        for (int x = x0; x < x1; ++x)
-        {
-          const uint8_t *px = row + static_cast<size_t>(x) * 4;
-          if (px[3] == 0)
-            continue;
-          hiSeen |= static_cast<uint8_t>(1u << channelsAt(px, 255));
-          loSeen |= static_cast<uint8_t>(1u << channelsAt(px, 0));
-        }
-      }
-      Color col;
-      auto pick = [&](uint8_t seen, bool pastel, const Color &classic)
-      {
-        if (state.clipPerChannel)
-        {
-          const uint8_t partial = seen & 0x7E; // masks 1..6; 7 = all, skipped
-          if (!partial)
-            return false;
-          uint8_t m = 1;
-          while (!(partial & (1u << m)))
-            ++m; // lowest clipped-channel set present
-          col = clipChannelColor(m, pastel);
-          return true;
-        }
-        if (!(seen & 0xFE)) // any clipped channel at all
-          return false;
-        col = classic;
-        return true;
-      };
-      if (!(state.clipHighlightsOn && pick(hiSeen, false, kColorClipHighlight)) &&
-          !(state.clipShadowsOn && pick(loSeen, true, kColorClipShadow)))
-        continue;
-      uint8_t *o = out->pixels.data() + (static_cast<size_t>(oy) * ow + ox) * 4;
-      o[0] = col.r;
-      o[1] = col.g;
-      o[2] = col.b;
-      o[3] = 255;
-    }
-  }
-  state.clipOverlay = std::move(out);
-}
-
-// Rebuilds the R/G/B/luma histograms from the image currently on screen,
-// visiting at most ~kHistMaxSamples pixels on a regular grid. Fully
-// transparent pixels (straighten's empty corners) are skipped.
+// Rebuilds the R/G/B/luma histograms and the clipping overlay from the image
+// currently on screen (the mid-drag preview, or the full-resolution result).
+// The counting and the overlay are histogram.hpp; this only picks the image
+// and stores the results where the histogram and canvas painters read them.
 static void computeHistogram()
 {
-  state.histR.fill(0);
-  state.histG.fill(0);
-  state.histB.fill(0);
-  state.histL.fill(0);
-
   const CanvasImage *img =
       state.showPreview() ? state.previewImage.get() : state.image.get();
-  if (img && img->width > 0 && img->height > 0)
-  {
-    const double total = static_cast<double>(img->width) * img->height;
-    const int step =
-        std::max(1, static_cast<int>(std::sqrt(total / kHistMaxSamples)));
-    const uint8_t *p = img->pixels.data();
-    for (int y = 0; y < img->height; y += step)
-    {
-      const uint8_t *row = p + static_cast<size_t>(y) * img->width * 4;
-      for (int x = 0; x < img->width; x += step)
-      {
-        const uint8_t *px = row + static_cast<size_t>(x) * 4;
-        if (px[3] == 0)
-          continue;
-        ++state.histR[px[0]];
-        ++state.histG[px[1]];
-        ++state.histB[px[2]];
-        // Rec. 601 luma, integer math.
-        ++state.histL[(px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8];
-      }
-    }
-  }
-  // Channels with any clipped pixel, from the end bins of the histograms.
-  state.histClipLo = static_cast<uint8_t>((state.histR[0] ? kChanR : 0) |
-                                          (state.histG[0] ? kChanG : 0) |
-                                          (state.histB[0] ? kChanB : 0));
-  state.histClipHi = static_cast<uint8_t>((state.histR[255] ? kChanR : 0) |
-                                          (state.histG[255] ? kChanG : 0) |
-                                          (state.histB[255] ? kChanB : 0));
-
-  buildClipOverlay(img);
+  const histogram::Counts c = histogram::compute(img);
+  state.histR = c.r;
+  state.histG = c.g;
+  state.histB = c.b;
+  state.histL = c.l;
+  state.histClipLo = c.clipLo;
+  state.histClipHi = c.clipHi;
+  state.clipOverlay = histogram::clipOverlay(
+      img, {state.clipShadowsOn, state.clipHighlightsOn, state.clipPerChannel});
   state.histStale = false;
   ++state.histVersion;
 }
@@ -6350,7 +5846,7 @@ static void paintHistogram(CanvasContext &ctx)
   auto triangle = [&](bool left, uint8_t mask, bool overlayOn)
   {
     const float s = kHistTriPx, m = 3.0f;
-    const Color c = mask ? clipChannelColor(mask, false) : Color{90, 90, 95, 255};
+    const Color c = mask ? histogram::clipChannelColor(mask, false) : Color{90, 90, 95, 255};
     const float x0 = left ? m : W - m;
     const float dx = left ? s : -s;
     auto path = [&]
