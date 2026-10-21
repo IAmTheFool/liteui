@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 
 // Exposure range (percentage; scales each R/G/B channel multiplicatively,
 // applied before brightness's flat offset — see kAdjustmentSpecs below).

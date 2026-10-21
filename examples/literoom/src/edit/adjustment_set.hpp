@@ -11,17 +11,17 @@
 #include <utility>
 #include <vector>
 
-#include "adjustments.hpp"
-#include "color_grade.hpp"
-#include "color_mix.hpp"
-#include "color_pass.hpp"
-#include "curves.hpp"
-#include "geometry.hpp"
-#include "mask.hpp"
-#include "minijson.hpp"
-#include "neighbor_fx.hpp"
-#include "render_params.hpp"
-#include "sidecar.hpp"
+#include "color/color_grade.hpp"
+#include "color/color_mix.hpp"
+#include "color/color_pass.hpp"
+#include "color/curves.hpp"
+#include "core/adjustments.hpp"
+#include "core/geometry.hpp"
+#include "detail/neighbor_fx.hpp"
+#include "edit/render_params.hpp"
+#include "io/minijson.hpp"
+#include "io/sidecar.hpp"
+#include "mask/mask.hpp"
 
 // Undo history: at most this many steps can be undone; older ones are
 // dropped as new edits come in. (A drag on one slider is a single step.)

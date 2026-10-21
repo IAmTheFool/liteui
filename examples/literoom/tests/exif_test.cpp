@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. exif_test.cpp -o exif_test && ./exif_test
-#include "exif.hpp"
+#include "io/exif.hpp"
 #include <cstdio>
 #include <random>
 

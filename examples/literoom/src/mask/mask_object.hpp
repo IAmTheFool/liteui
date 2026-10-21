@@ -13,8 +13,8 @@
 #include <mutex>
 #include <vector>
 
-#include "geometry.hpp"
-#include "mask_raster.hpp"
+#include "core/geometry.hpp"
+#include "mask/mask_raster.hpp"
 
 // Object masks
 constexpr int kObjectMapEdge = 1024;       // long side of a stored/warped map

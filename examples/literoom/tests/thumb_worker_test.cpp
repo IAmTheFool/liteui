@@ -5,9 +5,9 @@
 // decoded by the real decoder. Every wait has a timeout so a broken worker fails
 // instead of hanging; CHECK is not thread-safe (check.hpp), so assertions only
 // run on the main thread.
-#include "thumb_worker.hpp"
-#include "exif.hpp"
-#include "image_codec.hpp"
+#include "workers/thumb_worker.hpp"
+#include "io/exif.hpp"
+#include "io/image_codec.hpp"
 #include "check.hpp"
 
 #include <atomic>

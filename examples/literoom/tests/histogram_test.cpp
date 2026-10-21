@@ -7,7 +7,7 @@
 #include <numeric>
 
 #include "check.hpp"
-#include "histogram.hpp"
+#include "render/histogram.hpp"
 
 static void put(CanvasImage &img, int x, int y, int r, int g, int b, int a = 255)
 {

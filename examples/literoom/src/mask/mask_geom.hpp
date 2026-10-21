@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include "geometry.hpp"
+#include "core/geometry.hpp"
 
 // Radii are a fraction of the picture's SHORTER side (the original's when
 // stored, the current picture's once mapped).

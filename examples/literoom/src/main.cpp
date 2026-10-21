@@ -1,11 +1,6 @@
 // Simple Photo Editor.
 
 #include "liteui.hpp"
-#include "sam_segmenter.hpp"
-#include "exif.hpp"
-#include "minijson.hpp"
-#include "detail_layer.hpp"
-#include "neighbor_fx.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,25 +26,44 @@
 #include <vector>
 
 // Engine headers: pure logic with no UI, each covered by its own unit
-// test in tests/ (see CMakeLists.txt).
-#include "file_utils.hpp"
-#include "image_meta.hpp"
-#include "image_codec.hpp"
-#include "histogram.hpp"
-#include "pixel_math.hpp"
-#include "adjustments.hpp"
-#include "color_mix.hpp"
-#include "color_grade.hpp"
-#include "color_pass.hpp"
-#include "geometry.hpp"
-#include "curves.hpp"
-#include "raster_ops.hpp"
-#include "mask.hpp"
-#include "seg_basic.hpp"
-#include "adjustment_set.hpp"
-#include "render.hpp"
-#include "latest_worker.hpp"
-#include "thumb_worker.hpp"
+// test in tests/ (see CMakeLists.txt). Grouped by folder, lowest layer first.
+
+// core: shared vocabulary
+#include "core/pixel_math.hpp"
+#include "core/geometry.hpp"
+#include "core/adjustments.hpp"
+#include "core/raster_ops.hpp"
+
+// color
+#include "color/color_mix.hpp"
+#include "color/color_grade.hpp"
+#include "color/color_pass.hpp"
+#include "color/curves.hpp"
+
+// detail effects
+#include "detail/detail_layer.hpp"
+#include "detail/neighbor_fx.hpp"
+
+// masks and object selection
+#include "mask/mask.hpp"
+#include "mask/seg_basic.hpp"
+#include "mask/sam_segmenter.hpp"
+
+// saving and files
+#include "io/file_utils.hpp"
+#include "io/minijson.hpp"
+#include "io/exif.hpp"
+#include "io/image_meta.hpp"
+#include "io/image_codec.hpp"
+
+// edit state and rendering
+#include "edit/adjustment_set.hpp"
+#include "render/render.hpp"
+#include "render/histogram.hpp"
+
+// background work
+#include "workers/latest_worker.hpp"
+#include "workers/thumb_worker.hpp"
 
 constexpr float kSamSoftness = 2.0f; // logit -> coverage steepness (edge softness)
 

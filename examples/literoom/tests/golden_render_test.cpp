@@ -30,11 +30,11 @@
 #include "engine/all.hpp"
 #else
 #include "liteui.hpp"
-#include "sam_segmenter.hpp"
-#include "exif.hpp"
-#include "minijson.hpp"
-#include "detail_layer.hpp"
-#include "neighbor_fx.hpp"
+#include "mask/sam_segmenter.hpp"
+#include "io/exif.hpp"
+#include "io/minijson.hpp"
+#include "detail/detail_layer.hpp"
+#include "detail/neighbor_fx.hpp"
 // main.cpp's own includes, pulled in first so that the `main` macro below
 // can't touch any of them.
 #include <algorithm>
@@ -63,15 +63,6 @@
 #include "main.cpp"
 #undef main
 #endif
-
-#include <cstdint>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <map>
-#include <sstream>
-#include <string>
-#include <vector>
 
 namespace golden
 {

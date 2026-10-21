@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstddef>
 
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 
 // ---------------- Color Grading (3-way + global wheels) ----------------
 // Lightroom-style split toning: four wheels (Shadows, Midtones, Highlights,

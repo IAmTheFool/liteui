@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. adjustments_test.cpp -o adjustments_test && ./adjustments_test
-#include "adjustments.hpp"
+#include "core/adjustments.hpp"
 #include "check.hpp"
 
 #include <set>

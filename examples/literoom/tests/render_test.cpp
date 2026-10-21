@@ -1,6 +1,6 @@
 // Build: g++ -std=c++20 -I.. -I<folder with liteui.hpp> render_test.cpp -o render_test
 // render.hpp takes liteui's CanvasImage, so in CMake this test links liteui.
-#include "render.hpp"
+#include "render/render.hpp"
 #include "check.hpp"
 
 #include <random>

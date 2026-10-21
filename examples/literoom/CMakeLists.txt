@@ -1,16 +1,66 @@
-add_executable(literoom main.cpp sam_segmenter.hpp minijson.hpp exif.hpp detail_layer.hpp neighbor_fx.hpp
-    pixel_math.hpp adjustments.hpp color_mix.hpp color_grade.hpp color_pass.hpp
-    geometry.hpp curves.hpp raster_ops.hpp
-    mask_geom.hpp mask_raster.hpp mask_brush.hpp mask_range.hpp mask_object.hpp
-    mask.hpp seg_basic.hpp
-    sidecar.hpp render_params.hpp adjustment_set.hpp render.hpp latest_worker.hpp thumb_worker.hpp
-    file_utils.hpp image_meta.hpp image_codec.hpp histogram.hpp)
+# ---- Layout ----
+# All sources live under src/. That folder is the include root, so any file can
+# write  #include "mask/mask.hpp"  no matter which folder it sits in.
+set(LITEROOM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+set(LITEROOM_HEADERS
+    # core: the shared vocabulary (no dependencies on other folders)
+    src/core/pixel_math.hpp
+    src/core/geometry.hpp
+    src/core/adjustments.hpp
+    src/core/raster_ops.hpp
+
+    # color
+    src/color/color_mix.hpp
+    src/color/color_grade.hpp
+    src/color/color_pass.hpp
+    src/color/curves.hpp
+
+    # detail effects (need neighbor pixels)
+    src/detail/detail_layer.hpp
+    src/detail/neighbor_fx.hpp
+
+    # masks and object selection
+    src/mask/mask.hpp
+    src/mask/mask_geom.hpp
+    src/mask/mask_range.hpp
+    src/mask/mask_raster.hpp
+    src/mask/mask_brush.hpp
+    src/mask/mask_object.hpp
+    src/mask/seg_basic.hpp
+    src/mask/sam_segmenter.hpp
+
+    # edit state
+    src/edit/adjustment_set.hpp
+    src/edit/render_params.hpp
+
+    # rendering and analysis
+    src/render/render.hpp
+    src/render/histogram.hpp
+
+    # saving and files
+    src/io/sidecar.hpp
+    src/io/minijson.hpp
+    src/io/file_utils.hpp
+    src/io/image_codec.hpp
+    src/io/exif.hpp
+    src/io/image_meta.hpp
+
+    # background work
+    src/workers/latest_worker.hpp
+    src/workers/thumb_worker.hpp)
+
+add_executable(literoom src/main.cpp ${LITEROOM_HEADERS})
+target_include_directories(literoom PRIVATE ${LITEROOM_SRC})
 target_link_libraries(literoom PRIVATE liteui::liteui)
+
+# Show the same folder tree in Visual Studio's Solution Explorer.
+source_group(TREE ${LITEROOM_SRC} FILES src/main.cpp ${LITEROOM_HEADERS})
 
 if(MSVC)
     target_compile_options(literoom PRIVATE /utf-8)
     # Need to split main in small build functions this is temporary but works
-    target_link_options(literoom PRIVATE /STACK:8388608) 
+    target_link_options(literoom PRIVATE /STACK:8388608)
 endif()
 
 # ---- Object selection (MobileSAM via ONNX Runtime), optional ----
@@ -66,12 +116,16 @@ if(LITEROOM_TESTS)
     enable_testing()
     find_package(Threads REQUIRED)
 
+    # Tests include headers by their src-relative path ("mask/mask.hpp") and the
+    # shared harness ("check.hpp") from tests/.
+    set(LITEROOM_TEST_INCLUDES ${LITEROOM_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
     foreach(t minijson exif
               pixel_math adjustments color_mix color_grade color_pass geometry curves
               mask_geom mask_raster mask_brush mask_range mask_object mask
               sidecar render_params adjustment_set file_utils image_meta sam_segmenter)
         add_executable(${t}_test tests/${t}_test.cpp)
-        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_include_directories(${t}_test PRIVATE ${LITEROOM_TEST_INCLUDES})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
@@ -80,7 +134,7 @@ if(LITEROOM_TESTS)
     # so they link the platform thread library (a no-op on MSVC).
     foreach(t detail_layer neighbor_fx)
         add_executable(${t}_test tests/${t}_test.cpp)
-        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_include_directories(${t}_test PRIVATE ${LITEROOM_TEST_INCLUDES})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         target_link_libraries(${t}_test PRIVATE Threads::Threads)
         add_test(NAME ${t} COMMAND ${t}_test)
@@ -90,7 +144,7 @@ if(LITEROOM_TESTS)
     # test links the platform thread library (a no-op on MSVC). Run it in a loop
     # to shake out timing flakiness:  ctest -C Release -R latest_worker --repeat until-fail:50
     add_executable(latest_worker_test tests/latest_worker_test.cpp)
-    target_include_directories(latest_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(latest_worker_test PRIVATE ${LITEROOM_TEST_INCLUDES})
     target_compile_features(latest_worker_test PRIVATE cxx_std_20)
     target_link_libraries(latest_worker_test PRIVATE Threads::Threads)
     add_test(NAME latest_worker COMMAND latest_worker_test)
@@ -98,7 +152,7 @@ if(LITEROOM_TESTS)
     # thumb_worker.hpp decodes real files (liteui's decoder, the app's encoders in
     # the test) on a std::jthread, so it needs both liteui and the thread library.
     add_executable(thumb_worker_test tests/thumb_worker_test.cpp)
-    target_include_directories(thumb_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(thumb_worker_test PRIVATE ${LITEROOM_TEST_INCLUDES})
     target_compile_features(thumb_worker_test PRIVATE cxx_std_20)
     target_link_libraries(thumb_worker_test PRIVATE liteui::liteui Threads::Threads)
     if(MSVC)
@@ -110,7 +164,7 @@ if(LITEROOM_TESTS)
     # their tests link liteui like the app does.
     foreach(t raster_ops seg_basic render image_codec histogram)
         add_executable(${t}_test tests/${t}_test.cpp)
-        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_include_directories(${t}_test PRIVATE ${LITEROOM_TEST_INCLUDES})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         target_link_libraries(${t}_test PRIVATE liteui::liteui)
         if(MSVC)
@@ -126,7 +180,7 @@ if(LITEROOM_TESTS)
     #   cmake --build . --config Release --target golden_record   (once, BEFORE refactoring)
     #   ctest -C Release -R golden_render                         (after every step)
     add_executable(golden_render_test tests/golden_render_test.cpp)
-    target_include_directories(golden_render_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(golden_render_test PRIVATE ${LITEROOM_TEST_INCLUDES})
     target_compile_features(golden_render_test PRIVATE cxx_std_20)
     target_link_libraries(golden_render_test PRIVATE liteui::liteui)
     if(MSVC)

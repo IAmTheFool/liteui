@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. curves_test.cpp -o curves_test && ./curves_test
-#include "curves.hpp"
+#include "color/curves.hpp"
 #include "check.hpp"
 
 #include <algorithm>

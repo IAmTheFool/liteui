@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <vector>
 
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 
 constexpr float kCurveMinGap = 2.0f;  // min x distance between points (0..255)
 constexpr std::size_t kCurveMaxPoints = 16;

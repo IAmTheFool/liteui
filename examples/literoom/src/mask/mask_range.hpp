@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include "geometry.hpp"
+#include "core/geometry.hpp"
 
 // Luminosity range masks.
 constexpr float kLumMaxRamp = 0.5f; // soft edge width at Smoothness = 100%,

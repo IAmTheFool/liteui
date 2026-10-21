@@ -1,7 +1,7 @@
 
 // cl /std:c++20 /EHsc /O2 /W3 /I. /I..\.. tests\detail_layer_test.cpp /Fe:tests\detail_layer_test.exe /Fo:tests\
 // tests\detail_layer_test.exe
-#include "detail_layer.hpp"
+#include "detail/detail_layer.hpp"
 
 #include <cstdio>
 #include <cstdlib>

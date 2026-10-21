@@ -11,8 +11,8 @@
 #include <mutex>
 #include <vector>
 
-#include "geometry.hpp"
-#include "mask_raster.hpp"
+#include "core/geometry.hpp"
+#include "mask/mask_raster.hpp"
 
 // Brush masks (see the "Brush mask" section below). A brush's size is its
 // RADIUS as a fraction of the picture's shorter side, like the radial

@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "liteui.hpp"
-#include "mask_object.hpp"
+#include "mask/mask_object.hpp"
 
 constexpr int kSegPrepEdge = 512; // long side the stand-in segmenter works at
 constexpr int kSegTolerance = 40; // stand-in: RGB distance for "same color"

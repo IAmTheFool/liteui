@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstddef>
 
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 
 // Color Mixer (HSL): 8 hue bands x (Hue, Saturation, Luminance), each slider
 // -100..+100 (0 = untouched). See the "Color Mixer (HSL)" block below.

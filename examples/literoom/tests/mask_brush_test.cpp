@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. mask_brush_test.cpp -o mask_brush_test && ./mask_brush_test
-#include "mask_brush.hpp"
+#include "mask/mask_brush.hpp"
 #include "check.hpp"
 
 #include <random>

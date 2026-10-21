@@ -8,15 +8,15 @@
 #include <variant>
 #include <vector>
 
-#include "adjustments.hpp"
-#include "color_grade.hpp"
-#include "color_mix.hpp"
-#include "curves.hpp"
-#include "geometry.hpp"
-#include "mask_brush.hpp"
-#include "mask_geom.hpp"
-#include "mask_object.hpp"
-#include "mask_range.hpp"
+#include "core/adjustments.hpp"
+#include "color/color_grade.hpp"
+#include "color/color_mix.hpp"
+#include "color/curves.hpp"
+#include "core/geometry.hpp"
+#include "mask/mask_brush.hpp"
+#include "mask/mask_geom.hpp"
+#include "mask/mask_object.hpp"
+#include "mask/mask_range.hpp"
 
 // ---------------- Masks (local adjustments) ----------------
 // A mask is a shape plus its own set of Adjust sliders (the same table as the

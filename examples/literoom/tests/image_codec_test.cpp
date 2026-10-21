@@ -12,8 +12,8 @@
 #include <vector>
 
 #include "check.hpp"
-#include "image_codec.hpp"
-#include "image_meta.hpp"
+#include "io/image_codec.hpp"
+#include "io/image_meta.hpp"
 
 namespace fs = std::filesystem;
 using Bytes = std::vector<uint8_t>;

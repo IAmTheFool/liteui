@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. color_pass_test.cpp -o color_pass_test && ./color_pass_test
-#include "color_pass.hpp"
+#include "color/color_pass.hpp"
 #include "check.hpp"
 
 #include <random>

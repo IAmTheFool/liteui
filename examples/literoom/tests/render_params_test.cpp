@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. render_params_test.cpp -o render_params_test && ./render_params_test
-#include "render_params.hpp"
+#include "edit/render_params.hpp"
 #include "check.hpp"
 
 static Mask maskWith(AdjId id, float v)

@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. minijson_test.cpp -o minijson_test && ./minijson_test
-#include "minijson.hpp"
+#include "io/minijson.hpp"
 #include <cstdio>
 #include <cstdlib>
 

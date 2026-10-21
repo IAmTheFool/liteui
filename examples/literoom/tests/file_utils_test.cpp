@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "check.hpp"
-#include "file_utils.hpp"
+#include "io/file_utils.hpp"
 
 namespace fs = std::filesystem;
 

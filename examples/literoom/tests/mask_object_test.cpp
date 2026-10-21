@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. mask_object_test.cpp -o mask_object_test && ./mask_object_test
-#include "mask_object.hpp"
+#include "mask/mask_object.hpp"
 #include "check.hpp"
 
 #include <random>

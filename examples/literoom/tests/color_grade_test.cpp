@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. color_grade_test.cpp -o color_grade_test && ./color_grade_test
-#include "color_grade.hpp"
+#include "color/color_grade.hpp"
 #include "check.hpp"
 
 static constexpr size_t S = static_cast<size_t>(GradeRange::Shadows);

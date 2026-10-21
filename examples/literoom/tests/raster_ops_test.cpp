@@ -1,8 +1,8 @@
 // Build: g++ -std=c++20 -I.. -I<folder with liteui.hpp> raster_ops_test.cpp -o raster_ops_test
 // raster_ops.hpp only needs liteui.hpp for the CanvasImage struct, so in CMake
 // this test links liteui::liteui like the app does.
-#include "raster_ops.hpp"
-#include "exif.hpp"
+#include "core/raster_ops.hpp"
+#include "io/exif.hpp"
 #include "check.hpp"
 
 #include <atomic>

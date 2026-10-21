@@ -45,7 +45,7 @@
 
 #pragma once
 
-#include "detail_layer.hpp"
+#include "detail/detail_layer.hpp"
 
 #include <algorithm>
 #include <array>

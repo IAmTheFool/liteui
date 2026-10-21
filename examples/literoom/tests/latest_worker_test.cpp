@@ -5,7 +5,7 @@
 // worker fails the test instead of hanging it. CHECK is not thread-safe
 // (check.hpp), so assertions only ever run on the main thread; the worker
 // thread only records into atomics / mutex-guarded state.
-#include "latest_worker.hpp"
+#include "workers/latest_worker.hpp"
 #include "check.hpp"
 
 #include <chrono>

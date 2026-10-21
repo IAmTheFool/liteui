@@ -9,14 +9,15 @@
 #include <memory>
 #include <vector>
 
-#include "adjustment_set.hpp"
-#include "color_pass.hpp"
-#include "detail_layer.hpp"
 #include "liteui.hpp"
-#include "mask.hpp"
-#include "neighbor_fx.hpp"
-#include "pixel_math.hpp"
-#include "render_params.hpp"
+
+#include "color/color_pass.hpp"
+#include "core/pixel_math.hpp"
+#include "detail/detail_layer.hpp"
+#include "detail/neighbor_fx.hpp"
+#include "edit/adjustment_set.hpp"
+#include "edit/render_params.hpp"
+#include "mask/mask.hpp"
 
 // Applies one mask to the rows held in `q` (`n` bytes = whole rows, the first
 // of which is image row `y0`). Per row: find the span the shape touches, copy

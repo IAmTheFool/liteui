@@ -1,6 +1,6 @@
 // Build: g++ -std=c++20 -I.. -I<folder with liteui.hpp> seg_basic_test.cpp -o seg_basic_test
 // seg_basic.hpp takes liteui's CanvasImage, so in CMake this test links liteui.
-#include "seg_basic.hpp"
+#include "mask/seg_basic.hpp"
 #include "check.hpp"
 
 #include <atomic>

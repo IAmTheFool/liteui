@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. mask_geom_test.cpp -o mask_geom_test && ./mask_geom_test
-#include "mask_geom.hpp"
+#include "mask/mask_geom.hpp"
 #include "check.hpp"
 
 #include <random>

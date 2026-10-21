@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. pixel_math_test.cpp -o pixel_math_test && ./pixel_math_test
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 #include "check.hpp"
 
 static void testSmoothStep()

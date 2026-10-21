@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. mask_range_test.cpp -o mask_range_test && ./mask_range_test
-#include "mask_range.hpp"
+#include "mask/mask_range.hpp"
 #include "check.hpp"
 
 #include <vector>

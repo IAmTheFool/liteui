@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. geometry_test.cpp -o geometry_test && ./geometry_test
-#include "geometry.hpp"
+#include "core/geometry.hpp"
 #include "check.hpp"
 
 #include <random>

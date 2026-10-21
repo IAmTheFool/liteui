@@ -13,13 +13,13 @@
 #include <utility>
 #include <vector>
 
-#include "adjustments.hpp"
-#include "color_grade.hpp"
-#include "color_mix.hpp"
-#include "curves.hpp"
-#include "geometry.hpp"
-#include "mask.hpp"
-#include "minijson.hpp"
+#include "core/adjustments.hpp"
+#include "color/color_grade.hpp"
+#include "color/color_mix.hpp"
+#include "color/curves.hpp"
+#include "core/geometry.hpp"
+#include "mask/mask.hpp"
+#include "io/minijson.hpp"
 
 // ---------------- Saved edits (the sidecar file's content) ----------------
 // Everything the user did to a picture, as JSON: slider values, curves, color

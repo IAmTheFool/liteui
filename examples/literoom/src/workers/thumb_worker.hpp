@@ -8,10 +8,10 @@
 // flight finishes, and results accumulate until collect() drains them.
 #pragma once
 #include "liteui.hpp"
-#include "geometry.hpp"   // Orient
-#include "raster_ops.hpp" // orientImage
-#include "file_utils.hpp" // fsPath
-#include "sidecar.hpp"    // sidecarFileOf
+#include "core/geometry.hpp"      // Orient
+#include "core/raster_ops.hpp"    // orientImage
+#include "io/file_utils.hpp"      // fsPath
+#include "io/sidecar.hpp"         // sidecarFileOf
 
 #include <algorithm>
 #include <cmath>

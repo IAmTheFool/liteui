@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. color_mix_test.cpp -o color_mix_test && ./color_mix_test
-#include "color_mix.hpp"
+#include "color/color_mix.hpp"
 #include "check.hpp"
 
 #include <cstring>

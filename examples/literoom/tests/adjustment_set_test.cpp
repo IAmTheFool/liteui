@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. adjustment_set_test.cpp -o adjustment_set_test && ./adjustment_set_test
-#include "adjustment_set.hpp"
+#include "edit/adjustment_set.hpp"
 #include "check.hpp"
 
 static void fresh(AdjustmentSet &s)

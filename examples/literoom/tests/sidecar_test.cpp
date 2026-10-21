@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. sidecar_test.cpp -o sidecar_test && ./sidecar_test
-#include "sidecar.hpp"
+#include "io/sidecar.hpp"
 #include "check.hpp"
 
 #include <random>

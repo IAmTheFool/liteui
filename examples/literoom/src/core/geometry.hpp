@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "pixel_math.hpp"
+#include "core/pixel_math.hpp"
 
 // Straighten (arbitrary-angle rotation) range in degrees; positive turns the
 // picture clockwise. Combined with the 90-degree buttons this reaches any

@@ -3,7 +3,7 @@
 //   g++ -std=c++20 -O1 -Wall -Wextra -pthread -I . tests/neighbor_fx_test.cpp -o nfx_test && ./nfx_test
 //   (add -fsanitize=thread, or -fsanitize=address,undefined, for the sanitizer runs)
 
-#include "neighbor_fx.hpp"
+#include "detail/neighbor_fx.hpp"
 
 #include <cstdio>
 #include <thread>

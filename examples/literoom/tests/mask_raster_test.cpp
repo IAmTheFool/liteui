@@ -1,5 +1,5 @@
 // Build: g++ -std=c++20 -I.. mask_raster_test.cpp -o mask_raster_test && ./mask_raster_test
-#include "mask_raster.hpp"
+#include "mask/mask_raster.hpp"
 #include "check.hpp"
 
 #include <random>

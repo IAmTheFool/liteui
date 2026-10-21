@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "geometry.hpp"
+#include "core/geometry.hpp"
 #include "liteui.hpp"
 
 // Interactive-preview sizing (see EditorState::previewBase): the preview's

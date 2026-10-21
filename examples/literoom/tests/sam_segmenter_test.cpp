@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "check.hpp"
-#include "sam_segmenter.hpp"
+#include "mask/sam_segmenter.hpp"
 
 using Rgba = std::vector<uint8_t>;
 

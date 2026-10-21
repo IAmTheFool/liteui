@@ -6,9 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "color_grade.hpp"
-#include "color_mix.hpp"
-#include "pixel_math.hpp"
+#include "color/color_grade.hpp"
+#include "color/color_mix.hpp"
+#include "core/pixel_math.hpp"
 
 constexpr float kHueShiftDegrees = 90.0f; // Hue slider +/-100 = +/- this many degrees
 constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction of the tint's chroma

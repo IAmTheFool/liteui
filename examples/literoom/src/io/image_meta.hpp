@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
-#include "exif.hpp"
-#include "file_utils.hpp"
-#include "geometry.hpp"
+#include "io/exif.hpp"
+#include "io/file_utils.hpp"
+#include "core/geometry.hpp"
 
 // How much of the source file is searched for its EXIF / ICC header segments
 // when exporting (exifOrientationOf looks at the first 256 KiB only).

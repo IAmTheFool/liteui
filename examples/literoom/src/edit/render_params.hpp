@@ -8,12 +8,12 @@
 #include <cstdint>
 #include <vector>
 
-#include "adjustments.hpp"
-#include "color_pass.hpp"
-#include "curves.hpp"
-#include "geometry.hpp"
-#include "mask.hpp"
-#include "neighbor_fx.hpp"
+#include "color/color_pass.hpp"
+#include "color/curves.hpp"
+#include "core/adjustments.hpp"
+#include "core/geometry.hpp"
+#include "detail/neighbor_fx.hpp"
+#include "mask/mask.hpp"
 
 // A mask frozen for the render thread: its shape and everything its sliders
 // boil down to. Built on the UI thread (O(256)), copied into RenderParams.
