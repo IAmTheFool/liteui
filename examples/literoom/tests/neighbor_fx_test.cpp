@@ -1,7 +1,7 @@
-// Standalone test for neighbor_fx.hpp (no UI library needed).
+// g++ -std=c++20 -O1 -Wall -Wextra -pthread -I src tests/neighbor_fx_test.cpp -o nfx_test && ./nfx_test
+// (add -fsanitize=thread, or -fsanitize=address,undefined, for the sanitizer runs)
 //
-//   g++ -std=c++20 -O1 -Wall -Wextra -pthread -I . tests/neighbor_fx_test.cpp -o nfx_test && ./nfx_test
-//   (add -fsanitize=thread, or -fsanitize=address,undefined, for the sanitizer runs)
+// Standalone test for neighbor_fx.hpp (no UI library needed).
 
 #include "detail/neighbor_fx.hpp"
 

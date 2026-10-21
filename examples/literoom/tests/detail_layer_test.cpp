@@ -1,6 +1,7 @@
-
-// cl /std:c++20 /EHsc /O2 /W3 /I. /I..\.. tests\detail_layer_test.cpp /Fe:tests\detail_layer_test.exe /Fo:tests\
+// cl /std:c++20 /EHsc /O2 /W3 /Isrc tests\detail_layer_test.cpp /Fe:tests\detail_layer_test.exe /Fo:tests\detail_layer_test.obj
 // tests\detail_layer_test.exe
+// g++ -std=c++20 -O1 -Wall -Wextra -pthread -I src tests/detail_layer_test.cpp -o dl_test && ./dl_test
+// (add -fsanitize=thread, or -fsanitize=address,undefined, for the sanitizer runs)
 #include "detail/detail_layer.hpp"
 
 #include <cstdio>

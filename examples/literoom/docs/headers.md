@@ -14,6 +14,7 @@ One entry for every engine header. Each says what the file is for, the ideas wor
 
 ## Contents
 
+- [Where things live](#where-things-live)
 - [Basics](#basics)
 - [Adjustments and the edit state](#adjustments-and-the-edit-state)
 - [Color](#color)
@@ -23,8 +24,27 @@ One entry for every engine header. Each says what the file is for, the ideas wor
 - [Rendering](#rendering)
 - [Saving and files](#saving-and-files)
 - [Background work](#background-work)
-- [Analysis](#analysis)
 - [Test support](#test-support)
+
+---
+
+## Where things live
+
+Every header sits under `src/`, which is the include root, so a header is always included by its path from `src/` (for example `#include "mask/mask.hpp"`). The entries below use bare file names; this table gives the folder for each. Header names are unique, so a bare name is enough to find one.
+
+| Folder | Headers |
+|---|---|
+| `core/` | `pixel_math`, `geometry`, `adjustments`, `raster_ops` |
+| `color/` | `color_mix`, `color_grade`, `color_pass`, `curves` |
+| `detail/` | `detail_layer`, `neighbor_fx` |
+| `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
+| `edit/` | `adjustment_set`, `render_params` |
+| `render/` | `render`, `histogram` |
+| `io/` | `sidecar`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
+| `workers/` | `latest_worker`, `thumb_worker` |
+| `tests/` | `check.hpp`, next to the test files that use it |
+
+The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
 
 ---
 
@@ -1166,7 +1186,7 @@ The pixel pass: tone tables → color pass → neighbor effects → masks, in bl
 ### `histogram.hpp`
 Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the clipping overlay. Pure functions of an image and a few flags; the editor's state is not touched. Everything is in `namespace histogram` except the constants. (Needs LiteUI for `CanvasImage` and `Color`.)
 
-**Depends on:** `liteui.hpp`. **Test:** `histogram_test`. `main.cpp`'s `computeHistogram()` picks the image on screen, calls these and stores the results.
+**Depends on:** `liteui.hpp`. **Test:** `histogram_test`. `src/main.cpp`'s `computeHistogram()` picks the image on screen, calls these and stores the results.
 
 **Constants**
 

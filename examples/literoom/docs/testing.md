@@ -40,9 +40,9 @@ Things worth knowing:
 
 ### 1. Plain unit tests (no UI, no LiteUI)
 
-One `tests/<name>_test.cpp` per header. Each is compiled on its own against the engine headers:
+One `tests/<name>_test.cpp` per header. Each is compiled on its own against the engine headers. A test includes a header by its path from `src/`, for example `#include "mask/mask_brush.hpp"`; the test targets have `src/` on their include path, and `tests/` too so that `check.hpp` is found:
 
-`minijson`, `exif`, `detail_layer`, `pixel_math`, `adjustments`, `color_mix`, `color_grade`, `color_pass`, `geometry`, `curves`, `mask_geom`, `mask_raster`, `mask_brush`, `mask_range`, `mask_object`, `mask`, `sidecar`, `render_params`, `adjustment_set`, `file_utils`, `image_meta`, `neighbor_fx`.
+`minijson`, `exif`, `pixel_math`, `adjustments`, `color_mix`, `color_grade`, `color_pass`, `geometry`, `curves`, `mask_geom`, `mask_raster`, `mask_brush`, `mask_range`, `mask_object`, `mask`, `sidecar`, `render_params`, `adjustment_set`, `file_utils`, `image_meta`, `sam_segmenter` (21 in all; `detail_layer` and `neighbor_fx` are also engine tests with no UI, but they start threads, so they are built with the thread library, see below).
 
 Tests that touch the disk (`file_utils`, `image_meta`, and also `image_codec` and `thumb_worker` below) work in a throw-away folder under the system temp directory (`literoom_<tag>_<timestamp>`), removed again when the test ends. The metadata tests build their own synthetic JPEG files (hand-made EXIF and ICC segments), so no sample photos are needed.
 
@@ -69,18 +69,20 @@ ctest --test-dir build -C Release -R thumb_worker --repeat until-fail:50
 
 This repeats the test up to 50 times and stops at the first failure.
 
-How the thread tests are written so they stay reliable:
+How `latest_worker` and `thumb_worker` are written so they stay reliable:
 
 - They use **gates and latches instead of sleeps**, and every wait has a timeout (5 to 10 s), so a broken worker fails the test instead of hanging it.
 - A short `grace()` sleep (100 ms) is used only where a *negative* check has no signal to wait for (for example "nothing was notified after the job returned nothing"). Too short a grace can hide a bug (a false pass) but can never fail a correct worker.
 - They check the properties the code's comments promise: the newest request wins, a queued job that is replaced never starts, the notify callback runs on the worker thread and **outside** the worker's lock (the test calls `collect()` from inside notify), `shutdown()` is idempotent, and destruction with work queued does not hang.
 - `latest_worker_test` ends with a stress test: 2000 submits mixed with random `invalidate()` calls, checking that a collected value is always the newest submit's.
 
+`detail_layer_test` and `neighbor_fx_test` are simpler: they start a handful of `std::thread`s, `join()` them, and compare the results on the main thread (equal planes for equal keys, identical output pictures). They use no gates and no timeouts, so a deadlock in a cache would hang the test until ctest's own timeout instead of failing it, and a data race is only caught by a thread-sanitizer run (see [Sanitizers](#sanitizers)).
+
 ### 3. The golden render test
 
-This is the safety net for refactoring `main.cpp`, and it works differently from the others.
+This is the safety net for refactoring `src/main.cpp`, and it works differently from the others.
 
-It compiles `main.cpp` itself (with `main()` renamed so the test can have its own), renders roughly **230** picture/edit combinations (the test prints the exact count at the end of every run), and **fingerprints** each result. It then compares the fingerprints with a saved "golden" file.
+It compiles `src/main.cpp` itself (with `main()` renamed so the test can have its own), renders roughly **230** picture/edit combinations (the test prints the exact count at the end of every run), and **fingerprints** each result. It then compares the fingerprints with a saved "golden" file.
 
 The idea: if you restructure code and the pixels come out bit-for-bit the same, the fingerprints match and the test passes. If a refactoring changes even one pixel, you find out immediately, at the step that caused it.
 
@@ -141,9 +143,9 @@ Notes that do **not** fail the run, so read them: a scenario with no visible eff
 
 `golden_render_test --dump out_before/ --record x.txt` also writes one `.ppm` picture per image scenario (`/` in the name becomes `_`). Dump before and after a change, then compare the two folders with `cmp` or `fc /b` to see which scenario moved and look at it. Scenarios that are text (history, sidecar JSON, histogram counts, helpers) are fingerprinted but not dumped.
 
-#### Refactoring `main.cpp`
+#### Refactoring `src/main.cpp`
 
-The test includes `main.cpp` today (phase 0). It reaches into it for `renderAdjusted`, `renderWith`, `clearMaskCaches`, `segmentObjectWand`, `orientImage`, `rotateArbitrary`, `cropImage`, `makeThumb`, `makePreviewBase`, `computeHistogram()`, and the editor's global `state` (the histogram and overlay fields). When you move code out of `main.cpp` into headers, those names must stay reachable. After the split, build the test with `-DGOLDEN_USE_ENGINE_HEADERS`, which includes `engine/all.hpp` instead of `main.cpp`; nothing else in the test should need to change. `CMakeLists.txt` does not set that define yet, so add it to the `golden_render_test` target when the split happens.
+The test includes `src/main.cpp` today (phase 0); the include resolves because `src/` is on the test target's include path. It reaches into it for `renderAdjusted`, `renderWith`, `clearMaskCaches`, `segmentObjectWand`, `orientImage`, `rotateArbitrary`, `cropImage`, `makeThumb`, `makePreviewBase`, `computeHistogram()`, and the editor's global `state` (the histogram and overlay fields). When you move code out of `src/main.cpp` into headers, those names must stay reachable. After the split, build the test with `-DGOLDEN_USE_ENGINE_HEADERS`, which includes `engine/all.hpp` (that is, `src/engine/all.hpp`) instead of `src/main.cpp`; nothing else in the test should need to change. `CMakeLists.txt` does not set that define yet, so add it to the `golden_render_test` target when the split happens.
 
 The test target is built **without** `LITEROOM_ONNX`, whatever the option says (the ONNX settings are applied to the `literoom` target only), so it always uses the stand-in segmenter and never exercises the ONNX path.
 
@@ -169,8 +171,8 @@ A few habits that make this pay off:
 | `color_pass` | Which flags turn on, a neutral pass is a byte-exact no-op, white balance keeps brightness, grays stay gray, saturation +100 doubles chroma, vibrance spares vivid colors, hue direction, colorize, byte-count handling and untouched alpha. |
 | `geometry` | `rotatedDims` (expand and fit, symmetry), `GeoFrame` for all 8 orientations, straighten and crop (orthonormal, round trips, centre preserved), `geoStep` (turns, mirrors, crop following the picture), angle wrapping, `snapAngle`. |
 | `curves` | Shape through the points, monotone and no overshoot on 3000 random point sets, insert / move / remove rules (minimum gap, end points), identity detection, 20,000 random edits keep the list valid. |
-| `detail_layer` | The blur against a naive reference, flat images stay flat, radius scales with picture size, the cache (fingerprint, cancellation, eviction, threads), `addPixels` for each effect. |
-| `neighbor_fx` | Which planes a set of sliders needs, the detail part equals `detail_layer`, luminance and color noise reduction (edges kept), dehaze against a known veil, blur (monotone, mean kept), caches and cancellation, odd and tiny sizes, pieces equal the whole picture, threads. |
+| `detail_layer` | `blurLuma` against a naive reference (`refBlur`: three horizontal then three vertical box passes, replicated edges, rounding after every pass) at radii 1, 2, 5, 30 and 80 (80 is larger than the 61 × 47 test picture), off by at most one 1/16 level. A flat picture stays flat at the borders. `boxRadius` scales with picture size (a 6000 px picture gets 5 to 7 times the radius of a 1000 px one), Texture < Clarity, Sharpness ≤ Texture, never below 1 or above `kMaxBoxRadius`. Cache: a repeat request returns the very same plane, another kind gives another plane, a reused address with different pixels is told apart by the fingerprint, a cancelled build returns null and caches nothing, at most 9 entries are kept (the newest survives), and 8 threads over 3 keys get equal planes and leave exactly 3 entries. `addPixels` on a step edge, for each of Texture, Clarity and Sharpness: contrast across the edge grows, flat areas and alpha do not change, negative Texture and Clarity smooth, negative Sharpness is clamped to 0, all-zero gains leave the picture untouched and build no plane, the same amount goes into R, G and B (no hue shift), and Clarity leaves a near-white edge alone (changes ≤ 1). |
+| `neighbor_fx` | Zero gains change nothing (random bytes come back identical, `need()` is 0). The `need()` bit layout: 0 to 2 luma planes (noise reduction reads Sharpness's), 3 chroma, 4 veil, 5 to 7 blur levels. Negative Dehaze needs no map, and Blur 0 to 33 reads level 0, 34 to 66 levels 0+1, 67 to 100 levels 1+2. With only detail sliders set, `apply` equals `detail_layer::addPixels` byte for byte. Luminance noise reduction (noise ±8 beside a hard edge): flat-area noise at least halved, edge height kept above 90 %, half slider lands between, R, G and B stay equal. Color noise reduction (chroma noise at constant luma): chroma spread under 40 %, luma moves by at most 3, a hard red-to-blue edge keeps 80 % of its color difference. Dehaze on a scene veiled with known transmission 0.55 and airlight 235: error against the clear scene falls below 60 %, contrast rises 1.4 times, half strength lands between. Negative values lower contrast and raise the mean, and a haze-free picture is only mildly changed. Blur: spread falls monotonically at 20, 50 and 100, mean kept within 2 levels, slider 100 leaves under 10 % of the spread, a flat picture and slider 0 are untouched, no jump at the level boundary (33.2 vs 33.5), and a red-to-blue edge of equal luma is softened (color blur, not luma-only). Caches: a second `acquire` shares every plane, level 2 is not built at slider 50, a slider drag with the same `need()` builds nothing new, and a cancelled `acquire` returns false and leaves all three caches empty. Sizes from 1 × 1 up to 500 × 3 and 5 × 500 keep the picture size and alpha. Uneven pieces that start mid-row equal the whole picture byte for byte, and 6 threads give identical output. |
 | `mask_geom` | Radial and Linear falloff written out as formulas, feather limits, row spans cover every non-zero pixel on random shapes, round trips through random `GeoFrame`s, `applySourceEdit` leaves unrelated fields untouched. |
 | `mask_raster` | Reading a coverage map at the same size (exact) and at another size (bilinear), row spans cover every non-zero pixel, empty and out-of-range rows. |
 | `mask_brush` | A single dab, density, painting and erasing arithmetic (including rounding), flow build-up, map size caps, spans, incremental rasterizing equals a full one, the LRU cache. |
@@ -185,7 +187,7 @@ A few habits that make this pay off:
 | `file_utils` | Paths and UTF-8, extensions, natural order (and its deterministic tie-break), `readFilePrefix`, atomic writes (failure cases, no leftover temp file), `listImageFiles`. |
 | `image_meta` | `exifOrientationOf` (all 8 values, both byte orders, bad input, the 256 KiB window) and `embedSourceMetadata` (layout, patched sizes, the old thumbnail erased, refusals). |
 | `raster_ops` | Crop, quarter turns and mirror, `orientImage` and `cropImage` checked pixel by pixel against `GeoFrame` and the EXIF table, `rotateArbitrary`, the preview downsample. |
-| `sam_segmenter` | The stand-in `Segmenter` of a build without ONNX (every call fails with `built without LITEROOM_ONNX`, null `errorOut` is fine) and `sam::preprocess`, the resize / normalize / pad step `encode` feeds the model: output size for wide, tall, tiny and 1-pixel-high pictures, box average when shrinking (whole and fractional factors), nearest when enlarging, ImageNet normalization in R, G, B planes, zero padding after normalization, the raw HWC layout, alpha ignored, invalid input. |
+| `sam_segmenter` | The stand-in `Segmenter` of a build without ONNX (the test body is skipped if `LITEROOM_ONNX` is defined, which the test target never does): `load` fails with exactly `built without LITEROOM_ONNX`, `encode` and `decode` fail with a non-empty error, `loaded()` and `encoded()` stay false, a null `errorOut` is fine. `sam::preprocess`, the resize / normalize / pad step `encode` feeds the model: output size for wide, tall, tiny and 1-pixel-high pictures, buffer size per layout (rank 4 the full padded square, rank 3 only the resized picture), box average when shrinking (whole and fractional factors), nearest when enlarging, ImageNet normalization in R, G, B planes, zero padding after normalization at the bottom (wide) or right (tall), the raw HWC layout checked pixel-exactly at scale 1, alpha ignored in both layouts, invalid input (null pointer, zero or negative size). |
 | `seg_basic` | Preparing a picture, the color tolerance, 4-connected growth, the 5 × 5 seed patch, cancellation, the wand's prompts, reuse of the prepared picture. |
 | `render` | An untouched set reproduces the input, tone is an exact table lookup, 128-row blocks and one-row renders give the same result, cancellation, masks blend as the formula says, later masks see earlier ones. |
 | `image_codec` | `flattenRow` over white, PNG round trip (lossless, alpha kept), JPEG round trip, channel order, quality and 4:4:4 chroma, the size limit (`jpegSizeOk`; the encoder itself refuses empty and oversized pictures, so no caller can skip it), metadata embedded into real encoder output. |
@@ -199,6 +201,7 @@ A few habits that make this pay off:
 If you write a new test, these patterns will look familiar:
 
 - **A naive reference beside the fast code.** Blurs, morphology and rotations are checked against a slow, obvious version written in the test (`refBlur`, `refMorph`).
+- **Behavioral checks with loose thresholds.** `neighbor_fx` has no naive reference for its chroma, veil and blur maps. It checks what each effect should do (noise at least halved, edges kept, error against a known clear scene, monotone blur) with generous bounds. A small numeric drift in dehaze or blur would pass; a wrong direction or a lost edge would not.
 - **"The span covers every non-zero pixel"** is checked on random shapes for every mask type, because a span that is too small would silently cut off part of a mask.
 - **Written-out numbers.** Several tests (`adjustments`, `mask_geom`, `mask_range`, `mask_object`, `mask_brush`) repeat a formula and its constants from the design, so a changed constant or a refactored formula fails loudly.
 - **Cross-module ties.** `raster_ops` is checked against `GeoFrame` and the EXIF table, and mask tables against the global table builders, so two copies of the same recipe cannot drift apart.
@@ -206,14 +209,14 @@ If you write a new test, these patterns will look familiar:
 
 ## Sanitizers
 
-Several test files say they are meant to be run under the sanitizers (`adjustments`, `latest_worker`, `thumb_worker`, `neighbor_fx`, and the fuzz tests in `exif` and `sidecar`). `CMakeLists.txt` has no switch for this, so build the test by hand. Each test's first line gives its command; add the flags:
+Several test files say they are meant to be run under the sanitizers (`adjustments`, `latest_worker`, `thumb_worker`, `detail_layer`, `neighbor_fx`, and the fuzz tests in `exif` and `sidecar`). `CMakeLists.txt` has no switch for this, so build the test by hand. Each test's first line gives its command; add the flags:
 
 ```bash
-# from the tests/ folder, next to the headers' parent
-g++ -std=c++20 -I.. -g -O1 -fsanitize=address,undefined sidecar_test.cpp -o sidecar_test && ./sidecar_test
+# from the tests/ folder; -I../src is the include root (check.hpp is found next to the test)
+g++ -std=c++20 -I../src -g -O1 -fsanitize=address,undefined sidecar_test.cpp -o sidecar_test && ./sidecar_test
 
 # data races in the thread tests
-g++ -std=c++20 -I.. -g -O1 -pthread -fsanitize=thread latest_worker_test.cpp -o latest_worker_test && ./latest_worker_test
+g++ -std=c++20 -I../src -g -O1 -pthread -fsanitize=thread latest_worker_test.cpp -o latest_worker_test && ./latest_worker_test
 ```
 
 Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libraries, which is easier through CMake. On MSVC, `/fsanitize=address` is available for the address checks.
@@ -222,11 +225,11 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 
 - `image_codec` uses libpng and libjpeg on Linux and WIC on Windows, and the test exercises whichever one is compiled. A bug in the other path only shows up when you run the tests there. (`encodeJpegMemory`'s channel-order check exists because the WIC path flattens to BGR.)
 - `file_utils`' case-only tie-break check is skipped on file systems that fold case (Windows, default macOS), since both files cannot exist.
-- `detail_layer_test` carries an MSVC build line at the top; the others use `g++`.
+- `detail_layer_test` and `sam_segmenter_test` carry an MSVC (`cl`) build line at the top (`detail_layer_test` also a `g++` one for sanitizer runs); the others use `g++`. All build lines are meant to be run from the repository root, with `-I src` (and `-I tests` for tests that include `check.hpp`).
 
 ## Where a new test belongs
 
-1. **A new engine header with no UI:** add `tests/<name>_test.cpp` and add the name to the first `foreach` list in `CMakeLists.txt` (the plain unit tests).
+1. **A new engine header with no UI:** put the header in the `src/` folder for its layer (see [Where things live](headers.md#where-things-live)) and add it to `LITEROOM_HEADERS` in `CMakeLists.txt`. Then add `tests/<name>_test.cpp` and add the name to the first `foreach` list in `CMakeLists.txt` (the plain unit tests).
 2. **One that takes `CanvasImage`:** add it to the `foreach` that links `liteui::liteui`.
 3. **One that runs a thread:** link `Threads::Threads` (copy the `detail_layer`/`neighbor_fx` loop, or the `latest_worker` block), assert only on the main thread, give every wait a timeout, and loop it with `--repeat until-fail`.
 4. Start the test file with `#include "check.hpp"`, end it with `return finish();`, and put the build command in a comment on the first line, like the others.
@@ -235,6 +238,9 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 ## Known gaps and things to check
 
 - **The real model path is not tested.** `Segmenter::load`, the encoder and decoder runs and the mask pick need ONNX Runtime and a model, and the test target is built without `LITEROOM_ONNX`. `sam_segmenter_test` covers the stand-in and `sam::preprocess`; `seg_basic` tests the stand-in object selection with the same contract, and the golden test uses it too, so nothing runs the real model automatically.
-- **The `main.cpp` UI itself is not under test.** The golden test reaches the render and geometry pipeline, undo history, sidecar, histogram state and a few helpers, but not widgets, shortcuts, menus or the event loop.
+- **The `src/main.cpp` UI itself is not under test.** The golden test reaches the render and geometry pipeline, undo history, sidecar, histogram state and a few helpers, but not widgets, shortcuts, menus or the event loop.
 - **`render_test`'s second mask check** compares a gray channel value against 0.4 where it means luma. This is fine for the gray ramp it uses, but would be wrong for a colored picture.
-- **Timing.** The thread tests are timeout-guarded, but run them in a loop after touching `latest_worker.hpp` or `thumb_worker.hpp`.
+- **Timing.** The `latest_worker` and `thumb_worker` tests are timeout-guarded, but run them in a loop after touching `latest_worker.hpp` or `thumb_worker.hpp`. The `detail_layer` and `neighbor_fx` thread tests have no timeouts (see above).
+- **Input handling and guards in the neighbor effects are mostly untested.** `gainsFromValues` clamping and NaN/inf handling (in both `detail_layer` and `neighbor_fx`), `toU8`'s NaN and infinity rules, invalid arguments to `blurLuma`, `Cache::get` and the two `acquire` functions (null pixels, non-positive size, unknown kind), `apply` with `W <= 0`, and the "plane too small, skip it" guards in `addPixels`, `nrLumaPass` and `nrColorPass`.
+- **Cache limits and mid-build cancellation.** Only the entry cap of `detail_layer`'s cache (9) is checked. Its 384 MB byte cap, which entry the LRU drops, and the eviction of `chromaStore` (256 MB, 6 entries) and `mapStore` (64 MB, 40 entries) are not tested. Every cancellation test sets the generation before the build starts, so only the first cancellation check fires; none cancels part-way through a blur.
+- **Effect internals and interactions.** `kClarityLimit` soft limiting, the veil's airlight clamp (180 to 255) and transmission floor (0.25), `sampleMap` clamping, the order of effects inside `apply` (dehaze, detail, noise reduction, blur last) and interactions between effects (each is tested alone, or all at once on tiny pictures that check only size and alpha, never pairwise).

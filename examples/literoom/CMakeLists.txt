@@ -174,7 +174,8 @@ if(LITEROOM_TESTS)
     endforeach()
 
     # ---- Golden render test: the refactoring safety net ----
-    # Compiles main.cpp itself (main() renamed) and fingerprints ~180 renders.
+    # Compiles src/main.cpp itself (main() renamed) and fingerprints every render
+    # scenario (the test prints the exact count when it runs).
     # One golden file per configuration, because float results can differ
     # between compilers and flags:
     #   cmake --build . --config Release --target golden_record   (once, BEFORE refactoring)

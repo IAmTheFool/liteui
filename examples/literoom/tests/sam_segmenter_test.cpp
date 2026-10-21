@@ -2,7 +2,7 @@
 // ONNX Runtime nor a model: the stand-in Segmenter of a build without
 // LITEROOM_ONNX, and sam::preprocess (the resize / normalize / pad step that
 // Segmenter::encode feeds the encoder). The real model path is not covered.
-// cl /std:c++20 /EHsc /O2 /W3 /I. tests\sam_segmenter_test.cpp /Fe:tests\sam_segmenter_test.exe
+// cl /std:c++20 /EHsc /O2 /W3 /Isrc /Itests tests\sam_segmenter_test.cpp /Fe:tests\sam_segmenter_test.exe
 // tests\sam_segmenter_test.exe
 #include <cmath>
 #include <cstdint>
@@ -38,7 +38,7 @@ static Rgba solid(int w, int h, int r, int g, int b, int a = 255)
   return img;
 }
 
-// The same constants as Segmenter::encode (SAM's ImageNet mean / std, 0-255).
+// The same constants as sam::preprocess (SAM's ImageNet mean / std, 0-255).
 static float norm(int v, int c)
 {
   static const float mean[3] = {123.675f, 116.28f, 103.53f};

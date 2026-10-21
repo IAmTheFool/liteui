@@ -36,10 +36,19 @@ C:\User\
 ├── liteui\                               <- the repo
 │   ├── build\                            <- created by CMake (safe to delete)
 │   └── examples\literoom\
-│       ├── main.cpp                      <- the UI and the glue
-│       ├── *.hpp                         <- the engine headers (see Part 3)
-│       ├── tests\                        <- unit tests and the golden render test
 │       ├── CMakeLists.txt
+│       ├── src\                          <- all the code (see "Source layout" in Part 3)
+│       │   ├── main.cpp                  <- the UI and the glue
+│       │   ├── core\                     <- shared basics: pixel math, geometry, slider table
+│       │   ├── color\                    <- Color Mixer, Color Grading, curves, color pass
+│       │   ├── detail\                   <- texture, clarity, sharpening, noise
+│       │   ├── mask\                     <- mask shapes, brush, object selection
+│       │   ├── edit\                     <- the edit state and what the renderer needs
+│       │   ├── render\                   <- the pixel pass and the histogram
+│       │   ├── io\                       <- saved edits, JSON, files, EXIF, PNG/JPEG
+│       │   └── workers\                  <- background threads
+│       ├── tests\                        <- unit tests and the golden render test
+│       ├── docs\                         <- developer documentation (Part 3)
 │       └── models\                       <- ONLY the two .onnx files go here
 │           ├── mobile_sam.encoder.onnx
 │           └── mobile_sam.decoder.onnx
@@ -104,7 +113,7 @@ After changing code, you only need the build and run commands again.
 | `built without LITEROOM_ONNX` | Reconfigure with `-DLITEROOM_ONNX=ON` and the `ONNXRUNTIME_DIR` path. |
 | `onnxruntime was not found` (CMake error) | `ONNXRUNTIME_DIR` is wrong. It must contain `include\` and `lib\`. |
 | Models not found / `looked in ...\models` | Put both `.onnx` files in `examples\literoom\models\`, then rebuild so they get copied next to the exe. Or set the `LITEROOM_MODELS` environment variable to their folder. |
-| `encoder input is not NCHW` | You are using an old `sam_segmenter.hpp`. Use the updated one, which supports both encoder layouts. |
+| `encoder input is not NCHW` | You are using an old `src/mask/sam_segmenter.hpp`. Use the updated one, which supports both encoder layouts. |
 | `decoder lacks input '...'` | The decoder model has different input names. The message lists what it does have. |
 | `onnxruntime.dll` not found at startup | Rebuild (it is copied next to the exe after linking), or copy `lib\onnxruntime.dll` next to `literoom.exe` by hand. |
 | `?` icons in the toolbar | The file must be compiled as UTF-8. The project already adds `/utf-8` for MSVC; if you copied the code elsewhere, add it to your own build. |
@@ -406,8 +415,8 @@ Good to know:
 
 The code is organized around one idea: **the engine and the UI are separate.**
 
-- The **engine** is a set of header-only files (`*.hpp`) that describe edits and turn them into pixels. They have no window code, and each has its own unit test.
-- **`main.cpp`** is the UI shell: the window, the panes, the canvas, and the glue to the engine.
+- The **engine** is a set of header-only files (`*.hpp`) under `src/` that describe edits and turn them into pixels. They have no window code, and each has its own unit test.
+- **`src/main.cpp`** is the UI shell: the window, the panes, the canvas, and the glue to the engine.
 - **LiteUI** provides the window, widgets, canvas drawing and image decoding.
 
 The picture goes through a chain, each step built from the one before:
@@ -415,6 +424,23 @@ The picture goes through a chain, each step built from the one before:
 `original → oriented → rotated → source (cropped) → image (adjusted)`
 
 Edits are applied in a fixed order: **Tone** (one lookup table), then **Color** (one float pass), then **Detail** (neighbor-pixel effects), then **masks**. Slow work runs on background threads that only ever use "newest request wins".
+
+### Source layout
+
+Everything lives under `src/`, and `src/` is the include root: a header is always included by its path from `src/`, wherever the including file sits, for example `#include "mask/mask.hpp"`.
+
+| Folder | What is in it | Headers |
+|---|---|---|
+| `core/` | The shared vocabulary everything else builds on | `pixel_math`, `geometry`, `adjustments`, `raster_ops` |
+| `color/` | Color math and tone curves | `color_mix`, `color_grade`, `color_pass`, `curves` |
+| `detail/` | Effects that look at neighboring pixels | `detail_layer`, `neighbor_fx` |
+| `mask/` | Mask shapes, brush strokes and object selection | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
+| `edit/` | The edit state (values, undo history) and the frozen snapshot the renderer reads | `adjustment_set`, `render_params` |
+| `render/` | The pixel pass and the histogram | `render`, `histogram` |
+| `io/` | Saved edits, JSON, files, EXIF and image encoding | `sidecar`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
+| `workers/` | Background threads | `latest_worker`, `thumb_worker` |
+
+The folders form layers, listed here from lowest to highest: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`. **A folder may include headers from folders below it, never from folders above it.** If a build fails because `core/` includes something from `mask/`, a header is in the wrong place.
 
 ## 23. Documentation for developers
 
@@ -436,11 +462,13 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
 
-Before refactoring `main.cpp`, record the golden render reference once, then check after every step:
+Before refactoring `src/main.cpp`, record the golden render reference once, then check after every step:
 
 ```powershell
 cmake --build build --config Release --target golden_record
 ctest --test-dir build -C Release -R golden_render
 ```
+
+The golden test compiles `src/main.cpp` itself (with `main()` renamed), because everything in it is static and that is the only way to reach it. That is why the test targets have `src/` on their include path.
 
 See [docs/testing.md](docs/testing.md) for what each kind of test is for.

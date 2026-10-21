@@ -4,7 +4,7 @@ Two common extensions are covered here: adding a **slider** and adding a **mask 
 
 ## Adding a slider
 
-Every slider in the Adjust pane is one entry in the `kAdjustmentSpecs` table in `adjustments.hpp`. The same table also drives each mask's own sliders, the History labels, and the saved-edits file.
+Every slider in the Adjust pane is one entry in the `kAdjustmentSpecs` table in `core/adjustments.hpp`. The same table also drives each mask's own sliders, the History labels, and the saved-edits file.
 
 ### Step 1: add an `AdjId` and a table entry
 
@@ -34,13 +34,13 @@ The stage decides where the slider acts and what else you need to write.
 
 **Color sliders** also need:
 
-1. A field in `ColorPass` and the math in `makeColorPass` / `applyColorPass` (`color_pass.hpp`). `makeColorPass` takes the slider values as parameters, so add a parameter.
-2. The new value passed in at **both** call sites: `AdjustmentSet::buildColorPass()` for the global edit, and `buildMaskPasses()` in `render_params.hpp` for masks.
+1. A field in `ColorPass` and the math in `makeColorPass` / `applyColorPass` (`color/color_pass.hpp`). `makeColorPass` takes the slider values as parameters, so add a parameter.
+2. The new value passed in at **both** call sites: `AdjustmentSet::buildColorPass()` for the global edit, and `buildMaskPasses()` in `edit/render_params.hpp` for masks.
 3. The new slider included in `cp.active`, so the fast path is skipped when it is non-zero.
 
 **Detail sliders** also need:
 
-1. A new gain in `neighbor_fx::Gains` and the math in `neighbor_fx.hpp` (or `detail_layer.hpp`). Include it in `Gains::any()`: when `any()` is false the effects are skipped, and a mask with only that slider set is dropped by `buildMaskPasses`. If your effect needs a new blurred plane, add it to the set that `acquire` builds, and to `need()`.
+1. A new gain in `neighbor_fx::Gains` and the math in `detail/neighbor_fx.hpp` (or `detail/detail_layer.hpp`). Include it in `Gains::any()`: when `any()` is false the effects are skipped, and a mask with only that slider set is dropped by `buildMaskPasses`. If your effect needs a new blurred plane, add it to the set that `acquire` builds, and to `need()`.
 2. The new value passed to `neighbor_fx::gainsFromValues` at **both** call sites: `AdjustmentSet::buildRenderParams()` and `buildMaskPasses()`.
 
 ### What you get for free
@@ -74,18 +74,20 @@ You need four things:
 2. **An `Eval` struct** (like `RadialEval`): the shape resolved for one concrete image size. It needs:
    - `rowSpan(y, W, x0, x1)`: which pixels `[x0, x1)` of row `y` can be non-zero? It may return a superset. Returning "all of them" is always correct, just slower.
    - `rowWeights(y, x0, x1, out, pix)`: fill in the weights (0 to 1) for those pixels. `pix` is the row's current RGBA pixels, for shapes that depend on them.
-3. **One more enumerator in `MaskType`** (before `Count`) and **one more alternative in `MaskShape` and `MaskEval`**, in the same order, plus one more line in `maskTypeName`. If the weights read the picture's pixels, update `maskTypeUsesPixels` too. `maskShapeToSource`, `prepareMask`, `maskRowSpan` and `maskRowWeights` are generic `std::visit` functions and need no per-kind line.
-4. **The UI** (all in `main.cpp`):
+3. **One more enumerator in `MaskType`** (before `Count`; the enum and the variants live in `mask/mask.hpp`) and **one more alternative in `MaskShape` and `MaskEval`**, in the same order, plus one more line in `maskTypeName`. If the weights read the picture's pixels, update `maskTypeUsesPixels` too. `maskShapeToSource`, `prepareMask`, `maskRowSpan` and `maskRowWeights` are generic `std::visit` functions and need no per-kind line.
+4. **The UI** (all in `src/main.cpp`):
    - `newMaskShape(MaskType)`: the starting shape of a new mask of this kind.
    - A button in the Masks pane that calls `addMask(MaskType)`, and a "+ Part: ..." button that calls `addPart(MaskType)`.
    - Its Shape controls panel, shown while `selectedPartType()` is your kind.
    - Its overlay and handles (`paintMaskOverlay`, `maskPress` and friends).
 
-Also teach the **sidecar** about it: `sidecarShapeToJson` and `sidecarShapeFromJson` in `sidecar.hpp`. The loader validates and clamps everything, so keep that property for your new fields.
+Put the shape and its Eval in their own header in `mask/`, the way `mask_range.hpp` does, and include it from `mask/mask.hpp`, where the variants are declared. Add the new header to `LITEROOM_HEADERS` in `CMakeLists.txt`. It may include headers from `core/`, `color/` and other `mask/` headers, but never from `edit/` or `render/`, which sit above `mask/`. Its unit test goes in the first `foreach` list of `CMakeLists.txt` (see [testing.md](testing.md)).
+
+Also teach the **sidecar** about it: `sidecarShapeToJson` and `sidecarShapeFromJson` in `io/sidecar.hpp`. The loader validates and clamps everything, so keep that property for your new fields.
 
 ### Rules for the Eval
 
 - Keep the per-row loops plain (raw pointers, no `std::` helpers). The project does this deliberately so Debug builds stay usable.
 - If building the Eval is expensive (a bitmap, a blur), cache it, like the Brush and Object masks do, so a slider drag does not start over. Caches are small, memoized lists protected by a mutex, because renders run on worker threads.
 - Never modify a cached map after it is shared. Maps are immutable.
-- If you add a cache, empty it in `clearMaskCaches()` (`mask.hpp`) so one call still clears every mask cache.
+- If you add a cache, empty it in `clearMaskCaches()` (`mask/mask.hpp`) so one call still clears every mask cache.
