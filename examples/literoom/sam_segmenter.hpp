@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #if defined(LITEROOM_ONNX)
 #include <memory>
@@ -19,6 +20,78 @@ struct Point {
   bool fg = true;
 };
 
+// What encode() feeds the encoder, as a plain function so it can be tested
+// without ONNX Runtime or a model. Returns an empty result (nw == nh == 0) for
+// a null picture or a size <= 0.
+inline constexpr int kInputSize = 1024; // SAM's longest-side input size
+
+struct Prepared {
+  std::vector<float> data;
+  int nw = 0, nh = 0; // the picture as resized (long side kInputSize)
+  bool ok() const { return nw > 0 && nh > 0; }
+};
+
+//   rank 4: normalized NCHW 1x3xkInputSize x kInputSize, zero-padded at the
+//           bottom / right (data.size() == 3 * kInputSize^2);
+//   anything else: raw 0-255 RGB, HWC at nh x nw (data.size() == nh * nw * 3).
+// Alpha is ignored.
+inline Prepared preprocess(const uint8_t *rgba, int w, int h, int rank) {
+  Prepared out;
+  if (!rgba || w <= 0 || h <= 0)
+    return out;
+  const double scale = static_cast<double>(kInputSize) / std::max(w, h);
+  const int nw = std::max(1, static_cast<int>(std::lround(w * scale)));
+  const int nh = std::max(1, static_cast<int>(std::lround(h * scale)));
+
+  // Resize (box average when shrinking, nearest when enlarging). Rank 4:
+  // normalize, CHW, zero-padded to kInputSize x kInputSize at the bottom / right.
+  // Rank 3: raw 0-255 HWC at nh x nw (the model preprocesses itself).
+  const size_t plane = static_cast<size_t>(kInputSize) * kInputSize;
+  std::vector<float> in(rank == 4
+                            ? 3 * plane
+                            : static_cast<size_t>(nw) * nh * 3,
+                        0.0f);
+  static const float mean[3] = {123.675f, 116.28f, 103.53f};
+  static const float inv[3] = {1.0f / 58.395f, 1.0f / 57.12f, 1.0f / 57.375f};
+  for (int y = 0; y < nh; ++y) {
+    const double sy0 = static_cast<double>(y) * h / nh;
+    const double sy1 = static_cast<double>(y + 1) * h / nh;
+    const int y0 = std::min(h - 1, static_cast<int>(std::floor(sy0)));
+    const int y1 = std::min(h, std::max(y0 + 1, static_cast<int>(std::ceil(sy1))));
+    for (int x = 0; x < nw; ++x) {
+      const double sx0 = static_cast<double>(x) * w / nw;
+      const double sx1 = static_cast<double>(x + 1) * w / nw;
+      const int x0 = std::min(w - 1, static_cast<int>(std::floor(sx0)));
+      const int x1 = std::min(w, std::max(x0 + 1, static_cast<int>(std::ceil(sx1))));
+      float sum[3] = {0, 0, 0};
+      for (int yy = y0; yy < y1; ++yy) {
+        const uint8_t *row = rgba + (static_cast<size_t>(yy) * w + x0) * 4;
+        for (int xx = x0; xx < x1; ++xx, row += 4) {
+          sum[0] += row[0];
+          sum[1] += row[1];
+          sum[2] += row[2];
+        }
+      }
+      const float cnt = static_cast<float>((y1 - y0) * (x1 - x0));
+      const float v[3] = {sum[0] / cnt, sum[1] / cnt, sum[2] / cnt};
+      if (rank == 4) {
+        for (int c = 0; c < 3; ++c)
+          in[c * plane + static_cast<size_t>(y) * kInputSize + x] =
+              (v[c] - mean[c]) * inv[c];
+      } else {
+        float *o = &in[(static_cast<size_t>(y) * nw + x) * 3];
+        o[0] = v[0];
+        o[1] = v[1];
+        o[2] = v[2];
+      }
+    }
+  }
+  out.data = std::move(in);
+  out.nw = nw;
+  out.nh = nh;
+  return out;
+}
+
 #if defined(LITEROOM_ONNX)
 
 // One image encoded at a time (the embedding is kept), any number of cheap
@@ -30,7 +103,7 @@ struct Point {
 //           normalizes and pads itself (samexporter-style export).
 class Segmenter {
 public:
-  static constexpr int kInput = 1024; // SAM's longest-side input size
+  static constexpr int kInput = kInputSize;
 
   Segmenter() : env_(ORT_LOGGING_LEVEL_WARNING, "literoom") {}
 
@@ -86,53 +159,12 @@ public:
     embedding_.clear();
     if (!loaded() || !rgba || w <= 0 || h <= 0)
       return fail(err, "segmenter not ready");
-    const double scale = static_cast<double>(kInput) / std::max(w, h);
-    nw_ = std::max(1, static_cast<int>(std::lround(w * scale)));
-    nh_ = std::max(1, static_cast<int>(std::lround(h * scale)));
-
-    // Resize (box average when shrinking, nearest when enlarging). Rank 4:
-    // normalize, CHW, zero-padded to kInput x kInput at the bottom / right.
-    // Rank 3: raw 0-255 HWC at nh_ x nw_ (the model preprocesses itself).
-    const size_t plane = static_cast<size_t>(kInput) * kInput;
-    std::vector<float> in(encRank_ == 4
-                              ? 3 * plane
-                              : static_cast<size_t>(nw_) * nh_ * 3,
-                          0.0f);
-    static const float mean[3] = {123.675f, 116.28f, 103.53f};
-    static const float inv[3] = {1.0f / 58.395f, 1.0f / 57.12f, 1.0f / 57.375f};
-    for (int y = 0; y < nh_; ++y) {
-      const double sy0 = static_cast<double>(y) * h / nh_;
-      const double sy1 = static_cast<double>(y + 1) * h / nh_;
-      const int y0 = std::min(h - 1, static_cast<int>(std::floor(sy0)));
-      const int y1 = std::min(h, std::max(y0 + 1, static_cast<int>(std::ceil(sy1))));
-      for (int x = 0; x < nw_; ++x) {
-        const double sx0 = static_cast<double>(x) * w / nw_;
-        const double sx1 = static_cast<double>(x + 1) * w / nw_;
-        const int x0 = std::min(w - 1, static_cast<int>(std::floor(sx0)));
-        const int x1 = std::min(w, std::max(x0 + 1, static_cast<int>(std::ceil(sx1))));
-        float sum[3] = {0, 0, 0};
-        for (int yy = y0; yy < y1; ++yy) {
-          const uint8_t *row = rgba + (static_cast<size_t>(yy) * w + x0) * 4;
-          for (int xx = x0; xx < x1; ++xx, row += 4) {
-            sum[0] += row[0];
-            sum[1] += row[1];
-            sum[2] += row[2];
-          }
-        }
-        const float cnt = static_cast<float>((y1 - y0) * (x1 - x0));
-        const float v[3] = {sum[0] / cnt, sum[1] / cnt, sum[2] / cnt};
-        if (encRank_ == 4) {
-          for (int c = 0; c < 3; ++c)
-            in[c * plane + static_cast<size_t>(y) * kInput + x] =
-                (v[c] - mean[c]) * inv[c];
-        } else {
-          float *o = &in[(static_cast<size_t>(y) * nw_ + x) * 3];
-          o[0] = v[0];
-          o[1] = v[1];
-          o[2] = v[2];
-        }
-      }
-    }
+    Prepared p = preprocess(rgba, w, h, encRank_);
+    if (!p.ok())
+      return fail(err, "segmenter not ready");
+    nw_ = p.nw;
+    nh_ = p.nh;
+    std::vector<float> in = std::move(p.data);
     try {
       Ort::MemoryInfo mem =
           Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);

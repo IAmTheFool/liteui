@@ -1,0 +1,1559 @@
+# Header reference
+
+One entry for every engine header. Each says what the file is for, the ideas worth knowing before you edit it, and what it depends on. For the bigger picture of how they fit together, read [architecture.md](architecture.md) first.
+
+"No UI" means the header does not include `liteui.hpp` and can be tested alone. A few headers need LiteUI only for its `CanvasImage` (an RGBA8 picture) or its decoders; those are marked.
+
+**How an entry is laid out.** Each entry gives: what the file is for; what it **depends on** and which **test** covers it; its **constants** (name, type, value, meaning); its **types** (fields with type, default and range); and every **function** with its signature, inputs (type and valid range), return value, and details (rounding, cancellation, caching, what happens on bad input).
+
+**Conventions used throughout.**
+- A picture is RGBA8 (4 bytes per pixel, row-major, alpha last). Functions that take a byte count (`n`) mean bytes, not pixels, unless stated.
+- **Cancellation contract:** long routines take `const std::atomic<uint64_t> *latest, uint64_t gen` and stop early (returning false or `nullopt`) when `latest->load() != gen`. A null `latest` means "never cancel". See `latest_worker.hpp`.
+- **Rounding rule:** every float-to-byte conversion goes through `toU8Clamped` (`pixel_math.hpp`) so results stay bit-identical.
+- **Sanitizing rule:** slider values are clamped to their range and NaN/infinity become 0 (the neutral value) before they reach any table index or cast.
+
+## Contents
+
+- [Basics](#basics)
+- [Adjustments and the edit state](#adjustments-and-the-edit-state)
+- [Color](#color)
+- [Detail effects](#detail-effects)
+- [Geometry](#geometry)
+- [Masks](#masks)
+- [Rendering](#rendering)
+- [Saving and files](#saving-and-files)
+- [Background work](#background-work)
+- [Analysis](#analysis)
+- [Test support](#test-support)
+
+---
+
+## Basics
+
+### `pixel_math.hpp`
+Three tiny helpers used everywhere.
+
+**Depends on:** standard library only (`<algorithm>`, `<cassert>`, `<cmath>`, `<cstdint>`). No UI. **Test:** `pixel_math_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kDegToRad` | `constexpr double` | π / 180 | Degrees to radians. It is a `double`; code that needs a float casts it (`static_cast<float>(kDegToRad)`) |
+
+**Functions**
+
+**`inline float smoothStep01(float e0, float e1, float x)`**
+- Inputs: `e0` lower edge, `e1` upper edge (**must be greater than `e0`**), `x` the value.
+- Returns: `t²(3 − 2t)` where `t = clamp((x − e0) / (e1 − e0), 0, 1)`, so 0 at or below `e0`, 1 at or above `e1`, smooth between.
+- Edge cases: NaN `x` returns 0; ±infinity saturates to 0 or 1.
+- Gotcha: the `e1 > e0` requirement is only an `assert`, which is compiled out in Release builds. With `e1 <= e0` a Release build divides by zero.
+- Used for the tonal-range weights of Highlights, Shadows, Whites and Blacks, the soft edges of masks, and the Color Mixer and Color Grading blends.
+
+**`inline uint8_t toU8Clamped(float v)`**
+- Input: any float. Returns: a byte.
+- Rule (**the** rounding rule of the whole pipeline): NaN → 0; the value is clamped to 0..255 (so infinities saturate); then `(uint8_t)(v + 0.5f)`, i.e. round to nearest with halves rounding up (within float precision of the `+ 0.5` step).
+- Anything that turns a float into a byte should use it so results stay bit-identical. `neighbor_fx::toU8` is the same rule written without `std::` calls.
+
+---
+
+## Adjustments and the edit state
+
+### `adjustments.hpp`
+The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table (label, range, per-channel function, stage), and `AdjValues` is one value per slider (used by the global edit and by every mask). No UI, no pixels.
+
+**Depends on:** `pixel_math.hpp` (`smoothStep01`, `toU8Clamped`). **Test:** `adjustments_test`.
+
+**Three stages**
+- **Tone**: pointwise per channel (0..255 in, float out). Composed into one lookup table by `toneLutFromValues`. Runs first.
+- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`).
+- **Detail**: needs neighbor pixels. `apply` is `nullptr`; read by `detail_layer.hpp` and `neighbor_fx.hpp`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kExposureMin` / `kExposureMax` | `int` | -100 / 100 | Exposure range (percent; scales each channel) |
+| `kBrightnessMin` / `kBrightnessMax` | `int` | -100 / 100 | Brightness range (flat offset in levels) |
+| `kBipolarMin` / `kBipolarMax` | `int` | -100 / 100 | The shared range; 0 is "untouched" |
+| `kToneMin` / `kToneMax` | `int` | = `kBipolar*` | Older names for the same range, kept so old code compiles |
+
+**Types**
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `struct AdjustmentSpec`
+
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `id` | `AdjId` | Must equal the entry's position in the table |
+  | `label` | `std::string_view` | Display name (a string literal, so the table is constant-initialized) |
+  | `min`, `max` | `float` | Slider range; `min < max` is enforced at compile time |
+  | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color and Detail |
+  | `stage` | `Stage` (`Tone`, `Color`, `Detail`) | Which pass consumes it. Defaults to `Tone` |
+- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 21 floats, indexed by `adjIndex(id)`.
+
+**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 21>`). Declaration order is the sidebar order and, within Tone, the processing order.
+
+| Slider | Range | Stage | Per-channel function (x = channel 0..255, v = value) |
+|---|---|---|---|
+| Exposure | -100..100 | Tone | `x * (1 + v/100)` |
+| Brightness | -100..100 | Tone | `x + round(v)` |
+| Contrast | -100..100 | Tone | `128 + (x - 128) * (1 + v/100)` |
+| Highlights | -100..100 | Tone | `x + v * 0.6 * smoothStep01(0.4, 1, x/255)` |
+| Shadows | -100..100 | Tone | `x + v * 0.6 * (1 - smoothStep01(0, 0.6, x/255))` |
+| Whites | -100..100 | Tone | `x + v * 0.4 * smoothStep01(0.75, 1, x/255)` |
+| Blacks | -100..100 | Tone | `x + v * 0.4 * (1 - smoothStep01(0, 0.25, x/255))` |
+| Temperature, Tint, Vibrance, Saturation, Hue | -100..100 | Color | none (see `color_pass.hpp`) |
+| ColorizeHue | 0..360 (degrees) | Color | none |
+| ColorizeAmount | 0..100 | Color | none |
+| Texture, Clarity, Dehaze | -100..100 | Detail | none |
+| Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
+
+- The Highlights/Shadows/Whites/Blacks scales (0.6 / 0.4) were chosen so the curve stays monotonic. Whites and Blacks have the thinnest margin (about 0.94); raising their 0.4 much past 0.42 breaks it.
+- These four act per channel through the shared table, so they are a tone-curve approximation, not a luminance-preserving recovery.
+
+**Functions**
+
+**`constexpr size_t adjIndex(AdjId id)`**
+- Input: `id` (`AdjId`). Returns: its index as `size_t` (the position in `kAdjustmentSpecs` and `AdjValues`).
+
+**`constexpr bool adjustmentSpecsValid()`**
+- Returns `true` if entry *i* has `id == i`, every `min < max`, and every Tone entry has a non-null `apply`.
+- Evaluated by a `static_assert` right after the table, so a missing or misordered entry fails the build.
+
+**`inline AdjValues defaultAdjValues()`**
+- Returns: all sliders at 0 (value-initialized array).
+
+**`inline float sanitizedValue(const AdjustmentSpec &spec, float v)`**
+- Inputs: `spec` (supplies `min`/`max`), `v` (raw slider value, may be NaN or infinite).
+- Returns: `v` clamped to `[spec.min, spec.max]`; NaN/infinity give `0`.
+- Why: the monotonicity of the tone functions was only worked out inside the range, so a corrupt sidecar or UI bug must not get past this.
+
+**`inline std::array<uint8_t, 256> toneLutFromValues(const AdjValues &values, const std::array<float, 256> *curveLut)`**
+- Inputs:
+  - `values`: one value per slider; only Tone entries are read.
+  - `curveLut`: optional float table from `curveToLut`, or `nullptr` for no curve.
+- Returns: a 256-entry table; input level *i* maps to `lut[i]`. The same table serves R, G and B.
+- Details:
+  - For each input level, runs every Tone spec in table order. Specs whose sanitized value is 0 are skipped.
+  - **Rounds and clamps (`toU8Clamped`) after each spec**, not once at the end, so the result is bit-identical to separate per-pixel passes that each stored a byte.
+  - The optional curve is applied last, indexed by the already-rounded level, and rounded again.
+  - Shared by `AdjustmentSet::buildLut` and by masks.
+
+### `adjustment_set.hpp`
+`AdjustmentSet`: the live value of every edit, the undo/redo history, the History labels, the sidecar JSON and the `RenderParams`. No UI, no pixels. See [undo-and-history.md](undo-and-history.md).
+
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
+
+**Constants:** `kMaxUndoSteps` (`size_t`, 200): the history holds the baseline plus at most this many steps (so `historySize()` is at most 201); older steps are dropped as new edits come in.
+
+**How undo coalescing works.** A slider drags continuously (many `set()` calls per second) and LiteUI sends no drag-end event, so repeated calls for the **same control** overwrite the newest history entry instead of adding one. Dragging Exposure from -20 to +40 is one undo step. Rules:
+- Coalescing only happens while the newest step is the current one (no redo tail pending).
+- Touching a different control, any discrete edit, an undo/redo, or a jump in the History panel starts a fresh step.
+- The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
+- Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
+
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list.
+
+**Read access**
+
+| Member | Returns |
+|---|---|
+| `float get(AdjId id) const` | The slider value (no range check on `id`) |
+| `const CropRect &crop() const` | The committed crop (empty = none) |
+| `const Orient &orient() const` | Mirror and quarter turns |
+| `float angle() const` | Straighten angle, degrees clockwise |
+| `bool expand() const` | Straighten keeps the full canvas (true) or auto-crops (false) |
+| `const CurvePoints &curve(CurveChannel ch = Master) const` | One tone curve |
+| `float mix(MixChan c, size_t band) const`, `const MixValues &mixValues() const` | Color Mixer values |
+| `const ColorGrade &grade() const` | Color Grading |
+| `const MaskSet &masks() const` | The masks |
+| `GeoFrame geoFrame() const` | `makeGeoFrame(origW_, origH_, orient_, angle_, expand_, crop_)`: the identity frame until `setOriginalSize` has been called |
+| `uint64_t version() const` | Bumped by **every** change to the edit state (edit, undo, redo, jump, reset, load). The app compares it with its value at the last save/load to know whether the sidecar is stale. Not part of the undo history |
+
+**Editing members** (each call that changes something creates or updates an undo step as described above)
+
+**`void set(AdjId id, float value)`**
+- Sets one slider. The value is **stored as given** (not clamped here; `toneLutFromValues`, `makeColorPass` and the other passes sanitize it later). It does not check for "no change": a call with an unchanged value still counts as an edit (it overwrites the current step if it is the same slider, otherwise it adds one).
+
+**`void setCrop(const CropRect &c)`**
+- Commits a crop (an empty `CropRect` removes it). Always its own undo step, and a slider drag never coalesces into it. A no-op if equal to the current crop. (The header comment says "original-image coordinates", but `CropRect` elsewhere is defined on the **oriented, straightened** picture, which is what `makeGeoFrame` and `geoStep` use.)
+
+**`void setGeometry(const Orient &o, float angle, const CropRect &c)`**
+- Commits a new orientation, straighten angle and crop together (the crop is stored relative to the oriented, straightened image, so all three must change together). One undo step. No-op if all three are unchanged.
+
+**`void setAngle(float deg, bool coalesce)`**
+- Sets the straighten angle. It changes the picture's size, so **any committed crop is dropped** (undo brings it back). `coalesce = true` for a slider drag (repeated calls fold into one step); `false` for a discrete action (nudge button, reset). No-op if unchanged.
+
+**`void setExpand(bool expand)`**
+- Sets the corner mode (false = auto-crop the empty corners, true = grow the canvas). Always its own step. If the angle is non-zero the crop is dropped, since the picture just changed size. No-op if unchanged.
+
+**`void setCurve(CurveChannel ch, const CurvePoints &c, bool coalesce)`** and **`void setCurve(const CurvePoints &c, bool coalesce)`** (master shorthand)
+- Sets one tone curve. `coalesce = true` while a point is added or dragged: repeated calls for the **same channel** fold into one step until `endCurveEdit()` (or any other edit). `false` for a discrete action. No-op if unchanged.
+
+**`void resetAllCurves()`**: all four curves back to straight lines, as one step (no-op if they already are). **`void endCurveEdit()`**: the point drag ended; the next curve edit starts a fresh step.
+
+**`void setMix(MixChan c, size_t band, float value)`**
+- Sets one Color Mixer slider. A drag on the same slider folds into one step; no-op if the value is unchanged. `band` is not range-checked (it must be below `kMixBandCount`). **`void resetMix()`**: zeroes all 24 sliders as one step (no-op if already 0), labelled "Color Mix: Reset".
+
+**`void setGrade(const ColorGrade &g, int key)`**
+- Commits a grade. Repeated calls with the same non-negative `key` (the control being dragged) fold into one step until `endGradeEdit()`. `key < 0` is a discrete action (eye toggle, reset) and always its own step. No-op if unchanged. **`void endGradeEdit()`** closes the drag.
+
+**`void setMasks(const MaskSet &m, int key)`**
+- Commits a new mask list (add, delete, move, edit a slider...). `key` works as in `setGrade`; callers pack the mask index into it so two masks never share a step. No-op if equal (mask equality is cheap: object bitmaps compare by id). **`void endMaskEdit()`** closes the drag.
+
+**Loading, saving and resetting**
+
+**`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
+
+**`void reset()`**: a fresh baseline for a newly opened image: every slider, Mixer value, grade, mask, crop, orientation and angle back to neutral, curves to identity, history reduced to that one baseline step.
+
+**`mj::Json toJson() const`**: everything the user has done, as the sidecar JSON (the undo history is not included). Calls `sidecarEditsToJson`.
+
+**`bool loadJson(const mj::Json &j)`**
+- Replaces every edit with the saved ones (call after `reset()` and `setOriginalSize()`). Returns false with **nothing changed** if `j` isn't usable (not an object, or the original size isn't set). Otherwise the undo history restarts from the loaded state. Everything else is validated and clamped by `sidecarEditsFromJson`.
+
+**Undo, redo and History panel**
+- `bool canUndo() const`, `bool canRedo() const`; **`void undo()`**, **`void redo()`**: move one step and restore it; both end any drag coalescing. No-ops if impossible.
+- `size_t historySize() const`, `size_t historyIndex() const`.
+- **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
+- **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
+
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). The **first** difference found wins, checked in this order:
+1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
+2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
+3. `Tone Curve: RGB / Red / Green / Blue`.
+4. Color Mixer: more than one value changed → `Color Mix: Reset`; one value → `Color Mix: <band> <Hue|Saturation|Luminance> <value>`.
+5. `Color Grading: <Shadows|Midtones|Highlights|Global>`, or `Blending`, or `Balance`.
+6. Masks: `Add <type> Mask`, `Delete Mask`, `Reorder Masks` (exactly two positions differ and each mask now sits where the other was; checked before the per-mask loop), then per mask `Mask <n>: ` followed by `Rename`, a slider and value, `Amount <n>`, `Color Mix`, `Color Grading`, `Curve`, `On`/`Off`, `Invert`, `Parts`, or `Edit`.
+7. Anything else: `Edit`.
+
+**Building render input** (no pixels; these are what the worker thread gets copies of)
+
+**`std::array<uint8_t, 256> buildLut() const`**
+- The Tone sliders composed into one 256-entry table, then the **master** curve on top (Lightroom's order). The curve is skipped when it rounds to identity (`curveIsIdentity`), so an untouched curve gives bit-identical results. O(256) whatever the image size.
+
+**`std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const`**
+- Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what `renderWith`'s fast path checks).
+
+**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer and the grade.
+
+**`RenderParams buildRenderParams() const`**
+- Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), and `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks).
+
+### `render_params.hpp`
+`RenderParams` and `MaskPass`: everything the per-pixel pipeline needs, frozen into one small copyable value. Built from the edit state in O(256), so the UI thread builds one and hands a copy to a worker; the worker never touches the `AdjustmentSet`, which the UI thread keeps mutating. No pixels, no UI.
+
+**Depends on:** `adjustments.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `neighbor_fx.hpp`. **Test:** `render_params_test`.
+
+**Types**
+
+`struct MaskPass`: one mask frozen for the render thread.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `parts` | `std::vector<MaskPassPart>` | empty | The mask's shapes, **already mapped into the current picture**, combined left to right |
+| `invert` | `bool` | false | Adjust everything outside the shapes |
+| `amount` | `float` | 1 | 0..1; multiplies the weight |
+| `tone` | `bool` | false | Any Tone slider or curve is non-neutral, so `luts` is valid |
+| `luts` | `std::array<std::array<uint8_t, 256>, 3>` | zeros | R, G, B tone tables (only filled when `tone`) |
+| `color` | `ColorPass` | inactive | The mask's own color pass |
+| `fx` | `neighbor_fx::Gains` | all 0 | The mask's Texture, Clarity, Sharpness, Dehaze, Noise and Blur gains |
+
+`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it).
+
+**Functions**
+
+**`inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks, const GeoFrame &frame)`**
+- Inputs: the user's masks (stored against the original picture) and the `GeoFrame` of the picture being rendered.
+- Returns: one `MaskPass` per mask that is **on** and would **change something**, in list order. Shapes are mapped into the current picture here, once, on the UI thread.
+- A mask is skipped if it is disabled, has no parts, has `amount <= 0` (`amount` is clamped to 0..100 first), or has no effect (no tone, no active color pass, no neighbor effects).
+- How each part is built:
+  - `tone` is set if any Tone slider is non-zero or any of the four curves is not the identity (checked with `curveIsIdentity`).
+  - Tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
+  - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount).
+  - `fx` comes from `neighbor_fx::gainsFromValues` with the seven detail sliders.
+
+---
+
+## Color
+
+### `color_pass.hpp`
+The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization).
+
+**Depends on:** `color_grade.hpp`, `color_mix.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kHueShiftDegrees` | `float` | 90 | The Hue slider at ±100 turns colors by ±90° |
+| `kColorizeStrength` | `float` | 0.6 | Colorize Amount 100 = this fraction of the tint's chroma |
+
+**Types**
+
+`struct ColorPass`: everything the loop needs, built once per render by `makeColorPass`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `active` | `bool` | false | False = skip the whole pass (fast path) |
+| `gain[3]` | `float[3]` | {1,1,1} | White-balance gains R, G, B (already luma-normalized) |
+| `vibrance` | `float` | 0 | -1..+1 |
+| `saturation` | `float` | 1 | Multiplier: 0 gray, 1 untouched, 2 double |
+| `hue` | `bool` | false | Hue shift on; `hueM` is valid |
+| `hueM[9]` | `float[9]` | identity | Row-major 3×3 rotation about the gray axis |
+| `colorize` | `bool` | false | Colorize on; `tintVec` is valid |
+| `tintVec[3]` | `float[3]` | {0,0,0} | Luma-neutral RGB offset at full midtone weight (0..255 units) |
+| `mix` | `bool` | false | Color Mixer on; `mixLut` is valid |
+| `mixLut` | `MixLut` | zeros | Only filled when `mix` |
+| `grade` | `bool` | false | Color Grading on; `gradeLut` is valid |
+| `gradeLut` | `GradeLut` | zeros | Only filled when `grade` |
+
+**Functions**
+
+**`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f)`**
+- Inputs (all UI slider values):
+  - `temperature`, `tint`, `vibrance`, `saturation`, `hueShift`: -100..100, 0 = untouched.
+  - `mix`: the 8 × 3 Color Mixer sliders (`MixValues`).
+  - `grade`: the four-wheel `ColorGrade`.
+  - `colorizeHue`: degrees; only checked for finiteness (it wraps, so any value works).
+  - `colorizeAmount`: 0..100.
+- Returns: a `ColorPass`. If nothing is non-neutral, `active` is false and the rest is left at defaults.
+- Sanitizing: each slider is clamped to its range and NaN/infinity become 0, so the loop only ever sees finite values and its table indexes are in range. `grade` is sanitized inside `buildGradeLut`.
+- Details:
+  - Gains: `gR = (1 + 0.3 t)(1 + 0.1 n)`, `gG = 1 - 0.2 n`, `gB = (1 - 0.3 t)(1 + 0.1 n)` with `t = temperature/100`, `n = tint/100`. Then divided by the gains' luma so white balance changes color, not brightness.
+  - `saturation` field = `1 + slider/100`; `vibrance` field = `slider/100`.
+  - Hue matrix is the SVG `hueRotate` matrix with angle = `hueShift/100 × 90°`.
+  - `tintVec` = (hue color − its own luma) × `colorizeAmount/100 × 0.6 × 255`.
+  - The Mixer and Grade tables are built here (`buildMixLut`, `buildGradeLut`) only when those stages are on.
+
+**`inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)`**
+- Inputs:
+  - `cp`: the frozen pass.
+  - `p`: pointer to RGBA8 pixels, modified in place.
+  - `n`: number of **bytes** (4 per pixel), not pixels. Trailing bytes that don't make a whole pixel are left alone.
+- Returns: nothing. Alpha is never touched. Returns at once if `!cp.active`.
+- Per-pixel order and rules:
+  1. Multiply by the white-balance gains.
+  2. **Vibrance**: HSV saturation `s = (max − min)/max`. Positive vibrance scales chroma by `1 + vib(1 − s)` (muted colors most); negative by `1 + vib·s` (saturated colors most). Chroma is measured from Rec. 601 luma.
+  3. **Saturation**: chroma scaled about luma by `cp.saturation`.
+  4. **Hue**: multiply by `hueM`.
+  5. **Mixer**: clamp to 0..255, RGB → HSL, apply `hueShift`/`satMul`/`lumAdj` from `mixLut`, HSL → RGB. Pure grays (max = min) are skipped. The effect fades in with chroma (smoothstep up to `kMixChromaFull`), so near-gray noise does not become colored speckle. Luminance moves toward white (positive) or black (negative) by `lumAdj × w × kMixLumAmount`.
+  6. **Colorize**: adds `tintVec × 4·l·(1 − l)` where `l` is luma 0..1 (strongest in midtones, zero at black and white).
+  7. **Grading**: clamp to 0..255, `yi = int(luma + 0.5)`, add `gradeLut[c][yi]`.
+  8. Write back with `toU8Clamped`, once.
+- Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
+
+### `color_mix.hpp`
+The Color Mixer (HSL): eight hue bands × (Hue, Saturation, Luminance), baked into three per-hue tables (`MixLut`) of 720 entries (half-degree resolution). Pure math; the sliders' display colors stay with the UI.
+
+**Depends on:** `pixel_math.hpp`. No UI. **Test:** `color_mix_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kMixMin` / `kMixMax` | `int` | -100 / 100 | Slider range |
+| `kMixHueRangeDeg` | `float` | 30 | Hue slider ±100 = ±30° |
+| `kMixLumAmount` | `float` | 0.5 | Luminance +100 = halfway to white |
+| `kMixChromaFull` | `float` | 0.10 | Chroma (0..1) at which a pixel gets the full effect |
+| `kMixLutSize` | `int` | 720 | Table resolution (0.5°) |
+| `kMixBandCount`, `kMixChanCount` | `std::size_t` | 8, 3 | Bands and channels |
+| `kMixCenters` | `std::array<float, 9>` | 0, 30, 60, 120, 180, 240, 270, 320, 360 | Hue (degrees) at the middle of each band; the last entry closes the circle |
+
+**Types**
+- `enum class MixBand : int`: `Red, Orange, Yellow, Green, Aqua, Blue, Purple, Magenta, Count`.
+- `enum class MixChan : int`: `Hue, Saturation, Luminance, Count`.
+- `using MixValues = std::array<float, 24>`: channel-major, index = `chan * 8 + band`.
+- `struct MixLut`: three `std::array<float, 720>`:
+  - `hueShift`: degrees to add to the hue.
+  - `satMul`: multiplier on HSL saturation, always 0..2.
+  - `lumAdj`: luminance amount, -1..+1.
+
+**Functions**
+
+**`constexpr std::size_t mixIndex(MixChan c, std::size_t band)`**: flat index into `MixValues` (`c * 8 + band`). No range check on `band`.
+
+**`inline MixValues defaultMixValues()`**: all 24 sliders at 0.
+
+**`constexpr bool mixCentersValid()`**: true if `kMixCenters` starts at 0, ends at 360 and is strictly increasing (a zero-length segment would divide by zero). Checked by a `static_assert`.
+
+**`inline const char *mixBandName(std::size_t band)`**: "Red" … "Magenta"; empty string for `band >= 8`.
+
+**`inline bool mixAnyNonZero(const MixValues &m)`**: true if any of the 24 values is non-zero.
+
+**`inline bool mixChanAnyNonZero(const MixValues &m, MixChan c)`**: true if any band of channel `c` is non-zero.
+
+**`inline float mixClamped(float v)`**: clamp to `kMixMin..kMixMax`; NaN/infinity → 0.
+
+**`inline std::size_t mixLutIndex(float hueDeg)`**
+- Input: hue in degrees (any finite value; wraps).
+- Returns: nearest table index, always `0..719`. NaN/infinity → 0.
+- Always use this instead of rounding by hand: `round(hue/360 × 720)` reaches 720 for hues near 360. Here 359.9° → 0 and -0.1° → 719.
+
+**`inline MixLut buildMixLut(const MixValues &m)`**
+- Input: the 24 slider values (sanitized inside with `mixClamped`).
+- Returns: the three tables. For table entry *i* (hue = *i* × 0.5°): find the segment `[kMixCenters[j], kMixCenters[j+1])`, blend band *j* and band *j+1* (Magenta's next is Red) with `t = smoothStep01(0, 1, position in segment)`, divide by 100, then
+  - `hueShift = blend(Hue) × 30`,
+  - `satMul = 1 + blend(Saturation)`,
+  - `lumAdj = blend(Luminance)`.
+- A pixel exactly at a band center gets that band's value alone; there are no seams.
+
+### `color_grade.hpp`
+Color Grading: Shadows, Midtones, Highlights and Global wheels, baked into one per-luma table of RGB offsets (`GradeLut`). Pure math.
+
+**Depends on:** `pixel_math.hpp`. No UI. **Test:** `color_grade_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kGradeRangeCount` | `size_t` | 4 | Number of wheels |
+| `kGradeTintStrength` | `float` | 0.30 | A saturation-100 tint moves the most-shifted channel by about 27% of 255 |
+| `kGradeLumAmount` | `float` | 0.30 | Luminance ±100 = ±30% of 255 |
+| `kGradeLumaR/G/B` | `float` | 0.299 / 0.587 / 0.114 | Rec. 601 luma. **Shared with `color_pass.hpp`**: the tint is made luma-neutral with them and the table is indexed by luma computed with them, so both sides must agree |
+
+**Types**
+- `enum class GradeRange : int`: `Shadows, Midtones, Highlights, Global, Count`.
+- `struct GradeWheel`
+
+  | Field | Type | Default | Range | Meaning |
+  |---|---|---|---|---|
+  | `hue` | `float` | 0 | 0..359° (any value wraps) | Wheel puck angle |
+  | `sat` | `float` | 0 | 0..100 | Wheel puck distance |
+  | `lum` | `float` | 0 | -100..100 | Luminance offset |
+  | `visible` | `bool` | true | | The eye icon; hidden wheels contribute nothing |
+
+  Methods: `neutral()` (`sat == 0 && lum == 0`), `operator==`.
+- `struct ColorGrade`: `wheel` (`std::array<GradeWheel, 4>`), `blending` (`float`, 0..100, default 50: how softly ranges overlap), `balance` (`float`, -100..100, default 0: positive moves the crossovers toward the shadows, so the highlights wheel covers more). Methods: `anyActive()` (any visible, non-neutral wheel), `operator==`.
+- `using GradeLut = std::array<std::array<float, 256>, 3>`: per-channel (R, G, B) offsets in 0..255 units, indexed by 8-bit luma.
+
+**Functions**
+
+**`inline void gradeHueToRgb(float h, float *rgb)`**
+- Inputs: `h` hue in degrees (any value; wraps; NaN/infinity treated as 0); `rgb` pointer to **3 floats** to fill.
+- Output: the fully saturated color of that hue, channels 0..1. Also used by `makeColorPass` for Colorize.
+
+**`inline float gradeClampOr(float v, float lo, float hi, float def)`**: `v` clamped to `[lo, hi]`; NaN/infinity give `def` (the neutral value).
+
+**`inline GradeLut buildGradeLut(const ColorGrade &g)`**
+- Input: the grade. Every field is sanitized with `gradeClampOr` (NaN gives the neutral value: sat 0, lum 0, blending 50, balance 0).
+- Returns: the per-luma offset table.
+- How it is built:
+  1. Per visible wheel: `tint = (hue color − its luma) × sat/100 × 0.30 × 255`, and `lumOff = lum/100 × 0.30 × 255`.
+  2. `pivot = 0.5 − 0.2 × balance/100`; crossovers at `pivot ∓ 0.25`; edge half-width `hw = 0.05 + 0.30 × blending/100` (never below 0.05, so edges don't collapse).
+  3. For each luma `y`: `wS = 1 − smoothStep01(lo − hw, lo + hw, y)`, `wH = smoothStep01(hi − hw, hi + hw, y)`, `wM = max(0, 1 − wS − wH)`; if the three sum above 1 they are normalized. Global always has weight 1.
+  4. Offsets are the weighted sums of the wheels' tints, plus the weighted luminance offsets added to all three channels.
+  5. **Monotonic guard**: the luminance part is held at a plateau wherever `i + offset` would drop below an earlier output level, so large offsets with low Blending can't invert tones. Settings that were already monotonic are copied through unchanged.
+
+### `curves.hpp`
+Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 256-entry table, and the operations that keep the point list valid.
+
+**Depends on:** `pixel_math.hpp`. No UI. **Test:** `curves_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kCurveMinGap` | `float` | 2 | Minimum x distance between points (0..255 scale) |
+| `kCurveMaxPoints` | `std::size_t` | 16 | Most points per curve |
+| `kCurveChannelCount` | `std::size_t` | 4 | Curves per set |
+
+**Types**
+- `struct CurvePoint { float x = 0, y = 0; }`: input level and output level, both 0..255. Has `operator==`.
+- `using CurvePoints = std::vector<CurvePoint>`: sorted by `x`. The first and last points sit at x = 0 and x = 255 (their `y` may move, e.g. to lift blacks).
+- `enum class CurveChannel : int`: `Master, Red, Green, Blue, Count`. Master applies to all three channels first; Red/Green/Blue then apply to their own channel.
+- `using CurveSet = std::array<CurvePoints, 4>`.
+
+**Functions**
+
+**`inline CurvePoints identityCurve()`**: `{(0,0), (255,255)}`. **`inline CurveSet identityCurves()`**: four identity curves.
+
+**`inline bool curveEvaluable(const CurvePoints &pts)`**
+- Returns true if there are at least 2 points, all coordinates are finite, and `x` is strictly increasing. This is the minimum `curveToLut` needs; the edit functions below keep stricter invariants.
+
+**`inline std::array<float, 256> curveToLut(const CurvePoints &pts)`**
+- Input: control points.
+- Returns: the curve evaluated at every level 0..255, **unrounded**, clamped to 0..255. If the points are not evaluable, returns the identity table.
+- Details: Fritsch–Carlson PCHIP. It passes through every point and never overshoots. Interior slope is the weighted harmonic mean of neighboring secants, or 0 at a local extremum or flat spot. End slopes are shape-preserving one-sided estimates. Interval widths are floored at 1e-3. Outside the first/last point the value is held flat.
+
+**`inline bool curveIsIdentity(const std::array<float, 256> &lut)`**
+- Returns true if every entry rounds to its own index with `toU8Clamped`. The pipeline then skips the curve stage. It must use the same rounding as the code that applies the curve, which is why it uses `toU8Clamped`.
+
+**`inline int curveInsert(CurvePoints &pts, float x, float y)`**
+- Inputs: the list (modified), and the new point (`x`, `y` are clamped to 0..255).
+- Returns: the new point's index, or **-1** if a value is not finite, the list already has `kCurveMaxPoints` points, the point would be at or beyond an end (an end point can't be duplicated), or it is closer than `kCurveMinGap` to a neighbor.
+
+**`inline void curveMovePoint(CurvePoints &pts, int idx, float x, float y)`**
+- Inputs: the list, the point index, and the target position.
+- Behavior: out-of-range `idx` or non-finite coordinates are ignored. `y` is always clamped to 0..255 and applied. End points keep their `x`. Interior points move to `x` clamped between their neighbors ± `kCurveMinGap`, so order never changes (if there is no room, `x` is left unchanged).
+
+**`inline bool curveRemove(CurvePoints &pts, int idx)`**
+- Removes an interior point and returns true. Returns false (nothing removed) for either end point or an out-of-range index.
+
+---
+
+## Detail effects
+
+### `detail_layer.hpp`
+Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `detail = luma − blur(luma)`, then `result = pixel + gain × detail`. The three differ only in blur size. All of it lives in `namespace detail_layer`.
+
+**Depends on:** standard library only. No UI (plain RGBA8 pointers). **Test:** `detail_layer_test`.
+
+**Design rules worth knowing**
+- The blur is of the **source** picture's luma, so a plane depends only on the image: it is built once and cached. No slider drag recomputes it (Texture's own slider only changes `gain`).
+- Trade-off: detail is measured before tone mapping, so a big Exposure boost does not amplify it.
+- The plane covers the whole image, so no halo rows are needed and masks work for free.
+- Only luma is blurred and the same amount is added to R, G and B, so edges get no color fringes.
+- Blur sizes are fractions of the long edge, so the 1024 px preview and the full render look alike. The box radius is an integer ≥ 1, so the smallest blurs (Sharpness on anything under about 6000 px) are wider than nominal.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kKindCount` | `int` | 3 | Number of layers |
+| `kSigmaFrac[3]` | `float[3]` | 0.0012, 0.006, 0.0003 | Gaussian sigma as a fraction of the long edge (Texture, Clarity, Sharpness) |
+| `kSigmaMin[3]` | `float[3]` | 1, 3, 0.6 | Floor on sigma, in pixels |
+| `kGain[3]` | `float[3]` | 0.8, 1.0, 1.5 | What slider ±100 adds |
+| `kClarityLimit` | `float` | 64 | Soft limit on Clarity's detail, in levels |
+| `kMaxBoxRadius` | `int` | 1000 | Keeps every running sum exact in float (at most about 8.2 million, below 2^24) |
+| `kLumaR/G/B` | `int` | 54, 183, 19 | 8-bit luma weights, /256, summing to exactly 256 (`static_assert`). Used both to build planes and to measure each pixel; they must agree |
+
+**Types**
+- `enum Kind : int { Texture = 0, Clarity = 1, Sharpness = 2 }`: index of a layer (unscoped, inside the namespace).
+- `using Plane = std::vector<uint16_t>`: `width × height` values, each **luma × 16** (4 fractional bits).
+- `struct Gains`: `float g[3]` (per kind; default 0). Methods: `any()` (any gain non-zero), `need()` (bitmask; bit *k* set if layer *k*'s gain is non-zero), `operator==`.
+- `struct Planes`: `Cache::PlanePtr p[3]`; a null entry means that layer isn't needed.
+- `class Cache`: see below.
+
+**Functions**
+
+**`inline int lumaOf(const uint8_t *p)`**: `p` points at an RGBA pixel. Returns 0..255, `(54R + 183G + 19B + 128) >> 8`.
+
+**`inline int boxRadius(int kind, int w, int h)`**
+- Inputs: layer `kind` (0..2, **not validated**), picture size.
+- Returns: box radius `r` (box width 2r + 1), clamped to `1..1000`.
+- Details: `sigma = max(kSigmaMin, kSigmaFrac × longEdge)`. Three box passes approximate a Gaussian when `width = sqrt(4 sigma² + 1)`, and `r = round((width − 1)/2)`.
+
+**`inline bool cancelled(const std::atomic<uint64_t> *latest, uint64_t gen)`**: true if `latest` is non-null and no longer equals `gen` (relaxed load). A null `latest` never cancels.
+
+**`inline void hboxRow(uint16_t *row, size_t W, int r, uint16_t *pad, float inv)`**
+- Horizontal box blur of one row, **in place**. `pad` is scratch for `W + 2r` values; `inv = 1/(2r+1)`. Edges replicate the border pixel, so a flat picture stays flat. Does nothing if `W == 0`.
+
+**`inline bool vbox(const uint16_t *in, uint16_t *out, size_t W, size_t H, int r, uint32_t *col, float inv, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Vertical box blur `in` → `out` (different buffers). `col` is scratch for `W` running column sums, so memory is read row by row. Edges replicate. Polls cancellation every 16 rows.
+- Returns: false if cancelled (`out` is then incomplete).
+
+**`inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Inputs: RGBA8 picture, size, box radius `r` (≥ 1), the output plane (resized), and the cancellation pair.
+- Returns: true on success. False if `rgba` is null, a size is non-positive, `r < 1`, or it was cancelled; `out` is then garbage.
+- Details: luma × 16, then 3 horizontal passes, then 3 vertical passes.
+
+**`inline uint64_t fingerprint(const uint8_t *rgba, int w, int h)`**
+- Returns: a 64-bit FNV-1a hash seeded with the size, over about 1024 bytes spread across the picture plus the last byte. **Not a full hash**: a small edit between the samples goes unnoticed, which is why the cache assumes pixels are never edited in place.
+
+**`class Cache`** (shared by the UI thread and render workers; internally locked)
+- `using PlanePtr = std::shared_ptr<const Plane>`.
+- `PlanePtr get(const uint8_t *rgba, int w, int h, int kind, const std::atomic<uint64_t> *latest, uint64_t gen)`: the plane for this picture and layer, built if absent. Returns **null** if cancelled (nothing is cached then) or if an argument is invalid (null pixels, non-positive size, kind outside 0..2). The key is pixel pointer + size + kind + fingerprint. The blur runs outside the lock; two threads may rarely build the same plane and one wins.
+- `void clear()`: drops everything. Call it after any in-place edit of pixels.
+- `size_t size() const`: number of cached planes.
+- Limits: 9 entries and 384 MiB. The least recently used are evicted, never the newest. A plane still held by a render stays alive through its `shared_ptr`.
+
+**`inline Cache &cache()`**: the one process-wide `Cache`.
+
+**`inline Gains gainsFromValues(float texture, float clarity, float sharpness)`**
+- Inputs: slider values; texture and clarity -100..100, sharpness 0..100. Each is clamped; NaN/infinity count as 0.
+- Returns: `g = value/100 × kGain[kind]`. Always finite.
+
+**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, unsigned need, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Inputs: `need` is the bitmask from `Gains::need()`. Fills `out.p[k]` for each requested layer from the cache.
+- Returns: false if cancelled. Returns **true** with the planes left null if `rgba` is null or a size is non-positive (nothing to do).
+
+**`inline const float *midWeights()`**: pointer to a 256-entry table of `4 l (1 − l)` (l = index/255). Clarity uses it so it leaves the ends alone and can't clip highlights or crush shadows.
+
+**`inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**
+- Inputs:
+  - `pl`, `gn`: the planes and gains for this render.
+  - `src`: the **source** pixels for these positions (they give each pixel's own luma).
+  - `dst`: the pixels to modify (RGBA8, alpha untouched). They may already be tone/color adjusted.
+  - `count`: number of pixels.
+  - `first`: index (`y × width + x`) of the first pixel in the whole picture, used to index the planes.
+- Behavior: for each pixel, `d = luma − blur` in levels, then one offset `k` is added to R, G and B, clamped and rounded:
+  - Texture: `k += gTexture × d`.
+  - Clarity: `d` is soft-limited, `d / (1 + |d|/64)`, then `k += gClarity × mid[luma] × d`.
+  - Sharpness: `k += gSharpness × d`.
+- A plane that doesn't cover `[first, first + count)` (built for another picture size) is skipped, not read out of range. Returns at once if all effective gains are 0. Raw pointers and no `std::` helpers in the loop, for Debug-build speed.
+
+### `neighbor_fx.hpp`
+Dehaze, noise reduction (luminance and color) and Blur, built on the same idea as `detail_layer.hpp`: every effect is a per-pixel formula that reads precomputed, cached planes of the **source** picture, so it needs no halo rows, works the same inside masks, and never recomputes while a slider is dragged. Read the top of `detail_layer.hpp` first. Everything is in `namespace neighbor_fx` (alias `dl` = `detail_layer`).
+
+**Depends on:** `detail_layer.hpp`. No UI. **Test:** `neighbor_fx_test`.
+
+**How each effect works**
+- **Luminance noise reduction** takes away only the *small* part of the finest detail layer (the Sharpness plane: pixel minus a roughly 1.4 px blur). Per pixel, with `d` = that difference in levels and `s` = the slider (0..1): `k = −s·d / (1 + d²/T²)` is added to R, G and B, where `T = 2 + 14·s` levels. Small differences (noise) are removed, large ones (real edges) are spared.
+- **Color noise reduction** moves each pixel toward its blurred chroma (R − luma and B − luma; G follows because chroma has zero luma). With `dr`, `db`, `dg` the moves, the weight is `s / (1 + (dr² + db² + dg²)/20²)`, so a genuine color edge (a big move) is left alone.
+- **Dehaze (positive)**: dark-channel prior. A tiny "veil" map gives `t = 1 − omega·dark/A` (`omega = 0.85 × amount`, clamped to `t >= 0.25`), then `J = A + (I − A)/t`. **Dehaze (negative)** needs no map: a flat blend toward gray 235 by `0.6 × |amount|`.
+- **Blur**: a color blur stored at three fixed strengths at reduced resolution; the slider interpolates between source → level 0 → level 1 → level 2.
+- Noise reduction and blur are applied as a **delta measured on the source** ("blurred minus source") added to the current pixel, so they sit on top of the tone and color sliders instead of undoing them.
+- Order inside `apply()`: Dehaze, detail layers (`addPixels`), luminance NR, color NR, Blur last (so it wins).
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kChromaSigmaFrac`, `kChromaSigmaMin` | `float` | 0.0025, 2 | Chroma blur sigma: fraction of the long edge, floored at 2 px |
+| `kNrLumaTMin`, `kNrLumaTMax` | `float` | 2, 16 | Luminance NR threshold `T` (levels) at slider 0 / 100 |
+| `kNrColorT` | `float` | 20 | Chroma move that gets half weight |
+| `kVeilEdge` | `int` | 384 | Long edge of the veil map, px |
+| `kVeilPatch` | `int` | 3 | Erosion radius (and blur radius) on the veil map |
+| `kDehazeStrength` | `float` | 0.85 | "omega": how much of the veil to remove |
+| `kDehazeMinT` | `float` | 0.25 | Transmission floor (limits blow-up) |
+| `kLightMin` | `float` | 180 | Estimated airlight is clamped to `[180, 255]` |
+| `kHazeAdd` | `float` | 0.6 | Negative Dehaze: blend amount at -100 |
+| `kHazeLight` | `float` | 235 | ...toward this gray |
+| `kBlurSigmaFrac[3]` | `float[3]` | 0.004, 0.012, 0.035 | Blur sigma of each level, times the long edge |
+| `kBlurSigmaMin` | `float` | 1.5 | Floor on blur sigma, px |
+| `kBlurTargetSigma` | `float` | 2.5 | Sigma, in reduced px, of the stored blur (sets the reduction factor) |
+
+**Types**
+- `struct Map { int w, h, ch = 1; float scale = 1; float aux = 0; std::vector<uint16_t> v; }`: a small multi-channel map at reduced resolution. Values are stored × 16 (4 fractional bits). `scale` = reduced px per source px; `aux` holds the estimated airlight `A` for a veil map. `using MapPtr = std::shared_ptr<const Map>`.
+- `template <class T> class Store`: a keyed, byte-capped LRU cache for any plane type (`Ptr` = `std::shared_ptr<const T>`).
+  - `Store(size_t maxBytes, size_t maxEntries)`.
+  - `Ptr get(const uint8_t *rgba, int w, int h, int kind, Build &&build)`: returns the cached item or builds it. `build` is a callable returning `std::shared_ptr<T>` or null if cancelled; a cancelled build is never cached. Key = pixel pointer + size + `detail_layer::fingerprint` + `kind`. The build runs outside the lock.
+  - `void clear()`, `size_t size() const`. Eviction drops the least recently used, never the newest.
+- `struct Gains`: slider values as multipliers.
+
+  | Field | Type | Range | Meaning |
+  |---|---|---|---|
+  | `detail` | `dl::Gains` | | Texture / Clarity / Sharpness |
+  | `dehaze` | `float` | -1..+1 | -1 adds haze, +1 removes it |
+  | `nrLuma`, `nrColor`, `blur` | `float` | 0..1 | |
+
+  Methods:
+  - `bool any() const`: any gain non-zero.
+  - `unsigned blurLevels() const`: bitmask over blur levels 0..2 this setting reads. `pos = min(blur, 1) × 3`; segment 0 → `1` (level 0), segment 1 → `3` (levels 0, 1), segment 2 → `6` (levels 1, 2). 0 when `blur <= 0`.
+  - `uint32_t need() const`: which planes a render needs. **Bits 0..2** the luma detail planes (Texture, Clarity, Sharpness; luminance NR uses Sharpness's), **bit 3** the two chroma planes, **bit 4** the veil (only for positive Dehaze), **bits 5..7** blur levels.
+  - `operator==`.
+- `struct Planes`: `dl::Planes luma`, `dl::Cache::PlanePtr chroma[2]` (R − luma, B − luma), `MapPtr veil`, `MapPtr blur[3]`. Null = not needed.
+- `struct Walker`: steps through consecutive pixels of a picture `W` wide keeping `(x, y)`. `Walker(size_t first, int width)` (width must be positive), `next()`.
+
+**Stores (process-wide)**
+
+| Function | Holds | Limits | `kind` keys |
+|---|---|---|---|
+| `Store<dl::Plane> &chromaStore()` | full-size chroma planes | 256 MiB, 6 entries | 10, 11 |
+| `Store<Map> &mapStore()` | veil and blur maps (reduced size) | 64 MiB, 40 entries | veil 20; blur 30..32 |
+
+With `detail_layer`'s own cache (384 MiB) the worst case is about 700 MB of cached planes on very large pictures. **`inline void clearCaches()`** empties `dl::cache()`, `chromaStore()` and `mapStore()`.
+
+**Functions**
+
+**`inline int boxRadiusForSigma(float sigma)`**: box radius whose 3-pass blur approximates a Gaussian of `sigma` (same derivation as `detail_layer::boxRadius`), clamped to `1..dl::kMaxBoxRadius`.
+
+**`inline bool blurPlane(dl::Plane &p, size_t W, size_t H, int r, const std::atomic<uint64_t> *latest, uint64_t gen)`**: 3 box passes each way, **in place**. Returns false if cancelled (then `p` is garbage).
+
+**`inline float chromaSigma(int w, int h)`**: `max(2, 0.0025 × long edge)`.
+
+**`inline bool buildChroma(const uint8_t *rgba, int w, int h, int which, dl::Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- `which`: 0 = blurred (R − luma), 1 = blurred (B − luma). Stored as `(chroma + 255) × 16` so the signed value fits an unsigned plane. Returns false if cancelled.
+
+**`inline void erode(std::vector<uint8_t> &m, int w, int h, int r)`**: separable min filter of radius `r` on a small 8-bit map, in place, edges clamped.
+
+**`inline std::shared_ptr<Map> buildVeil(const uint8_t *rgba, int w, int h, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Returns the veil map, or null if cancelled. Steps: min-pool `min(R, G, B)` over `f × f` blocks (`f = ceil(longEdge / 384)`), erode by `kVeilPatch`, set airlight `A` = the brightest dark-channel value clamped to `[180, 255]` (stored in `aux`), then blur the map.
+
+**`inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h, int level, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- `level` 0..2 (**not validated**). Builds a 3-channel color blur of sigma `max(1.5, kBlurSigmaFrac[level] × longEdge)`, stored at reduced size (box average by `f = round(sigma / 2.5)`, then a small blur). Null if cancelled.
+
+**`inline void sampleMap(const Map &m, int x, int y, float *out)`**: bilinear sample of a map at **source** pixel `(x, y)`; `out` receives `m.ch` values (still × 16). Coordinates are clamped to the map.
+
+**`inline Gains gainsFromValues(float texture, float clarity, float sharpness, float dehaze = 0, float noiseLuma = 0, float noiseColor = 0, float blur = 0)`**
+- Inputs are UI values: texture, clarity, dehaze in -100..100; the rest 0..100. Each is clamped and NaN/infinity count as 0, so every gain is finite. Returns the `Gains` (values divided by 100; the three detail values go through `dl::gainsFromValues`).
+
+**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, uint32_t need, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Fetches (or builds, the first time) the planes in `need`. Returns false if cancelled. With null pixels or a non-positive size it returns **true** and leaves the planes null.
+
+**`inline uint8_t toU8(float v)`**: the `toU8Clamped` rule without `std::` calls (NaN → 0, over 255 → 255, otherwise `v + 0.5` truncated).
+
+**`inline bool covers(const dl::Plane *p, size_t first, size_t count)`**: true if the plane exists and covers pixels `[first, first + count)`.
+
+**Per-pixel passes** (all take `count` consecutive pixels of `dst`, RGBA8, alpha untouched; `src` is the **source** pixels at the same positions; `first` is the index in the whole picture; the loops use raw pointers for Debug-build speed)
+- **`dehazePass(const Map *veil, float amount, uint8_t *dst, size_t count, size_t first, int W)`**: see above. A positive amount with a null `veil` does nothing.
+- **`nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**: skipped if the plane doesn't cover the range.
+- **`nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**: skipped unless both planes cover the range. `dg` is derived so the luma-weighted moves sum to zero.
+- **`blurPass(const MapPtr *levels, float amount, const uint8_t *src, uint8_t *dst, size_t count, size_t first, int W)`**: `pos = min(amount, 1) × 3`, `seg = min(int(pos), 2)`, `t = pos − seg`. Blends level `seg−1` (or the source itself when `seg == 0`) toward level `seg`, then adds `blurred − source` to `dst`. Skipped if a needed level is missing.
+
+**`inline void apply(const Planes &pl, const Gains &g, const uint8_t *src, uint8_t *dst, size_t count, size_t first, int W)`**
+- Runs all the effects in the order above for `count` consecutive pixels. `W` is the picture width and must be positive, otherwise nothing is done. Each effect runs only when its gain is non-zero.
+
+---
+
+## Geometry
+
+### `geometry.hpp`
+`CropRect`, `Orient`, the rotated size, the `GeoFrame`, and the rotate/flip algebra. Pure math, no pixels.
+
+**Depends on:** `pixel_math.hpp` (`kDegToRad`). No UI. **Test:** `geometry_test`.
+
+**Constants:** `kAngleMax` (`float`, 45): the Straighten range in degrees; positive turns the picture clockwise. With the 90° buttons it reaches any angle.
+
+**Order of operations** (as `syncSource` runs them): orient (mirror, then quarter turns) → straighten → crop. Masks are stored against the **original** picture and mapped through `GeoFrame`, so no geometry change ever has to touch a mask.
+
+**Types**
+- `struct CropRect { int x = 0, y = 0, w = 0, h = 0; }`: a region in pixels of the oriented, straightened image. `empty()` is true when `w <= 0 || h <= 0`; a default `CropRect` means "no crop". Has `operator==`.
+- `struct Orient { int rot = 0; bool flip = false; }`: an optional left-right mirror, then `rot` clockwise quarter turns (0..3). Covers all 8 ways to rotate/flip. `identity()` is `rot == 0 && !flip`.
+- `struct Dims { int w, h; }`.
+- `enum class GeoOp { RotateCW, RotateCCW, FlipH, FlipV }`.
+- `struct GeoFrame`: one similarity transform `p_source = L · p_original + t`, in continuous pixel coordinates (pixel centers at +0.5).
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `m00, m01, m10, m11` | `double` | 1, 0, 0, 1 | The 2×2 matrix `L` (orthogonal: a rotation, or a mirror then a rotation) |
+  | `tx, ty` | `double` | 0 | Translation |
+  | `origW, origH` | `double` | 1 | Size of the untouched picture, px |
+  | `srcW, srcH` | `double` | 1 | Size after orient / straighten / crop, px |
+
+  Methods:
+  - `double det() const`: determinant of `L` (negative when mirrored).
+  - `void toSrc(double x, double y, double &ox, double &oy) const`: original → source.
+  - `void toOrig(double x, double y, double &ox, double &oy) const`: source → original.
+  - `double radiusScale() const`: `min(origW, origH) / min(srcW, srcH)`. Radii are stored as a fraction of the original's shorter side but shown against the current picture's.
+  - `static float wrapAxis(float a)`: an axis angle folded into `[-90, 90]`. NaN/infinity → 0; never returns -0. Safe for huge angles (an older subtract-180 loop never terminated).
+  - `static float wrapDir(float a)`: an arrow angle kept in `(-180, 180]`. NaN/infinity → 0.
+  - `float axisToSrc(float deg) const` / `float axisToOrig(float deg) const`: direction of an **axis** (degrees clockwise, no head or tail) between original and source; result in `[-90, 90]`. A mirror flips the sign.
+  - `float dirToSrc(float deg) const` / `float dirToOrig(float deg) const`: direction of an **arrow** (degrees clockwise from +x), result in `(-180, 180]`. The unit vector is pushed through the linear part and the angle re-read, so a mirror or half turn does not fold the arrow onto its opposite.
+
+**Functions**
+
+**`inline Dims rotatedDims(int w, int h, float deg, bool expand)`**
+- Inputs: picture size, turn angle `deg` (either direction), and the mode.
+- Returns: the size after turning:
+  - `expand = true`: the bounding box of the turned picture (nothing lost, empty corners).
+  - `expand = false` (fit): the largest rectangle with the picture's own aspect ratio inside the turned picture (no empty corners).
+- Edge cases: a non-positive size comes back as at least 1 × 1; `deg == 0` or NaN/infinity returns `{w, h}`. A tiny epsilon keeps exact quarter-turns from rounding up. Both formulas are symmetric in (w, h), so a later quarter turn gives exactly the transposed size.
+
+**`inline GeoFrame makeGeoFrame(int ow, int oh, const Orient &o, float angle, bool expand, const CropRect &crop)`**
+- Inputs: original size `ow × oh`, orientation, straighten `angle` (degrees), `expand` mode, and crop.
+- Returns: the frame. With no known size (`ow <= 0` or `oh <= 0`) it returns the identity frame, so masks pass through unchanged.
+- Details: `o.rot` is taken modulo 4; a NaN/infinite angle counts as 0. Mirror is `(x, y) → (w − x, y)`; a quarter turn is `(x, y) → (h − y, x)`. Straighten rotates clockwise about the center into the `rotatedDims` size. The crop is clamped exactly as `cropImage` does it (sums done in 64 bits, so a huge crop can't overflow). `srcW`/`srcH` are at least 1.
+
+**`inline void geoStep(Orient &o, float &angle, CropRect &c, int &W, int &H, GeoOp op)`**
+- Inputs/outputs (all modified in place):
+  - `o`: the orientation. An out-of-range `rot` is normalized first.
+  - `angle`: the straighten angle.
+  - `c`: the crop; it moves with the picture so the same part stays selected. Ignored if empty.
+  - `W`, `H`: size of the straightened image **before** the op; updated to the size after (swapped by quarter turns).
+  - `op`: which button.
+- Rules: a mirror reverses the rotation direction (flip toggled, `rot` negated); `FlipV` is `FlipH` plus a half turn. A mirror also negates the straighten angle; a quarter turn leaves it alone.
+
+**`inline float snapAngle(float deg)`**
+- Returns `deg` rounded to 0.1° and clamped to `±kAngleMax`; exactly `0` near zero (never -0); NaN/infinity → 0.
+
+### `raster_ops.hpp`
+Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turns, mirror, orient, straighten by any angle, and the box downsample behind the preview. (Needs LiteUI for `CanvasImage`.)
+
+**Depends on:** `geometry.hpp`, `liteui.hpp`. **Test:** `raster_ops_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kPreviewMaxEdge` | `int` | 1024 | Long side of the preview, at most |
+| `kPreviewMinRatio` | `float` | 1.5 | Images whose long side is within `1024 × 1.5` skip the preview |
+
+**Functions**
+
+**`inline bool isLargeImage(const CanvasImage &img)`**: true if the long side is greater than `int(1024 × 1.5) = 1536`. Decides whether a full-resolution geometry rebuild is moved off the UI thread. It is gated on the **original** (decoded file), not on the cropped working image, so one editing session always takes the same path.
+
+**`inline std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)`**
+- Returns: null unless `isLargeImage(src)` (also null if the result would be empty). Otherwise a box-downsampled copy by the smallest integer factor `k = ceil(longEdge / 1024)`, with size `(width / k) × (height / k)` (integer division, so up to `k − 1` edge pixels are dropped). Each output channel, alpha included, is the rounded mean of its `k × k` block. Runs once per opened image.
+
+**`inline std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src, const CropRect &r)`**
+- Returns: a **new** image of the `r` region, clamped to `src`'s bounds (a rectangle outside the picture gives a 0-pixel dimension). Never null.
+
+**`inline std::shared_ptr<CanvasImage> rotate90cw(const CanvasImage &src)`**: a new `h × w` image, the source rotated 90° clockwise (source `(x, y)` lands at column `h − 1 − y`, row `x`).
+
+**`inline std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src)`**: a new image mirrored left-right.
+
+**`inline std::shared_ptr<CanvasImage> orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o)`**
+- Applies `o`: the mirror first (if `flip`), then `o.rot` quarter turns. The identity orientation returns **`src` itself** (no copy).
+- Gotcha: `o.rot` is **not** normalized here (unlike `makeGeoFrame` and `geoStep`, which take it modulo 4). It must already be 0..3; a negative value turns nothing.
+
+**`inline std::shared_ptr<CanvasImage> rotateArbitrary(const CanvasImage &src, float deg, bool expand, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
+- Inputs: the picture; `deg` the clockwise angle about the center; `expand` mode (see `rotatedDims`); optional cancellation pair.
+- Returns: the rotated picture in a canvas of `rotatedDims(...)` size, or **null only if cancelled**. `deg == 0` returns an unchanged copy.
+- Details:
+  - Bilinear resampling in **premultiplied alpha**, so transparent pixels contribute no color.
+  - *Fit*: every output pixel lands inside the picture; samples that graze the edge repeat the edge pixel.
+  - *Expand*: empty corners come out fully transparent and the rotated edge is anti-aliased by a one-pixel coverage falloff.
+  - Cancellation is polled every 64 rows (the most expensive stage of an async geometry rebuild).
+
+---
+
+## Masks
+
+### `mask.hpp`
+The mask data model: `MaskType`, the `MaskShape` and `MaskEval` variants, the Add/Subtract/Intersect composition, and `Mask` / `MaskSet`. Includes every shape header, and the top of the file contains the long explanation of how masks work.
+
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask_brush.hpp`, `mask_geom.hpp`, `mask_object.hpp`, `mask_range.hpp`. No UI. **Test:** `mask_test`.
+
+**How a mask is applied:** the picture is rendered as usual first. Then for each enabled mask in list order, every pixel is run through **that mask's** adjustments and blended back: `out = base + (adjusted(base) − base) × weight`. Weight 1 = full effect, 0 = untouched; later masks stack on earlier ones.
+
+**Where geometry lives:** shapes are stored against the **original** picture (centers as a fraction of its width/height, radii as a fraction of its shorter side) and mapped by a `GeoFrame` into the current one when drawn, edited or rendered. Rotating, flipping, straightening or cropping never has to touch a mask, and the same mask renders identically on the preview and the full image.
+
+**Adding another kind of mask:** (1) a shape struct with `toSource`, `fromSource`, `applySourceEdit`; (2) an `Eval` struct with `rowSpan` and `rowWeights`; (3) one more alternative in `MaskShape` and `MaskEval` (same order as `MaskType`) and a line in `maskTypeName` and `maskShapeToSource`; (4) its overlay and handles in the UI. The pipeline, undo, preview, workers, export and the per-mask sliders need no change.
+
+**Constants:** `kMaxMasks` (`size_t`, 8): rows in the Masks list. `kMaxMaskParts` (`size_t`, 6): shapes combined inside one mask. `kMaskNameMax` (`size_t`, 32).
+
+**Types**
+- `enum class MaskType : int`: `Radial, Linear, Brush, Luminosity, ColorRange, Object, Count`. **Same order as the alternatives of `MaskShape` / `MaskEval`**: `MaskPart::type()` is the variant index.
+- `using MaskShape = std::variant<RadialShape, LinearShape, BrushShape, LuminosityShape, ColorRangeShape, ObjectShape>`; `using MaskEval = std::variant<RadialEval, LinearEval, BrushEval, LuminosityEval, ColorRangeEval, ObjectEval>`.
+- `enum class MaskOp : int { Add, Subtract, Intersect }`. With `c` the new part's weight and `m` the running weight:
+  - Add: `m + c − m·c` (union; never exceeds 1).
+  - Subtract: `m·(1 − c)`.
+  - Intersect: `m·c`.
+  - A **fold, left to right**, so order matters, exactly like the mask's own Invert (applied last).
+- `struct MaskPassPart { MaskShape shape; MaskOp op = Add; }`: a part with its shape already mapped into the picture being rendered.
+- `struct MaskComposite`: the parts of one mask resolved for one image size. Fields `std::vector<MaskEval> evals`, `std::vector<MaskOp> ops` (`ops[0]` is ignored). Methods below.
+- `struct MaskPart { MaskShape shape; MaskOp op = Add; }`: `op` is ignored on the first part. `type()` returns the `MaskType`. Has `operator==`.
+- `struct Mask`: one mask as the user sees it.
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `parts` | `std::vector<MaskPart>` | empty | Never empty for a mask made by `addMask` |
+  | `name` | `std::string` | empty | The user's name; empty = show its kind |
+  | `enabled` | `bool` | true | |
+  | `invert` | `bool` | false | Adjust everything **outside** the shapes |
+  | `amount` | `float` | 100 | 0..100: how strongly the adjustments apply |
+  | `adj` | `AdjValues` | zeros | The mask's own sliders (same table as the global ones) |
+  | `mix` | `MixValues` | zeros | Its own Color Mixer |
+  | `grade` | `ColorGrade` | neutral | Its own Color Grading |
+  | `curves` | `CurveSet` | identity | Its own tone curves (RGB, R, G, B) |
+
+  `type()` is the first part's kind (Radial if there are no parts). Has `operator==`.
+- `using MaskSet = std::vector<Mask>`.
+
+**Functions**
+
+**`inline const char *maskTypeName(MaskType t)`**: "Radial", "Linear", "Brush", "Luminosity", "Color Range", "Object"; "Mask" for anything else.
+
+**`inline bool maskTypeUsesPixels(MaskType t)`**: true for Luminosity and ColorRange, whose weights read the picture's own pixels (so the overlay must be built from the picture just before them).
+
+**`inline const char *maskOpName(MaskOp op)`**: "Add", "Subtract", "Intersect".
+
+**`inline MaskShape maskShapeToSource(const MaskShape &shape, const GeoFrame &f)`**: maps any shape into the current picture (calls the alternative's `toSource`).
+
+**`inline MaskEval prepareMask(const MaskShape &shape, int W, int H)`**: resolves a shape for one image size (calls `prepare`).
+
+**`inline bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1)`**: which pixels `[x0, x1)` of row `y` can have non-zero weight. A superset. False if none.
+
+**`inline void maskRowWeights(const MaskEval &e, int y, int x0, int x1, float *out, const uint8_t *pix)`**: fills `out[0 .. x1 − x0)` with weights 0..1. `pix` is the RGBA row from `x0` on **as it is when the mask is reached** (after the global adjustments and earlier masks); only the pixel-reading kinds use it.
+
+**`MaskComposite::rowSpan(int y, int W, int &x0, int &x1) const`**
+- Folds the parts' spans: **Add widens** the union, **Intersect narrows** (and drops the span if nothing is left or the span is empty), **Subtract** can only remove weight so it leaves the span alone. Part 0 counts as Add. Returns false if nothing is left. The result is a superset, so it is safe to cut work with it.
+
+**`MaskComposite::rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix, float *tmp) const`**
+- Weights for pixels `[x0, x1)` of row `y`. `tmp` is scratch for one row of weights (at least `x1 − x0` floats). An empty composite gives zeros. Plain loops, no `std::` helpers.
+
+**`inline MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts, int W, int H)`**: resolves every part for one image size.
+
+**`inline std::string sanitizeMaskName(const std::string &s)`**: keeps only printable ASCII (0x20..0x7E) and caps the result at 32 characters (the TextInput widget is ASCII with a byte cursor).
+
+**`inline bool maskNameBlank(const std::string &s)`**: true if the name is empty or only spaces.
+
+**`inline void clearMaskCaches()`**: empties the brush cache and the object warp and eval caches.
+
+### `mask_geom.hpp`
+The two gradient masks: **Radial** (a rotated ellipse) and **Linear** (graduated). Each has a stored shape, its mapping through a `GeoFrame`, and an `Eval` resolved for one image size with exact row spans. No UI, no pixels of its own.
+
+**Depends on:** `geometry.hpp`. **Test:** `mask_geom_test`.
+
+**Constants:** `kMaskMinRadius` (`float`, 0.02): smallest radial radius and linear half-length, applied in `prepare`. `kMaskMaxRadius` (`float`, 1.5): the largest radius (not referenced inside this header; the UI uses it). Radii are a fraction of the picture's **shorter** side (the original's when stored, the current picture's once mapped).
+
+**Common shape contract** (all mask shape structs follow it)
+- `toSource(const GeoFrame &f) const`: stored → in the current picture.
+- `static fromSource(const T &s, const GeoFrame &f)`: the inverse, for a shape drawn on the current picture.
+- `applySourceEdit(const T &before, const T &after, const GeoFrame &f)`: folds an edit made on the in-view form into the stored shape, **touching only fields that changed**, so an unrelated slider never nudges a position through float round-off and an unchanged mask compares equal (no undo step).
+- `prepare(int W, int H) const`: resolves the shape for one image size into an `Eval`.
+- Every `Eval` has `bool rowSpan(int y, int W, int &x0, int &x1) const` and `void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix = nullptr) const` (weights for pixels `[x0, x1)` into `out[x − x0]`; `pix` is unused by these two).
+
+**Radial**
+- `struct RadialShape`
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `cx`, `cy` | `float` | 0.5 | Center, fraction of image width / height |
+  | `rx`, `ry` | `float` | 0.3 | Half-axes, fraction of the shorter side |
+  | `angle` | `float` | 0 | Rotation of the `rx` axis, degrees clockwise |
+  | `feather` | `float` | 0.5 | 0 = hard edge .. 1 = fades from the center |
+
+  - `float innerFrac() const`: `1 − feather` clamped to `[0, 0.99]`, so a "hard" edge is still a one-percent ramp and never divides by zero.
+  - `toSource` / `fromSource` map the center through the frame, scale radii by `f.radiusScale()` (and back), and map the angle with `axisToSrc` / `axisToOrig`.
+  - `prepare`: radii below `kMaskMinRadius` are raised to it; `inner = innerFrac()`.
+- `struct RadialEval`: `cx, cy` (px), `c, s` (cos/sin of the rotation), `invRx, invRy` (1/radius, px), `inner`, `invFall` (`1/(1 − inner)`), `qa, qb` (`1/rx²`, `1/ry²`).
+  - `rowSpan`: exact for the rotated ellipse (solves the outline quadratic for the row), padded one pixel each side, clamped to `[0, W]`. False when the ellipse doesn't reach the row.
+  - `rowWeights`: weight 1 while normalized distance `d <= inner`, 0 at `d >= 1`, and `1 − smoothstep(t)` with `t = (d − inner)/(1 − inner)` between.
+
+**Linear**
+- `struct LinearShape`
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `cx`, `cy` | `float` | 0.5 | Center, fraction of width / height |
+  | `len` | `float` | 0.25 | Half length of the ramp, fraction of the shorter side |
+  | `angle` | `float` | 90 | Direction of fade-**out**, degrees clockwise from +x, in (-180, 180]. 90 = full at the top, fading toward the bottom |
+
+  - The ramp runs from the line `len` behind the center (weight 1) to the line `len` ahead (weight 0), perpendicular to the direction. `toSource` / `fromSource` use `dirToSrc` / `dirToOrig` (an arrow, not an axis). `prepare` raises `len` to at least `kMaskMinRadius`.
+- `struct LinearEval`: `cx, cy` (px), `ux, uy` (unit fade-out direction), `len`, `invLen`.
+  - `rowSpan`: the weight is non-zero exactly where the ramp coordinate `s < 1`, which is a half-line of the row (all or none of it when the axis is vertical, `|ux| < 1e-6`), padded one pixel.
+  - `rowWeights`: `s = ((dx·ux + dy·uy)/len)` in -1..+1; weight 1 for `s <= −1`, 0 for `s >= 1`, otherwise `1 − smoothstep((s + 1)/2)`.
+
+### `mask_range.hpp`
+The two masks that select by the picture's own values: **Luminosity** and **Color Range**. Neither is spatial, so neither maps through a `GeoFrame` (`toSource` returns the shape unchanged and `applySourceEdit` just copies `after`). Both are evaluated on the picture as it stands when the mask is reached (after the global adjustments and earlier masks) but before the mask's own adjustments, so darkening the shadows doesn't change which pixels are "shadows".
+
+**Depends on:** `geometry.hpp`. No UI. **Test:** `mask_range_test`. See `mask_geom.hpp` for the common shape contract.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kLumMaxRamp` | `float` | 0.5 | Soft edge width at Feather = 100%, as a fraction of 0..1 luminance |
+| `kColorRangeMaxDist` | `float` | 0.75 | Distance reached at Range = 100% |
+| `kColorRangeLumWeight` | `float` | 0.35 | How much brightness differences count in Color Range |
+
+**Luminosity**
+- `struct LuminosityShape`: `lo` (`float`, default 0): luminance 0..1 where full weight begins; `hi` (0.35): where it ends (a new mask picks out the shadows); `feather` (0.4): 0 = hard cut .. 1 = widest soft edge.
+  - `void setLo(float v)` / `void setHi(float v)`: clamp to 0..1 and push the other end so **Min can never pass Max** (the end being dragged wins).
+  - `prepare`: `a = min(lo, hi)`, `b = max(lo, hi)`, ramp width `f = feather × 0.5`. For each of the 256 luminance levels, with `f <= 1e-4` a hard cut (1 inside `[a, b]`), otherwise `smooth((t − (a − f))/f) × (1 − smooth((t − b)/f))` (a ramp **outside** each end).
+- `struct LuminosityEval`: `std::array<float, 256> lut` (weight per 8-bit luminance, built once per render request).
+  - `rowSpan`: every row, the whole width (`W > 0`).
+  - `rowWeights`: luminance per pixel is the integer `(54R + 183G + 19B + 128) >> 8` (about Rec. 709), then a table read. With `pix == nullptr` (can't happen through the pipeline) it returns zeros.
+
+**Color Range**
+- `struct ColorRangeShape`: `set` (`bool`, false until a color is clicked), `r, g, b` (`float` 0..1, the sample as it was when clicked), `range` (0.30, 0..1 tolerance), `feather` (0.5).
+  - Distance is measured in an opponent space: `y` = Rec. 709 luma (0.2126, 0.7152, 0.0722), `cb = b − y`, `cr = r − y`, all 0..1.
+  - `prepare`: `outer = clamp(range) × 0.75`, `inner = outer × (1 − clamp(feather))`, `invFall = 1 / max(1e-4, outer − inner)`.
+- `struct ColorRangeEval`: `set`, sample `y0, cb0, cr0`, `inner`, `outer`, `invFall`.
+  - `rowSpan`: the whole width if `set`, otherwise none.
+  - `rowWeights`: `d = sqrt((0.35·(y − y0))² + (cb − cb0)² + (cr − cr0)²)`; weight 1 for `d <= inner`, 0 for `d >= outer`, otherwise `1 − smoothstep`. Zeros if `!set` or `pix == nullptr`.
+
+### `mask_raster.hpp`
+`RasterEval`: a 0-to-255 coverage map resolved for one image size and read back with bilinear interpolation. Brush and Object masks both use it; they differ only in how the map is made. It keeps a per-row `[lo, hi)` range of non-zero pixels so empty areas are skipped. Standard library only; no UI.
+
+**Depends on:** standard library only. **Test:** `mask_raster_test` (also exercised through the brush and object tests).
+
+**Types**
+
+`struct RasterEval`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `W`, `H` | `int` | The image this is resolved for |
+| `mw`, `mh` | `int` | The map's own size: `W × H`, or smaller for a big image |
+| `map` | `std::shared_ptr<const std::vector<uint8_t>>` | 0..255 per map pixel, row-major `mw × mh`. Shared, so copying an Eval (they live in a `std::variant`) is cheap |
+| `lo`, `hi` | `std::shared_ptr<const std::vector<int>>` | Per **map** row, `[lo, hi)` covers every non-zero pixel. A superset: an erase stroke does not shrink it |
+
+**Functions** (members)
+
+**`void mapRows(int y, int &r0, int &r1, float &t) const`**: the two map rows image row `y` interpolates between (`r0`, `r1`, clamped to the map) and the blend factor `t`. The image row's center maps to map row `(y + 0.5) × mh / H − 0.5`.
+
+**`bool rowSpan(int y, int imgW, int &x0, int &x1) const`**
+- Returns false if there is no map, `y` is outside `[0, H)`, or the rows' range is empty. Otherwise `[x0, x1)` is the union of the two map rows' ranges, scaled to image pixels and padded by `ceil(W/mw) + 1` for the interpolation's reach, clamped to `[0, imgW]`. It assumes `lo` and `hi` are set whenever `map` is.
+
+**`void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix = nullptr) const`**
+- Fills `out[x − x0]` with weights 0..1 (map value / 255, bilinear in both axes). `pix` is unused. Zeros if there is no map or `y` is out of range.
+- Fast path: when `mw == W` there is no horizontal interpolation and it reads `row0[x]` directly, so `x0..x1` must lie inside `[0, W)`.
+
+### `mask_brush.hpp`
+The **Brush** mask: strokes of round dabs rasterized into a coverage map. A brush's size is its radius as a fraction of the picture's shorter side. A memo of the last few maps means a slider drag, or one more stroke, doesn't start over.
+
+**Depends on:** `geometry.hpp`, `mask_raster.hpp`. No UI. **Test:** `mask_brush_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kBrushMinSize` / `kBrushMaxSize` | `float` | 0.005 / 0.50 | Smallest / largest brush radius |
+| `kBrushDefaultSize` | `float` | 0.05 | Radius of a fresh brush |
+| `kBrushSpacing` | `float` | 0.20 | Render dab spacing × radius |
+| `kBrushPointGap` | `float` | 0.08 | Minimum gap between recorded points × radius (used by the UI when recording; not referenced here) |
+| `kBrushMaxStrokes` | `size_t` | 512 | Per mask |
+| `kBrushMaxPoints` | `size_t` | 20000 | Per stroke |
+| `kBrushLutSize` | `size_t` | 1024 | Falloff table resolution |
+| `kBrushMapEdge` | `int` | 2048 | Longest side the coverage map is rasterized at; bigger images upsample it |
+| `kBrushCacheSize` | `size_t` | 6 | Memoized coverage maps |
+
+**Types**
+- `struct BrushPt { float x = 0, y = 0; }`: a point as a fraction of the picture's width / height.
+- `struct BrushStroke`
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `erase` | `bool` | false | Erases from the mask instead of adding |
+  | `size` | `float` | 0.05 | Radius, fraction of the shorter side |
+  | `feather` | `float` | 0.5 | 0 = hard edge .. 1 = fades from the center |
+  | `density` | `float` | 1 | 0..1, the most a stroke can add or remove |
+  | `flow` | `float` | 1 | 0..1: 1 = a dab sets coverage (max); lower = dabs build up toward `density` (one pass ≈ flow) |
+  | `pts` | `std::vector<BrushPt>` | empty | The polyline |
+- `struct BrushEval : RasterEval {}`.
+- `struct BrushShape { std::vector<BrushStroke> strokes; }`.
+- `struct BrushCacheEntry { BrushShape shape; int W, H; BrushEval eval; }`, `struct BrushCache { std::mutex mutex; std::vector<BrushCacheEntry> entries; clear(); size(); }`.
+
+**Functions**
+
+**`BrushShape::toSource(const GeoFrame &f) const`**: every point goes through the frame, every `size` is multiplied by `f.radiusScale()`. (There is no `applySourceEdit`: strokes are only ever appended, never edited in place.)
+
+**`static BrushPt BrushShape::pointFromSource(const BrushPt &p, const GeoFrame &f)`** and **`static float BrushShape::sizeFromSource(float size, const GeoFrame &f)`**: the inverse, for the pieces of a new stroke drawn on the current picture.
+
+**`BrushEval BrushShape::prepare(int W, int H) const`** (memoized)
+- Returns the coverage map for this shape at this size. Looks in the cache (most recent first): an identical shape and size returns the same map. Otherwise, the **first** cached entry (most recent first) of the same size whose strokes are a prefix of this brush's becomes the `base`, and only the new strokes are stamped on top of a copy of it. The result is inserted at the front; the cache keeps `kBrushCacheSize` entries. The rasterizing runs outside the lock.
+
+**`BrushEval BrushShape::rasterize(int W, int H, const BrushEval *base = nullptr, size_t first = 0) const`**
+- Inputs: image size; optionally `base` (the finished map of this brush's first `first` strokes, same map size) to build on.
+- Returns: the map (`BrushEval`). `W <= 0` or `H <= 0` gives an empty Eval (null `map`).
+- Details:
+  - Map size: the image size shrunk (aspect kept) so its long side is at most 2048.
+  - Per stroke, radius = `max(size, 0.005) × shorter map side`; dab step = `max(1, radius × 0.20)`; the falloff table is 1 inside `inner = clamp(1 − feather, 0, 0.99)`, easing (smoothstep) to 0 at the rim, scaled by `density`.
+  - **Flow ≥ 0.999**: one stroke's coverage is the **max** over its dabs (a stroke crossing itself doesn't double up).
+  - **Flow < 0.999** (clamped to at least 0.01): dabs **accumulate** toward `255 × density`, each adding `(cap − cov) × falloff × aF`, with `aF` chosen so one straight pass adds up to about `flow`. Dabs are placed at exact spacing along the path (carried across segments, so build-up doesn't depend on how often points were recorded); a single-point stroke gets one pass worth of dabs.
+  - Strokes fold into the map in order: paint `m = m + (1 − m)·c`, erase `m = m·(1 − c)` (in bytes, rounded). Row spans widen only for painted strokes, so an erase never shrinks them.
+  - Safety caps: at most 65536 dabs per segment.
+
+### `mask_object.hpp`
+The **Object** mask: a coverage bitmap from a segmentation, stored against the original picture and warped into the current one, then grown/shrunk and feathered. Maps are immutable and shared; the warp and the grown/feathered result are memoized (the last 6 of each).
+
+**Depends on:** `geometry.hpp`, `mask_raster.hpp`. No UI. **Test:** `mask_object_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kObjectMapEdge` | `int` | 1024 | Long side of a stored / warped map |
+| `kObjectMaxGrow` | `float` | 0.03 | Grow = ±1 means 3% of the long side |
+| `kObjectMaxFeather` | `float` | 0.02 | Feather = 1 means 2% of the long side |
+| `kObjectCacheSize` | `size_t` | 6 | Entries in each cache |
+
+**Types**
+- `struct ObjectMap { int w = 0, h = 0; std::vector<uint8_t> a; uint64_t id = 0; }`: coverage 0..255, row-major. `id` is unique per result (and per warp). **Equality of shapes compares this id**, so undo snapshots and `setMasks`' `m == masks_` stay cheap.
+- `struct ObjectPrompt { float x = 0, y = 0; bool fg = true; }`: a click as a fraction of the picture; `fg` false = background.
+- `struct ObjectEval : RasterEval {}`.
+- `struct ObjectShape`
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `map` | `std::shared_ptr<const ObjectMap>` | null | Stored: original orientation. In-view form: warped |
+  | `prompts` | `std::vector<ObjectPrompt>` | empty | The clicks, for refinement |
+  | `feather` | `float` | 0 | 0..1 |
+  | `grow` | `float` | 0 | -1 (shrink) .. +1 (grow) |
+
+  `operator==` compares map ids (a null map counts as id 0), prompts, feather and grow.
+- `ObjectWarpCache` / `ObjectEvalCache` (each `{ mutex, entries, clear(), size() }`) and `ObjectCacheEntry { uint64_t id; float grow, feather; ObjectEval eval; }`.
+
+**Functions**
+
+**`inline uint64_t nextObjectMapId()`**: a process-wide unique id (atomic counter, starts at 1).
+
+**`inline uint64_t hashMix(uint64_t h, double v)`**: mixes a double's bits into a hash (boost-style combine).
+
+**`inline void objAxisMorph(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, int w, int h, int r, bool dilate, bool horizontal)`**: box-shaped max (`dilate`) or min filter of radius `r` along one axis; `out` is resized. Edges are clamped. Cost is O(w·h·r).
+
+**`inline void objAxisBlur(const std::vector<uint8_t> &in, std::vector<uint8_t> &out, int w, int h, int r, bool horizontal)`**: running-sum box blur of radius `r` along one axis (edges replicated, rounded mean).
+
+**`inline ObjectWarpCache &objectWarpCache()`**, **`inline ObjectEvalCache &objectEvalCache()`**: the process-wide caches (emptied by `clearMaskCaches()`).
+
+**`inline std::shared_ptr<const ObjectMap> warpObjectMap(const std::shared_ptr<const ObjectMap> &src, const GeoFrame &f)`**
+- Warps a stored map (original orientation) into the picture on screen. `src` must be non-null.
+- The result's `id` mixes the source id with every number of the frame, so anything that caches on the in-view shape is invalidated by a rotate, flip, straighten or crop, not just by a new segmentation.
+- Output size: `srcW × srcH` scaled by `min(1, 1024 / longEdge)`, at least 1 × 1. Each output pixel is mapped back through `f.toOrig`; pixels that fall outside the original (straighten's empty corners) stay 0; the rest are bilinearly sampled (edges clamped). The last 6 warps are cached.
+
+**`ObjectShape::toSource(const GeoFrame &f) const`**: prompts are mapped through the frame; a non-empty map is warped with `warpObjectMap`.
+
+**`ObjectShape::applySourceEdit(const ObjectShape &before, const ObjectShape &after, const GeoFrame &)`**: only the sliders edit an object, so only `feather` and `grow` are copied from `after`. The bitmap and prompts are replaced wholesale by `setSelectedObjectMap`.
+
+**`ObjectEval ObjectShape::prepare(int W, int H) const`** (memoized)
+- Returns the resolved Eval (with `W`, `H` set). A null or empty map gives an Eval with no map (nothing selected).
+- Cache key: map id + `grow` + `feather`. It does not depend on `W`/`H` (the map keeps its own size), so the preview and the full-size render share one result.
+- Steps: grow/shrink by `rg = round(|grow| × 0.03 × longSide)` with a box dilate (grow > 0) or erode (grow < 0), then feather with `rf = round(feather × 0.02 × longSide)` as two box-blur passes in each axis (close to a Gaussian), then per-row `[lo, hi)` spans of non-zero pixels.
+
+### `seg_basic.hpp`
+The stand-in segmenter, used when the app is built without ONNX: a magic wand that grows over similar colors. It has the same contract as the real model (picture and prompts in, coverage map out, cancellable, runs on the worker thread), so everything around it works the same. (Needs LiteUI for `CanvasImage`.)
+
+**Depends on:** `liteui.hpp`, `mask_object.hpp`. **Test:** `seg_basic_test`.
+
+**Constants:** `kSegPrepEdge` (`int`, 512): long side the stand-in works at. `kSegTolerance` (`int`, 40): RGB distance that counts as "same color".
+
+**Types:** `struct SegPrepared { int w = 0, h = 0; std::vector<uint8_t> rgb; }`: what a model would cache per image (an embedding): a box-averaged RGB copy (`w × h × 3`).
+
+**Functions**
+
+**`inline std::shared_ptr<const SegPrepared> prepareSegImage(const CanvasImage &s)`**: box-averages the picture down by `k = max(1, ceil(longEdge / 512))`; the result is `max(1, width/k) × max(1, height/k)`. Alpha is ignored.
+
+**`inline bool segGrow(const SegPrepared &im, int sx, int sy, std::vector<uint8_t> &mark, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Inputs: the prepared image, the seed `(sx, sy)` in its pixels, a `mark` buffer (`w × h`, 1 = included; modified in place), and the cancellation pair.
+- Returns: false if cancelled.
+- Details: the seed color is the mean of a 5 × 5 patch. A 4-neighbor flood fill adds pixels whose squared RGB distance from that color is at most `40²`. Cancellation is polled every 4096 steps. Pixels already marked are not revisited.
+
+**`inline std::shared_ptr<const ObjectMap> segmentObjectWand(const CanvasImage &img, uint64_t key, const std::vector<ObjectPrompt> &prompts, std::string *err, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Inputs: the picture, a `key` identifying it (the prepared copy is reused while the key is unchanged), the prompts (fractions, clamped into the picture), an error string (never set by this stand-in), and the cancellation pair.
+- Returns: a new `ObjectMap` (a fresh `id`; size = the prepared image's) with coverage 255 where a foreground region covers the pixel and no background region does, else 0. **Null if cancelled.**
+- Gotcha: **worker thread only**. The cache of the prepared image is a plain `static`, not locked.
+
+### `sam_segmenter.hpp`
+Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything is in `namespace sam`. Only compiled in with `LITEROOM_ONNX`; without it the same `Segmenter` class exists (same method names) but is never available: `loaded()` and `encoded()` return false, and `load`, `encode` and `decode` return false with the error "built without LITEROOM_ONNX".
+
+**Depends on:** ONNX Runtime (`onnxruntime_cxx_api.h`) when enabled; `toWide` from LiteUI on Windows. **Not thread-safe**: use it from one thread, the segmentation worker.
+
+**Types**
+- `struct Point { float x = 0, y = 0; bool fg = true; }`: a prompt as a fraction of the picture's width / height; `fg` false = background.
+- `class Segmenter`. `static constexpr int kInput = 1024`: SAM's longest-side input size.
+
+**Encoder layouts** (detected from the model's input rank): **rank 4**: NCHW `1 × 3 × 1024 × 1024`, normalized here (mean 123.675 / 116.28 / 103.53, std 58.395 / 57.12 / 57.375) and zero-padded at the bottom/right. **Rank 3**: HWC raw 0..255 RGB at the resized size (`nh × nw × 3`); the model normalizes and pads itself (samexporter-style export).
+
+**Members**
+
+**`bool loaded() const`**: both models are loaded.
+
+**`bool load(const std::string &encoderPath, const std::string &decoderPath, std::string *err)`**
+- Loads both ONNX models (intra-op threads = hardware concurrency, at least 1; full graph optimization). Returns false with `*err` set if a session can't be created, the encoder has no inputs/outputs, the decoder lacks any of the inputs `image_embeddings, point_coords, point_labels, mask_input, has_mask_input, orig_im_size` or the output `masks`, or the encoder input rank is neither 3 nor 4. `iou_predictions` is optional. Logs the model names to `stderr`.
+
+**`bool encode(const uint8_t *rgba, int w, int h, std::string *err)`**
+- Encodes an RGBA8 picture (alpha ignored). **Slow** (about 0.5 to 2 s on a CPU), so do it once per opened image. The picture is resized so its long side is 1024 (box average) and the embedding is kept. Returns false if not loaded, the pixels are null or a size is non-positive (`"segmenter not ready"`), or the run fails. Any earlier embedding is cleared first.
+
+**`bool encoded() const`**: an embedding is held.
+
+**`bool decode(const std::vector<Point> &pts, std::vector<float> *logits, int *outW, int *outH, std::string *err)`**
+- Cheap (tens of ms). Needs an embedding and at least one prompt. Prompts are converted to the resized picture's coordinates and a padding point (label -1) is appended, as SAM expects; no previous mask is passed.
+- Output: `*logits` (row-major, **> 0 means inside**) of size `*outW × *outH`, at the encoded picture's aspect, long side 1024.
+- Mask choice: if the model returns several masks and there is **exactly one** prompt and IoU scores are available, the best of masks 1..K−1 is used; otherwise mask 0.
+
+---
+
+## Rendering
+
+### `render.hpp`
+The pixel pass: tone tables → color pass → neighbor effects → masks, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
+
+**Depends on:** `adjustment_set.hpp`, `color_pass.hpp`, `detail_layer.hpp`, `liteui.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `pixel_math.hpp`, `render_params.hpp`. **Test:** `render_test`.
+
+**Functions**
+
+**`inline std::shared_ptr<CanvasImage> renderWith(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
+- Inputs: the source picture (**never modified**), the frozen parameters, and the optional cancellation pair.
+- Returns: a new rendered picture, or **null if cancelled**. With no `latest` it always runs to completion (the synchronous path).
+- Order per pixel: tone tables → color pass → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy.
+- How it works:
+  - Masks are resolved against **this** image's size (`prepareComposite`), so preview and full-size renders agree.
+  - Neighbor planes for the global effects **and every mask** are acquired once up front from `src`'s pixels (a cancelled build returns null). The detail layers come from whole-image planes, not halo rows, which is why `src` must stay untouched.
+  - Rows are processed in blocks of 128; `latest` is re-read before every block. Each pixel is independent, so blocking doesn't change the result.
+  - When all three channel tables are identical (no per-channel curves) a single-table fast path is used.
+
+**`inline void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev, uint8_t *q, size_t n, int y0, int W, uint8_t *scratch, float *wbuf, float *wbuf2, const uint8_t *ref, const neighbor_fx::Planes &dp)`**
+- Inputs:
+  - `mp`, `ev`: the frozen mask and its composite resolved for this image size.
+  - `q`, `n`: the rows to edit (`n` bytes = whole rows; the first is image row `y0`).
+  - `W`: picture width.
+  - `scratch`: one row of RGBA; `wbuf`, `wbuf2`: one row of weights each (`wbuf2` for combining parts).
+  - `ref`: the **source** pixels of the same rows (the neighbor effects measure against them).
+  - `dp`: the whole-image planes.
+- Per row:
+  1. Find the span the shape touches (`rowSpan`). **Inverted masks use the whole row** (weight is `1 − w`), so no span cut applies.
+  2. Compute the weights from the row **before** this mask edits it, so a mask's own adjustment never changes what it selects.
+  3. Copy the span to `scratch`; run the mask's tone tables (if `tone`), its color pass, and its neighbor effects (planes from `dp`, so they have all their neighbors whatever the span).
+  4. Blend back: `w = (invert ? 1 − w : w) × amount`; each channel becomes `toU8Clamped(a + (b − a)·w)`. Pixels with `w <= 0` are skipped.
+
+**`inline std::shared_ptr<CanvasImage> renderAdjusted(const AdjustmentSet &set, const CanvasImage &original)`**
+- The simple synchronous entry point: `renderWith(original, set.buildRenderParams())`. Non-destructive; always starts from `original`'s untouched pixels. Big images go through the render worker instead.
+
+### `histogram.hpp`
+Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the clipping overlay. Pure functions of an image and a few flags; the editor's state is not touched. Everything is in `namespace histogram` except the constants. (Needs LiteUI for `CanvasImage` and `Color`.)
+
+**Depends on:** `liteui.hpp`. **Test:** `histogram_test`. `main.cpp`'s `computeHistogram()` picks the image on screen, calls these and stores the results.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kHistMaxSamples` | `int` | 300000 | About this many pixels are visited per recompute |
+| `kClipOverlayMaxEdge` | `int` | 2048 | Overlay resolution cap (long edge) |
+| `kColorClipShadow` | `Color` | (60, 110, 255, 255) | Classic-mode shadow clipping color (blue) |
+| `kColorClipHighlight` | `Color` | (235, 50, 50, 255) | Classic-mode highlight clipping color (red) |
+| `kChanR`, `kChanG`, `kChanB` | `uint8_t` | 1, 2, 4 | Channel bits used in clipping masks |
+
+**Types**
+- `struct Counts`: `r`, `g`, `b`, `l` (each `std::array<uint32_t, 256>`, zero by default), and `clipLo`, `clipHi` (`uint8_t`): the `kChan*` bits of channels that have any pixel at 0 / at 255. They are read from the end bins, so on a picture bigger than `kHistMaxSamples` they reflect only the sampled pixels (the overlay looks at every pixel).
+- `struct ClipOptions { bool shadows = false, highlights = false; bool perChannel = false; }`: which overlays are on, and whether to color by exactly which channels clip.
+
+**Functions**
+
+**`inline Counts compute(const CanvasImage *img)`**
+- Input: the image (may be null or empty, which gives all zeros).
+- Returns: the four histograms and the clip flags.
+- Details: visits a regular grid with `step = max(1, int(sqrt(w·h / 300000)))`. Pixels with alpha 0 are skipped. Luma is integer Rec. 601, `(77R + 150G + 29B) >> 8`.
+
+**`inline uint8_t channelsAt(const uint8_t *px, uint8_t level)`**: `px` points at an RGBA pixel. Returns the `kChan*` bits of the R/G/B values equal to `level`.
+
+**`inline Color clipChannelColor(uint8_t mask, bool pastel)`**
+- Inputs: a channel set (1 = R, 2 = G, 4 = B; only the low 3 bits are used) and whether to lighten the color.
+- Returns: the additive mix color from one palette table (R red, G green, R+G yellow, B blue, R+B magenta, G+B cyan, all three light gray; `mask == 0` is fully transparent). `pastel` moves each channel halfway to 255. This table is the one place to tweak the palette.
+
+**`inline std::shared_ptr<CanvasImage> clipOverlay(const CanvasImage *img, const ClipOptions &opt)`**
+- Input: the image and the options.
+- Returns: an RGBA overlay, or **null** if both overlays are off or the image is null/empty.
+- Details:
+  - Size: `step = ceil(max(w, h) / 2048)`, overlay is `ceil(w/step) × ceil(h/step)`. A block is marked if **any** pixel in it is clipped, so small highlights don't vanish.
+  - Classic mode: red where any channel is 255, blue where any is 0.
+  - Per-channel mode: colored by exactly which channels clip. Pixels clipped in all three are left untinted.
+  - Where a block holds both kinds, highlights win. Fully transparent pixels never count. Marked blocks get alpha 255; others stay transparent.
+
+---
+
+## Saving and files
+
+### `sidecar.hpp`
+The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`.
+
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`. No UI. **Test:** `sidecar_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kSidecarVersion` | `int` | 1 | Declared here; this header neither writes nor checks it |
+| `kSidecarExt` | `const char *` | `".literoom.json"` | Appended to the picture's path |
+| `kSidecarMaxPrompts` | `size_t` | 256 | Object prompts kept per mask part |
+| `kSidecarMaxMapPixels` | `int64_t` | 2^26 | Largest object bitmap (8192 × 8192) |
+
+**Types:** `struct SidecarEdits { AdjValues values{}; CropRect crop; Orient orient; float angle = 0; bool expand = false; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; MaskSet masks; }`: everything the user did to a picture.
+
+**File layout** (written by `sidecarEditsToJson`)
+- `adjust`: object keyed by **slider label** (e.g. `"Exposure"`, `"Noise Reduction"`, `"Color Noise"`, `"Colorize Hue"`); zero sliders are left out.
+- `curves`: keys `rgb`, `r`, `g`, `b`, each an array of `[x, y]` pairs; identity curves left out.
+- `colorMix`: keys `hue`, `sat`, `lum`, each an array of 8 numbers; `{}` if all zero.
+- `colorGrading`: `wheels` (4 objects with `hue`, `sat`, `lum`, `visible`), `blending`, `balance`; `{}` if default.
+- `geometry`: `flip`, `rotate` (quarter turns), `angle`, `keepFullCanvas`, and `crop` as `[x, y, w, h]` (only if there is a crop).
+- `masks`: array of masks. Each has `enabled`, `invert`, `adjust`, `parts`, and only when non-default: `name`, `amount`, `colorMix`, `colorGrading`, `curves`. Each part is the shape object plus `op` (`"add"`, `"subtract"`, `"intersect"`).
+- Shape objects by `type`: `radial` (`cx, cy, rx, ry, angle, feather`); `linear` (`cx, cy, len, angle`); `brush` (`strokes` of `erase, size, feather, density, flow` (only if not 1), and `pts` as a flat `x0, y0, x1, y1, …` list); `luminosity` (`lo, hi, feather`); `colorRange` (`set, r, g, b, range, feather`); `object` (`feather, grow, prompts` as `[x, y, fg]`, and `map` = `{w, h, rle}` where `rle` is base64 of the run-length-coded bytes).
+
+**Functions**
+
+**`inline std::string sidecarFileOf(const std::string &imagePath)`**: `"photo.jpg"` → `"photo.jpg.literoom.json"`.
+
+**`inline float sidecarNum(const mj::Json &o, const char *key, float def, float lo, float hi)`**: the number under `key` in object `o`, clamped to `[lo, hi]`; `def` (**not clamped**) if the key is missing or not a number.
+
+**`inline bool sidecarFlag(const mj::Json &o, const char *key, bool def)`**: the bool under `key`, or `def` if missing or not a bool.
+
+**`inline float sidecarClampNum(const mj::Json &x, float lo, float hi)`**: a JSON value as a float clamped to `[lo, hi]` (a non-number counts as 0).
+
+**`inline mj::Json sidecarAdjToJson(const AdjValues &v)`** / **`inline AdjValues sidecarAdjFromJson(const mj::Json *j)`**
+- Write: label-keyed object of non-zero sliders. Read: each slider clamped to its own range; a null pointer, a non-object, or a missing or non-numeric key gives 0.
+
+**`inline mj::Json sidecarCurvesToJson(const CurveSet &cs)`** / **`inline CurvePoints sidecarCurveFromJson(const mj::Json &arr)`**
+- Read enforces the editor's invariants: 2 to 16 points, each an `[x, y]` pair of numbers (clamped to 0..255), first point at x = 0 and last at x = 255, interior points at least `kCurveMinGap` apart. **Anything else becomes the identity curve.**
+
+**`inline mj::Json sidecarMixToJson(const MixValues &m)`** / **`inline MixValues sidecarMixFromJson(const mj::Json *j)`**: read clamps each value to -100..100; missing rows or entries stay 0.
+
+**`inline mj::Json sidecarGradeToJson(const ColorGrade &g)`** / **`inline ColorGrade sidecarGradeFromJson(const mj::Json *j)`**: read clamps `hue` to 0..359, `sat` to 0..100, `lum` to -100..100, `blending` to 0..100, `balance` to -100..100.
+
+**`inline const char *sidecarOpKey(MaskOp op)`**: `"subtract"`, `"intersect"`, otherwise `"add"`.
+
+**`inline std::string sidecarMapData(const ObjectMap &m)`**: base64 of the run-length-coded bitmap, memoized by the map's id (maps are immutable) so autosave doesn't re-encode them. The memo holds up to 16 entries. **UI thread only.**
+
+**`inline mj::Json sidecarShapeToJson(const MaskShape &s)`**: one shape as above. An object's bitmap is included only if its size matches `w × h`.
+
+**`inline bool sidecarShapeFromJson(const mj::Json &o, MaskShape *out)`**
+- Returns false if `type` is missing or unknown. Load limits:
+  - radial: `cx, cy` -1..2; `rx, ry` 0.001..4; `angle` -360..360; `feather` 0..1. linear: `len` 0.001..4.
+  - brush: at most 512 strokes and 20000 points per stroke; `size` within `kBrushMinSize..kBrushMaxSize`; point coordinates -1..2; a stroke with no points is dropped; `flow` 0.01..1.
+  - luminosity: `lo` and `hi` set through `setLo` / `setHi`, so Min never passes Max.
+  - object: `feather` 0..1, `grow` -1..1; prompts need 3 items (`[x, y, fg]`), at most 256, coordinates 0..1. The bitmap is accepted only if `w`, `h` are 1..16384, `w × h <= 2^26`, the base64 and run-length decode succeed and give exactly `w × h` bytes; it gets a **new `id`**.
+
+**`inline mj::Json sidecarMaskToJson(const Mask &m)`** / **`inline bool sidecarMaskFromJson(const mj::Json &o, Mask *out)`**
+- Read: false if `o` isn't an object, `parts` is missing, or **no valid part** remains (a mask without a shape can't be shown or edited). Parts with an unknown or invalid shape are skipped; at most `kMaxMaskParts` are kept. The name is passed through `sanitizeMaskName`; `amount` is clamped to 0..100 (default 100).
+
+**`inline mj::Json sidecarEditsToJson(const SidecarEdits &e)`**: the whole file's content (layout above).
+
+**`inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH, SidecarEdits *out)`**
+- Inputs: the parsed JSON, the picture's original size (needed to check the crop), and the output.
+- Returns: false (and leaves `*out` untouched) only if `o` isn't an object or `origW`/`origH` aren't positive. Anything wrong inside is dropped or clamped instead.
+- Details: `rotate` is rounded into 0..3; `angle` clamped to ±`kAngleMax`. The crop is kept only if it has four numbers, positive `w`/`h`, and fits inside the oriented, straightened size (a quarter turn swaps width and height first, then `rotatedDims` with the angle and `keepFullCanvas`). At most `kMaxMasks` masks are loaded.
+
+### `minijson.hpp`
+A tiny JSON value, writer and parser (UTF-8, no dependencies), plus base64 and byte run-length helpers. Everything is in `namespace mj`. Used for the edit sidecar.
+
+**Depends on:** standard library only. No UI. **Test:** `minijson_test`.
+
+**Number text is locale-independent:** the C library's decimal separator is swapped for `.` on write and back on read, so a comma-decimal locale can neither corrupt a file nor make a valid one unreadable. Save files in binary mode (`dump()` uses `\n`), ideally with `writeFileAtomic`.
+
+**`class Json`**
+
+Constants: `Json::kMaxInputBytes` = 64 MiB (larger inputs are rejected before parsing: each value is about 140 bytes in memory).
+
+`enum class Type { Null, Bool, Number, String, Array, Object }`. A default-constructed `Json` is Null.
+
+**Building values** (static)
+- `Json::flag(bool b)`; `Json::str(std::string s)`; `Json::array()`; `Json::object()`.
+- `Json::num(double v)`: NaN and infinity become 0 (JSON has none), and `-0` becomes `+0`.
+- `Json::num(float v)`: written with the **fewest digits that read back as the same float** (`0.3f` → `0.3`, not `0.300000012`).
+- `Json::num(T v)` for any integer type except `bool`: converted to `double`. Values beyond 2^53 lose precision; store hashes or mtimes as strings.
+
+**Inspecting**
+- `type()`, `isNull()`, `isBool()`, `isNumber()`, `isString()`, `isArray()`, `isObject()`.
+- `double asNum(double def) const`, `bool asFlag(bool def) const`: the value, or `def` if it is not that type. `const std::string &asStr() const`: the string (empty if not a string).
+- `int asInt(int def, int lo = INT_MIN, int hi = INT_MAX) const` and `float asFloat(float def, float lo, float hi) const`: clamped, so safe to cast even for hostile values like 1e300.
+
+**Arrays**
+- `Json &push(Json v)`: appends (a Null becomes an array first; `assert` if it is some other type). Chainable.
+- `const std::vector<Json> &items() const`; `const Json &at(size_t i) const` (throws `std::out_of_range`); `size_t size() const` (member count for an object, else item count).
+
+**Objects** (insertion order is kept, so files diff cleanly)
+- `Json &set(const std::string &key, Json v)`: adds or **replaces** (a Null becomes an object first). Chainable.
+- `const Json *find(std::string_view key) const` and `Json *find(...)`: pointer to the member or null.
+- `const Json &get(std::string_view key) const`: like `find` but returns a shared Null when missing, so lookups chain: `j.get("a").get("b").asNum(0)`.
+- `keys()`, `values()`: parallel vectors, so unknown keys can be round-tripped.
+
+**Text**
+- `std::string dump() const`: pretty-printed with 2-space indent and a trailing `\n`. Arrays that hold only numbers/bools are packed 16 per line; other arrays and objects get one item per line. Integral numbers below 1e15 are written without a decimal point; others use the fewest digits (up to 17) that read back exactly.
+- `static bool parse(std::string_view text, Json *out, std::string *err)`: returns true and sets `*out`, or returns false with `*err` (optional) saying where (`... at line L, column C (byte N)`). Rules:
+  - A leading UTF-8 BOM is skipped; input over 64 MiB is rejected; trailing characters are an error; nesting deeper than 64 is an error.
+  - Strings must be valid UTF-8 (no overlongs, surrogates or code points above U+10FFFF); control characters are rejected; `\uXXXX` escapes with proper surrogate pairs are decoded; a lone surrogate or `\u0000` is an error.
+  - Numbers are scanned leniently and then checked with `strtod` (must consume the whole token and be finite), so a few non-standard forms such as leading zeros are accepted.
+  - A duplicate object key keeps the **last** value.
+
+**Base64** (RFC 4648, padded)
+- **`inline std::string base64Encode(const std::vector<std::uint8_t> &d)`**.
+- **`inline bool base64Decode(std::string_view s, std::vector<std::uint8_t> *out)`**: strict. Length must be a multiple of 4; `=` only at the very end (one or two); no whitespace; any other character fails. `*out` is cleared on failure.
+
+**Run-length coding** (byte pairs: count 1..255, then value)
+- **`inline std::vector<std::uint8_t> rleEncode(const std::vector<std::uint8_t> &in)`**: worst case (no repeated bytes) doubles the size.
+- **`inline bool rleDecode(const std::vector<std::uint8_t> &in, std::size_t expected, std::vector<std::uint8_t> *out)`**: true only if the runs add up to exactly `expected` bytes. Fails on an odd length, a zero count, or a total that overshoots or falls short; `*out` is empty on failure. **Safe on untrusted input**: it refuses at once if `expected` exceeds what the stream could produce (`pairs × 255`), so it never allocates more than the data can fill, whatever `expected` claims.
+
+### `file_utils.hpp`
+Paths, extensions, folder listing, natural sort and atomic writes. Standard library only, so every function is tested against a temp directory. Paths are UTF-8 `std::string` at the edges of the program.
+
+**Depends on:** standard library only. No UI. **Test:** `file_utils_test`.
+
+**Functions**
+
+**`inline std::filesystem::path fsPath(const std::string &utf8)`**: converts a UTF-8 string to a path without going through the system code page.
+
+**`inline std::string u8ToString(const std::filesystem::path &p)`**: the way back, to UTF-8.
+
+**`inline std::string baseName(const std::string &path)`**: the part after the last `/` or `\`; all of it if there is none.
+
+**`inline std::string fileExtLower(const std::string &path)`**
+- Returns: the extension after the last `.`, lower-cased (ASCII), without the dot. Empty if there is no dot or the last dot lies before the last slash.
+- Gotcha: a name that is only an extension (`".jpg"`) returns `"jpg"`.
+
+**`inline bool isJpegPath(const std::string &path)`**: true if the extension is `jpg` or `jpeg` (any case).
+
+**`inline std::string filmLower(std::string s)`**: ASCII lower-case copy; the filmstrip's case-insensitive name key.
+
+**`inline bool naturalLess(const std::string &a, const std::string &b)`**
+- Returns: true if `a` sorts before `b` in natural order (`IMG_2` before `IMG_10`).
+- Rules: runs of digits compare by numeric value (leading zeros ignored, one digit kept; a longer run is larger). Other characters compare lower-cased. If one string is a prefix of the other, the shorter is less.
+- Not a total order on its own: `"a01"` and `"a1"` are equivalent, which `listImageFiles` resolves with a plain comparison.
+
+**`inline bool readFilePrefix(const std::string &path, size_t maxBytes, std::vector<uint8_t> *out)`**
+- Inputs: UTF-8 path, the most bytes to read, output buffer.
+- Returns: true if the file opened and at least one byte was read; false if unreadable or empty. `*out` holds the bytes actually read (all of the file if smaller than `maxBytes`). Note it allocates `maxBytes` up front.
+
+**`inline bool writeFileAtomic(const std::string &path, const std::vector<uint8_t> &bytes, std::string *errorOut)`**
+- Inputs: UTF-8 target path, the bytes, and an optional (may be null) error string.
+- Returns: true on success.
+- Details: writes to `<path>.tmp`, then renames over the target, so an interrupted export never leaves a half-written picture over a good one. On failure the temp file is removed and `*errorOut` is set (`"couldn't write <name>"`, or the filesystem's message for a failed rename). It does not `fsync`.
+
+**`inline std::vector<std::string> listImageFiles(const std::string &folder, size_t maxFiles)`**
+- Inputs: folder path (UTF-8), cap on the number of names.
+- Returns: file names (UTF-8, no directory part) of regular files ending in `.jpg`, `.jpeg` or `.png` (any case) that lie **directly** in `folder`, in natural order. Equal names under natural order are ordered by plain comparison, so the result never depends on directory order. A missing or unreadable folder gives `{}`; unreadable entries are skipped.
+- Cap behavior (on purpose, pinned by a test): the cap is applied **before** sorting, so a folder over the cap yields an arbitrary (directory-order) subset, sorted.
+
+### `image_codec.hpp`
+Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Windows. (Needs LiteUI because it reuses the libraries LiteUI already pulls in.) Everything that touches the editor (file pickers, state, status line) stays in `main.cpp`'s `exportImage` / `saveJpegFile`.
+
+**Depends on:** `liteui.hpp`. **Test:** `image_codec_test`.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kJpegQualityDefault` | `int` | 92 | Default JPEG quality |
+| `kJpegMaxSide` | `int` | 65500 | Largest side allowed (the format's limit is 65535). **Declared here but not checked by the encoders**; the caller must enforce it |
+
+**Functions**
+
+**`inline bool encodePngFile(const std::string &path, const CanvasImage &img, std::string *errorOut)`**
+- Inputs: output path, the picture (RGBA8, straight alpha), and an optional (may be null) error string.
+- Returns: true if the file was written; otherwise false with `*errorOut` set.
+- Details: 8-bit RGBA PNG, alpha kept. Linux uses libpng (a failure `longjmp`s to the cleanup path); Windows uses WIC, swaps R and B if the encoder substitutes BGRA, and fails on any other pixel format. The Linux version opens the file with `fopen(path.c_str())`.
+
+**`inline void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)`**
+- Inputs: the picture, row index `y` (not range-checked), destination for `width × 3` bytes, and the channel order (`true` = BGR for WIC, `false` = RGB for libjpeg).
+- Output: that row as packed 8-bit color, with alpha composited **over white**: `(c·a + 255·(255 − a) + 127) / 255`; fully opaque pixels are copied exactly.
+
+**`inline bool jpegFullChroma(int quality)`**: true when `quality >= 90`, meaning 4:4:4 (no chroma subsampling), to keep colored edges crisp.
+
+**`inline bool encodeJpegMemory(const CanvasImage &img, int quality, std::vector<uint8_t> *out, std::string *errorOut)`**
+- Inputs: the picture, quality (about 1..100; libjpeg clamps it, WIC uses `quality/100`), the output buffer, and an optional error string.
+- Returns: true on success, with the whole JPEG in `*out`; otherwise false and `*errorOut` is set.
+- Details: encoded **to memory** so the source photo's EXIF and ICC can be spliced in before the file is written (`embedSourceMetadata`, then `writeFileAtomic`). Alpha is flattened onto white. Linux installs a custom libjpeg error handler (`JpegEncErr`, `jpegEncErrExit`) that `longjmp`s back instead of letting libjpeg `exit()` the app. Windows writes in chunks of 64 rows and asks for 4:4:4 as a best-effort property. Image size is not validated here.
+
+### `exif.hpp`
+JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a source JPEG's EXIF block and ICC profile into a re-encoded one. Everything is in `namespace exif`. Every read is bounds-checked, so a damaged or hostile file yields "no metadata" rather than reading out of range.
+
+**Depends on:** standard library only. No UI. **Test:** `exif_test`.
+
+**What happens on export**
+- The orientation is reset to upright (the pixels already are), the embedded thumbnail is erased (its data zeroed, not just unlinked), and the picture size fields are updated.
+- **Not carried over:** XMP and IPTC (captions, copyright fields and any develop settings stored in XMP are dropped), and thumbnails stored anywhere other than IFD1 (e.g. inside a MakerNote).
+- **Carried over verbatim:** GPS data inside the EXIF block. Strip it yourself for a "remove location" export.
+- Embedding the source ICC profile is only right if the pixels are still in that profile's color space.
+
+**Types**
+- `struct Transform { int rot = 0; bool flip = false; }`: how to turn a picture upright: mirror left-right first (if `flip`), then `rot` clockwise quarter turns. Same convention as `Orient` in `geometry.hpp`.
+- `struct JpegMeta`
+
+  | Field | Type | Default | Meaning |
+  |---|---|---|---|
+  | `orientation` | `int` | 1 | The stored EXIF orientation, 1..8 (1 if absent or invalid) |
+  | `exif` | `std::vector<uint8_t>` | empty | The EXIF APP1 payload (`"Exif\0\0"` + TIFF data), **already rewritten** for an upright re-encode: orientation 1, thumbnail erased and unlinked. Empty if the file had none |
+  | `icc` | `std::vector<std::vector<uint8_t>>` | empty | The ICC APP2 payloads (`"ICC_PROFILE\0"` + chunk header + data), verbatim, in sequence order. Empty if none, or if the chunks were incomplete, inconsistent or over 16 MiB (a broken profile is worse than none) |
+
+**Functions**
+
+**`inline Transform orientationToTransform(int o)`**
+- Input: EXIF orientation value.
+- Returns: the upright transform. Any value outside 2..8 gives `{0, false}`.
+
+  | Value | Meaning | `{rot, flip}` |
+  |---|---|---|
+  | 1 | normal | `{0, false}` |
+  | 2 | mirror | `{0, true}` |
+  | 3 | turn 180 | `{2, false}` |
+  | 4 | mirror vertically | `{2, true}` |
+  | 5 | transpose | `{3, true}` |
+  | 6 | turn 90 cw | `{1, false}` |
+  | 7 | transverse | `{1, true}` |
+  | 8 | turn 270 cw | `{3, false}` |
+
+**`inline bool readJpegMeta(const uint8_t *data, size_t size, JpegMeta *out)`**
+- Inputs: bytes of a JPEG (a prefix is fine; only the header up to the first scan is read), its length, and the output (always reset first).
+- Returns: false if it isn't a JPEG (no `FF D8` start); true otherwise, **even when there is no metadata**.
+- Details: walks the marker segments until SOS or EOI, stopping quietly if it loses sync or hits a bad length. Uses the **first** EXIF APP1 only. ICC chunks are collected and validated (all agree on the count, sequence numbers exactly 1..count once each). `out->exif` is only set if the TIFF header (byte order, magic 42, IFD0 offset ≥ 8) is valid.
+
+**`inline std::vector<uint8_t> embed(const std::vector<uint8_t> &jpeg, const JpegMeta &meta, int w, int h)`**
+- Inputs: a freshly encoded JPEG, the metadata from `readJpegMeta`, and the new picture size.
+- Returns: a copy of `jpeg` with the EXIF segment and ICC segments inserted right after SOI (after a leading APP0 if the file starts with one, as JFIF requires). A buffer that isn't a JPEG is returned unchanged.
+- Details: the EXIF segment is left out if `meta.exif` is malformed or `w`/`h` aren't positive (its size fields would be stale). Size fields written: IFD0 ImageWidth/ImageLength and the EXIF sub-IFD's PixelXDimension/PixelYDimension, where present, each rewritten as a LONG. Invalid ICC chunks and any segment over 65533 bytes of payload are skipped.
+
+**`namespace exif::detail`** (internal; listed so you can find things)
+- `kMaxIccBytes` (`size_t`, 16 MiB).
+- `struct Tiff`: a bounds-checked, endian-aware view over a TIFF block with `ok`, `rd16`, `rd32`, `wr16`, `wr32`, `zero`. Every read or write that would fall outside the block fails or is skipped.
+- `findEntry(t, ifd, tag, &entry, &count, &end)`: finds a tag in an IFD; `count` and `end` are filled whenever the IFD is readable, even if the tag is absent.
+- `tiffHeader(t, &ifd0)`: reads byte order and IFD0's offset (rejects offsets under 8).
+- `dropThumbnail(t, nextIfdPtr)`: zeroes the IFD1 thumbnail's data and IFD, then unlinks IFD1.
+- `resetOrientation(t, ifd0)`: sets tag 0x0112 to 1 (only if SHORT, count 1), drops the thumbnail, and returns the original value.
+- `setLong(t, ifd, tag, value)` and `setDimensions(t, ifd0, w, h)`: rewrite size tags.
+- `isExifPayload`, `isIccPayload`: header checks. `normalizeIcc(icc)`: validates and orders the chunks.
+
+### `image_meta.hpp`
+Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's camera rotation as an `Orient` and copies metadata into an export. No UI, no editor state, so both functions are tested with synthetic JPEG files in a temp folder.
+
+**Depends on:** `exif.hpp`, `file_utils.hpp`, `geometry.hpp`. **Test:** `image_meta_test`.
+
+**Constants:** `kMetaPrefixBytes` (`size_t`, 8 MiB): how much of the source file is searched for its EXIF/ICC segments when exporting. (`exifOrientationOf` looks at only the first 256 KiB.)
+
+**Functions**
+
+**`inline Orient exifOrientationOf(const std::string &path)`**
+- Input: UTF-8 path of a picture file.
+- Returns: the `Orient` that makes the picture upright. Identity for anything that isn't a `.jpg`/`.jpeg`, can't be read, isn't a JPEG, or has no valid orientation tag.
+- Why: decoders hand back the stored pixels, so a portrait shot would otherwise open on its side. It is applied **once**, as the file is opened: the "original" the editor (and its saved edits and masks) work on is the upright picture.
+
+**`inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg, const std::string &sourcePath, int width, int height)`**
+- Inputs: `jpeg` (a freshly encoded JPEG, modified in place), the source photo's path, and the new picture size.
+- Returns: true when the source is a `.jpg`/`.jpeg` whose header could be read (i.e. `exif::embed` ran). `*jpeg` is then rewritten, and stays byte-identical if the source had no EXIF or ICC data. Returns false with `*jpeg` untouched for a non-JPEG, missing or empty source, or one that doesn't start like a JPEG.
+- Effects: orientation reset to upright, thumbnail erased, size fields updated (see `exif::embed`). GPS is carried over.
+
+---
+
+## Background work
+
+### `latest_worker.hpp`
+`LatestWorker<Job, Value>`: one background thread that runs "latest wins" jobs. It replaces the hand-written render, geometry, decode and segment workers, which all implemented the same protocol. See [threading.md](threading.md). No UI.
+
+**Depends on:** standard library only (`std::jthread`). **Test:** `latest_worker_test` (links the thread library; run it in a loop to shake out timing flakiness).
+
+**The protocol**
+- Every `submit()` and `invalidate()` bumps a generation number. Only the newest request can win: a newer submit replaces a job still waiting, and a running job polls the number to abandon itself.
+- A finished value is parked under a lock and re-checked against the newest generation, so a result invalidated while it finished is never delivered.
+- The UI thread is woken by the notify callback **outside** the lock, so it can't deadlock on the worker's mutex.
+- **Thread model:** every public member is called from **one** thread (the UI thread). The worker thread, started lazily by the first `submit()`, only runs the job function and touches the parked slot.
+
+**Types**
+- `struct WorkerCancel`
+  - `std::atomic<uint64_t> *latest` and `uint64_t gen`: the raw atomic and this job's generation, so existing cancellable routines (`renderWith`, `rotateArbitrary`, `segmentObject`) keep their `(const std::atomic<uint64_t>* latest, uint64_t gen)` parameters. Pass `c.latest, c.gen`.
+  - `bool cancelled() const`: true once a newer `submit()`/`invalidate()`/`shutdown()` has superseded this job.
+- `template <class Job, class Value> class LatestWorker`, with aliases `JobType`, `Result`, `Cancel` (= `WorkerCancel`), and
+  `using JobFn = std::function<std::optional<Value>(Job &&, Cancel)>`: runs on the worker thread. Return `std::nullopt` to say "abandoned" (nothing is parked or notified). A job that can't be cancelled simply always returns a value (a failure value, if need be).
+
+**Members**
+
+**`explicit LatestWorker(JobFn fn)`**: stores the job function. No thread yet. Non-copyable.
+
+**`~LatestWorker()`**: marks shutdown so a running job bails at its next poll; the `std::jthread` (declared last, so destroyed first) requests stop and joins.
+
+**`void setNotify(std::function<void()> fn)`**: callback run **on the worker thread** each time a result has been parked. Call it **before the first `submit()`**; the thread is created by `submit`, so it then sees the value without extra synchronization.
+
+**`void shutdown()`**: stops the worker and joins it; afterwards the notify callback never runs again. Blocks until a running job that ignores `Cancel` has finished.
+
+**`void submit(Job job)`**: starts the thread if needed, queues `job`, and supersedes any earlier one (waiting or running). Sets `outstanding()` to true.
+
+**`void invalidate()`**: forgets whatever is waiting or running; its result will never be taken. Sets `outstanding()` to false.
+
+**`bool outstanding() const`**: true from `submit()` until its result has been taken or `invalidate()`.
+
+**`std::optional<Value> collect()`**
+- Non-blocking. Returns the finished result of the newest request if it is ready (and clears `outstanding()`); otherwise `std::nullopt`. Always `nullopt` when nothing is outstanding. A parked result from an older generation is discarded.
+
+**`Value waitForLatest()`**
+- Blocking. Waits for the newest request to finish and returns its value. **Only call while `outstanding()`**: after `invalidate()` nothing would ever wake it.
+
+### `thumb_worker.hpp`
+The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a picture to fit 96 × 72, and `ThumbWorker` decodes a queue of files, thumbnails them, and notes which have a sidecar. A first-in-first-out queue with **no generations**, so **not** a `LatestWorker`. (Needs LiteUI's decoder.)
+
+**Depends on:** `liteui.hpp` (decoder), `geometry.hpp`, `raster_ops.hpp` (`orientImage`), `file_utils.hpp` (`fsPath`), `sidecar.hpp` (`sidecarFileOf`). **Test:** `thumb_worker_test` (links LiteUI and the thread library).
+
+**Constants:** `kFilmThumbW` = 96, `kFilmThumbH` = 72 (`int`).
+
+**Functions**
+
+**`inline std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)`**
+- Returns: a box-averaged copy that fits 96 × 72 (aspect kept, **never enlarged**; each side at least 1). Null for an empty picture or one whose pixel buffer is smaller than `width × height × 4`. All four channels, alpha included, are averaged with rounding.
+
+**`class ThumbWorker`** (non-copyable)
+
+- `struct Result { std::string path; std::shared_ptr<const CanvasImage> thumb; bool edited = false; }`: `thumb` is **null if the file couldn't be decoded** (the result is still delivered); `edited` is true if a sidecar file exists for the path.
+- `using OrientFn = std::function<Orient(const std::string &)>`: says how a file's camera rotation turns it upright. The app passes its own EXIF reader (`exifOrientationOf`), so thumbnails are turned exactly like the editor turns the picture.
+- **`explicit ThumbWorker(OrientFn orientOf)`**: no thread yet.
+- **`~ThumbWorker()`**: calls `shutdown()`.
+- **`void setNotify(std::function<void()> fn)`**: called **on the worker thread** after each result is stored. Set it before the first `setQueue()`.
+- **`void setQueue(std::vector<std::string> paths)`**: replaces what is still to do (starting the thread on first use). The file being processed finishes; results already made stay until collected. Call it again whenever the open picture changes so the work starts next to it.
+- **`std::vector<Result> collect()`**: returns everything made since the last call and empties the list. Thread-safe, non-blocking.
+- **`void shutdown()`**: clears the queue, requests stop and joins the thread.
+- Per file, the worker: decodes it (`liteui_image::decodeFile`), applies the orientation from `orientOf`, makes the thumbnail, and checks for the sidecar with `std::filesystem::exists`.
+
+---
+
+## Test support
+
+### `check.hpp`
+The tiny test harness shared by the unit tests: `CHECK`, `CHECK_NEAR` and `finish()`. See [testing.md](testing.md).
+
+**Depends on:** standard library only (`<cmath>`, `<cstdio>`). No test of its own; it is the harness the tests use.
+
+**State:** `tcheck::failures` (`inline int`, starts at 0). A plain `int`, so not thread-safe.
+
+**Macros**
+- **`CHECK(...)`**: records a failure when the expression is false and carries on. Prints `FAIL <file>:<line>  <expression>` and increments `tcheck::failures`. Variadic on purpose, so braced initializers with commas (`CropRect{1, 2, 3, 4}`) work inside.
+- **`CHECK_NEAR(a, b, tol)`**: fails unless `|a − b| <= tol`. All three are converted to `double`. A NaN on either side fails. Prints both values.
+
+**`inline int finish()`**: prints `all ok` or `<N> FAILED`. Returns 0 if there were no failures, otherwise 1. Use it as the last line: `return finish();`.

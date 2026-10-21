@@ -182,6 +182,13 @@ inline bool encodePngFile(const std::string &path, const CanvasImage &img,
 constexpr int kJpegQualityDefault = 92;
 constexpr int kJpegMaxSide = 65500; // the format's limit is 65535
 
+// JPEG stores width and height in 16 bits, and a picture needs at least 1 pixel
+// each way. encodeJpegMemory refuses anything else (before touching pixels).
+inline bool jpegSizeOk(int w, int h)
+{
+  return w > 0 && h > 0 && w <= kJpegMaxSide && h <= kJpegMaxSide;
+}
+
 // One row of the picture as packed 8-bit RGB (or BGR), alpha over white.
 inline void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)
 {
@@ -206,6 +213,12 @@ inline bool jpegFullChroma(int quality) { return quality >= 90; }
 inline bool encodeJpegMemory(const CanvasImage &img, int quality,
                              std::vector<uint8_t> *out, std::string *errorOut)
 {
+  if (!jpegSizeOk(img.width, img.height))
+  {
+    if (errorOut)
+      *errorOut = "JPEG can't hold a picture this size";
+    return false;
+  }
   HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   bool weInitialized = coHr == S_OK;
 
@@ -338,6 +351,12 @@ inline void jpegEncErrExit(j_common_ptr c)
 inline bool encodeJpegMemory(const CanvasImage &img, int quality,
                              std::vector<uint8_t> *out, std::string *errorOut)
 {
+  if (!jpegSizeOk(img.width, img.height))
+  {
+    if (errorOut)
+      *errorOut = "JPEG can't hold a picture this size";
+    return false;
+  }
   jpeg_compress_struct cinfo;
   JpegEncErr jerr;
   struct

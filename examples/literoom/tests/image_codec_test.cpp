@@ -132,6 +132,11 @@ static void testFlattenRow()
   CHECK(jpegFullChroma(100) && jpegFullChroma(92) && jpegFullChroma(90));
   CHECK(!jpegFullChroma(89) && !jpegFullChroma(50) && !jpegFullChroma(1));
   CHECK(kJpegQualityDefault == 92 && kJpegMaxSide == 65500);
+
+  const int M = kJpegMaxSide;
+  CHECK(jpegSizeOk(1, 1) && jpegSizeOk(M, 1) && jpegSizeOk(1, M) && jpegSizeOk(M, M));
+  CHECK(!jpegSizeOk(M + 1, 1) && !jpegSizeOk(1, M + 1) && !jpegSizeOk(M + 1, M + 1));
+  CHECK(!jpegSizeOk(0, 5) && !jpegSizeOk(5, 0) && !jpegSizeOk(-1, 5) && !jpegSizeOk(5, -1));
 }
 
 // -------------------------------------------------------------------- PNG
@@ -289,6 +294,45 @@ static void testJpegQualityAndChroma()
   }
 }
 
+// The size limit is enforced by the encoder itself, so no caller can skip it.
+static void testJpegSizeLimit()
+{
+  const int M = kJpegMaxSide;
+  // Exactly at the limit still encodes (1 pixel thick, so the buffers stay small).
+  for (const CanvasImage &img : {solid(M, 1, 10, 20, 30), solid(1, M, 10, 20, 30)})
+  {
+    Bytes jpeg;
+    std::string err;
+    CHECK(encodeJpegMemory(img, 90, &jpeg, &err));
+    CHECK(isJpegStream(jpeg));
+  }
+
+  // One past the limit, in either direction: refused, with an error and no output.
+  for (const CanvasImage &img : {solid(M + 1, 1, 10, 20, 30), solid(1, M + 1, 10, 20, 30)})
+  {
+    Bytes jpeg;
+    std::string err;
+    CHECK(!encodeJpegMemory(img, 90, &jpeg, &err));
+    CHECK(!err.empty());
+    CHECK(jpeg.empty());
+    CHECK(!encodeJpegMemory(img, 90, &jpeg, nullptr)); // null errorOut is fine
+  }
+
+  // Empty or negative sizes: the guard runs before any pixel is read, so the
+  // buffer behind a bogus width / height is never touched.
+  for (int bad : {0, -1})
+  {
+    CanvasImage w = solid(4, 4, 1, 2, 3), h = solid(4, 4, 1, 2, 3);
+    w.width = bad;
+    h.height = bad;
+    Bytes jpeg;
+    std::string err;
+    CHECK(!encodeJpegMemory(w, 90, &jpeg, &err) && !err.empty() && jpeg.empty());
+    err.clear();
+    CHECK(!encodeJpegMemory(h, 90, &jpeg, &err) && !err.empty() && jpeg.empty());
+  }
+}
+
 // A real encoder stream plus a source photo's metadata: still decodes, and the
 // EXIF now says "upright".
 static void testEmbedIntoRealEncoderOutput()
@@ -336,6 +380,7 @@ int main()
   testJpegChannelOrder();
   testJpegFlattensAlphaOnWhite();
   testJpegQualityAndChroma();
+  testJpegSizeLimit();
   testEmbedIntoRealEncoderOutput();
   return finish();
 }

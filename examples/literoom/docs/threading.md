@@ -1,0 +1,95 @@
+# Threading
+
+Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the five workers, and the rules that keep it safe.
+
+## The problem "latest wins" solves
+
+When you drag a slider, the UI asks for a new render many times a second. If each request were queued, the editor would fall further and further behind and then spend seconds drawing results nobody wants. What you actually want is: **only the newest request matters.** Older work should be abandoned as soon as possible.
+
+`latest_worker.hpp` implements exactly that, once, as a reusable class: `LatestWorker<Job, Result>`.
+
+## How `LatestWorker` works
+
+Every request gets a **generation number**. Think of it as a ticket number that only ever goes up.
+
+1. **`submit(job)`** bumps the generation, stores the job (replacing one that was still waiting), and wakes the thread. The thread itself is created lazily, the first time you submit.
+2. **The running job can check whether it was superseded.** It receives a `WorkerCancel` with the newest generation number, and calls `cancelled()` (or passes `latest` and `gen` to the routine it calls). If the number has moved on, it returns "abandoned" and its result is thrown away.
+3. **A finished result is re-checked under a lock** before it is parked. If `invalidate()` ran while the job was finishing, the result is dropped instead of delivered. A stale result is never handed to the UI.
+4. **`notify()` is called outside the lock** once a result is parked. In the app it calls `ui.wake()`, which is safe from any thread and wakes the otherwise sleeping event loop.
+5. **The UI collects the result.** `collect()` is non-blocking and returns the result of the newest request if it is ready. `waitForLatest()` blocks, for the few places that need the real pixels *now*.
+
+Other calls you will see:
+
+| Call | Meaning |
+|---|---|
+| `invalidate()` | Forget whatever is waiting or running; its result will never be taken. |
+| `outstanding()` | True from `submit()` until its result is taken or invalidated. |
+| `shutdown()` | Stop and join the thread. Blocks until a job that ignores cancellation finishes. |
+| `setNotify(fn)` | Must be called **before** the first `submit()`. |
+
+The class has no UI or editor dependency, so it is tested with plain integers.
+
+## The rule that makes it safe
+
+> Everything public is called from **one** thread, the UI thread. The worker thread only runs the job function and touches the parked result.
+
+A job must therefore be a **pure function of its inputs**. It gets an immutable picture and a *copy* of the parameters. It never reads `state`, never calls the LiteUI window and widget API, and never touches the `AdjustmentSet`, which the UI thread keeps changing. (The free decoder functions such as `liteui_image::decodeFile` are fine on a worker, and `LiteUI::wake()` is the one LiteUI member that is safe from any thread.)
+
+One qualification: the segmentation job keeps per-image state (the loaded model, the encoded image embedding, the stand-in's prepared image) in function-local statics. That is safe only because a single thread ever runs it, and each cache is keyed by the image (`imageKey`), so a new picture never reuses a stale one. The one value the UI reads back from that worker, the engine label shown in the Object panel, goes through a mutex-guarded string.
+
+This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs.
+
+## The five workers
+
+| Worker | Job | Can it be cancelled? | Notes |
+|---|---|---|---|
+| **Render** | Full-resolution `renderWith()` of `source` using a `RenderParams` copy. | Yes, checked between 128-row blocks and while building blur planes. | Started after an adjustment-only change on a large photo whose size hasn't changed: a slider release, undo, redo and so on. |
+| **Geometry** | The whole pipeline: orient → straighten → crop → render, from `original`. | Yes, between stages, every 64 rows of the straighten, and between render blocks. | Used for rotate/straighten/crop on large photos. See below. |
+| **Decode** | Decode a PNG/JPEG file and apply its EXIF rotation. | **No.** The image libraries have no cancel hook. | A second "open" queues behind a running decode; the first result is simply dropped. |
+| **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Keeps per-image state in worker-only statics (see the rule above). |
+| **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
+
+The first four are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
+
+### The geometry worker rebuilds everything
+
+A render job can start from `source`, because the source has not changed. A geometry job might be *changing* the source, so it always rebuilds the entire chain from `original`. That wastes some work (an unchanged straighten is redone when only the crop moved), but it keeps a job a pure function of its inputs with nothing that can drift out of sync, and the cost is only latency on a background thread, never a frozen window.
+
+Its result is a `GeometryBundle` containing every geometry-derived field. The UI thread adopts it as **one atomic swap**, so the picture, the document size and the crop selection always change together.
+
+While a geometry job is running, `state.rotated`, `state.source` and the crop selection still describe the *previous* geometry although the edit state already holds the new one. So `geometryBusy()` is true until the bundle lands, and any edit that measures against those (a second rotate that remaps the crop, Apply Crop) is ignored; their buttons are dimmed to match. The status bar shows "Applying changes..." meanwhile.
+
+### The thumbnail worker is not a `LatestWorker`
+
+Thumbnails are a different kind of work: you want *all* of them, not just the newest. `ThumbWorker` is a plain first-in-first-out queue with no generation numbers:
+
+- `setQueue()` **replaces** what is still to do (the app calls it again whenever the open picture changes, so work always starts next to it).
+- The item already in flight finishes.
+- Results accumulate until `collect()` drains them.
+- Like `LatestWorker`, `setNotify()` must be called before the first `setQueue()`.
+- For each file it also checks whether a saved-edits sidecar exists, which is what puts the dot on a thumbnail.
+
+## How the UI picks results up
+
+The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()` and `collectSegmentJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
+
+Nothing runs while nothing is outstanding, so an idle editor costs nothing.
+
+## Practical consequences
+
+- **Export blocks on purpose.** `exportImage()` calls `finishGeometryJob()` and `finishFullRender()` first, so you never export a stale frame.
+- **A drag cancels the full render.** `enterDrag()` invalidates the render worker, because the render in flight would be for values the drag is about to change.
+- **A result for something that no longer exists is dropped.** For example, a finished object segmentation for a mask you deleted in the meantime, or a thumbnail for a folder you have left.
+- **A new picture invalidates everything in flight.** When a decode lands, `adoptDecoded` invalidates the render, geometry and segmentation workers and bumps `imageSerial`, so nothing made for the old picture can be adopted over the new one.
+- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled.
+- **Small photos skip all of this.** For small images the pass is faster than the hand-off, so the render is synchronous.
+
+## When you add a worker
+
+1. If "newest wins" is the right behavior, use `LatestWorker`. Define a `Job` struct, a `Result` struct and a job function `std::optional<Result>(Job&&, WorkerCancel)`.
+2. Give the job **only immutable inputs**. Do not capture `state`.
+3. Pass `c.latest` and `c.gen` to any long loop, and return `std::nullopt` if it was superseded.
+4. Call `setNotify(...)` with `ui.wake()` in `main()`, before the first `submit()`.
+5. Poll with `collect()` each frame, and drop results that no longer apply.
+6. Call its `shutdown()` in `main()` after `ui.run()` returns, before `ui` is destroyed.
+7. Test timing with the repeat loop in [testing.md](testing.md).

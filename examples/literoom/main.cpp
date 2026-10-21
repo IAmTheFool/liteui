@@ -81,7 +81,7 @@ constexpr float kCropHandlePx = 8.0f; // drawn handle size, screen px
 constexpr float kCropHitPx = 10.0f;   // handle grab tolerance, screen px
 
 // Color Mixer tab width (the engine constants live in color_mix.hpp).
-constexpr float kMixTabW = 46.0f;         // Hue/Sat/Lum tab width (3 + gaps = 150)
+constexpr float kMixTabW = 46.0f; // Hue/Sat/Lum tab width (3 + gaps = 150)
 
 // Histogram canvas height (the counting constants live in histogram.hpp).
 constexpr float kHistHeightPx = 80.0f;
@@ -111,11 +111,11 @@ constexpr int kHistoryActivity = 9;
 // Masks, UI side: tint-bitmap sizes and overlay handle sizes. The engine
 // constants live next to their algorithms: mask_geom.hpp (radii), mask_brush.hpp,
 // mask_range.hpp, mask_object.hpp, seg_basic.hpp and mask.hpp (list limits).
-constexpr int kCompTintEdge = 512;      // long side of a combined mask's tint
-constexpr float kMaskHandlePx = 9.0f;   // overlay handle size, screen px
-constexpr float kMaskHitPx = 12.0f;     // overlay handle grab tolerance, px
-constexpr int kBrushTintEdge = 512;     // long side of the brush tint bitmap
-constexpr int kLumTintEdge = 512;       // long side of the on-canvas tint bitmap
+constexpr int kCompTintEdge = 512;    // long side of a combined mask's tint
+constexpr float kMaskHandlePx = 9.0f; // overlay handle size, screen px
+constexpr float kMaskHitPx = 12.0f;   // overlay handle grab tolerance, px
+constexpr int kBrushTintEdge = 512;   // long side of the brush tint bitmap
+constexpr int kLumTintEdge = 512;     // long side of the on-canvas tint bitmap
 
 // ---------------- Palette (dark, Lightroom-like) ----------------
 // Base swatches.
@@ -2105,13 +2105,6 @@ static bool saveJpegFile(const std::string &path, const CanvasImage &img,
                          int quality, bool keepMetadata,
                          const std::string &sourcePath, std::string *errorOut)
 {
-  if (img.width <= 0 || img.height <= 0 || img.width > kJpegMaxSide ||
-      img.height > kJpegMaxSide)
-  {
-    if (errorOut)
-      *errorOut = "JPEG can't hold a picture this size";
-    return false;
-  }
   std::vector<uint8_t> jpeg;
   if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
     return false;

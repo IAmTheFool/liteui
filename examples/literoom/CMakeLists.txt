@@ -64,20 +64,31 @@ endif()
 option(LITEROOM_TESTS "literoom: build unit tests" OFF)
 if(LITEROOM_TESTS)
     enable_testing()
-    foreach(t minijson exif detail_layer
+    find_package(Threads REQUIRED)
+
+    foreach(t minijson exif
               pixel_math adjustments color_mix color_grade color_pass geometry curves
               mask_geom mask_raster mask_brush mask_range mask_object mask
-              sidecar render_params adjustment_set file_utils image_meta)
+              sidecar render_params adjustment_set file_utils image_meta sam_segmenter)
         add_executable(${t}_test tests/${t}_test.cpp)
         target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_features(${t}_test PRIVATE cxx_std_20)
         add_test(NAME ${t} COMMAND ${t}_test)
     endforeach()
 
+    # detail_layer and neighbor_fx start std::threads (shared-cache race tests),
+    # so they link the platform thread library (a no-op on MSVC).
+    foreach(t detail_layer neighbor_fx)
+        add_executable(${t}_test tests/${t}_test.cpp)
+        target_include_directories(${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(${t}_test PRIVATE cxx_std_20)
+        target_link_libraries(${t}_test PRIVATE Threads::Threads)
+        add_test(NAME ${t} COMMAND ${t}_test)
+    endforeach()
+
     # latest_worker.hpp has no liteui dependency but runs a std::jthread, so its
     # test links the platform thread library (a no-op on MSVC). Run it in a loop
     # to shake out timing flakiness:  ctest -C Release -R latest_worker --repeat until-fail:50
-    find_package(Threads REQUIRED)
     add_executable(latest_worker_test tests/latest_worker_test.cpp)
     target_include_directories(latest_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_features(latest_worker_test PRIVATE cxx_std_20)
