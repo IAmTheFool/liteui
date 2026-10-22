@@ -1,19 +1,18 @@
 # ------------------------------------------------------------------------
 # liteui_tests — Catch2 unit tests for liteui.hpp
 #
-# WHY THIS DOESN'T LINK liteui::liteui
-# The XML parser, SVG parser and layout engine are all `inline` code that
-# lives inside the LITEUI_IMPLEMENTATION section of the header. The static
-# library liteui::liteui compiles that section in its own translation unit,
-# so a test file can't see those internals from the outside. Instead, this
-# executable has ONE translation unit (liteui_tests.cpp) that defines
-# LITEUI_IMPLEMENTATION itself and then #includes every test case file.
-# Linking liteui::liteui as well would compile the same non-inline
-# definitions twice (duplicate-symbol errors), so we deliberately don't.
-#
-# It still needs the same platform libraries as the library (Direct2D on
-# Windows; wayland/cairo/pango/EGL/... on Linux), so we borrow them from
-# liteui's own private link list rather than repeating them here.
+# liteui::liteui is a header-only INTERFACE library: the implementation
+# (XML parser, SVG parser, layout engine, ...) is compiled inside whichever
+# executable defines LITEUI_IMPLEMENTATION. This test executable has ONE
+# translation unit (liteui_tests.cpp) that defines LITEUI_IMPLEMENTATION
+# itself and then #includes every test case file, so linking liteui::liteui
+# is safe (no duplicate symbols) and gives us everything the header needs:
+#   - the include path for liteui.hpp
+#   - cxx_std_23 and the optional LITEUI_PROFILE define
+#   - platform libraries (Direct2D on Windows; wayland/cairo/pango/EGL/...
+#     on Linux)
+#   - liteui_wayland_protocols, which carries the include directory for
+#     the vendored xdg-shell / xdg-decoration client headers
 # ------------------------------------------------------------------------
 
 include(FetchContent)
@@ -37,9 +36,7 @@ endif()
 include(Catch)
 
 add_executable(liteui_tests liteui_tests.cpp)
-target_compile_features(liteui_tests PRIVATE cxx_std_23)
 target_include_directories(liteui_tests PRIVATE
-    ${PROJECT_SOURCE_DIR}           # liteui.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
 )
 if(MSVC)
@@ -48,7 +45,7 @@ endif()
 
 target_link_libraries(liteui_tests PRIVATE
     Catch2::Catch2WithMain
-    $<TARGET_PROPERTY:liteui,LINK_LIBRARIES>
+    liteui::liteui
 )
 
 # PRE_TEST = discover test names when `ctest` runs, not as a post-build step,
