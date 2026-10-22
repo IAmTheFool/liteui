@@ -36,7 +36,6 @@ the macro yourself) — see the [README](../README.md#how-the-single-header-work
 - [Image decoding](#image-decoding-liteui_image)
 - [`LiteUI`](#liteui)
 - [`TooltipStyle`](#tooltipstyle)
-- [`Box`](#box)
 
 ---
 
@@ -748,14 +747,6 @@ once — replaces the previous tree (freeing its cached text/canvas
 resources first) and invalidates any stale click/focus/scroll-drag/
 tooltip pointers into the old tree.
 
-```cpp
-void addBox(const Box &box);
-```
-
-Queues a static filled rectangle drawn underneath the `View` tree.
-Mostly a low-level escape hatch predating `View`/`Canvas` — prefer a
-plain `View` with `backgroundColor` for anything dynamic.
-
 ### Window control
 
 ```cpp
@@ -861,18 +852,3 @@ struct TooltipStyle {
 Applies to every `View::tooltip` in the window; set once via
 `LiteUI::setTooltipStyle`. `delayMs` is the hover time before a tooltip
 appears.
-
----
-
-## `Box`
-
-```cpp
-struct Box {
-  int width = 0, height = 0;
-  int pos_x = 0, pos_y = 0;
-  Color color;
-};
-```
-
-A static, axis-aligned filled rectangle for `LiteUI::addBox` — window-
-local pixel coordinates, `(0,0)` at top-left. See `addBox` above.

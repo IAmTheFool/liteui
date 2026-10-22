@@ -1,4 +1,4 @@
-// Tests for the small public value types: Color, Box, Size, Dynamic<T>.
+// Tests for the small public value types: Color, Size, EdgeInsets, Dynamic<T>.
 // (Included from liteui_tests.cpp — not a standalone .cpp.)
 
 TEST_CASE("Color: defaults and equality", "[core][color]") {
@@ -11,15 +11,6 @@ TEST_CASE("Color: defaults and equality", "[core][color]") {
   CHECK(Color{1, 2, 3, 4} == Color{1, 2, 3, 4});
   CHECK_FALSE(Color{1, 2, 3, 4} == Color{1, 2, 3, 5});
   CHECK(Color{1, 2, 3} == Color{1, 2, 3, 255});
-}
-
-TEST_CASE("Box: defaults are all zero", "[core]") {
-  Box b;
-  CHECK(b.width == 0);
-  CHECK(b.height == 0);
-  CHECK(b.pos_x == 0);
-  CHECK(b.pos_y == 0);
-  CHECK(b.color == Color{});
 }
 
 TEST_CASE("Size: factory functions", "[core][size]") {

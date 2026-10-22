@@ -160,17 +160,6 @@ struct KeyEvent
   KeyModifiers mods;
 };
 
-// A static, axis-aligned filled rectangle the caller wants drawn on the
-// window. Position is in window-local pixel coordinates, (0,0) at top-left.
-struct Box
-{
-  int width = 0;
-  int height = 0;
-  int pos_x = 0;
-  int pos_y = 0;
-  Color color;
-};
-
 // Width (vertical bar) / height (horizontal bar) of a scrollbar's track, in
 // pixels. Shared between the layout engine (which reserves this much space
 // out of a scroll container's content box on whichever edges show a bar)
@@ -1330,8 +1319,6 @@ public:
 
   // Blocks the calling thread and pumps the platform's event loop.
   void run();
-  // Adds a static box to be drawn on the window and triggers a repaint.
-  void addBox(const Box &box);
   // Sets (or replaces) the root of the layout tree, lays it out immediately,
   // and triggers a repaint.
   void setRoot(View view);
@@ -7323,9 +7310,6 @@ public:
   // event loop.
   void run(); // blocks, runs the event loop
 
-  // Adds a static box to be drawn on the window and triggers a repaint.
-  void addBox(const Box &box);
-
   // Sets (or replaces) the root of the layout tree, lays it out immediately,
   // and triggers a repaint. Ownership of the tree is copied/moved in.
   void setRoot(View view);
@@ -7426,8 +7410,6 @@ private:
   bool startMaximized_ = false;
   bool hideTitlebar_ = false;
 
-  // Boxes queued for drawing, in the order addBox() was called (paint order).
-  std::vector<Box> boxes_;
   View root_;
   bool hasRoot_ = false;
   static inline LiteUIImpl *activeInstance_ = nullptr;
@@ -9023,7 +9005,6 @@ private:
         LITEUI_PROF_START(profBuild);
         self->renderTarget_->BeginDraw();
         self->renderTarget_->Clear(toD2DColor(self->windowBg_));
-        self->paintBoxes(self->renderTarget_);
         self->paintRoot(self->renderTarget_);
         self->paintTooltip(self->renderTarget_);
         LITEUI_PROF_ADD(build, profBuild);
@@ -9420,15 +9401,6 @@ private:
     // Any message not explicitly handled above falls through to Windows'
     // default behavior.
     return DefWindowProcW(hwnd, msg, wp, lp);
-  }
-
-  // Draws every queued box into the render target.
-  void paintBoxes(ID2D1RenderTarget *rt)
-  {
-    for (const auto &b : boxes_)
-      d2dFillRect(rt, static_cast<float>(b.pos_x), static_cast<float>(b.pos_y),
-                  static_cast<float>(b.width), static_cast<float>(b.height),
-                  b.color);
   }
 
   // Draws the layout tree (if any). Border-radius is handled natively by
@@ -11466,11 +11438,6 @@ private:
     glClearColor(windowBg_.r / 255.0f, windowBg_.g / 255.0f,
                  windowBg_.b / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    // Paint queued boxes on top of the plain background, before the titlebar
-    // so it stays on top.
-    for (const auto &b : boxes_)
-      fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
-               b.color.b);
     if (hasRoot_)
     {
       renderView(root_, ClipRect{});
@@ -12462,21 +12429,6 @@ inline void LiteUIImpl::setRoot(View view)
 #endif
 }
 
-inline void LiteUIImpl::addBox(const Box &box)
-{
-  boxes_.push_back(box);
-#if defined(_WIN32)
-  // Ask Windows to repaint; the actual drawing happens in WM_PAINT.
-  if (hwnd_)
-    InvalidateRect(hwnd_, nullptr, FALSE);
-#else
-  // Repaint immediately if the buffer already exists; if it doesn't yet,
-  // attachBuffer()'s own redraw() will pick up boxes_ once configured.
-  if (eglReady_)
-    redraw();
-#endif
-}
-
 // Out-of-line definition of the blocking event loop.
 inline void LiteUIImpl::run()
 {
@@ -12638,7 +12590,6 @@ LiteUI::~LiteUI()
   delete p_;
 }
 void LiteUI::run() { p_->run(); }
-void LiteUI::addBox(const Box &box) { p_->addBox(box); }
 void LiteUI::setRoot(View view) { p_->setRoot(std::move(view)); }
 void LiteUI::requestClose() { p_->requestClose(); }
 void LiteUI::requestMinimize() { p_->requestMinimize(); }
