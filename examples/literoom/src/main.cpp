@@ -1821,21 +1821,24 @@ static void filmQueueThumbs()
   thumbWorker.setQueue(std::move(todo));
 }
 
-// A strip holding only `imagePath` (no folder scan, no thumbnails for others).
-static void filmAdoptSingle(const std::string &imagePath)
+// A strip holding exactly `paths` (already sorted). All come from one folder.
+static void filmAdoptFiles(const std::vector<std::string> &paths)
 {
-  const std::filesystem::path p = fsPath(imagePath);
-  std::string folder = u8ToString(p.parent_path());
-  if (folder.empty())
-    folder = ".";
   FilmStrip next;
-  next.folder = folder;
   next.visible = state.film.visible;
-  FilmEntry e;
-  e.path = imagePath;
-  e.name = u8ToString(p.filename());
-  next.byName[filmLower(e.name)] = 0;
-  next.files.push_back(std::move(e));
+  for (const std::string &p : paths)
+  {
+    FilmEntry e;
+    e.path = p;
+    e.name = baseName(p);
+    if (next.folder.empty())
+    {
+      std::string dir = u8ToString(fsPath(p).parent_path());
+      next.folder = dir.empty() ? "." : dir;
+    }
+    next.byName[filmLower(e.name)] = next.files.size();
+    next.files.push_back(std::move(e));
+  }
   state.film = std::move(next);
   state.film.dirty = true;
 }
@@ -1863,7 +1866,11 @@ static void filmSync(const std::string &imagePath)
   std::string folder = u8ToString(p.parent_path());
   if (folder.empty())
     folder = ".";
-  filmAdoptSingle(imagePath);
+  {
+    const auto it = f.byName.find(filmLower(baseName(imagePath)));
+    if (it == f.byName.end() || f.files[it->second].path != imagePath)
+      filmAdoptFiles({imagePath});
+  }
   FilmStrip &g = state.film;
   const auto it = g.byName.find(filmLower(u8ToString(p.filename())));
   g.current = g.target = it == g.byName.end() ? -1 : static_cast<int>(it->second);
@@ -2115,12 +2122,38 @@ static void collectDecodeJob()
 
 static void openImage()
 {
-  auto path = openFilePicker(
-      "Open Image", {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
-  if (!path)
+  auto paths = openFilesPicker(
+      "Open Images",
+      {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
+  if (paths.empty())
     return; // user cancelled
-  setStatus("Opening " + baseName(*path) + "...", /*isError=*/false);
-  decodeWorker.submit(*path);
+
+  if (paths.size() > 1)
+  {
+    // The dialog also offers "All Files": keep only pictures we can show.
+    paths.erase(std::remove_if(paths.begin(), paths.end(),
+                               [](const std::string &p)
+                               {
+                                 const std::string e = fileExtLower(p);
+                                 return e != "jpg" && e != "jpeg" && e != "png";
+                               }),
+                paths.end());
+    if (paths.empty())
+    {
+      setStatus("No JPEG or PNG pictures selected", true);
+      return;
+    }
+    std::sort(paths.begin(), paths.end(),
+              [](const std::string &a, const std::string &b)
+              {
+                const std::string x = baseName(a), y = baseName(b);
+                return naturalLess(x, y) || (!naturalLess(y, x) && x < y);
+              });
+  }
+
+  filmAdoptFiles(paths); // the strip is exactly what was picked
+  filmQueueThumbs();
+  filmOpenIndex(0); // same background decode as before
 }
 
 // Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the

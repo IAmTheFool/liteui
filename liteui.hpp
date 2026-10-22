@@ -563,6 +563,12 @@ std::optional<std::string>
 openFilePicker(const std::string &title = "Open File",
                const std::vector<FileFilter> &filters = {});
 
+// Like openFilePicker, but the user may select several files (Ctrl / Shift).
+// Returns the chosen paths, or an empty vector on cancel/failure.
+std::vector<std::string>
+openFilesPicker(const std::string &title = "Open Files",
+                const std::vector<FileFilter> &filters = {});
+
 // Blocks until the user picks a save location or cancels. `defaultName` is
 // the pre-filled filename (e.g. "export.png"); `defaultExt` (no leading
 // dot, e.g. "png") gets appended if the user's typed name doesn't already
@@ -1666,6 +1672,78 @@ openFilePicker(const std::string &title,
   return result;
 }
 
+std::vector<std::string>
+openFilesPicker(const std::string &title,
+                const std::vector<FileFilter> &filters)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileOpenDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    return {};
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_ALLOWMULTISELECT);
+
+  std::vector<std::wstring> names, patterns;
+  std::vector<COMDLG_FILTERSPEC> specs;
+  for (auto &f : filters)
+  {
+    names.push_back(toWide(f.name));
+    patterns.push_back(toWide(f.pattern));
+  }
+  for (size_t i = 0; i < filters.size(); ++i)
+    specs.push_back({names[i].c_str(), patterns[i].c_str()});
+  if (!specs.empty())
+    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+
+  std::vector<std::string> result;
+  hr = dlg->Show(nullptr); // blocks until closed
+  if (SUCCEEDED(hr))
+  {
+    IShellItemArray *items = nullptr;
+    if (SUCCEEDED(dlg->GetResults(&items)))
+    {
+      DWORD count = 0;
+      items->GetCount(&count);
+      for (DWORD i = 0; i < count; ++i)
+      {
+        IShellItem *item = nullptr;
+        if (FAILED(items->GetItemAt(i, &item)))
+          continue;
+        PWSTR path = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+        {
+          int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0,
+                                        nullptr, nullptr);
+          std::string s(len > 0 ? len - 1 : 0, '\0');
+          if (len > 0)
+            WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                                nullptr);
+          result.push_back(std::move(s));
+          CoTaskMemFree(path);
+        }
+        item->Release();
+      }
+      items->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
 #else // Linux
 
 namespace liteui_filepicker
@@ -1746,6 +1824,77 @@ openFilePicker(const std::string &title,
     return std::nullopt;
   while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
     result.pop_back();
+  return result;
+}
+
+std::vector<std::string>
+openFilesPicker(const std::string &title,
+                const std::vector<FileFilter> &filters)
+{
+  using namespace liteui_filepicker;
+
+  std::string cmd;
+  if (commandExists("zenity"))
+  {
+    cmd = "zenity --file-selection --multiple --separator=" +
+          shellQuote("\n") + " --title=" + shellQuote(title);
+    for (auto &f : filters)
+    {
+      std::string globs = f.pattern;
+      std::replace(globs.begin(), globs.end(), ';', ' ');
+      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+    }
+  }
+  else if (commandExists("kdialog"))
+  {
+    cmd = "kdialog --getopenfilename . --multiple --separate-output --title " +
+          shellQuote(title);
+    if (!filters.empty())
+    {
+      std::string spec;
+      for (size_t i = 0; i < filters.size(); ++i)
+      {
+        std::string globs = filters[i].pattern;
+        std::replace(globs.begin(), globs.end(), ';', ' ');
+        if (i)
+          spec += "\n";
+        spec += globs + "|" + filters[i].name;
+      }
+      cmd += " " + shellQuote(spec);
+    }
+  }
+  else
+  {
+    return {};
+  }
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return {};
+  std::string out;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    out += buf;
+  if (pclose(pipe) != 0)
+    return {};
+
+  std::vector<std::string> result;
+  size_t start = 0;
+  while (start <= out.size())
+  {
+    size_t nl = out.find('\n', start);
+    std::string line = out.substr(start, nl == std::string::npos
+                                             ? std::string::npos
+                                             : nl - start);
+    while (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (!line.empty())
+      result.push_back(std::move(line));
+    if (nl == std::string::npos)
+      break;
+    start = nl + 1;
+  }
   return result;
 }
 
