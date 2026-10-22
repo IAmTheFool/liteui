@@ -387,6 +387,7 @@ struct Style
   bool scrollbarAutoHide = false;
   Dynamic<Display> display = Display::Flex;
   Dynamic<Visibility> visibility = Visibility::Visible;
+  bool escapeClip = false; // absolute: ignore scrollable ancestors' clip
 };
 
 // ---------------- Text: author-facing, leaf-only ----------------
@@ -7920,23 +7921,32 @@ private:
   {
     const View *view;
     int order; // document/discovery order, for stable z-index ties
+    ClipRect clip; // intersection of every scrollable ancestor's viewport
   };
 
   // Walks the whole tree (not just direct children) collecting every
   // Position::Absolute node, tagged with its pre-order discovery index.
   // Recurses into every node regardless of its own position, so nested
   // absolutes (an absolute inside another absolute's subtree) still get
-  // their own top-level slot in the global list.
-  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out)
+  // their own top-level slot in the global list. Each entry also carries
+  // the clip of its scrollable ancestors, so absolutes scrolled out of
+  // view are neither painted nor hit-tested.
+  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out,
+                        ClipRect clip = ClipRect{})
   {
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
     for (const auto &child : v.children)
     {
       if (resolveDynamic(child.style.display, child.computed.resolvedDisplay) ==
           Display::None)
         continue; // a display:none subtree contributes no absolutes either
       if (child.style.position == Position::Absolute)
-        out.push_back({&child, static_cast<int>(out.size())});
-      collectAbsolutes(child, out);
+        out.push_back({&child, static_cast<int>(out.size()),
+                       child.style.escapeClip ? ClipRect{} : childClip});
+      collectAbsolutes(child, out, childClip);
     }
   }
 
@@ -8035,7 +8045,7 @@ private:
     sortAbsolutes(absolutes);
     for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
       if (View *hit =
-              hitTestFlow(const_cast<View &>(*it->view), x, y, ClipRect{}, btn))
+              hitTestFlow(const_cast<View &>(*it->view), x, y, it->clip, btn))
         return hit;
     return hitTestFlow(root_, x, y, ClipRect{}, btn);
   }
@@ -8075,7 +8085,7 @@ private:
     sortAbsolutes(absolutes);
     for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
       if (View *hit = hitTestTooltipFlow(const_cast<View &>(*it->view), x, y,
-                                         ClipRect{}))
+                                         it->clip))
         return hit;
     return hitTestTooltipFlow(root_, x, y, ClipRect{});
   }
@@ -9484,7 +9494,7 @@ private:
       collectAbsolutes(root_, absolutes);
       sortAbsolutes(absolutes);
       for (const auto &e : absolutes)
-        paintView(rt, *e.view, ClipRect{});
+        paintView(rt, *e.view, e.clip);
     }
   }
 
@@ -11531,7 +11541,7 @@ private:
                          return a.order < b.order;
                        });
       for (const auto &e : absolutes)
-        renderView(*e.view, ClipRect{});
+        renderView(*e.view, e.clip);
     }
     // Paint the titlebar and its buttons on top of that background.
     if (!hideTitlebar_)
