@@ -5,13 +5,20 @@
       "name": "windows-base",
       "hidden": true,
       "generator": "Ninja",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "host=x64",
+        "strategy": "external"
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       },
       "cacheVariables": {
-        "CMAKE_C_COMPILER": "cl.exe",
         "CMAKE_CXX_COMPILER": "cl.exe"
       }
     },
@@ -82,6 +89,24 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "gcc-debug-profile",
+      "displayName": "GCC Debug + Profiler",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/debug-profile",
+      "cacheVariables": {
+        "LITEUI_PROFILE": "ON"
+      }
+    },
+    {
+      "name": "gcc-release-profile",
+      "displayName": "GCC Release + Profiler",
+      "inherits": "gcc-release",
+      "binaryDir": "${sourceDir}/build/release-profile",
+      "cacheVariables": {
+        "LITEUI_PROFILE": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -108,6 +133,14 @@
     {
       "name": "gcc-release-build",
       "configurePreset": "gcc-release"
+    },
+    {
+      "name": "gcc-debug-profile-build",
+      "configurePreset": "gcc-debug-profile"
+    },
+    {
+      "name": "gcc-release-profile-build",
+      "configurePreset": "gcc-release-profile"
     }
   ],
   "testPresets": [

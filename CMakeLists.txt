@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
-project(liteui LANGUAGES C CXX)
+project(liteui LANGUAGES CXX)
+
+# C is only needed on Linux, for the vendored Wayland protocol .c files.
+# Windows builds never compile any C, so don't require a C toolchain there.
+if(NOT WIN32)
+    enable_language(C)
+endif()
 
 # ------------------------------------------------------------------------
 # liteui::liteui — header-only INTERFACE library (liteui.hpp).
@@ -107,13 +113,31 @@ else()
         )
     endif()
 
-    # Only fires when the vendored files are missing (first build, or a
+    # All four generated files must exist: the two .c files are compiled
+    # into liteui_wayland_protocols, and the two headers are what
+    # liteui.hpp includes. Checking only one would let a partial checkout
+    # slip through and fail later with a confusing compile/link error.
+    set(LITEUI_PROTO_FILES
+        xdg-shell-protocol.c
+        xdg-shell-client-protocol.h
+        xdg-decoration-protocol.c
+        xdg-decoration-client-protocol.h
+    )
+    set(LITEUI_PROTO_MISSING "")
+    foreach(_f IN LISTS LITEUI_PROTO_FILES)
+        if(NOT EXISTS "${LITEUI_PROTO_DIR}/${_f}")
+            list(APPEND LITEUI_PROTO_MISSING "${_f}")
+        endif()
+    endforeach()
+
+    # Only fires when any vendored file is missing (first build, or a
     # fresh checkout before regen-protocols has been run and committed).
-    if(NOT EXISTS "${LITEUI_PROTO_DIR}/xdg-shell-protocol.c")
+    if(LITEUI_PROTO_MISSING)
+        list(JOIN LITEUI_PROTO_MISSING ", " _missing_str)
         if(TARGET regen-protocols)
             message(WARNING
-                "liteui: vendored Wayland protocol sources not found under "
-                "${LITEUI_PROTO_DIR}. Run:\n"
+                "liteui: vendored Wayland protocol files missing under "
+                "${LITEUI_PROTO_DIR}: ${_missing_str}. Run:\n"
                 "    cmake --build <builddir> --target regen-protocols\n"
                 "    git add platform/wayland-protocols && git commit\n"
                 "then re-run cmake's configure step. Continuing configure "
@@ -122,16 +146,16 @@ else()
                 "until the files exist.")
         else()
             message(FATAL_ERROR
-                "liteui: vendored Wayland protocol sources not found under "
-                "${LITEUI_PROTO_DIR}, and wayland-scanner + wayland-protocols "
+                "liteui: vendored Wayland protocol files missing under "
+                "${LITEUI_PROTO_DIR}: ${_missing_str}, and wayland-scanner + wayland-protocols "
                 "aren't available to generate them. Install both "
                 "(e.g. `sudo apt install libwayland-bin wayland-protocols`) "
                 "and re-run cmake, or obtain the vendored files another way.")
         endif()
     endif()
 
-    # Only build (and link) the protocol bindings once the sources exist.
-    if(EXISTS "${LITEUI_PROTO_DIR}/xdg-shell-protocol.c")
+    # Only build (and link) the protocol bindings once all four files exist.
+    if(NOT LITEUI_PROTO_MISSING)
         add_library(liteui_wayland_protocols STATIC
             ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
             ${LITEUI_PROTO_DIR}/xdg-decoration-protocol.c
