@@ -1,49 +1,56 @@
-# ---------------------------------------------------------------------
-# Unit tests for liteui's parsing / math internals:
-#   - liteui_xml   (the tolerant single-header XML parser)
-#   - liteui_svg   (Mat2x3 + parseTransform, path-data parsing, color
-#                   and style parsing, and full-document parseString)
+# ------------------------------------------------------------------------
+# liteui_tests — Catch2 unit tests for liteui.hpp
 #
-# Uses Catch2 v3, fetched via FetchContent so a fresh checkout doesn't
-# need Catch2 preinstalled. The test binary links against liteui::liteui
-# so it picks up the same include dirs and platform libraries (Wayland/
-# EGL/cairo/... or Win32/Direct2D) that liteui.hpp itself needs to
-# compile, even though these tests only exercise its parsing code.
-# ---------------------------------------------------------------------
+# WHY THIS DOESN'T LINK liteui::liteui
+# The XML parser, SVG parser and layout engine are all `inline` code that
+# lives inside the LITEUI_IMPLEMENTATION section of the header. The static
+# library liteui::liteui compiles that section in its own translation unit,
+# so a test file can't see those internals from the outside. Instead, this
+# executable has ONE translation unit (liteui_tests.cpp) that defines
+# LITEUI_IMPLEMENTATION itself and then #includes every test case file.
+# Linking liteui::liteui as well would compile the same non-inline
+# definitions twice (duplicate-symbol errors), so we deliberately don't.
+#
+# It still needs the same platform libraries as the library (Direct2D on
+# Windows; wayland/cairo/pango/EGL/... on Linux), so we borrow them from
+# liteui's own private link list rather than repeating them here.
+# ------------------------------------------------------------------------
 
 include(FetchContent)
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.7.1
-)
-FetchContent_MakeAvailable(Catch2)
 
-add_executable(liteui_tests
-    test_xml.cpp
-    test_matrix.cpp
-    test_svg.cpp
-)
+# 1) Prefer an installed Catch2 v3 (apt install catch2, vcpkg, conan, ...).
+find_package(Catch2 3 QUIET)
 
-target_link_libraries(liteui_tests PRIVATE liteui::liteui Catch2::Catch2WithMain)
+# 2) Otherwise download a pinned release.
+if(NOT Catch2_FOUND)
+    message(STATUS "liteui tests: Catch2 not installed, fetching v3.8.1")
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG        v3.8.1
+    )
+    FetchContent_MakeAvailable(Catch2)
+    # Provides catch_discover_tests() when Catch2 is built from source.
+    list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+endif()
 
-list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
-include(CTest)
 include(Catch)
-catch_discover_tests(liteui_tests)
 
+add_executable(liteui_tests liteui_tests.cpp)
+target_compile_features(liteui_tests PRIVATE cxx_std_23)
+target_include_directories(liteui_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}           # liteui.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
+)
+if(MSVC)
+    target_compile_options(liteui_tests PRIVATE /utf-8)  # sources are UTF-8
+endif()
 
-# # ---- photo editor tests ---------------------------------------------
-# # Same source file as the literoom example, built a second time with
-# # LITEROOM_TESTS so main() is replaced by Catch2's main.
-# set(LITEROOM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../examples/literoom.cpp)
+target_link_libraries(liteui_tests PRIVATE
+    Catch2::Catch2WithMain
+    $<TARGET_PROPERTY:liteui,LINK_LIBRARIES>
+)
 
-# if(EXISTS ${LITEROOM_SOURCE})
-#     add_executable(literoom_tests ${LITEROOM_SOURCE})
-#     target_compile_definitions(literoom_tests PRIVATE LITEROOM_TESTS)
-#     target_link_libraries(literoom_tests PRIVATE liteui::liteui Catch2::Catch2WithMain)
-#     catch_discover_tests(literoom_tests)
-# else()
-#     message(WARNING "tests: ${LITEROOM_SOURCE} not found, "
-#                     "skipping literoom_tests")
-# endif()
+# PRE_TEST = discover test names when `ctest` runs, not as a post-build step,
+# so building never depends on being able to execute the binary.
+catch_discover_tests(liteui_tests DISCOVERY_MODE PRE_TEST)

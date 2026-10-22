@@ -17,7 +17,9 @@
 // record one golden file per build configuration (CMake passes $<CONFIG>)
 // and only compare a run against a golden file recorded by the same build.
 //
-// Exit code: 0 = every scenario matches and every invariant holds.
+// Exit code: 0 = every scenario matches and every invariant holds,
+// 1 = a mismatch or invariant failure, 2 = bad usage,
+// 77 = no golden file recorded yet (CTest shows "skipped").
 
 // ---------------------------------------------------------------------------
 // What is under test. Phase 0 (today): main.cpp itself, compiled as part of
@@ -29,6 +31,7 @@
 #ifdef GOLDEN_USE_ENGINE_HEADERS
 #include "engine/all.hpp"
 #else
+#define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
 #include "mask/sam_segmenter.hpp"
 #include "io/exif.hpp"
@@ -1253,8 +1256,11 @@ int main(int argc, char **argv)
     std::ifstream in(goldenFile);
     if (!in)
     {
-      std::printf("cannot open %s (record it first with --record)\n", goldenFile.c_str());
-      return 2;
+      // 77 is CTest's SKIP_RETURN_CODE (set in CMakeLists.txt): a missing
+      // golden file means "not recorded yet for this build", reported as
+      // skipped rather than failed.
+      std::printf("cannot open %s (record it first with --record); skipping\n", goldenFile.c_str());
+      return 77;
     }
     std::map<std::string, Fp> want;
     std::string ln;

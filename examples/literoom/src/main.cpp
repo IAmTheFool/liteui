@@ -1,5 +1,6 @@
 // Simple Photo Editor.
 
+#define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
 
 #include <algorithm>
@@ -6042,7 +6043,6 @@ static void verifyAdjustmentSpecs()
 }
 
 int main()
-try
 {
   verifyAdjustmentSpecs();
   LiteUI ui("Literoom", -1, -1, /*hideTitlebar=*/true);
@@ -8240,10 +8240,4 @@ try
   thumbWorker.shutdown();    // ditto
   segmentWorker.shutdown();
   return 0;
-}
-catch (const std::exception &e)
-{
-  std::fprintf(stderr, "literoom: fatal: %s\n", e.what());
-  MessageBoxA(nullptr, e.what(), "literoom", MB_ICONERROR);
-  return 1;
 }

@@ -1,0 +1,10 @@
+add_executable(counter main.cpp)
+target_link_libraries(counter PRIVATE liteui::liteui)
+
+if(LITEUI_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    file(GLOB COUNTER_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+    add_executable(counter_tests ${COUNTER_TEST_SOURCES})
+    target_include_directories(counter_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(counter_tests PRIVATE Catch2::Catch2WithMain)
+    add_test(NAME counter COMMAND counter_tests)
+endif()

@@ -1,11 +1,16 @@
 # API reference
 
 Field-by-field, method-by-method reference for `liteui.hpp`. Read
-[`getting-started.md`](getting-started.md) first if you haven't built a
+[`GETTING_STARTED.md`](GETTING_STARTED.md) first if you haven't built a
 window yet — this doc assumes you know the `View` tree / `Dynamic<T>` /
 `addChild` model already. See [`PLATFORM_NOTES.md`](PLATFORM_NOTES.md)
 for anything that behaves differently between Windows and Linux, or is a
 deliberate v1 limitation.
+
+Everything below is declared in the part of `liteui.hpp` you get from a
+plain `#include`. The implementation is compiled in the one `.cpp` that
+defines `LITEUI_IMPLEMENTATION` (or by linking the `liteui::liteui` CMake
+target) — see the [README](../README.md#how-the-single-header-works).
 
 ## Contents
 
@@ -27,6 +32,7 @@ deliberate v1 limitation.
 - [Input types](#input-types) (`Key`, `KeyEvent`, `KeyModifiers`, `MouseButton`)
 - [File & folder pickers](#file--folder-pickers)
 - [Clipboard](#clipboard-liteui_clipboard)
+- [Image decoding](#image-decoding-liteui_image)
 - [`LiteUI`](#liteui)
 - [`TooltipStyle`](#tooltipstyle)
 - [`Box`](#box)
@@ -325,8 +331,8 @@ frame of a game loop."
 
 Passed by reference into `onPaint`. HTML5-canvas-style 2D API, backed
 by Direct2D on Windows and Cairo on Linux — see PLATFORM_NOTES for the
-handful of places the two backends diverge (`getImageData`,
-`clearRect`, `globalCompositeOperation`, radial gradients, shadows,
+handful of places the two backends diverge (`clearRect` edge
+antialiasing, `globalCompositeOperation`, radial gradients, shadows,
 `strokeText`).
 
 ```cpp
@@ -448,9 +454,11 @@ std::optional<CanvasImage> getImageData(float x, float y, float w, float h);
 void putImageData(const CanvasImage &img, float dx, float dy);
 ```
 
-`getImageData` always returns `std::nullopt` on Windows (unsupported in
-this build — see PLATFORM_NOTES); fully supported on Linux, reading
-straight from the canvas's own backing surface. `putImageData` ignores
+`getImageData` is supported on both platforms: it reads raw device pixels
+straight from the canvas's own backing surface (a Cairo image surface on
+Linux, the WIC bitmap behind the render target on Windows), ignoring the
+current transform. It returns `std::nullopt` only if the canvas has no
+backing surface at all. `putImageData` ignores
 the current transform and paints directly at `(dx, dy)`, matching HTML
 canvas semantics.
 
@@ -571,8 +579,20 @@ never touch it directly, but it's there if you need to read/set
 for both typed and pasted text — see PLATFORM_NOTES; this does not
 affect plain `Text` rendering.
 
-For anything this widget doesn't cover, build a `Canvas` by hand using
-`liteui_text::caretIndexForX` the same way this does internally.
+For anything this widget doesn't cover, build a `Canvas` by hand and use
+`liteui_text::caretIndexForX` — the same helper this widget uses
+internally for click-to-position:
+
+```cpp
+namespace liteui_text {
+  // Byte index in `text` whose caret position is closest to `clickX`
+  // (measured from the text's own left edge). O(n) — fine for typical
+  // single-line field text.
+  size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                        float fontSize, FontWeight fontWeight,
+                        FontStyle fontStyle, float clickX);
+}
+```
 
 ---
 
@@ -656,6 +676,10 @@ namespace liteui_clipboard {
   // no OS clipboard tool available:
   void setTextWithFallback(const std::string &s);
   std::string getTextWithFallback();
+
+  // Line-ending helpers:
+  std::string toLF(const std::string &in);   // "\r\n" and lone "\r" -> "\n"
+  std::string toCRLF(const std::string &in); // "\n" -> "\r\n" (existing CRLF untouched)
 }
 ```
 
@@ -663,6 +687,26 @@ On Linux, `setText`/`getText` shell out to `wl-copy`/`wl-paste`
 (Wayland), `xclip`, or `xsel`, checked in that order and only counted
 as available if the matching display-server env var is also set. See
 PLATFORM_NOTES for the silent in-process fallback's caveats.
+
+---
+
+## Image decoding (`liteui_image`)
+
+```cpp
+namespace liteui_image {
+  std::optional<CanvasImage> decodeFile(const std::string &path,
+                                        std::string *errorOut = nullptr);
+  std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
+                                          std::string *errorOut = nullptr);
+}
+```
+
+Synchronous decode into an RGBA8 `CanvasImage` (PNG/JPEG via
+libpng/libjpeg on Linux, WIC on Windows). Both return `std::nullopt` on
+failure; if `errorOut` is non-null it receives a short message (for
+example `"unrecognized image format (not PNG or JPEG)"`). This is what
+the `Image` node uses internally — call it directly when you want the
+pixels for `CanvasContext::drawImage` / `putImageData`.
 
 ---
 
@@ -712,7 +756,20 @@ void requestClose();
 void requestMinimize();
 void requestMaximize(); // toggles: maximizes if normal, restores if maximized
 void requestMove();     // starts an interactive window-drag (call from onClick)
+
+void setOnCloseRequest(std::function<void()> fn);
+void forceClose();
 ```
+
+`setOnCloseRequest` installs a handler that runs whenever the user asks
+to close the window — the system close button, the custom titlebar's
+close button via `requestClose()`, Alt+F4, or a window-manager "Close"
+action — instead of the window closing immediately. The handler decides
+what happens next: call `forceClose()` right away if there's nothing to
+lose, or show a confirmation UI first and call it once the user has
+answered. With no handler installed, a close request closes the window
+immediately. `forceClose()` closes unconditionally, bypassing the
+handler.
 
 ### Timers
 
@@ -725,6 +782,32 @@ void removeInterval(int handle);
 triggers the same poll-dynamic-sources + relayout + repaint cycle as a
 click/key dispatch, so `fn` can freely mutate plain captured
 variables and have it show up on screen with no extra plumbing.
+
+### Background threads
+
+```cpp
+void wake();                                   // safe from ANY thread
+void setWakeHandler(std::function<void()> fn);
+```
+
+`wake()` is the one `LiteUI` call that is safe off the UI thread. The
+event loop normally sleeps until the OS hands it an event, so a worker
+thread that has finished something (a render, a decode, a download) has
+no other way to make the UI notice. `wake()` makes the UI thread run the
+wake handler (if one is set), then poll dynamic sources and repaint —
+exactly as after a click or timer tick.
+
+Wakes coalesce: several `wake()` calls before the UI thread gets to them
+produce **one** callback, so a chatty worker can't flood the loop. A wake
+is never lost — one issued while the UI thread is busy is delivered as
+soon as it next waits. The handler runs on the UI thread before the
+repaint and is optional; with none installed, a wake still polls and
+repaints, which is all a worker needs when the UI reads its results from
+a `canvasDirtySource`. Set it from the UI thread before the first
+`wake()`.
+
+**Lifetime:** join every thread that can still call `wake()` before the
+`LiteUI` is destroyed.
 
 ### Global shortcuts
 
@@ -750,6 +833,7 @@ void setScrollbarColors(Color track, Color thumb);
 void requestRepaint();       // polls dynamic sources, relayouts, repaints
 static LiteUI *current();    // the active instance (used internally by
                               // TextInput/Image for their own timers/polling)
+KeyModifiers modifiers() const; // Shift/Ctrl/Alt/Super state right now
 ```
 
 ---

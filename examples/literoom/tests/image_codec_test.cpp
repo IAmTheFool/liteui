@@ -1,6 +1,9 @@
 // image_codec_test.cpp - flattenRow (pure) and the platform encoders (libpng /
 // libjpeg on Linux, WIC on Windows), checked by decoding what they write with
 // liteui's own decoders. Links liteui like raster_ops_test does.
+#define LITEUI_IMPLEMENTATION
+#include "liteui.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>

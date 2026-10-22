@@ -1,65 +1,52 @@
-// include/liteui.hpp
+// liteui.hpp
 //
-// Single-header, cross-platform window.
-// Platform members/methods are selected at compile time via #ifdef
+// Single-header, cross-platform window / UI library.
+//
+// USAGE
+//   Include this file wherever you need the API (it only pulls in a few
+//   standard headers, so it is cheap). In EXACTLY ONE .cpp file of your
+//   program, define LITEUI_IMPLEMENTATION before including it; that is the
+//   one translation unit that compiles the platform backend (Win32 /
+//   Wayland+Cairo+Pango+EGL) and sees the platform headers:
+//
+//       // ui.cpp
+//       #define LITEUI_IMPLEMENTATION
+//       #include "liteui.hpp"
+//
+//   A program with a single .cpp file just does both in that file.
+//   With CMake, linking liteui::liteui does this for you.
+//
+// Platform members/methods are selected at compile time via #ifdef.
 
-#pragma once
+#ifndef LITEUI_HPP_INCLUDED
+#define LITEUI_HPP_INCLUDED
 
 #include <algorithm>
-#include <atomic>
-#include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
+// Opaque platform types referenced (by pointer only) from View::Computed, so
+// the public part of this header never needs the platform SDK headers.
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <d2d1.h>
-#include <dwrite.h>
-#include <dwrite_1.h>
-#include <dxgiformat.h> // DXGI_FORMAT_R8G8B8A8_UNORM, used by Canvas::drawImage/putImageData
-#include <shobjidl.h>
-#include <wincodec.h>
-#include <windows.h>
-#include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
-#pragma comment(lib, "d2d1")
-#pragma comment(lib, "dwrite")
+struct IDWriteTextLayout;
+struct ID2D1RenderTarget;
+struct IWICBitmap;
+struct ID2D1Bitmap;
 #else
-#include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
-#include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GLES2/gl2.h>
-#include <cairo/cairo.h>
-#include <cstdio> // popen, pclose, fgets
-#include <fcntl.h>
-#include <jpeglib.h>
-#include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
-#include <png.h>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
-#include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
-#include <wayland-cursor.h> // wl_cursor_theme_load / wl_cursor_theme_get_cursor, for showing resize/arrow cursors.
-#include <wayland-egl.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
-#include <xkbcommon/xkbcommon.h>
+typedef struct _cairo_surface cairo_surface_t;
 #endif
 
 // Plain RGB color, one byte per channel.
-struct Color {
+struct Color
+{
   uint8_t r = 0, g = 0, b = 0, a = 255;
   bool operator==(const Color &) const = default;
 };
@@ -68,11 +55,17 @@ struct Color {
 // per-button press/drag tracking in LiteUI (pressedView_/dragView_) and
 // to select which of a View's onClick/onMiddleClick/onRightClick (etc.)
 // triple gets checked/fired.
-enum class MouseButton { Left, Middle, Right };
+enum class MouseButton
+{
+  Left,
+  Middle,
+  Right
+};
 
 // Logical key identity, independent of platform scancode/VK. Extend as
 // needed — this covers what a typical text field / shortcut system wants.
-enum class Key {
+enum class Key
+{
   Unknown = 0,
   A,
   B,
@@ -153,113 +146,22 @@ enum class Key {
   Grave,
 };
 
-struct KeyModifiers {
+struct KeyModifiers
+{
   bool shift = false, ctrl = false, alt = false, super = false;
   bool operator==(const KeyModifiers &) const = default;
 };
 
-struct KeyEvent {
+struct KeyEvent
+{
   Key key = Key::Unknown;
   KeyModifiers mods;
 };
 
-#if defined(_WIN32)
-// Converts a UTF-8 std::string to the UTF-16 wide string Win32/DirectWrite
-// APIs require. File-scope (rather than a LiteUI member) because both
-// LiteUI's WndProc path and liteui_text's DirectWrite layout builder need
-// it, and DirectWrite objects aren't tied to any particular window.
-inline std::wstring toWide(const std::string &s) {
-  int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-  std::wstring w(wlen, L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), wlen);
-  return w;
-}
-inline Key vkToKey(WPARAM vk) {
-  if (vk >= 'A' && vk <= 'Z')
-    return static_cast<Key>(static_cast<int>(Key::A) + (vk - 'A'));
-  if (vk >= '0' && vk <= '9')
-    return static_cast<Key>(static_cast<int>(Key::N0) + (vk - '0'));
-  if (vk >= VK_F1 && vk <= VK_F12)
-    return static_cast<Key>(static_cast<int>(Key::F1) + (vk - VK_F1));
-  switch (vk) {
-  case VK_RETURN:
-    return Key::Enter;
-  case VK_ESCAPE:
-    return Key::Escape;
-  case VK_BACK:
-    return Key::Backspace;
-  case VK_TAB:
-    return Key::Tab;
-  case VK_SPACE:
-    return Key::Space;
-  case VK_DELETE:
-    return Key::Delete;
-  case VK_LEFT:
-    return Key::Left;
-  case VK_RIGHT:
-    return Key::Right;
-  case VK_UP:
-    return Key::Up;
-  case VK_DOWN:
-    return Key::Down;
-  case VK_HOME:
-    return Key::Home;
-  case VK_END:
-    return Key::End;
-  case VK_PRIOR:
-    return Key::PageUp;
-  case VK_NEXT:
-    return Key::PageDown;
-  case VK_SHIFT:
-    return Key::Shift;
-  case VK_CONTROL:
-    return Key::Control;
-  case VK_MENU:
-    return Key::Alt;
-  case VK_LWIN:
-  case VK_RWIN:
-    return Key::Super;
-  case VK_OEM_MINUS:
-    return Key::Minus;
-  case VK_OEM_PLUS:
-    return Key::Equal;
-  case VK_OEM_4:
-    return Key::LeftBracket;
-  case VK_OEM_6:
-    return Key::RightBracket;
-  case VK_OEM_5:
-    return Key::Backslash;
-  case VK_OEM_1:
-    return Key::Semicolon;
-  case VK_OEM_7:
-    return Key::Quote;
-  case VK_OEM_COMMA:
-    return Key::Comma;
-  case VK_OEM_PERIOD:
-    return Key::Period;
-  case VK_OEM_2:
-    return Key::Slash;
-  case VK_OEM_3:
-    return Key::Grave;
-  default:
-    return Key::Unknown;
-  }
-}
-
-inline KeyModifiers currentModifiers() {
-  KeyModifiers m;
-  m.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-  m.ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-  m.alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-  m.super = (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
-            (GetKeyState(VK_RWIN) & 0x8000) != 0;
-  return m;
-}
-#endif
-
 // A static, axis-aligned filled rectangle the caller wants drawn on the
 // window. Position is in window-local pixel coordinates, (0,0) at top-left.
-struct Box {
+struct Box
+{
   int width = 0;
   int height = 0;
   int pos_x = 0;
@@ -278,13 +180,15 @@ constexpr float kScrollbarThickness = 12.0f;
 // A field settable as either a fixed value or a callback polled after each
 // dispatched event (see checkForUpdates) — lets author code write
 // `x = "hello";` or `x = []{ return someVar; };` through plain assignment.
-template <class T> using Dynamic = std::variant<T, std::function<T()>>;
+template <class T>
+using Dynamic = std::variant<T, std::function<T()>>;
 
 // What every read site outside checkForUpdates should call: the stored
 // value directly if it's static (always fresh, no indirection), or `cache`
 // — the last value checkForUpdates polled from the callback — if dynamic.
 template <class T>
-inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache) {
+inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache)
+{
   if (auto *v = std::get_if<T>(&field))
     return *v;
   return cache;
@@ -296,7 +200,9 @@ inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache) {
 // there's nothing to fall back to. Throws (via std::get) if that
 // assumption is ever violated, rather than silently resolving to a wrong
 // default.
-template <class T> inline const T &resolveStatic(const Dynamic<T> &field) {
+template <class T>
+inline const T &resolveStatic(const Dynamic<T> &field)
+{
   return std::get<T>(field);
 }
 
@@ -306,8 +212,15 @@ template <class T> inline const T &resolveStatic(const Dynamic<T> &field) {
 // to the sum/max of children (like CSS's "auto" on a flex item); Full fills
 // whatever space the parent gives along that axis (like width: 100%, but
 // resolved from available space rather than the parent's own size).
-struct Size {
-  enum class Kind { Fixed, Percentage, Fit, Full };
+struct Size
+{
+  enum class Kind
+  {
+    Fixed,
+    Percentage,
+    Fit,
+    Full
+  };
   Kind kind = Kind::Fit;
   float value = 0; // pixels for Fixed, 0-100 for Percentage; unused otherwise
 
@@ -317,8 +230,13 @@ struct Size {
   static Size full() { return {Kind::Full, 0}; }
 };
 
-enum class FlexDirection { Row, Column };
-enum class Justify {
+enum class FlexDirection
+{
+  Row,
+  Column
+};
+enum class Justify
+{
   Start,
   End,
   Center,
@@ -327,17 +245,28 @@ enum class Justify {
   SpaceEvenly
 };
 
-enum class Align { Start, End, Center, Stretch };
+enum class Align
+{
+  Start,
+  End,
+  Center,
+  Stretch
+};
 
 // Whether children that overflow the main axis wrap onto additional lines.
-enum class FlexWrap { NoWrap, Wrap };
+enum class FlexWrap
+{
+  NoWrap,
+  Wrap
+};
 
 // How multiple flex lines are distributed along the cross axis. Only
 // meaningful when FlexWrap::Wrap actually produces more than one line;
 // with a single line this reduces to Stretch filling crossAvail (matching
 // the old un-wrapped behavior) or the others packing that one line at the
 // start.
-enum class AlignContent {
+enum class AlignContent
+{
   Start,
   End,
   Center,
@@ -347,22 +276,35 @@ enum class AlignContent {
   Stretch
 };
 
-struct EdgeInsets {
+struct EdgeInsets
+{
   float top = 0, right = 0, bottom = 0, left = 0;
   static EdgeInsets all(float v) { return {v, v, v, v}; }
   bool operator==(const EdgeInsets &) const = default;
 };
 
-enum class Position { Static, Absolute };
+enum class Position
+{
+  Static,
+  Absolute
+};
 
 // display:none analog — a false-y node is skipped entirely by layout,
 // paint, and hit-testing, everywhere Position::Absolute is already
 // skipped for being "out of flow". Space is NOT reserved.
-enum class Display { Flex, None };
+enum class Display
+{
+  Flex,
+  None
+};
 
 // visibility:hidden analog — layout still reserves the node's space and
 // siblings flow around it normally; only paint/hit-test/hover skip it.
-enum class Visibility { Visible, Hidden };
+enum class Visibility
+{
+  Visible,
+  Hidden
+};
 
 // CSS-style overflow behavior for one axis of a container. Visible (the
 // default) behavior: children are never clipped and never
@@ -371,9 +313,16 @@ enum class Visibility { Visible, Hidden };
 // clips *and* always shows that axis's scrollbar, even if content
 // currently fits. Auto clips and shows the scrollbar only when content
 // actually exceeds the viewport on that axis.
-enum class Overflow { Visible, Hidden, Scroll, Auto };
+enum class Overflow
+{
+  Visible,
+  Hidden,
+  Scroll,
+  Auto
+};
 
-struct Style {
+struct Style
+{
   Dynamic<Size> width = Size::fit();
   Dynamic<Size> height = Size::fit();
 
@@ -432,7 +381,7 @@ struct Style {
   Overflow overflowY = Overflow::Visible;
   bool contentPanEnabled = true;
   bool wheelScrollEnabled = true;
-  
+
   Dynamic<std::optional<Color>> scrollTrackColor;
   Dynamic<std::optional<Color>> scrollThumbColor;
   bool scrollbarAutoHide = false;
@@ -441,7 +390,8 @@ struct Style {
 };
 
 // ---------------- Text: author-facing, leaf-only ----------------
-enum class FontWeight : int {
+enum class FontWeight : int
+{
   Thin = 100,
   ExtraLight = 200,
   Light = 300,
@@ -452,15 +402,34 @@ enum class FontWeight : int {
   ExtraBold = 800,
   Black = 900
 };
-enum class FontStyle { Normal, Italic };
-enum class TextAlign { Start, Center, End, Justify };
-enum class TextOverflow { Clip, Ellipsis };
-enum class TextWrap { Wrap, NoWrap };
+enum class FontStyle
+{
+  Normal,
+  Italic
+};
+enum class TextAlign
+{
+  Start,
+  Center,
+  End,
+  Justify
+};
+enum class TextOverflow
+{
+  Clip,
+  Ellipsis
+};
+enum class TextWrap
+{
+  Wrap,
+  NoWrap
+};
 
 // Internal mirror of Text's styling fields, stored on the View a Text
 // flattens into (see View::toView below). Kept as its own struct so View
 // doesn't have to duplicate every Text field under a different name.
-struct TextStyle {
+struct TextStyle
+{
   Dynamic<float> fontSize = 16.0f;
   Dynamic<FontWeight> fontWeight = FontWeight::Regular;
   Dynamic<FontStyle> fontStyle = FontStyle::Normal;
@@ -478,7 +447,8 @@ struct TextStyle {
 
 // Author-facing leaf node. addChild(Text) flattens this into a View (see
 // View::toView) — Text itself never appears in the retained tree.
-struct Text {
+struct Text
+{
   Dynamic<std::string> label = std::string{};
   Style
       style; // layout only — width/height/margin/position/etc, reused from View
@@ -507,13 +477,13 @@ struct Text {
 // everything else is vector drawing, matching what Direct2D (Windows) and
 // Cairo (Linux) both do natively.
 //
-// CanvasContext itself is platform-specific (see the two full definitions
-// guarded by #if defined(_WIN32) below, after liteui_text) since its
-// internals wrap either an ID2D1RenderTarget or a cairo_t directly rather
-// than going through a generic vtable — consistent with this file's "one
-// compiled definition per build, no vtable" design. Both definitions
-// expose the exact same public method surface, so app code that only
-// calls CanvasContext's public API compiles unchanged on either platform.
+// CanvasContext's public methods are declared below. The platform backends
+// (CanvasContextImpl, in the LITEUI_IMPLEMENTATION section, one per
+// #if defined(_WIN32) branch) wrap either an ID2D1RenderTarget or a cairo_t
+// directly rather than going through a virtual interface — consistent with
+// this file's "no vtable" design. Both backends implement the exact same
+// public method surface, so app code that only calls CanvasContext's public
+// API compiles unchanged on either platform.
 //
 // Known limitations (fine for v1, revisit if needed):
 //  - No image decoding (PNG/JPEG/etc.) is included; CanvasImage just wraps
@@ -549,79 +519,13 @@ struct Text {
 //    a true outline of the glyph contours.
 //  - fillText/strokeText's maxWidth parameter is accepted for API
 //    familiarity but currently unused (no horizontal squeeze-to-fit).
-// ---- optional frame profiler ------------------------------------------
-// Compile with -DLITEUI_PROFILE to print, once per second on stderr, how
-// long each stage of interaction/painting takes (avg and worst case, in
-// ms, plus how many times it ran that second). Compiled out entirely
-// otherwise — LITEUI_PROF_START/ADD expand to nothing. Stages nest: e.g.
-// `build` (all of WM_PAINT's drawing) contains `canvas` and `blit`.
-#ifdef LITEUI_PROFILE
-#include <chrono>
-namespace liteui_prof {
-struct Stat {
-  double sum = 0, worst = 0;
-  int n = 0;
-  void add(double ms) {
-    sum += ms;
-    if (ms > worst)
-      worst = ms;
-    ++n;
-  }
-  double avg() const { return n ? sum / n : 0.0; }
-};
-struct Report {
-  Stat move, build, endDraw, canvas, blit, recompute, appPaint;
-  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-  void flushIfDue() {
-    auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(1))
-      return;
-    auto line = [](const char *name, const Stat &s) {
-      if (s.n)
-        std::fprintf(stderr, "  %-9s x%-4d avg %6.2f ms  worst %6.2f ms\n",
-                     name, s.n, s.avg(), s.worst);
-    };
-    if (move.n || build.n) {
-      std::fprintf(stderr, "[liteui profile]\n");
-      line("mouse", move);
-      line("recompute", recompute);
-      line("build", build);
-      line("canvas", canvas);
-      line("appPaint", appPaint);
-      line("blit", blit);
-      line("EndDraw", endDraw);
-    }
-    move = build = endDraw = canvas = blit = recompute = appPaint = Stat{};
-    last = now;
-  }
-};
-inline Report &report() {
-  static Report r;
-  return r;
-}
-inline double msSince(std::chrono::steady_clock::time_point t) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now() - t)
-      .count();
-}
-} // namespace liteui_prof
-#define LITEUI_PROF_START(var) auto var = std::chrono::steady_clock::now()
-#define LITEUI_PROF_ADD(stat, var)                                             \
-  do {                                                                         \
-    liteui_prof::report().stat.add(liteui_prof::msSince(var));                 \
-    liteui_prof::report().flushIfDue();                                        \
-  } while (0)
-#else
-#define LITEUI_PROF_START(var) ((void)0)
-#define LITEUI_PROF_ADD(stat, var) ((void)0)
-#endif
-
 class CanvasContext;
 
 // A simple RGBA8, straight- (non-premultiplied) alpha bitmap. The app is
 // responsible for populating `pixels` (e.g. from a decoded image file or
 // generated procedurally) — this header does no image-format decoding.
-struct CanvasImage {
+struct CanvasImage
+{
   int width = 0, height = 0;
   std::vector<uint8_t> pixels; // width*height*4 bytes, row-major, RGBA8
 
@@ -633,11 +537,19 @@ struct CanvasImage {
 
 // How a decoded image's aspect ratio is reconciled with the box it's
 // drawn into — same semantics as CSS object-fit.
-enum class ObjectFit { Fill, Contain, Cover, None, ScaleDown };
+enum class ObjectFit
+{
+  Fill,
+  Contain,
+  Cover,
+  None,
+  ScaleDown
+};
 
 // A single filter entry — Windows-style pattern syntax on both platforms
 // ("*.png;*.jpg"), so one filter list works unmodified either way.
-struct FileFilter {
+struct FileFilter
+{
   std::string name;
   std::string pattern; // ';'-separated globs, e.g. "*.png;*.jpg"
 };
@@ -650,139 +562,6 @@ std::optional<std::string>
 openFilePicker(const std::string &title = "Open File",
                const std::vector<FileFilter> &filters = {});
 
-#if defined(_WIN32)
-
-inline std::optional<std::string>
-openFilePicker(const std::string &title,
-               const std::vector<FileFilter> &filters) {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileOpenDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-
-  // COMDLG_FILTERSPEC just points at wide strings we own, so keep the
-  // backing wstrings alive until after SetFileTypes/Show.
-  std::vector<std::wstring> names, patterns;
-  std::vector<COMDLG_FILTERSPEC> specs;
-  names.reserve(filters.size());
-  patterns.reserve(filters.size());
-  for (auto &f : filters) {
-    names.push_back(toWide(f.name));
-    patterns.push_back(toWide(f.pattern));
-  }
-  for (size_t i = 0; i < filters.size(); ++i)
-    specs.push_back({names[i].c_str(), patterns[i].c_str()});
-  if (!specs.empty())
-    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr); // blocks until closed
-  if (SUCCEEDED(hr)) {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item))) {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? len - 1 : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-#else // Linux
-
-namespace liteui_filepicker {
-
-inline bool commandExists(const char *name) {
-  std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
-  return std::system(check.c_str()) == 0;
-}
-
-// Very small shell-arg escaper: single-quote the whole thing, escaping any
-// embedded single quotes. Titles/patterns here are app-supplied, but this
-// keeps popen() safe regardless.
-inline std::string shellQuote(const std::string &s) {
-  std::string out = "'";
-  for (char c : s)
-    out += (c == '\'') ? "'\\''" : std::string(1, c);
-  out += "'";
-  return out;
-}
-
-} // namespace liteui_filepicker
-
-inline std::optional<std::string>
-openFilePicker(const std::string &title,
-               const std::vector<FileFilter> &filters) {
-  using namespace liteui_filepicker;
-
-  std::string cmd;
-  if (commandExists("zenity")) {
-    cmd = "zenity --file-selection --title=" + shellQuote(title);
-    for (auto &f : filters) {
-      // zenity wants space-separated globs; our pattern is ';'-separated.
-      std::string globs = f.pattern;
-      std::replace(globs.begin(), globs.end(), ';', ' ');
-      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
-    }
-  } else if (commandExists("kdialog")) {
-    // kdialog's filter syntax is "*.png *.jpg|Images\n*.mp3|Audio" — build
-    // it from all filters at once, appended as a single trailing arg.
-    cmd = "kdialog --getopenfilename . --title " + shellQuote(title);
-    if (!filters.empty()) {
-      std::string spec;
-      for (size_t i = 0; i < filters.size(); ++i) {
-        std::string globs = filters[i].pattern;
-        std::replace(globs.begin(), globs.end(), ';', ' ');
-        if (i)
-          spec += "\n";
-        spec += globs + "|" + filters[i].name;
-      }
-      cmd += " " + shellQuote(spec);
-    }
-  } else {
-    return std::nullopt; // no picker binary available
-  }
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-#endif
-
 // Blocks until the user picks a save location or cancels. `defaultName` is
 // the pre-filled filename (e.g. "export.png"); `defaultExt` (no leading
 // dot, e.g. "png") gets appended if the user's typed name doesn't already
@@ -793,178 +572,6 @@ saveFilePicker(const std::string &title = "Save File",
                const std::string &defaultName = "",
                const std::vector<FileFilter> &filters = {},
                const std::string &defaultExt = "");
-
-#if defined(_WIN32)
-
-inline std::optional<std::string>
-saveFilePicker(const std::string &title, const std::string &defaultName,
-               const std::vector<FileFilter> &filters,
-               const std::string &defaultExt) {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileSaveDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  if (!defaultName.empty())
-    dlg->SetFileName(toWide(defaultName).c_str());
-  if (!defaultExt.empty())
-    dlg->SetDefaultExtension(toWide(defaultExt).c_str());
-
-  // Prompt-on-overwrite is IFileSaveDialog's default behavior already
-  // (unlike zenity below, which needs it requested explicitly), so
-  // nothing extra is needed here.
-
-  std::vector<std::wstring> names, patterns;
-  std::vector<COMDLG_FILTERSPEC> specs;
-  names.reserve(filters.size());
-  patterns.reserve(filters.size());
-  for (auto &f : filters) {
-    names.push_back(toWide(f.name));
-    patterns.push_back(toWide(f.pattern));
-  }
-  for (size_t i = 0; i < filters.size(); ++i)
-    specs.push_back({names[i].c_str(), patterns[i].c_str()});
-  if (!specs.empty())
-    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr); // blocks until closed
-  if (SUCCEEDED(hr)) {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item))) {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? len - 1 : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-#else // Linux
-
-namespace liteui_filepicker {
-
-// Appends defaultExt to path if it doesn't already end in one of the
-// extensions listed in `filters`' patterns. Keeps zenity/kdialog (which
-// don't reliably force an extension the way Windows' dialog does) from
-// producing "export" instead of "export.png".
-inline std::string ensureExtension(std::string path,
-                                   const std::string &defaultExt,
-                                   const std::vector<FileFilter> &filters) {
-  if (defaultExt.empty() || path.empty())
-    return path;
-  auto endsWithAny = [&](const std::string &p) {
-    for (auto &f : filters) {
-      size_t start = 0;
-      while (start < f.pattern.size()) {
-        size_t sep = f.pattern.find(';', start);
-        std::string glob = f.pattern.substr(start, sep - start);
-        // glob is like "*.png" — check the suffix after '*'
-        size_t star = glob.find('*');
-        if (star != std::string::npos) {
-          std::string suffix = glob.substr(star + 1);
-          if (suffix.size() <= p.size() &&
-              std::equal(suffix.rbegin(), suffix.rend(), p.rbegin(),
-                         [](char a, char b) {
-                           return std::tolower(a) == std::tolower(b);
-                         }))
-            return true;
-        }
-        if (sep == std::string::npos)
-          break;
-        start = sep + 1;
-      }
-    }
-    return false;
-  };
-  if (!filters.empty() && endsWithAny(path))
-    return path;
-  if (path.size() >= defaultExt.size() + 1 &&
-      path[path.size() - defaultExt.size() - 1] == '.' &&
-      std::equal(
-          defaultExt.rbegin(), defaultExt.rend(), path.rbegin(),
-          [](char a, char b) { return std::tolower(a) == std::tolower(b); }))
-    return path;
-  return path + "." + defaultExt;
-}
-
-} // namespace liteui_filepicker
-
-inline std::optional<std::string>
-saveFilePicker(const std::string &title, const std::string &defaultName,
-               const std::vector<FileFilter> &filters,
-               const std::string &defaultExt) {
-  using namespace liteui_filepicker;
-
-  std::string cmd;
-  if (commandExists("zenity")) {
-    cmd = "zenity --file-selection --save --confirm-overwrite --title=" +
-          shellQuote(title);
-    if (!defaultName.empty())
-      cmd += " --filename=" + shellQuote(defaultName);
-    for (auto &f : filters) {
-      std::string globs = f.pattern;
-      std::replace(globs.begin(), globs.end(), ';', ' ');
-      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
-    }
-  } else if (commandExists("kdialog")) {
-    cmd = "kdialog --getsavefilename";
-    cmd += " " + shellQuote(defaultName.empty() ? "." : defaultName);
-    if (!filters.empty()) {
-      std::string spec;
-      for (size_t i = 0; i < filters.size(); ++i) {
-        std::string globs = filters[i].pattern;
-        std::replace(globs.begin(), globs.end(), ';', ' ');
-        if (i)
-          spec += "\n";
-        spec += globs + "|" + filters[i].name;
-      }
-      cmd += " " + shellQuote(spec);
-    }
-    cmd += " --title " + shellQuote(title);
-    // kdialog itself prompts on overwrite by default.
-  } else {
-    return std::nullopt;
-  }
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return ensureExtension(result, defaultExt, filters);
-}
-
-#endif
 
 // Blocks until the user picks a folder or cancels. Unlike files, folders
 // have no natural "open" vs "save" distinction — saveFolderPicker exists
@@ -977,2127 +584,38 @@ openFolderPicker(const std::string &title = "Open Folder");
 std::optional<std::string>
 saveFolderPicker(const std::string &title = "Select Folder");
 
-#if defined(_WIN32)
-
-inline std::optional<std::string> openFolderPicker(const std::string &title) {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileOpenDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  DWORD opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_PICKFOLDERS);
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr);
-  if (SUCCEEDED(hr)) {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item))) {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-// Same as openFolderPicker but via IFileSaveDialog, so the dialog's
-// action button reads "Save"/"Select" rather than "Open" — the only
-// difference; folders have no other save-specific behavior.
-inline std::optional<std::string> saveFolderPicker(const std::string &title) {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileSaveDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  DWORD opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_PICKFOLDERS);
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr);
-  if (SUCCEEDED(hr)) {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item))) {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-#else // Linux
-
-inline std::optional<std::string> openFolderPicker(const std::string &title) {
-  using namespace liteui_filepicker;
-  std::string cmd;
-  if (commandExists("zenity"))
-    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
-  else if (commandExists("kdialog"))
-    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
-  else
-    return std::nullopt;
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-// zenity/kdialog have no separate "save" mode for directories, so this
-// is identical to openFolderPicker aside from the default title string
-// the caller passes.
-inline std::optional<std::string> saveFolderPicker(const std::string &title) {
-  using namespace liteui_filepicker;
-  std::string cmd;
-  if (commandExists("zenity"))
-    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
-  else if (commandExists("kdialog"))
-    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
-  else
-    return std::nullopt;
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-#endif
-
-// ==================== Clipboard ====================
-namespace liteui_clipboard {
-
-// Same-process fallback: only used when NO working OS clipboard mechanism
-// exists (headless container, no wl-copy/xclip/xsel, Windows clipboard
-// permanently locked). It is never consulted when the OS clipboard works,
-// so it can't paste stale text over something the user copied elsewhere.
-inline std::string &internalFallback() {
-  static std::string s;
-  return s;
-}
-
-// Normalizes "\r\n" and lone "\r" to "\n" — the editor splits lines on
-// '\n' only, so any '\r' left in pasted text would end up at the end of
-// every line.
-inline std::string toLF(const std::string &in) {
-  std::string out;
-  out.reserve(in.size());
-  for (size_t i = 0; i < in.size(); ++i) {
-    if (in[i] == '\r') {
-      if (i + 1 < in.size() && in[i + 1] == '\n')
-        continue;  // CRLF: drop the CR, the LF is kept on the next iteration
-      out += '\n'; // lone CR (classic Mac line ending)
-      continue;
-    }
-    out += in[i];
-  }
-  return out;
-}
-
-// Converts "\n" to "\r\n" without doubling any that are already CRLF.
-inline std::string toCRLF(const std::string &in) {
-  std::string out;
-  out.reserve(in.size() + in.size() / 16 + 1);
-  for (size_t i = 0; i < in.size(); ++i) {
-    if (in[i] == '\n' && (i == 0 || in[i - 1] != '\r'))
-      out += '\r';
-    out += in[i];
-  }
-  return out;
-}
-
-#if defined(_WIN32)
-
-namespace detail {
-// Another process can briefly hold the clipboard open; a few short
-// retries avoids spurious failures without ever blocking noticeably.
-inline bool openClipboardRetry() {
-  for (int i = 0; i < 5; ++i) {
-    if (OpenClipboard(nullptr))
-      return true;
-    Sleep(10);
-  }
-  return false;
-}
-} // namespace detail
-
-// Returns false if the clipboard couldn't be written.
-inline bool setText(const std::string &utf8) {
-  // Windows apps (Notepad, Word, browsers) expect CRLF line endings.
-  std::string crlf = toCRLF(utf8);
-  int wlen = MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, nullptr, 0);
-  if (wlen <= 0)
-    return false;
-  if (!detail::openClipboardRetry())
-    return false;
-  EmptyClipboard();
-  HGLOBAL hMem =
-      GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wlen) * sizeof(wchar_t));
-  if (!hMem) {
-    CloseClipboard();
-    return false;
-  }
-  wchar_t *dst = static_cast<wchar_t *>(GlobalLock(hMem));
-  if (!dst) {
-    GlobalFree(hMem);
-    CloseClipboard();
-    return false;
-  }
-  MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, dst, wlen);
-  GlobalUnlock(hMem);
-  if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
-    GlobalFree(hMem); // clipboard did NOT take ownership on failure
-    CloseClipboard();
-    return false;
-  }
-  CloseClipboard(); // on success the clipboard owns hMem
-  return true;
-}
-
-// nullopt  = clipboard couldn't be opened (caller may use the fallback)
-// ""       = clipboard opened fine but holds no text (e.g. an image)
-inline std::optional<std::string> getText() {
-  if (!detail::openClipboardRetry())
-    return std::nullopt;
-  std::string result;
-  if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-      const wchar_t *w = static_cast<const wchar_t *>(GlobalLock(h));
-      if (w) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        if (len > 1) {
-          result.assign(static_cast<size_t>(len - 1), '\0');
-          WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(), len, nullptr,
-                              nullptr);
-        }
-        GlobalUnlock(h);
-      }
-    }
-  }
-  CloseClipboard();
-  return result;
-}
-
-#else // Linux: shell out to whatever clipboard tool is usable here.
-
-namespace detail {
-
-inline bool commandExists(const char *name) {
-  std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
-  return std::system(check.c_str()) == 0;
-}
-
-inline bool envSet(const char *name) {
-  const char *v = std::getenv(name);
-  return v && *v;
-}
-
-struct Tools {
-  std::string copyCmd, pasteCmd; // both empty = no usable clipboard tool
-};
-
-// Detected once and cached. A tool only counts if its display server is
-// actually present: wl-copy installed inside a headless container is
-// useless, and treating it as "available" would suppress the fallback.
-inline const Tools &tools() {
-  static const Tools t = [] {
-    Tools r;
-    if (envSet("WAYLAND_DISPLAY") && commandExists("wl-copy") &&
-        commandExists("wl-paste")) {
-      r.copyCmd = "wl-copy";
-      // "--type text" makes wl-paste refuse non-text contents (an image)
-      // instead of dumping binary data into the editor.
-      r.pasteCmd = "wl-paste --no-newline --type text";
-    } else if (envSet("DISPLAY") && commandExists("xclip")) {
-      r.copyCmd = "xclip -selection clipboard";
-      r.pasteCmd = "xclip -selection clipboard -o";
-    } else if (envSet("DISPLAY") && commandExists("xsel")) {
-      r.copyCmd = "xsel --clipboard --input";
-      r.pasteCmd = "xsel --clipboard --output";
-    }
-    return r;
-  }();
-  return t;
-}
-
-} // namespace detail
-
-// Returns false if no clipboard tool is available or it couldn't be run.
-inline bool setText(const std::string &utf8) {
-  const auto &t = detail::tools();
-  if (t.copyCmd.empty())
-    return false;
-  FILE *pipe = popen((t.copyCmd + " 2>/dev/null").c_str(), "w");
-  if (!pipe)
-    return false;
-  if (!utf8.empty())
-    fwrite(utf8.data(), 1, utf8.size(), pipe);
-  pclose(pipe); // wl-copy/xclip/xsel fork and detach to hold ownership,
-                // so this returns promptly
-  return true;
-}
-
-// nullopt  = no usable clipboard tool (caller may use the fallback)
-// ""       = tool ran fine but the clipboard has no text (e.g. an image)
-inline std::optional<std::string> getText() {
-  const auto &t = detail::tools();
-  if (t.pasteCmd.empty())
-    return std::nullopt;
-  FILE *pipe = popen((t.pasteCmd + " 2>/dev/null").c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[4096];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
-    result.append(buf, n);
-  pclose(pipe);
-  return result;
-}
-
-#endif
-
-// What CodeEditor actually calls.
-//
-// Set:  always mirrors into the in-process fallback, then tries the OS.
-// Get:  if the OS clipboard is reachable, its answer is final, even when
-//       that answer is "empty". The fallback is used only when there is
-//       no OS clipboard to ask. Line endings are normalized to '\n'.
-inline void setTextWithFallback(const std::string &s) {
-  internalFallback() = s;
-  setText(s);
-}
-
-inline std::string getTextWithFallback() {
-  if (std::optional<std::string> os = getText())
-    return toLF(*os);
-  return internalFallback();
-}
-
+// ---------------- Clipboard / image decoding (implemented in the
+// LITEUI_IMPLEMENTATION section) ----------------
+namespace liteui_clipboard
+{
+  std::string toLF(const std::string &in);
+  std::string toCRLF(const std::string &in);
+  bool setText(const std::string &utf8);
+  std::optional<std::string> getText();
+  void setTextWithFallback(const std::string &s);
+  std::string getTextWithFallback();
 } // namespace liteui_clipboard
 
-namespace liteui_image {
+// Text helper documented for authors of hand-built Canvas widgets: returns the
+// byte index in `text` whose caret position is closest to `clickX` (measured
+// from the text's own left edge).
+namespace liteui_text
+{
+  size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                        float fontSize, FontWeight fontWeight,
+                        FontStyle fontStyleVal, float clickX);
+} // namespace liteui_text
 
-#if defined(_WIN32)
-
-inline std::optional<CanvasImage>
-decodeMemory(const uint8_t *data, size_t size,
-             std::string *errorOut = nullptr) {
-  if (!data || size == 0) {
-    if (errorOut)
-      *errorOut = "empty buffer";
-    return std::nullopt;
-  }
-
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return std::nullopt;
-  }
-
-  // IWICStream::InitializeFromMemory wraps the buffer in place (no copy),
-  // so `data` must stay valid for the lifetime of this call — fine here
-  // since decoding happens synchronously before we return.
-  IWICStream *stream = nullptr;
-  hr = factory->CreateStream(&stream);
-  if (SUCCEEDED(hr))
-    hr = stream->InitializeFromMemory(const_cast<BYTE *>(data),
-                                      static_cast<DWORD>(size));
-  if (FAILED(hr)) {
-    if (stream)
-      stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: InitializeFromMemory failed";
-    return std::nullopt;
-  }
-
-  IWICBitmapDecoder *decoder = nullptr;
-  hr = factory->CreateDecoderFromStream(
-      stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
-  if (FAILED(hr)) {
-    stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: failed to decode buffer (unrecognized format?)";
-    return std::nullopt;
-  }
-
-  IWICBitmapFrameDecode *frame = nullptr;
-  hr = decoder->GetFrame(0, &frame);
-  IWICFormatConverter *converter = nullptr;
-  if (SUCCEEDED(hr)) {
-    hr = factory->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr))
-      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
-                                 WICBitmapDitherTypeNone, nullptr, 0.0,
-                                 WICBitmapPaletteTypeCustom);
-  }
-  if (FAILED(hr)) {
-    if (converter)
-      converter->Release();
-    if (frame)
-      frame->Release();
-    decoder->Release();
-    stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: decode/convert failed";
-    return std::nullopt;
-  }
-
-  UINT w = 0, h = 0;
-  converter->GetSize(&w, &h);
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  hr = converter->CopyPixels(
-      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
-
-  converter->Release();
-  frame->Release();
-  decoder->Release();
-  stream->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (FAILED(hr)) {
-    if (errorOut)
-      *errorOut = "WIC: CopyPixels failed";
-    return std::nullopt;
-  }
-  return img;
-}
-
-inline std::optional<CanvasImage> decodeFile(const std::string &path,
-                                             std::string *errorOut = nullptr) {
-  // WIC needs an apartment; tolerate "already initialized differently"
-  // rather than fail, since the host app may have called this itself.
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return std::nullopt;
-  }
-
-  std::wstring wpath = toWide(path);
-  IWICBitmapDecoder *decoder = nullptr;
-  hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ,
-                                          WICDecodeMetadataCacheOnDemand,
-                                          &decoder);
-  if (FAILED(hr)) {
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: failed to open/decode file";
-    return std::nullopt;
-  }
-
-  IWICBitmapFrameDecode *frame = nullptr;
-  hr = decoder->GetFrame(0, &frame);
-  IWICFormatConverter *converter = nullptr;
-  if (SUCCEEDED(hr)) {
-    hr = factory->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr))
-      // Straight (non-premultiplied) alpha, matching CanvasImage's contract.
-      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
-                                 WICBitmapDitherTypeNone, nullptr, 0.0,
-                                 WICBitmapPaletteTypeCustom);
-  }
-  if (FAILED(hr)) {
-    if (converter)
-      converter->Release();
-    if (frame)
-      frame->Release();
-    decoder->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: decode/convert failed";
-    return std::nullopt;
-  }
-
-  UINT w = 0, h = 0;
-  converter->GetSize(&w, &h);
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  hr = converter->CopyPixels(
-      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
-
-  converter->Release();
-  frame->Release();
-  decoder->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (FAILED(hr)) {
-    if (errorOut)
-      *errorOut = "WIC: CopyPixels failed";
-    return std::nullopt;
-  }
-  return img;
-}
-
-#else // Linux
-
-namespace detail {
-
-inline std::string lowerExt(const std::string &path) {
-  auto dot = path.find_last_of('.');
-  if (dot == std::string::npos)
-    return "";
-  std::string ext = path.substr(dot + 1);
-  std::transform(ext.begin(), ext.end(), ext.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return ext;
-}
-
-// Since there's no filename/extension for a memory buffer, sniff the
-// format from its magic bytes instead — same signatures libpng/libjpeg
-// themselves check internally.
-enum class ImageFormat { Unknown, Png, Jpeg };
-inline ImageFormat sniffFormat(const uint8_t *data, size_t size) {
-  static const uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47,
-                                     0x0D, 0x0A, 0x1A, 0x0A};
-  if (size >= 8 && std::memcmp(data, kPngSig, 8) == 0)
-    return ImageFormat::Png;
-  if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
-    return ImageFormat::Jpeg;
-  return ImageFormat::Unknown;
-}
-
-// Read-callback state for libpng's png_set_read_fn — tracks how far
-// we've consumed into the caller's buffer.
-struct PngMemReader {
-  const uint8_t *data;
-  size_t size, offset = 0;
-};
-inline void pngMemRead(png_structp png, png_bytep out, png_size_t count) {
-  auto *r = static_cast<PngMemReader *>(png_get_io_ptr(png));
-  if (r->offset + count > r->size) {
-    png_error(png, "liteui: PNG read past end of buffer");
-    return;
-  }
-  std::memcpy(out, r->data + r->offset, count);
-  r->offset += count;
-}
-
-// Custom error manager so a corrupt/truncated JPEG returns nullopt instead
-// of libjpeg's default error_exit calling exit() and killing the process.
-// Mirrors the setjmp/longjmp escape libpng uses via png_jmpbuf above.
-struct JpegErrorMgr {
-  jpeg_error_mgr pub; // must be first member — libjpeg treats this struct
-                      // as a jpeg_error_mgr* via reinterpret_cast
-  jmp_buf escape;
-  std::string message;
-};
-
-inline void jpegErrorExit(j_common_ptr cinfo) {
-  auto *err = reinterpret_cast<JpegErrorMgr *>(cinfo->err);
-  char buf[JMSG_LENGTH_MAX];
-  (*cinfo->err->format_message)(cinfo, buf);
-  err->message = buf;
-  longjmp(err->escape, 1);
-}
-
-inline std::optional<CanvasImage>
-decodePngMemory(const uint8_t *data, size_t size, std::string *errorOut) {
-  if (size < 8 || png_sig_cmp(data, 0, 8)) {
-    if (errorOut)
-      *errorOut = "not a valid PNG buffer";
-    return std::nullopt;
-  }
-  png_structp png =
-      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-  png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info) {
-    if (png)
-      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
-    if (errorOut)
-      *errorOut = "libpng init failed";
-    return std::nullopt;
-  }
-  if (setjmp(png_jmpbuf(png))) {
-    png_destroy_read_struct(&png, &info, nullptr);
-    if (errorOut)
-      *errorOut = "libpng decode error";
-    return std::nullopt;
-  }
-
-  PngMemReader reader{data, size};
-  png_set_read_fn(png, &reader, pngMemRead);
-  png_read_info(png, info);
-
-  png_uint_32 w = png_get_image_width(png, info);
-  png_uint_32 h = png_get_image_height(png, info);
-  int bitDepth = png_get_bit_depth(png, info);
-  int colorType = png_get_color_type(png, info);
-
-  if (bitDepth == 16)
-    png_set_strip_16(png);
-  if (colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_palette_to_rgb(png);
-  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
-    png_set_expand_gray_1_2_4_to_8(png);
-  if (png_get_valid(png, info, PNG_INFO_tRNS))
-    png_set_tRNS_to_alpha(png);
-  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-  if (colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
-    png_set_gray_to_rgb(png);
-  png_set_interlace_handling(png);
-  png_read_update_info(png, info);
-
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  size_t rowBytes = png_get_rowbytes(png, info);
-  std::vector<png_bytep> rows(h);
-  for (png_uint_32 y = 0; y < h; ++y)
-    rows[y] = img.pixels.data() + y * rowBytes;
-  png_read_image(png, rows.data());
-
-  png_destroy_read_struct(&png, &info, nullptr);
-  return img;
-}
-
-inline std::optional<CanvasImage>
-decodeJpegMemory(const uint8_t *data, size_t size, std::string *errorOut) {
-  jpeg_decompress_struct cinfo;
-  JpegErrorMgr jerr;
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpegErrorExit;
-
-  if (setjmp(jerr.escape)) {
-    jpeg_destroy_decompress(&cinfo);
-    if (errorOut)
-      *errorOut = jerr.message;
-    return std::nullopt;
-  }
-
-  jpeg_create_decompress(&cinfo);
-  // jpeg_mem_src takes a non-const unsigned char* in some libjpeg
-  // versions; it never writes through it, so the cast is safe.
-  jpeg_mem_src(&cinfo, const_cast<unsigned char *>(data),
-               static_cast<unsigned long>(size));
-  jpeg_read_header(&cinfo, TRUE);
-  jpeg_start_decompress(&cinfo);
-
-  int w = static_cast<int>(cinfo.output_width);
-  int h = static_cast<int>(cinfo.output_height);
-  int channels = cinfo.output_components;
-
-  CanvasImage img(w, h);
-  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
-  unsigned char *rowPtr = row.data();
-  while (cinfo.output_scanline < cinfo.output_height) {
-    int y = static_cast<int>(cinfo.output_scanline);
-    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
-    for (int x = 0; x < w; ++x) {
-      if (channels == 1) {
-        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
-      } else {
-        dst[x * 4 + 0] = row[x * 3 + 0];
-        dst[x * 4 + 1] = row[x * 3 + 1];
-        dst[x * 4 + 2] = row[x * 3 + 2];
-      }
-      dst[x * 4 + 3] = 255;
-    }
-  }
-
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
-  return img;
-}
-
-inline std::optional<CanvasImage> decodePngFile(const std::string &path,
-                                                std::string *errorOut) {
-  FILE *fp = fopen(path.c_str(), "rb");
-  if (!fp) {
-    if (errorOut)
-      *errorOut = "failed to open file";
-    return std::nullopt;
-  }
-  png_byte header[8];
-  if (fread(header, 1, 8, fp) != 8 || png_sig_cmp(header, 0, 8)) {
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "not a valid PNG file";
-    return std::nullopt;
-  }
-  png_structp png =
-      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-  png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info) {
-    if (png)
-      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng init failed";
-    return std::nullopt;
-  }
-  if (setjmp(png_jmpbuf(png))) {
-    png_destroy_read_struct(&png, &info, nullptr);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng decode error";
-    return std::nullopt;
-  }
-  png_init_io(png, fp);
-  png_set_sig_bytes(png, 8);
-  png_read_info(png, info);
-
-  png_uint_32 w = png_get_image_width(png, info);
-  png_uint_32 h = png_get_image_height(png, info);
-  int bitDepth = png_get_bit_depth(png, info);
-  int colorType = png_get_color_type(png, info);
-
-  // Normalize every PNG variant (palette/gray/gray+alpha/RGB/RGBA, 1-16 bit)
-  // down to straight-alpha 8-bit RGBA.
-  if (bitDepth == 16)
-    png_set_strip_16(png);
-  if (colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_palette_to_rgb(png);
-  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
-    png_set_expand_gray_1_2_4_to_8(png);
-  if (png_get_valid(png, info, PNG_INFO_tRNS))
-    png_set_tRNS_to_alpha(png);
-  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-  if (colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
-    png_set_gray_to_rgb(png);
-  png_set_interlace_handling(png);
-  png_read_update_info(png, info);
-
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  size_t rowBytes = png_get_rowbytes(png, info);
-  std::vector<png_bytep> rows(h);
-  for (png_uint_32 y = 0; y < h; ++y)
-    rows[y] = img.pixels.data() + y * rowBytes;
-  png_read_image(png, rows.data());
-
-  png_destroy_read_struct(&png, &info, nullptr);
-  fclose(fp);
-  return img;
-}
-
-inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
-                                                 std::string *errorOut) {
-  FILE *fp = fopen(path.c_str(), "rb");
-  if (!fp) {
-    if (errorOut)
-      *errorOut = "failed to open file";
-    return std::nullopt;
-  }
-
-  jpeg_decompress_struct cinfo;
-  JpegErrorMgr jerr;
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpegErrorExit;
-
-  // Any libjpeg call inside this guarded region that would otherwise
-  // exit() instead longjmps back here — jpeg_create_decompress itself is
-  // included, per libjpeg's own documented pattern, since a version
-  // mismatch can in principle fail there too.
-  if (setjmp(jerr.escape)) {
-    jpeg_destroy_decompress(&cinfo);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = jerr.message;
-    return std::nullopt;
-  }
-
-  jpeg_create_decompress(&cinfo);
-  jpeg_stdio_src(&cinfo, fp);
-  jpeg_read_header(&cinfo, TRUE);
-  jpeg_start_decompress(&cinfo);
-
-  int w = static_cast<int>(cinfo.output_width);
-  int h = static_cast<int>(cinfo.output_height);
-  int channels = cinfo.output_components; // 1 (gray) or 3 (RGB) — no alpha
-
-  CanvasImage img(w, h);
-  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
-  unsigned char *rowPtr = row.data();
-  while (cinfo.output_scanline < cinfo.output_height) {
-    int y = static_cast<int>(cinfo.output_scanline);
-    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
-    for (int x = 0; x < w; ++x) {
-      if (channels == 1) {
-        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
-      } else {
-        dst[x * 4 + 0] = row[x * 3 + 0];
-        dst[x * 4 + 1] = row[x * 3 + 1];
-        dst[x * 4 + 2] = row[x * 3 + 2];
-      }
-      dst[x * 4 + 3] = 255; // JPEG carries no alpha channel
-    }
-  }
-
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
-  fclose(fp);
-  return img;
-}
-
-} // namespace detail
-
-inline std::optional<CanvasImage>
-decodeMemory(const uint8_t *data, size_t size,
-             std::string *errorOut = nullptr) {
-  switch (detail::sniffFormat(data, size)) {
-  case detail::ImageFormat::Png:
-    return detail::decodePngMemory(data, size, errorOut);
-  case detail::ImageFormat::Jpeg:
-    return detail::decodeJpegMemory(data, size, errorOut);
-  default:
-    if (errorOut)
-      *errorOut = "unrecognized image format (not PNG or JPEG)";
-    return std::nullopt;
-  }
-}
-
-inline std::optional<CanvasImage> decodeFile(const std::string &path,
-                                             std::string *errorOut = nullptr) {
-  std::string ext = detail::lowerExt(path);
-  if (ext == "png")
-    return detail::decodePngFile(path, errorOut);
-  if (ext == "jpg" || ext == "jpeg")
-    return detail::decodeJpegFile(path, errorOut);
-  if (errorOut)
-    *errorOut = "unsupported image extension: ." + ext;
-  return std::nullopt;
-}
-
-#endif
-
+namespace liteui_image
+{
+  std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
+                                          std::string *errorOut = nullptr);
+  std::optional<CanvasImage> decodeFile(const std::string &path,
+                                        std::string *errorOut = nullptr);
 } // namespace liteui_image
 
-// ---------------- Minimal XML parser (general-purpose subset) -----------
-// Supports: elements, attributes, nested content, comments, PIs, DOCTYPE
-// (with bracketed internal subset), CDATA sections, named + numeric
-// character references, and concatenated text content per element.
-// Still not a full XML implementation: no external entities, no DTD
-// validation, no namespace resolution (prefixes are kept as plain name
-// text, e.g. "xlink:href"), and mixed content order (interleaved text vs.
-// child elements) is not preserved — all text at a given level is
-// concatenated into that node's `text`, in document order, regardless of
-// where child elements fall between the runs. That's sufficient for
-// SVG (which never relies on interleaving) and most simple config/markup
-// use; a caller needing faithful mixed-content order would need a
-// different Node design (e.g. a single ordered vector of variant
-// text/element children).
-namespace liteui_xml {
-struct Node {
-  std::string tag;
-  std::unordered_map<std::string, std::string> attrs;
-  std::vector<Node> children;
-  std::string text; // concatenated character data (CDATA + decoded entities)
-};
-
-inline void skipWs(const std::string &s, size_t &i) {
-  while (i < s.size() && (unsigned char)s[i] <= ' ')
-    ++i;
-}
-
-inline void appendUtf8(std::string &out, unsigned long cp) {
-  if (cp <= 0x7F) {
-    out += (char)cp;
-  } else if (cp <= 0x7FF) {
-    out += (char)(0xC0 | (cp >> 6));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else if (cp <= 0xFFFF) {
-    out += (char)(0xE0 | (cp >> 12));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else {
-    out += (char)(0xF0 | (cp >> 18));
-    out += (char)(0x80 | ((cp >> 12) & 0x3F));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  }
-}
-
-inline std::string decodeEntities(const std::string &in) {
-  std::string out;
-  out.reserve(in.size());
-  for (size_t i = 0; i < in.size();) {
-    if (in[i] == '&') {
-      size_t semi = in.find(';', i);
-      if (semi != std::string::npos && semi - i <= 12) {
-        std::string ent = in.substr(i + 1, semi - i - 1);
-        if (ent == "amp") {
-          out += '&';
-          i = semi + 1;
-          continue;
-        }
-        if (ent == "lt") {
-          out += '<';
-          i = semi + 1;
-          continue;
-        }
-        if (ent == "gt") {
-          out += '>';
-          i = semi + 1;
-          continue;
-        }
-        if (ent == "quot") {
-          out += '"';
-          i = semi + 1;
-          continue;
-        }
-        if (ent == "apos") {
-          out += '\'';
-          i = semi + 1;
-          continue;
-        }
-        if (ent.size() > 1 && ent[0] == '#') {
-          bool hex = ent.size() > 2 && (ent[1] == 'x' || ent[1] == 'X');
-          const char *numStart = ent.c_str() + (hex ? 2 : 1);
-          char *end = nullptr;
-          unsigned long cp = std::strtoul(numStart, &end, hex ? 16 : 10);
-          if (end && *end == '\0') {
-            appendUtf8(out, cp);
-            i = semi + 1;
-            continue;
-          }
-        }
-      }
-    }
-    out += in[i++];
-  }
-  return out;
-}
-
-inline std::string parseAttrValue(const std::string &s, size_t &i) {
-  char q = s[i++];
-  size_t start = i;
-  while (i < s.size() && s[i] != q)
-    ++i;
-  std::string raw = s.substr(start, i - start);
-  if (i < s.size())
-    ++i;
-  return decodeEntities(raw);
-}
-
-inline void parseAttrs(const std::string &s, size_t &i, Node &node) {
-  while (true) {
-    skipWs(s, i);
-    if (i >= s.size() || s[i] == '>' || s[i] == '/' || s[i] == '?')
-      break;
-    size_t nameStart = i;
-    while (i < s.size() && s[i] != '=' && (unsigned char)s[i] > ' ' &&
-           s[i] != '>' && s[i] != '/')
-      ++i;
-    std::string name = s.substr(nameStart, i - nameStart);
-    skipWs(s, i);
-    std::string value;
-    if (i < s.size() && s[i] == '=') {
-      ++i;
-      skipWs(s, i);
-      if (i < s.size() && (s[i] == '"' || s[i] == '\''))
-        value = parseAttrValue(s, i);
-      else {
-        // Unquoted attribute value (invalid XML, but tolerate it — common
-        // in hand-written or HTML-ish markup).
-        size_t vs = i;
-        while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
-               s[i] != '/')
-          ++i;
-        value = decodeEntities(s.substr(vs, i - vs));
-      }
-    }
-    if (!name.empty())
-      node.attrs[name] = value;
-  }
-}
-
-// Skips a comment, processing instruction, or DOCTYPE (including a
-// bracketed internal subset, which may itself contain '>' characters
-// before the subset's closing ']'). Returns true if it consumed something.
-inline bool skipMisc(const std::string &s, size_t &i) {
-  if (s.compare(i, 4, "<!--") == 0) {
-    size_t end = s.find("-->", i);
-    i = (end == std::string::npos) ? s.size() : end + 3;
-    return true;
-  }
-  if (s.compare(i, 2, "<?") == 0) {
-    size_t end = s.find("?>", i);
-    i = (end == std::string::npos) ? s.size() : end + 2;
-    return true;
-  }
-  if (s.compare(i, 9, "<![CDATA[") != 0 && s.compare(i, 2, "<!") == 0) {
-    size_t j = i + 2;
-    int depth = 0;
-    while (j < s.size()) {
-      if (s[j] == '[')
-        ++depth;
-      else if (s[j] == ']')
-        --depth;
-      else if (s[j] == '>' && depth <= 0) {
-        ++j;
-        break;
-      }
-      ++j;
-    }
-    i = j;
-    return true;
-  }
-  return false;
-}
-
-inline bool parseElement(const std::string &s, size_t &i, Node &out) {
-  skipWs(s, i);
-  while (i < s.size() && s[i] == '<' && skipMisc(s, i))
-    skipWs(s, i);
-  if (i >= s.size() || s[i] != '<')
-    return false;
-  ++i;
-  size_t nameStart = i;
-  while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
-         s[i] != '/')
-    ++i;
-  out.tag = s.substr(nameStart, i - nameStart);
-  parseAttrs(s, i, out);
-  skipWs(s, i);
-  if (i < s.size() && s[i] == '/') {
-    ++i;
-    if (i < s.size() && s[i] == '>')
-      ++i;
-    return true;
-  }
-  if (i < s.size() && s[i] == '>')
-    ++i;
-  while (true) {
-    if (i >= s.size())
-      break;
-    if (s.compare(i, 2, "</") == 0) {
-      size_t end = s.find('>', i);
-      i = (end == std::string::npos) ? s.size() : end + 1;
-      break;
-    }
-    if (s.compare(i, 9, "<![CDATA[") == 0) {
-      size_t start = i + 9;
-      size_t end = s.find("]]>", start);
-      size_t stop = (end == std::string::npos) ? s.size() : end;
-      out.text += s.substr(start, stop - start); // raw, no entity decoding
-      i = (end == std::string::npos) ? s.size() : end + 3;
-      continue;
-    }
-    if (s[i] == '<') {
-      if (skipMisc(s, i))
-        continue;
-      Node child;
-      if (!parseElement(s, i, child))
-        break;
-      out.children.push_back(std::move(child));
-      continue;
-    }
-    size_t next = s.find('<', i);
-    size_t stop = (next == std::string::npos) ? s.size() : next;
-    out.text += decodeEntities(s.substr(i, stop - i));
-    i = stop;
-  }
-  return true;
-}
-
-inline std::optional<Node> parse(const std::string &xml) {
-  size_t i = 0;
-  Node root;
-  if (!parseElement(xml, i, root))
-    return std::nullopt;
-  return root;
-}
-} // namespace liteui_xml
-
-namespace liteui_svg {
-
-struct Mat2x3 {
-  float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
-  static Mat2x3 identity() { return {}; }
-  static Mat2x3 translate(float tx, float ty) { return {1, 0, 0, 1, tx, ty}; }
-  static Mat2x3 scaleM(float sx, float sy) { return {sx, 0, 0, sy, 0, 0}; }
-  static Mat2x3 rotate(float rad) {
-    float c = std::cos(rad), s = std::sin(rad);
-    return {c, s, -s, c, 0, 0};
-  }
-  static Mat2x3 skewX(float rad) { return {1, 0, std::tan(rad), 1, 0, 0}; }
-  static Mat2x3 skewY(float rad) { return {1, std::tan(rad), 0, 1, 0, 0}; }
-  Mat2x3 multiply(const Mat2x3 &r) const {
-    return {a * r.a + c * r.b, b * r.a + d * r.b,     a * r.c + c * r.d,
-            b * r.c + d * r.d, a * r.e + c * r.f + e, b * r.e + d * r.f + f};
-  }
-};
-
-inline void skipSep(const std::string &s, size_t &i) {
-  while (i < s.size() && (s[i] == ',' || (unsigned char)s[i] <= ' '))
-    ++i;
-}
-inline bool scanNumber(const std::string &s, size_t &i, float &out) {
-  skipSep(s, i);
-  size_t start = i;
-  if (i < s.size() && (s[i] == '+' || s[i] == '-'))
-    ++i;
-  bool any = false;
-  while (i < s.size() && isdigit((unsigned char)s[i])) {
-    ++i;
-    any = true;
-  }
-  if (i < s.size() && s[i] == '.') {
-    ++i;
-    while (i < s.size() && isdigit((unsigned char)s[i])) {
-      ++i;
-      any = true;
-    }
-  }
-  if (!any) {
-    i = start;
-    return false;
-  }
-  if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
-    size_t save = i;
-    ++i;
-    if (i < s.size() && (s[i] == '+' || s[i] == '-'))
-      ++i;
-    bool expDigits = false;
-    while (i < s.size() && isdigit((unsigned char)s[i])) {
-      ++i;
-      expDigits = true;
-    }
-    if (!expDigits)
-      i = save;
-  }
-  out = std::strtof(s.c_str() + start, nullptr);
-  return true;
-}
-
-inline Mat2x3 parseTransform(const std::string &str) {
-  Mat2x3 m = Mat2x3::identity();
-  size_t i = 0;
-  while (i < str.size()) {
-    skipSep(str, i);
-    size_t nameStart = i;
-    while (i < str.size() && isalpha((unsigned char)str[i]))
-      ++i;
-    std::string fn = str.substr(nameStart, i - nameStart);
-    if (fn.empty())
-      break;
-    skipSep(str, i);
-    if (i >= str.size() || str[i] != '(')
-      break;
-    ++i;
-    std::vector<float> args;
-    float v;
-    while (scanNumber(str, i, v))
-      args.push_back(v);
-    skipSep(str, i);
-    if (i < str.size() && str[i] == ')')
-      ++i;
-    constexpr float kDeg2Rad = 3.14159265358979f / 180.0f;
-    if (fn == "translate" && args.size() >= 1)
-      m = m.multiply(Mat2x3::translate(args[0], args.size() > 1 ? args[1] : 0));
-    else if (fn == "scale" && args.size() >= 1)
-      m = m.multiply(
-          Mat2x3::scaleM(args[0], args.size() > 1 ? args[1] : args[0]));
-    else if (fn == "rotate" && args.size() >= 1) {
-      float rad = args[0] * kDeg2Rad;
-      if (args.size() >= 3) {
-        m = m.multiply(Mat2x3::translate(args[1], args[2]));
-        m = m.multiply(Mat2x3::rotate(rad));
-        m = m.multiply(Mat2x3::translate(-args[1], -args[2]));
-      } else
-        m = m.multiply(Mat2x3::rotate(rad));
-    } else if (fn == "skewX" && args.size() >= 1)
-      m = m.multiply(Mat2x3::skewX(args[0] * kDeg2Rad));
-    else if (fn == "skewY" && args.size() >= 1)
-      m = m.multiply(Mat2x3::skewY(args[0] * kDeg2Rad));
-    else if (fn == "matrix" && args.size() >= 6)
-      m = m.multiply(
-          Mat2x3{args[0], args[1], args[2], args[3], args[4], args[5]});
-  }
-  return m;
-}
-
-inline bool parseHexColor(const std::string &s, Color &out) {
-  auto hex1 = [](char c) -> int {
-    if (c >= '0' && c <= '9')
-      return c - '0';
-    if (c >= 'a' && c <= 'f')
-      return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-      return c - 'A' + 10;
-    return -1;
-  };
-  if (s.size() == 4) {
-    int r = hex1(s[1]), g = hex1(s[2]), b = hex1(s[3]);
-    if (r < 0 || g < 0 || b < 0)
-      return false;
-    out = {(uint8_t)(r * 17), (uint8_t)(g * 17), (uint8_t)(b * 17), 255};
-    return true;
-  }
-  if (s.size() == 7 || s.size() == 9) {
-    int vals[4] = {255, 255, 255, 255};
-    for (size_t k = 0; k * 2 + 1 < s.size() - 1; ++k) {
-      int hi = hex1(s[1 + k * 2]), lo = hex1(s[2 + k * 2]);
-      if (hi < 0 || lo < 0)
-        return false;
-      vals[k] = hi * 16 + lo;
-    }
-    out = {(uint8_t)vals[0], (uint8_t)vals[1], (uint8_t)vals[2],
-           (uint8_t)vals[3]};
-    return true;
-  }
-  return false;
-}
-
-// Extend as needed — small deliberately.
-inline bool namedColor(const std::string &name, Color &out) {
-  static const std::unordered_map<std::string, Color> kNames = {
-      {"black", {0, 0, 0, 255}},      {"white", {255, 255, 255, 255}},
-      {"red", {255, 0, 0, 255}},      {"green", {0, 128, 0, 255}},
-      {"blue", {0, 0, 255, 255}},     {"yellow", {255, 255, 0, 255}},
-      {"gray", {128, 128, 128, 255}}, {"grey", {128, 128, 128, 255}},
-      {"orange", {255, 165, 0, 255}}, {"purple", {128, 0, 128, 255}},
-      {"cyan", {0, 255, 255, 255}},   {"magenta", {255, 0, 255, 255}},
-      {"lime", {0, 255, 0, 255}},     {"navy", {0, 0, 128, 255}},
-      {"transparent", {0, 0, 0, 0}},
-  };
-  auto it = kNames.find(name);
-  if (it == kNames.end())
-    return false;
-  out = it->second;
-  return true;
-}
-
-inline bool parsePaint(const std::string &raw, Color &out) {
-  std::string s = raw;
-  size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
-  if (b == std::string::npos)
-    return false;
-  s = s.substr(b, e - b + 1);
-  if (s == "none" || s.empty())
-    return false;
-  if (s[0] == '#')
-    return parseHexColor(s, out);
-  if (s.compare(0, 4, "rgb(") == 0 || s.compare(0, 5, "rgba(") == 0) {
-    size_t p = s.find('(');
-    std::string inner = s.substr(p + 1, s.size() - p - 2);
-    std::vector<float> vals;
-    size_t i = 0;
-    float v;
-    while (scanNumber(inner, i, v)) {
-      skipSep(inner, i);
-      if (i < inner.size() && inner[i] == '%') {
-        v = v * 255.0f / 100.0f;
-        ++i;
-      }
-      vals.push_back(v);
-      skipSep(inner, i);
-    }
-    if (vals.size() < 3)
-      return false;
-    out = {(uint8_t)std::clamp(vals[0], 0.0f, 255.0f),
-           (uint8_t)std::clamp(vals[1], 0.0f, 255.0f),
-           (uint8_t)std::clamp(vals[2], 0.0f, 255.0f),
-           (uint8_t)std::clamp(vals.size() > 3 ? vals[3] * 255.0f : 255.0f,
-                               0.0f, 255.0f)};
-    return true;
-  }
-  return namedColor(s, out);
-}
-
-inline float parseOpacity(const std::string &s) {
-  if (s.empty())
-    return 1.0f;
-  float v = std::strtof(s.c_str(), nullptr);
-  if (s.back() == '%')
-    v /= 100.0f;
-  return std::clamp(v, 0.0f, 1.0f);
-}
-
-struct PathOp {
-  enum class Kind { Move, Line, Cubic, Quad, Close } kind;
-  float x = 0, y = 0;
-  float c1x = 0, c1y = 0, c2x = 0, c2y = 0; // Cubic
-  float qx = 0, qy = 0;                     // Quad control point
-};
-
-// SVG-1.1 Appendix-F endpoint->center arc conversion, then split into
-// <=90-degree cubic segments (same kappa approach CanvasContext's own
-// appendArc uses for arc()/ellipse()) — kept independent of that internal
-// helper since path parsing only talks to CanvasContext's public API.
-inline void arcToCubics(std::vector<PathOp> &out, float x0, float y0, float rx,
-                        float ry, float xAxisRotDeg, bool largeArc, bool sweep,
-                        float x1, float y1) {
-  if (rx == 0 || ry == 0) {
-    out.push_back({PathOp::Kind::Line, x1, y1});
-    return;
-  }
-  rx = std::abs(rx);
-  ry = std::abs(ry);
-  float phi = xAxisRotDeg * 3.14159265358979f / 180.0f;
-  float cosPhi = std::cos(phi), sinPhi = std::sin(phi);
-  float dx2 = (x0 - x1) / 2.0f, dy2 = (y0 - y1) / 2.0f;
-  float x1p = cosPhi * dx2 + sinPhi * dy2, y1p = -sinPhi * dx2 + cosPhi * dy2;
-  float rxsq = rx * rx, rysq = ry * ry, x1psq = x1p * x1p, y1psq = y1p * y1p;
-  float lambda = x1psq / rxsq + y1psq / rysq;
-  if (lambda > 1.0f) {
-    float s = std::sqrt(lambda);
-    rx *= s;
-    ry *= s;
-    rxsq = rx * rx;
-    rysq = ry * ry;
-  }
-  float sign = (largeArc != sweep) ? 1.0f : -1.0f;
-  float num = rxsq * rysq - rxsq * y1psq - rysq * x1psq;
-  float den = rxsq * y1psq + rysq * x1psq;
-  float coef = den > 1e-9f ? sign * std::sqrt(std::max(0.0f, num / den)) : 0.0f;
-  float cxp = coef * (rx * y1p / ry), cyp = coef * -(ry * x1p / rx);
-  float cx = cosPhi * cxp - sinPhi * cyp + (x0 + x1) / 2.0f;
-  float cy = sinPhi * cxp + cosPhi * cyp + (y0 + y1) / 2.0f;
-  auto angle = [](float ux, float uy, float vx, float vy) {
-    float dot = ux * vx + uy * vy,
-          len = std::sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
-    float a = std::acos(std::clamp(dot / len, -1.0f, 1.0f));
-    return (ux * vy - uy * vx) < 0 ? -a : a;
-  };
-  float theta1 = angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
-  float dtheta = angle((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx,
-                       (-y1p - cyp) / ry);
-  if (!sweep && dtheta > 0)
-    dtheta -= 6.28318530718f;
-  if (sweep && dtheta < 0)
-    dtheta += 6.28318530718f;
-  int segCount =
-      std::max(1, (int)std::ceil(std::abs(dtheta) / (3.14159265f / 2)));
-  float segAngle = dtheta / segCount, t = theta1;
-  for (int i = 0; i < segCount; ++i) {
-    float t2 = t + segAngle;
-    float alpha = std::sin(segAngle) *
-                  (std::sqrt(4.0f + 3.0f * std::tan(segAngle / 4.0f) *
-                                        std::tan(segAngle / 4.0f)) -
-                   1.0f) /
-                  3.0f;
-    auto ellipsePt = [&](float ang, float &px, float &py) {
-      float ex = rx * std::cos(ang), ey = ry * std::sin(ang);
-      px = cx + ex * cosPhi - ey * sinPhi;
-      py = cy + ex * sinPhi + ey * cosPhi;
-    };
-    auto ellipseDeriv = [&](float ang, float &dx, float &dy) {
-      float ex = -rx * std::sin(ang), ey = ry * std::cos(ang);
-      dx = ex * cosPhi - ey * sinPhi;
-      dy = ex * sinPhi + ey * cosPhi;
-    };
-    float p1x, p1y, p2x, p2y, d1x, d1y, d2x, d2y;
-    ellipsePt(t, p1x, p1y);
-    ellipsePt(t2, p2x, p2y);
-    ellipseDeriv(t, d1x, d1y);
-    ellipseDeriv(t2, d2x, d2y);
-    out.push_back({PathOp::Kind::Cubic, p2x, p2y, p1x + alpha * d1x,
-                   p1y + alpha * d1y, p2x - alpha * d2x, p2y - alpha * d2y});
-    t = t2;
-  }
-}
-
-inline std::vector<PathOp> parsePathData(const std::string &d) {
-  std::vector<PathOp> ops;
-  size_t i = 0;
-  float cx = 0, cy = 0, startX = 0, startY = 0, lastCtrlX = 0, lastCtrlY = 0;
-  char lastCmd = 0;
-  auto isCmd = [](char c) {
-    return std::string("MmLlHhVvCcSsQqTtAaZz").find(c) != std::string::npos;
-  };
-  while (i < d.size()) {
-    skipSep(d, i);
-    if (i >= d.size())
-      break;
-    char cmd = d[i];
-    if (isCmd(cmd))
-      ++i;
-    else {
-      cmd = lastCmd;
-      if (cmd == 0)
-        break;
-      if (cmd == 'M')
-        cmd = 'L';
-      if (cmd == 'm')
-        cmd = 'l';
-    }
-    bool rel = islower((unsigned char)cmd);
-    char up = (char)toupper(cmd);
-    float n[7];
-    auto need = [&](int count) {
-      for (int k = 0; k < count; ++k)
-        if (!scanNumber(d, i, n[k]))
-          return false;
-      return true;
-    };
-    switch (up) {
-    case 'M':
-      if (!need(2)) {
-        i = d.size();
-        break;
-      }
-      cx = rel ? cx + n[0] : n[0];
-      cy = rel ? cy + n[1] : n[1];
-      startX = cx;
-      startY = cy;
-      ops.push_back({PathOp::Kind::Move, cx, cy});
-      break;
-    case 'L':
-      if (!need(2)) {
-        i = d.size();
-        break;
-      }
-      cx = rel ? cx + n[0] : n[0];
-      cy = rel ? cy + n[1] : n[1];
-      ops.push_back({PathOp::Kind::Line, cx, cy});
-      break;
-    case 'H':
-      if (!need(1)) {
-        i = d.size();
-        break;
-      }
-      cx = rel ? cx + n[0] : n[0];
-      ops.push_back({PathOp::Kind::Line, cx, cy});
-      break;
-    case 'V':
-      if (!need(1)) {
-        i = d.size();
-        break;
-      }
-      cy = rel ? cy + n[0] : n[0];
-      ops.push_back({PathOp::Kind::Line, cx, cy});
-      break;
-    case 'C': {
-      if (!need(6)) {
-        i = d.size();
-        break;
-      }
-      float c1x = rel ? cx + n[0] : n[0], c1y = rel ? cy + n[1] : n[1],
-            c2x = rel ? cx + n[2] : n[2], c2y = rel ? cy + n[3] : n[3];
-      float ex = rel ? cx + n[4] : n[4], ey = rel ? cy + n[5] : n[5];
-      ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
-      lastCtrlX = c2x;
-      lastCtrlY = c2y;
-      cx = ex;
-      cy = ey;
-      break;
-    }
-    case 'S': {
-      if (!need(4)) {
-        i = d.size();
-        break;
-      }
-      bool prevCubic =
-          lastCmd == 'C' || lastCmd == 'c' || lastCmd == 'S' || lastCmd == 's';
-      float c1x = prevCubic ? 2 * cx - lastCtrlX : cx,
-            c1y = prevCubic ? 2 * cy - lastCtrlY : cy;
-      float c2x = rel ? cx + n[0] : n[0], c2y = rel ? cy + n[1] : n[1];
-      float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
-      ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
-      lastCtrlX = c2x;
-      lastCtrlY = c2y;
-      cx = ex;
-      cy = ey;
-      break;
-    }
-    case 'Q': {
-      if (!need(4)) {
-        i = d.size();
-        break;
-      }
-      float qx = rel ? cx + n[0] : n[0], qy = rel ? cy + n[1] : n[1];
-      float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
-      ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
-      lastCtrlX = qx;
-      lastCtrlY = qy;
-      cx = ex;
-      cy = ey;
-      break;
-    }
-    case 'T': {
-      if (!need(2)) {
-        i = d.size();
-        break;
-      }
-      bool prevQuad =
-          lastCmd == 'Q' || lastCmd == 'q' || lastCmd == 'T' || lastCmd == 't';
-      float qx = prevQuad ? 2 * cx - lastCtrlX : cx,
-            qy = prevQuad ? 2 * cy - lastCtrlY : cy;
-      float ex = rel ? cx + n[0] : n[0], ey = rel ? cy + n[1] : n[1];
-      ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
-      lastCtrlX = qx;
-      lastCtrlY = qy;
-      cx = ex;
-      cy = ey;
-      break;
-    }
-    case 'A': {
-      if (!need(7)) {
-        i = d.size();
-        break;
-      }
-      float ex = rel ? cx + n[5] : n[5], ey = rel ? cy + n[6] : n[6];
-      arcToCubics(ops, cx, cy, n[0], n[1], n[2], n[3] != 0, n[4] != 0, ex, ey);
-      cx = ex;
-      cy = ey;
-      break;
-    }
-    case 'Z':
-      ops.push_back({PathOp::Kind::Close});
-      cx = startX;
-      cy = startY;
-      break;
-    default:
-      i = d.size();
-      break;
-    }
-    lastCmd = cmd;
-  }
-  return ops;
-}
-
-inline std::vector<PathOp> rectToOps(float x, float y, float w, float h,
-                                     float rx, float ry) {
-  std::vector<PathOp> ops;
-  if (w <= 0 || h <= 0)
-    return ops;
-  rx = std::clamp(rx, 0.0f, w / 2.0f);
-  ry = std::clamp(ry, 0.0f, h / 2.0f);
-  if (rx <= 0 || ry <= 0) {
-    ops = {{PathOp::Kind::Move, x, y},
-           {PathOp::Kind::Line, x + w, y},
-           {PathOp::Kind::Line, x + w, y + h},
-           {PathOp::Kind::Line, x, y + h},
-           {PathOp::Kind::Close}};
-    return ops;
-  }
-  constexpr float k = 0.5522847498f;
-  ops.push_back({PathOp::Kind::Move, x + rx, y});
-  ops.push_back({PathOp::Kind::Line, x + w - rx, y});
-  ops.push_back({PathOp::Kind::Cubic, x + w, y + ry, x + w - rx + k * rx, y,
-                 x + w, y + ry - k * ry});
-  ops.push_back({PathOp::Kind::Line, x + w, y + h - ry});
-  ops.push_back({PathOp::Kind::Cubic, x + w - rx, y + h, x + w,
-                 y + h - ry + k * ry, x + w - rx + k * rx, y + h});
-  ops.push_back({PathOp::Kind::Line, x + rx, y + h});
-  ops.push_back({PathOp::Kind::Cubic, x, y + h - ry, x + rx - k * rx, y + h, x,
-                 y + h - ry + k * ry});
-  ops.push_back({PathOp::Kind::Line, x, y + ry});
-  ops.push_back(
-      {PathOp::Kind::Cubic, x + rx, y, x, y + ry - k * ry, x + rx - k * rx, y});
-  ops.push_back({PathOp::Kind::Close});
-  return ops;
-}
-
-inline std::vector<PathOp> ellipseToOps(float cx, float cy, float rx,
-                                        float ry) {
-  std::vector<PathOp> ops;
-  if (rx <= 0 || ry <= 0)
-    return ops;
-  constexpr float k = 0.5522847498f;
-  ops.push_back({PathOp::Kind::Move, cx + rx, cy});
-  ops.push_back({PathOp::Kind::Cubic, cx, cy + ry, cx + rx, cy + k * ry,
-                 cx + k * rx, cy + ry});
-  ops.push_back({PathOp::Kind::Cubic, cx - rx, cy, cx - k * rx, cy + ry,
-                 cx - rx, cy + k * ry});
-  ops.push_back({PathOp::Kind::Cubic, cx, cy - ry, cx - rx, cy - k * ry,
-                 cx - k * rx, cy - ry});
-  ops.push_back({PathOp::Kind::Cubic, cx + rx, cy, cx + k * rx, cy - ry,
-                 cx + rx, cy - k * ry});
-  ops.push_back({PathOp::Kind::Close});
-  return ops;
-}
-
-inline std::vector<PathOp> polyToOps(const std::string &pts, bool close) {
-  std::vector<PathOp> ops;
-  size_t i = 0;
-  bool first = true;
-  float x, y;
-  while (scanNumber(pts, i, x) && scanNumber(pts, i, y)) {
-    ops.push_back({first ? PathOp::Kind::Move : PathOp::Kind::Line, x, y});
-    first = false;
-  }
-  if (close && !ops.empty())
-    ops.push_back({PathOp::Kind::Close});
-  return ops;
-}
-
-struct Shape {
-  std::vector<PathOp> ops;
-  Mat2x3 transform;
-  bool hasFill = false;
-  Color fill{0, 0, 0, 255};
-  bool hasStroke = false;
-  Color stroke{0, 0, 0, 255};
-  float strokeWidth = 1.0f;
-  bool evenOdd = false;
-  int lineCap = 0;
-  int lineJoin = 0;
-  float miterLimit = 4.0f;
-  std::vector<float> dashArray;
-  float dashOffset = 0.0f;
-};
-
-struct Document {
-  std::vector<Shape> shapes;
-  float width = 0, height = 0;
-  float viewBoxX = 0, viewBoxY = 0;
-};
-
-struct InheritedStyle {
-  bool hasFill = true;
-  Color fill{0, 0, 0, 255};
-  float fillOpacity = 1.0f;
-  bool hasStroke = false;
-  Color stroke{0, 0, 0, 255};
-  float strokeOpacity = 1.0f;
-  float strokeWidth = 1.0f;
-  float opacity = 1.0f;
-  bool evenOdd = false;
-  int lineCap = 0;         // 0=butt, 1=round, 2=square (SVG default: butt)
-  int lineJoin = 0;        // 0=miter, 1=round, 2=bevel (SVG default: miter)
-  float miterLimit = 4.0f; // SVG default
-  std::vector<float> dashArray; // empty = solid (SVG default: none)
-  float dashOffset = 0.0f;
-};
-
-inline std::vector<float> parseDashArray(const std::string &val) {
-  std::vector<float> out;
-  if (val.empty() || val == "none")
-    return out;
-  size_t i = 0;
-  float v;
-  while (scanNumber(val, i, v)) {
-    skipSep(val, i);
-    if (i < val.size() &&
-        val[i] == '%') // percentages unsupported; skip the sign
-      ++i;
-    out.push_back(v);
-    skipSep(val, i);
-  }
-  return out;
-}
-
-// selector ("." + class name) -> raw declaration-block text (same
-// syntax as an inline style="" attribute, e.g. "fill:none;stroke:#000").
-using Stylesheet = std::unordered_map<std::string, std::string>;
-
-// Splits a semicolon-separated "prop:value;prop:value" block into pairs,
-// trimmed. Shared by both style="" attributes and stylesheet rules so
-// there's exactly one place that knows this syntax.
-inline std::vector<std::pair<std::string, std::string>>
-parseDeclarations(const std::string &block) {
-  std::vector<std::pair<std::string, std::string>> out;
-  size_t i = 0;
-  while (i < block.size()) {
-    size_t semi = block.find(';', i);
-    std::string decl = block.substr(
-        i, semi == std::string::npos ? std::string::npos : semi - i);
-    size_t colon = decl.find(':');
-    if (colon != std::string::npos) {
-      std::string k = decl.substr(0, colon), v = decl.substr(colon + 1);
-      auto trim = [](std::string &x) {
-        size_t b = x.find_first_not_of(" \t\r\n"),
-               e = x.find_last_not_of(" \t\r\n");
-        x = b == std::string::npos ? "" : x.substr(b, e - b + 1);
-      };
-      trim(k);
-      trim(v);
-      if (!k.empty())
-        out.push_back({k, v});
-    }
-    if (semi == std::string::npos)
-      break;
-    i = semi + 1;
-  }
-  return out;
-}
-
-// Concatenates the text content of every <style> element anywhere in
-// the tree (there's normally just one, inside <defs>, but nothing stops
-// an author from writing more than one).
-inline void collectStyleText(const liteui_xml::Node &node, std::string &out) {
-  if (node.tag == "style") {
-    out += node.text;
-    out += '\n';
-  }
-  for (auto &child : node.children)
-    collectStyleText(child, out);
-}
-
-// Deliberately minimal: only ".class { decl: value; ... }" rules are
-// recognized (comma-separated selector lists are split, and each class
-// gets its own entry) — covers the overwhelmingly common case of SVG
-// exporters (Illustrator, Figma, Inkscape, etc.) emitting
-// "<style>.cls-1{fill:none;...}</style>". Tag/id/attribute/descendant
-// selectors, @media, and specificity rules are all out of scope for v1
-// and are silently ignored. A class redefined by a later rule has its
-// declarations appended after the earlier ones, so parseDeclarations'
-// last-one-wins iteration order approximates ordinary CSS cascade
-// behavior for that (extremely common) case.
-inline Stylesheet parseStylesheet(const std::string &css) {
-  Stylesheet sheet;
-  std::string text;
-  text.reserve(css.size());
-  for (size_t i = 0; i < css.size();) {
-    if (css.compare(i, 2, "/*") == 0) {
-      size_t end = css.find("*/", i + 2);
-      i = (end == std::string::npos) ? css.size() : end + 2;
-    } else {
-      text += css[i++];
-    }
-  }
-  size_t i = 0;
-  while (i < text.size()) {
-    size_t open = text.find('{', i);
-    if (open == std::string::npos)
-      break;
-    size_t close = text.find('}', open);
-    if (close == std::string::npos)
-      break;
-    std::string selectors = text.substr(i, open - i);
-    std::string decls = text.substr(open + 1, close - open - 1);
-    size_t s = 0;
-    while (s <= selectors.size()) {
-      size_t comma = selectors.find(',', s);
-      std::string sel = selectors.substr(
-          s, comma == std::string::npos ? std::string::npos : comma - s);
-      size_t b = sel.find_first_not_of(" \t\r\n");
-      size_t e = sel.find_last_not_of(" \t\r\n");
-      if (b != std::string::npos) {
-        sel = sel.substr(b, e - b + 1);
-        if (!sel.empty() && sel[0] == '.') {
-          std::string &existing = sheet[sel];
-          if (!existing.empty() && existing.back() != ';')
-            existing += ';';
-          existing += decls;
-        }
-      }
-      if (comma == std::string::npos)
-        break;
-      s = comma + 1;
-    }
-    i = close + 1;
-  }
-  return sheet;
-}
-
-inline InheritedStyle
-applyStyle(const std::unordered_map<std::string, std::string> &attrs,
-           const InheritedStyle &inherited,
-           const Stylesheet *stylesheet = nullptr) {
-  InheritedStyle s = inherited;
-  auto apply = [&](const std::string &key, const std::string &val) {
-    Color c;
-    if (key == "fill") {
-      if (val == "none")
-        s.hasFill = false;
-      else if (parsePaint(val, c)) {
-        s.hasFill = true;
-        s.fill = c;
-      }
-    } else if (key == "stroke") {
-      if (val == "none")
-        s.hasStroke = false;
-      else if (parsePaint(val, c)) {
-        s.hasStroke = true;
-        s.stroke = c;
-      }
-    } else if (key == "fill-opacity")
-      s.fillOpacity = parseOpacity(val);
-    else if (key == "stroke-opacity")
-      s.strokeOpacity = parseOpacity(val);
-    else if (key == "opacity")
-      s.opacity = parseOpacity(val);
-    else if (key == "stroke-width")
-      s.strokeWidth = std::strtof(val.c_str(), nullptr);
-    else if (key == "fill-rule")
-      s.evenOdd = (val == "evenodd");
-    else if (key == "stroke-linecap")
-      s.lineCap = val == "round" ? 1 : val == "square" ? 2 : 0;
-    else if (key == "stroke-linejoin")
-      s.lineJoin = val == "round"   ? 1
-                   : val == "bevel" ? 2
-                                    : 0; // miter,
-                                         // miter-clip,
-                                         // arcs all
-                                         // fall back
-                                         // to miter
-    else if (key == "stroke-miterlimit")
-      s.miterLimit = std::strtof(val.c_str(), nullptr);
-    else if (key == "stroke-dasharray")
-      s.dashArray = parseDashArray(val);
-    else if (key == "stroke-dashoffset")
-      s.dashOffset = std::strtof(val.c_str(), nullptr);
-  };
-  auto tryAttr = [&](const char *key) {
-    auto it = attrs.find(key);
-    if (it != attrs.end())
-      apply(key, it->second);
-  };
-  tryAttr("fill");
-  tryAttr("stroke");
-  tryAttr("fill-opacity");
-  tryAttr("stroke-opacity");
-  tryAttr("opacity");
-  tryAttr("stroke-width");
-  tryAttr("fill-rule");
-  tryAttr("stroke-linecap");
-  tryAttr("stroke-linejoin");
-  tryAttr("stroke-miterlimit");
-  tryAttr("stroke-dasharray");
-  tryAttr("stroke-dashoffset");
-
-  // Stylesheet class rules override presentation attributes but are
-  // themselves overridden by an inline style="" — same precedence
-  // order CSS gives inline style over a stylesheet, approximated.
-  if (stylesheet && !stylesheet->empty()) {
-    auto classIt = attrs.find("class");
-    if (classIt != attrs.end()) {
-      const std::string &cls = classIt->second;
-      size_t i = 0;
-      while (i < cls.size()) {
-        while (i < cls.size() && (unsigned char)cls[i] <= ' ')
-          ++i;
-        size_t start = i;
-        while (i < cls.size() && (unsigned char)cls[i] > ' ')
-          ++i;
-        if (i > start) {
-          std::string name = cls.substr(start, i - start);
-          auto sit = stylesheet->find("." + name);
-          if (sit != stylesheet->end())
-            for (auto &decl : parseDeclarations(sit->second))
-              apply(decl.first, decl.second);
-        }
-      }
-    }
-  }
-
-  auto styleIt = attrs.find("style");
-  if (styleIt != attrs.end())
-    for (auto &decl : parseDeclarations(styleIt->second))
-      apply(decl.first, decl.second);
-
-  return s;
-}
-
-inline std::string attrOr(const std::unordered_map<std::string, std::string> &a,
-                          const std::string &k, const std::string &def = "") {
-  auto it = a.find(k);
-  return it == a.end() ? def : it->second;
-}
-inline float attrF(const std::unordered_map<std::string, std::string> &a,
-                   const std::string &k, float def = 0) {
-  auto it = a.find(k);
-  return it == a.end() || it->second.empty()
-             ? def
-             : std::strtof(it->second.c_str(), nullptr);
-}
-
-// Builds an id -> node index over the whole tree (including inside <defs>,
-// which is exactly where <use> targets usually live). Called once per
-// document before walking; the returned pointers stay valid for the
-// lifetime of the root Node they point into, which parseString keeps
-// alive for the whole parse — Document itself stores no tree pointers.
-inline void
-collectIds(const liteui_xml::Node &node,
-           std::unordered_map<std::string, const liteui_xml::Node *> &idMap) {
-  auto it = node.attrs.find("id");
-  if (it != node.attrs.end() && !it->second.empty())
-    idMap.emplace(it->second, &node); // first occurrence wins on duplicate ids
-  for (auto &child : node.children)
-    collectIds(child, idMap);
-}
-
-// Threaded through every walk() call. idMap resolves <use href="#id">
-// targets; useStack guards against reference cycles (A uses B uses A) and
-// caps total nesting depth so a pathological file can't recurse unbounded.
-struct WalkContext {
-  const std::unordered_map<std::string, const liteui_xml::Node *> *idMap;
-  std::vector<const liteui_xml::Node *> useStack;
-  const Stylesheet *stylesheet = nullptr;
-};
-
-inline void walk(const liteui_xml::Node &node, Mat2x3 parentTransform,
-                 InheritedStyle inherited, Document &doc, WalkContext &ctx,
-                 bool isUseTarget = false) {
-  Mat2x3 transform = parentTransform;
-  auto txIt = node.attrs.find("transform");
-  if (txIt != node.attrs.end())
-    transform = transform.multiply(parseTransform(txIt->second));
-  InheritedStyle style = applyStyle(node.attrs, inherited, ctx.stylesheet);
-
-  // <defs> and <symbol> are template containers — only rendered when
-  // reached as the direct resolution target of a <use> (isUseTarget),
-  // never when walked as ordinary document content.
-  if (!isUseTarget && (node.tag == "defs" || node.tag == "symbol"))
-    return;
-
-  if (node.tag == "use") {
-    std::string href = attrOr(node.attrs, "href");
-    if (href.empty())
-      href = attrOr(node.attrs, "xlink:href");
-    if (!href.empty() && href[0] == '#' && ctx.idMap) {
-      std::string id = href.substr(1);
-      auto it = ctx.idMap->find(id);
-      if (it != ctx.idMap->end()) {
-        const liteui_xml::Node *target = it->second;
-        bool cycle = false;
-        for (auto *n : ctx.useStack)
-          if (n == target) {
-            cycle = true;
-            break;
-          }
-        constexpr size_t kMaxUseDepth =
-            32; // guards runaway/pathological nesting
-        if (!cycle && ctx.useStack.size() < kMaxUseDepth) {
-          // <use x="".."" y=""..""> is an implicit extra translate applied
-          // on top of the <use> element's own transform="" (already folded
-          // into `transform` above).
-          float ux = attrF(node.attrs, "x"), uy = attrF(node.attrs, "y");
-          Mat2x3 useTransform = transform.multiply(Mat2x3::translate(ux, uy));
-          ctx.useStack.push_back(target);
-          walk(*target, useTransform, style, doc, ctx, /*isUseTarget=*/true);
-          ctx.useStack.pop_back();
-        }
-      }
-    }
-    return; // <use> has no children of its own to walk
-  }
-
-  auto emit = [&](std::vector<PathOp> ops) {
-    if (ops.empty())
-      return;
-    Shape shape;
-    shape.ops = std::move(ops);
-    shape.transform = transform;
-    shape.hasFill = style.hasFill;
-    if (style.hasFill) {
-      shape.fill = style.fill;
-      shape.fill.a =
-          (uint8_t)(shape.fill.a * style.fillOpacity * style.opacity);
-    }
-    shape.hasStroke = style.hasStroke;
-    if (style.hasStroke) {
-      shape.stroke = style.stroke;
-      shape.stroke.a =
-          (uint8_t)(shape.stroke.a * style.strokeOpacity * style.opacity);
-      shape.strokeWidth = style.strokeWidth;
-      shape.lineCap = style.lineCap;
-      shape.lineJoin = style.lineJoin;
-      shape.miterLimit = style.miterLimit;
-      shape.dashArray = style.dashArray;
-      shape.dashOffset = style.dashOffset;
-    }
-    shape.evenOdd = style.evenOdd;
-    doc.shapes.push_back(std::move(shape));
-  };
-
-  bool isShape = true;
-  if (node.tag == "path")
-    emit(parsePathData(attrOr(node.attrs, "d")));
-  else if (node.tag == "rect") {
-    float rx = attrF(node.attrs, "rx"), ry = attrF(node.attrs, "ry", rx);
-    if (node.attrs.count("rx") && !node.attrs.count("ry"))
-      ry = rx;
-    emit(rectToOps(attrF(node.attrs, "x"), attrF(node.attrs, "y"),
-                   attrF(node.attrs, "width"), attrF(node.attrs, "height"), rx,
-                   ry));
-  } else if (node.tag == "circle")
-    emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
-                      attrF(node.attrs, "r"), attrF(node.attrs, "r")));
-  else if (node.tag == "ellipse")
-    emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
-                      attrF(node.attrs, "rx"), attrF(node.attrs, "ry")));
-  else if (node.tag == "line")
-    emit(
-        {{PathOp::Kind::Move, attrF(node.attrs, "x1"), attrF(node.attrs, "y1")},
-         {PathOp::Kind::Line, attrF(node.attrs, "x2"),
-          attrF(node.attrs, "y2")}});
-  else if (node.tag == "polyline")
-    emit(polyToOps(attrOr(node.attrs, "points"), false));
-  else if (node.tag == "polygon")
-    emit(polyToOps(attrOr(node.attrs, "points"), true));
-  else
-    isShape = false;
-
-  // <g>, <symbol> (only reached here when isUseTarget was true above),
-  // nested <svg>, and unsupported containers all just recurse with the
-  // accumulated transform/style. Children recurse with isUseTarget reset
-  // to false (the default) — a <defs> nested inside a used <symbol> still
-  // shouldn't render on its own, only via its own <use>.
-  if (!isShape)
-    for (auto &child : node.children)
-      walk(child, transform, style, doc, ctx);
-}
-
-inline std::optional<Document> parseString(const std::string &xml) {
-  auto root = liteui_xml::parse(xml);
-  if (!root || root->tag != "svg")
-    return std::nullopt;
-  Document doc;
-  float vbX = 0, vbY = 0, vbW = 0, vbH = 0;
-  bool hasViewBox = false;
-  auto vbIt = root->attrs.find("viewBox");
-  if (vbIt != root->attrs.end()) {
-    size_t i = 0;
-    float vals[4];
-    int n = 0;
-    while (n < 4 && scanNumber(vbIt->second, i, vals[n]))
-      ++n;
-    if (n == 4) {
-      vbX = vals[0];
-      vbY = vals[1];
-      vbW = vals[2];
-      vbH = vals[3];
-      hasViewBox = true;
-    }
-  }
-  float attrW = attrF(root->attrs, "width", 0),
-        attrH = attrF(root->attrs, "height", 0);
-  doc.width = hasViewBox ? vbW : (attrW > 0 ? attrW : 100.0f);
-  doc.height = hasViewBox ? vbH : (attrH > 0 ? attrH : 100.0f);
-  doc.viewBoxX = hasViewBox ? vbX : 0;
-  doc.viewBoxY = hasViewBox ? vbY : 0;
-
-  std::unordered_map<std::string, const liteui_xml::Node *> idMap;
-  collectIds(*root, idMap);
-
-  std::string cssText;
-  collectStyleText(*root, cssText);
-  Stylesheet stylesheet = parseStylesheet(cssText);
-
-  WalkContext ctx{&idMap, {}, &stylesheet};
-
-  InheritedStyle rootStyle =
-      applyStyle(root->attrs, InheritedStyle(), &stylesheet);
-  Mat2x3 rootTf = Mat2x3::translate(-doc.viewBoxX, -doc.viewBoxY);
-  for (auto &child : root->children)
-    walk(child, rootTf, rootStyle, doc, ctx);
-  return doc;
-}
-
-inline std::optional<Document> parseFile(const std::string &path,
-                                         std::string *errorOut = nullptr) {
-  FILE *fp = fopen(path.c_str(), "rb");
-  if (!fp) {
-    if (errorOut)
-      *errorOut = "liteui_svg: failed to open " + path;
-    return std::nullopt;
-  }
-  fseek(fp, 0, SEEK_END);
-  long sz = ftell(fp);
-  fseek(fp, 0, SEEK_SET);
-  std::string data((size_t)std::max(0L, sz), '\0');
-  if (sz > 0) {
-    size_t got = fread(data.data(), 1, (size_t)sz, fp);
-    data.resize(got);
-  }
-  fclose(fp);
-  auto doc = parseString(data);
-  if (!doc && errorOut)
-    *errorOut = "liteui_svg: failed to parse " + path;
-  return doc;
-}
-
-} // namespace liteui_svg
-
-struct CanvasGradientStop {
+struct CanvasGradientStop
+{
   float offset; // 0..1
   Color color;
 };
@@ -3106,16 +624,22 @@ struct CanvasGradientStop {
 // addColorStop(). Passed to CanvasContext::setFillGradient/
 // setStrokeGradient (copied by value, so it's safe to build one on the
 // stack and hand it straight to the setter).
-struct CanvasGradient {
-  enum class Kind { Linear, Radial } kind = Kind::Linear;
+struct CanvasGradient
+{
+  enum class Kind
+  {
+    Linear,
+    Radial
+  } kind = Kind::Linear;
   float x0 = 0, y0 = 0, x1 = 0, y1 = 0; // Linear: the two endpoints.
                                         // Radial: (x0,y0) inner circle
                                         // center, (x1,y1) outer circle
                                         // center.
-  float r0 = 0, r1 = 0; // Radial only: inner/outer circle radii.
+  float r0 = 0, r1 = 0;                 // Radial only: inner/outer circle radii.
   std::vector<CanvasGradientStop> stops;
 
-  static CanvasGradient linear(float x0, float y0, float x1, float y1) {
+  static CanvasGradient linear(float x0, float y0, float x1, float y1)
+  {
     CanvasGradient g;
     g.kind = Kind::Linear;
     g.x0 = x0;
@@ -3125,7 +649,8 @@ struct CanvasGradient {
     return g;
   }
   static CanvasGradient radial(float x0, float y0, float r0, float x1, float y1,
-                               float r1) {
+                               float r1)
+  {
     CanvasGradient g;
     g.kind = Kind::Radial;
     g.x0 = x0;
@@ -3136,20 +661,42 @@ struct CanvasGradient {
     g.r1 = r1;
     return g;
   }
-  void addColorStop(float offset, Color color) {
+  void addColorStop(float offset, Color color)
+  {
     stops.push_back({offset, color});
   }
 };
 
-enum class LineCap { Butt, Round, Square };
-enum class LineJoin { Miter, Round, Bevel };
-enum class TextBaseline { Top, Middle, Alphabetic, Bottom };
-enum class FillRule { NonZero, EvenOdd };
+enum class LineCap
+{
+  Butt,
+  Round,
+  Square
+};
+enum class LineJoin
+{
+  Miter,
+  Round,
+  Bevel
+};
+enum class TextBaseline
+{
+  Top,
+  Middle,
+  Alphabetic,
+  Bottom
+};
+enum class FillRule
+{
+  NonZero,
+  EvenOdd
+};
 
 // Subset of HTML canvas's globalCompositeOperation. Fully honored on
 // Linux (maps 1:1 onto cairo_operator_t); on Windows only SourceOver and
 // Copy are distinguished (see the file-level Canvas limitations note).
-enum class CompositeOp {
+enum class CompositeOp
+{
   SourceOver,
   SourceIn,
   SourceOut,
@@ -3165,6 +712,76 @@ enum class CompositeOp {
   Screen
 };
 
+// Drawing surface handed to a Canvas's onPaint. Modeled after the HTML5 2D
+// context. Only declared here; the implementation lives in the
+// LITEUI_IMPLEMENTATION section (one translation unit per program).
+class CanvasContext
+{
+public:
+  struct TextMetricsResult
+  {
+    float width;
+  };
+  float width() const;
+  float height() const;
+  void save();
+  void restore();
+  void translate(float x, float y);
+  void rotate(float radians);
+  void scale(float sx, float sy);
+  void transformBy(float a, float b, float c, float d, float e, float f);
+  void setTransform(float a, float b, float c, float d, float e, float f);
+  void resetTransform();
+  void setFillColor(Color c);
+  void setFillGradient(const CanvasGradient &g);
+  void setStrokeColor(Color c);
+  void setStrokeGradient(const CanvasGradient &g);
+  void setLineWidth(float w);
+  void setLineCap(LineCap c);
+  void setLineJoin(LineJoin j);
+  void setMiterLimit(float m);
+  void setLineDash(const std::vector<float> &dashes);
+  void setLineDashOffset(float offset);
+  void setGlobalAlpha(float a);
+  void setGlobalCompositeOperation(CompositeOp op);
+  void setShadow(Color color, float blurPx, float offsetX, float offsetY);
+  void setFont(const std::string &family, float sizePx, FontWeight weight = FontWeight::Regular, FontStyle style = FontStyle::Normal);
+  void setTextAlign(TextAlign a);
+  void setTextBaseline(TextBaseline b);
+  void beginPath();
+  void closePath();
+  void moveTo(float x, float y);
+  void lineTo(float x, float y);
+  void quadraticCurveTo(float cpx, float cpy, float x, float y);
+  void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x, float y);
+  void arc(float cx, float cy, float r, float startAngle, float endAngle, bool ccw = false);
+  void arcTo(float x1, float y1, float x2, float y2, float radius);
+  void ellipse(float cx, float cy, float rx, float ry, float rotation, float startAngle, float endAngle, bool ccw = false);
+  void rect(float x, float y, float w, float h);
+  void roundRect(float x, float y, float w, float h, float radius);
+  void fill(FillRule rule = FillRule::NonZero);
+  void stroke();
+  void clip(FillRule rule = FillRule::NonZero);
+  void fillRect(float x, float y, float w, float h);
+  void strokeRect(float x, float y, float w, float h);
+  void clearRect(float x, float y, float w, float h);
+  TextMetricsResult measureText(const std::string &text);
+  void fillText(const std::string &text, float x, float y, float maxWidth = -1);
+  void strokeText(const std::string &text, float x, float y, float maxWidth = -1);
+  void drawImage(const CanvasImage &img, float dx, float dy);
+  void drawImage(const CanvasImage &img, float dx, float dy, float dw, float dh);
+  void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh);
+  std::optional<CanvasImage> getImageData(float x, float y, float w, float h);
+  void putImageData(const CanvasImage &img, float dx, float dy);
+
+protected:
+  // Only the library creates these (as the base of its platform backend).
+  CanvasContext() = default;
+  ~CanvasContext() = default;
+  CanvasContext(const CanvasContext &) = delete;
+  CanvasContext &operator=(const CanvasContext &) = delete;
+};
+
 // Author-facing leaf node, addChild(Canvas)'d the same way Text is —
 // flattened into a View with isCanvas=true (see View::toView(Canvas)).
 // `onPaint` is invoked (with a CanvasContext bound to this node's own
@@ -3177,7 +794,8 @@ enum class CompositeOp {
 // *not* re-issued on every frame the way a real-time game loop's draw
 // callback would be; treat onPaint as "rebuild my picture from whatever
 // app state it closes over" rather than "run every frame".
-struct Canvas {
+struct Canvas
+{
   Style style;
   std::function<void(CanvasContext &)> onPaint;
   std::function<void()> onClick;
@@ -3211,7 +829,8 @@ struct Canvas {
 // static source (a fixed shared_ptr, or path/memoryData decoded once at
 // build time) — those just populate `pixels` a single time and `dirty`
 // never flips again after the first paint.
-struct ImageState {
+struct ImageState
+{
   std::shared_ptr<CanvasImage> pixels;
   bool dirty = true; // starts true so the very first paint always runs
 };
@@ -3223,7 +842,8 @@ struct ImageState {
 // time; `source` is used as-is (for procedurally generated pixels, or
 // pixels the app decoded/cached itself). If neither yields a usable
 // image, the node simply paints nothing (onError still fires).
-struct Image {
+struct Image
+{
   Style style;
   std::string path;
   std::vector<uint8_t> memoryData;
@@ -3252,7 +872,8 @@ struct Image {
 // Mutable state for a TextInput, held by shared_ptr so every copy of the
 // View a TextInput flattens into (addChild copies Views) still shares one
 // live cursor/focus/blink state.
-struct TextInputState {
+struct TextInputState
+{
   std::string text;
   size_t cursor = 0; // byte offset; ASCII-only, same limitation as before
   bool focused = false;
@@ -3268,7 +889,8 @@ struct TextInputState {
 // caret, click-to-position, arrow-key navigation, and text editing already
 // wired up. For anything this doesn't cover, build a Canvas node by hand
 // using the same liteui_text::caretIndexForX helper this uses internally.
-struct TextInput {
+struct TextInput
+{
   Style style;
   std::string text;
   std::string placeholder;
@@ -3306,10 +928,11 @@ struct TextInput {
 // shape's own fill/stroke alpha rather than true isolated-layer
 // compositing, so it won't look exactly right where a group's shapes
 // overlap each other.
-struct Svg {
+struct Svg
+{
   Style style;
-  std::string path;   // exactly one of path / source should be set
-  std::string source; // inline SVG XML text, used if path is empty
+  std::string path;                   // exactly one of path / source should be set
+  std::string source;                 // inline SVG XML text, used if path is empty
   ObjectFit fit = ObjectFit::Contain; // SVG's default "meet" == Contain
   Color backgroundColor = Color{0, 0, 0, 0};
   std::function<void()> onLoad;
@@ -3319,7 +942,8 @@ struct Svg {
 // A node in the retained layout tree. Set `style` and `children`; the engine
 // fills in `computed` (absolute window pixel coordinates) during layout.
 // Renderers only ever read `computed`, never re-derive it from `style`.
-class View {
+class View
+{
 public:
   Style style;
   std::vector<View> children;
@@ -3472,7 +1096,8 @@ public:
 
   Dynamic<bool> disabled = false;
 
-  struct Computed {
+  struct Computed
+  {
     float x = 0, y = 0, w = 0, h = 0; // border-box, absolute window coords
 
     // Set by LiteUI::updateHover from pointer position on every move
@@ -3585,7 +1210,7 @@ public:
     mutable size_t cachedImagePixelsSize = 0;
     mutable int cachedImageW = -1, cachedImageH = -1;
 #else
-    mutable GLuint textTexture = 0;
+    mutable unsigned int textTexture = 0;
     mutable int textTexW = 0, textTexH = 0;
     mutable float textTextureBuiltForWidth = -1.0f;
     mutable std::string textTextureBuiltForText;
@@ -3602,7 +1227,7 @@ public:
     // makes getImageData possible on this platform: it's just a read of
     // the very same pixels already sitting in `canvasSurface`.
     mutable cairo_surface_t *canvasSurface = nullptr;
-    mutable GLuint canvasTexture = 0;
+    mutable unsigned int canvasTexture = 0;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
     // Caches the cairo_surface_t most recently uploaded by this canvas
     // node's own CanvasContext::drawImage() (see that method's comment),
@@ -3647,10 +1272,12 @@ public:
   // Maximum scrollX/scrollY this view can currently have, given its last
   // computed content size vs its viewport size. 0 when content fits (or
   // the axis doesn't scroll).
-  float maxScrollX() const {
+  float maxScrollX() const
+  {
     return std::max(0.0f, computed.contentW - computed.w);
   }
-  float maxScrollY() const {
+  float maxScrollY() const
+  {
     return std::max(0.0f, computed.contentH - computed.h);
   }
 
@@ -3660,45 +1287,7 @@ public:
   // two places a live tree is actually retired. (The name predates
   // Canvas support; kept as-is rather than renamed to minimize disruption
   // to any code already calling it.)
-  void freeTextResources() {
-#if defined(_WIN32)
-    if (computed.textLayout) {
-      computed.textLayout->Release();
-      computed.textLayout = nullptr;
-    }
-    if (computed.canvasTarget) {
-      computed.canvasTarget->Release();
-      computed.canvasTarget = nullptr;
-    }
-    if (computed.canvasWicBitmap) {
-      computed.canvasWicBitmap->Release();
-      computed.canvasWicBitmap = nullptr;
-    }
-    if (computed.cachedImageBitmap) {
-      computed.cachedImageBitmap->Release();
-      computed.cachedImageBitmap = nullptr;
-    }
-#else
-    if (computed.textTexture) {
-      glDeleteTextures(1, &computed.textTexture);
-      computed.textTexture = 0;
-    }
-    if (computed.canvasTexture) {
-      glDeleteTextures(1, &computed.canvasTexture);
-      computed.canvasTexture = 0;
-    }
-    if (computed.canvasSurface) {
-      cairo_surface_destroy(computed.canvasSurface);
-      computed.canvasSurface = nullptr;
-    }
-    if (computed.cachedImageSurface) {
-      cairo_surface_destroy(computed.cachedImageSurface);
-      computed.cachedImageSurface = nullptr;
-    }
-#endif
-    for (auto &c : children)
-      c.freeTextResources();
-  }
+  void freeTextResources();
 
 private:
   static View toView(Text t);
@@ -3708,7 +1297,3049 @@ private:
   static View toView(Svg s);
 };
 
-inline View View::toView(Text t) {
+struct TooltipStyle
+{
+  int delayMs = 500;
+  Color background{50, 50, 50, 230};
+  Color textColor{255, 255, 255, 255};
+  float padding = 6.0f;
+  float fontSize = 13.0f;
+  std::string fontFamily; // empty = platform default
+};
+
+// The application window. Declared here as a thin handle; the platform
+// implementation (Win32 / Wayland) lives in the LITEUI_IMPLEMENTATION section.
+class LiteUIImpl;
+class LiteUI
+{
+public:
+  explicit LiteUI(const std::string &title = "Window", int width = -1,
+                  int height = -1, bool hideTitlebar = false);
+  ~LiteUI();
+  LiteUI(const LiteUI &) = delete;
+  LiteUI &operator=(const LiteUI &) = delete;
+
+  // Blocks the calling thread and pumps the platform's event loop.
+  void run();
+  // Adds a static box to be drawn on the window and triggers a repaint.
+  void addBox(const Box &box);
+  // Sets (or replaces) the root of the layout tree, lays it out immediately,
+  // and triggers a repaint.
+  void setRoot(View view);
+
+  void requestClose();
+  void requestMinimize();
+  // Toggles: maximizes if the window is normal, restores it if maximized.
+  void requestMaximize();
+  void requestMove();
+  // Handler invoked when the user asks to close the window; it must call
+  // forceClose() itself. With no handler, close requests close immediately.
+  void setOnCloseRequest(std::function<void()> fn);
+  // Closes the window immediately, bypassing onCloseRequest.
+  void forceClose();
+  KeyModifiers modifiers() const;
+
+  // Runs fn every `ms` milliseconds until removeInterval() is called with the
+  // returned handle. Each tick polls Dynamic<> sources and repaints.
+  int addInterval(int ms, std::function<void()> fn);
+  void removeInterval(int handle);
+  void setTooltipStyle(TooltipStyle s);
+  void setWindowBackground(Color c);
+  // Window-wide default scrollbar colors (a view's own Style colors override).
+  void setScrollbarColors(Color track, Color thumb);
+  // App-global shortcut, checked before the focused view's onKeyDown.
+  void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn);
+  void requestRepaint();
+  static LiteUI *current();
+
+  // Wakes the event loop from ANY thread (the one call that is safe off the
+  // UI thread). Wakes coalesce; the caller must join all threads that can
+  // still call wake() before this LiteUI is destroyed.
+  void wake();
+  // Handler run on the UI thread once per coalesced wake, before the repaint.
+  void setWakeHandler(std::function<void()> fn);
+
+private:
+  LiteUIImpl *p_;
+};
+
+#endif // LITEUI_HPP_INCLUDED
+
+// ======================================================================
+// Implementation. Compiled only in the one translation unit that defines
+// LITEUI_IMPLEMENTATION before including this header.
+// ======================================================================
+#if defined(LITEUI_IMPLEMENTATION) && !defined(LITEUI_IMPLEMENTATION_DONE)
+#define LITEUI_IMPLEMENTATION_DONE
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <d2d1.h>
+#include <dwrite.h>
+#include <dwrite_1.h>
+#include <dxgiformat.h> // DXGI_FORMAT_R8G8B8A8_UNORM, used by Canvas::drawImage/putImageData
+#include <shobjidl.h>
+#include <wincodec.h>
+#include <windows.h>
+#include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
+#pragma comment(lib, "d2d1")
+#pragma comment(lib, "dwrite")
+#else
+#include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
+#include "xdg-shell-client-protocol.h"      // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <cairo/cairo.h>
+#include <cstdio> // popen, pclose, fgets
+#include <fcntl.h>
+#include <jpeglib.h>
+#include <pango/pangocairo.h> // Text shaping/layout + measurement; rendering still goes through GL (see ensureTextTexture)
+#include <png.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+#include <wayland-client.h> // Core Wayland client protocol: displays, registries, surfaces, shm.
+#include <wayland-cursor.h> // wl_cursor_theme_load / wl_cursor_theme_get_cursor, for showing resize/arrow cursors.
+#include <wayland-egl.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
+#include <xkbcommon/xkbcommon.h>
+#endif
+
+#if defined(_WIN32)
+// Converts a UTF-8 std::string to the UTF-16 wide string Win32/DirectWrite
+// APIs require. File-scope (rather than a LiteUI member) because both
+// LiteUI's WndProc path and liteui_text's DirectWrite layout builder need
+// it, and DirectWrite objects aren't tied to any particular window.
+inline std::wstring toWide(const std::string &s)
+{
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+  std::wstring w(wlen, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), wlen);
+  return w;
+}
+inline Key vkToKey(WPARAM vk)
+{
+  if (vk >= 'A' && vk <= 'Z')
+    return static_cast<Key>(static_cast<int>(Key::A) + (vk - 'A'));
+  if (vk >= '0' && vk <= '9')
+    return static_cast<Key>(static_cast<int>(Key::N0) + (vk - '0'));
+  if (vk >= VK_F1 && vk <= VK_F12)
+    return static_cast<Key>(static_cast<int>(Key::F1) + (vk - VK_F1));
+  switch (vk)
+  {
+  case VK_RETURN:
+    return Key::Enter;
+  case VK_ESCAPE:
+    return Key::Escape;
+  case VK_BACK:
+    return Key::Backspace;
+  case VK_TAB:
+    return Key::Tab;
+  case VK_SPACE:
+    return Key::Space;
+  case VK_DELETE:
+    return Key::Delete;
+  case VK_LEFT:
+    return Key::Left;
+  case VK_RIGHT:
+    return Key::Right;
+  case VK_UP:
+    return Key::Up;
+  case VK_DOWN:
+    return Key::Down;
+  case VK_HOME:
+    return Key::Home;
+  case VK_END:
+    return Key::End;
+  case VK_PRIOR:
+    return Key::PageUp;
+  case VK_NEXT:
+    return Key::PageDown;
+  case VK_SHIFT:
+    return Key::Shift;
+  case VK_CONTROL:
+    return Key::Control;
+  case VK_MENU:
+    return Key::Alt;
+  case VK_LWIN:
+  case VK_RWIN:
+    return Key::Super;
+  case VK_OEM_MINUS:
+    return Key::Minus;
+  case VK_OEM_PLUS:
+    return Key::Equal;
+  case VK_OEM_4:
+    return Key::LeftBracket;
+  case VK_OEM_6:
+    return Key::RightBracket;
+  case VK_OEM_5:
+    return Key::Backslash;
+  case VK_OEM_1:
+    return Key::Semicolon;
+  case VK_OEM_7:
+    return Key::Quote;
+  case VK_OEM_COMMA:
+    return Key::Comma;
+  case VK_OEM_PERIOD:
+    return Key::Period;
+  case VK_OEM_2:
+    return Key::Slash;
+  case VK_OEM_3:
+    return Key::Grave;
+  default:
+    return Key::Unknown;
+  }
+}
+
+inline KeyModifiers currentModifiers()
+{
+  KeyModifiers m;
+  m.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  m.ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  m.alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  m.super = (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+            (GetKeyState(VK_RWIN) & 0x8000) != 0;
+  return m;
+}
+#endif
+
+// ---- optional frame profiler ------------------------------------------
+// Compile with -DLITEUI_PROFILE to print, once per second on stderr, how
+// long each stage of interaction/painting takes (avg and worst case, in
+// ms, plus how many times it ran that second). Compiled out entirely
+// otherwise — LITEUI_PROF_START/ADD expand to nothing. Stages nest: e.g.
+// `build` (all of WM_PAINT's drawing) contains `canvas` and `blit`.
+#ifdef LITEUI_PROFILE
+#include <chrono>
+namespace liteui_prof
+{
+  struct Stat
+  {
+    double sum = 0, worst = 0;
+    int n = 0;
+    void add(double ms)
+    {
+      sum += ms;
+      if (ms > worst)
+        worst = ms;
+      ++n;
+    }
+    double avg() const { return n ? sum / n : 0.0; }
+  };
+  struct Report
+  {
+    Stat move, build, endDraw, canvas, blit, recompute, appPaint;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    void flushIfDue()
+    {
+      auto now = std::chrono::steady_clock::now();
+      if (now - last < std::chrono::seconds(1))
+        return;
+      auto line = [](const char *name, const Stat &s)
+      {
+        if (s.n)
+          std::fprintf(stderr, "  %-9s x%-4d avg %6.2f ms  worst %6.2f ms\n",
+                       name, s.n, s.avg(), s.worst);
+      };
+      if (move.n || build.n)
+      {
+        std::fprintf(stderr, "[liteui profile]\n");
+        line("mouse", move);
+        line("recompute", recompute);
+        line("build", build);
+        line("canvas", canvas);
+        line("appPaint", appPaint);
+        line("blit", blit);
+        line("EndDraw", endDraw);
+      }
+      move = build = endDraw = canvas = blit = recompute = appPaint = Stat{};
+      last = now;
+    }
+  };
+  inline Report &report()
+  {
+    static Report r;
+    return r;
+  }
+  inline double msSince(std::chrono::steady_clock::time_point t)
+  {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t)
+        .count();
+  }
+} // namespace liteui_prof
+#define LITEUI_PROF_START(var) auto var = std::chrono::steady_clock::now()
+#define LITEUI_PROF_ADD(stat, var)                             \
+  do                                                           \
+  {                                                            \
+    liteui_prof::report().stat.add(liteui_prof::msSince(var)); \
+    liteui_prof::report().flushIfDue();                        \
+  } while (0)
+#else
+#define LITEUI_PROF_START(var) ((void)0)
+#define LITEUI_PROF_ADD(stat, var) ((void)0)
+#endif
+
+#if defined(_WIN32)
+
+std::optional<std::string>
+openFilePicker(const std::string &title,
+               const std::vector<FileFilter> &filters)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileOpenDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+
+  // COMDLG_FILTERSPEC just points at wide strings we own, so keep the
+  // backing wstrings alive until after SetFileTypes/Show.
+  std::vector<std::wstring> names, patterns;
+  std::vector<COMDLG_FILTERSPEC> specs;
+  names.reserve(filters.size());
+  patterns.reserve(filters.size());
+  for (auto &f : filters)
+  {
+    names.push_back(toWide(f.name));
+    patterns.push_back(toWide(f.pattern));
+  }
+  for (size_t i = 0; i < filters.size(); ++i)
+    specs.push_back({names[i].c_str(), patterns[i].c_str()});
+  if (!specs.empty())
+    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr); // blocks until closed
+  if (SUCCEEDED(hr))
+  {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)))
+    {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+      {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+namespace liteui_filepicker
+{
+
+  inline bool commandExists(const char *name)
+  {
+    std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
+    return std::system(check.c_str()) == 0;
+  }
+
+  // Very small shell-arg escaper: single-quote the whole thing, escaping any
+  // embedded single quotes. Titles/patterns here are app-supplied, but this
+  // keeps popen() safe regardless.
+  inline std::string shellQuote(const std::string &s)
+  {
+    std::string out = "'";
+    for (char c : s)
+      out += (c == '\'') ? "'\\''" : std::string(1, c);
+    out += "'";
+    return out;
+  }
+
+} // namespace liteui_filepicker
+
+std::optional<std::string>
+openFilePicker(const std::string &title,
+               const std::vector<FileFilter> &filters)
+{
+  using namespace liteui_filepicker;
+
+  std::string cmd;
+  if (commandExists("zenity"))
+  {
+    cmd = "zenity --file-selection --title=" + shellQuote(title);
+    for (auto &f : filters)
+    {
+      // zenity wants space-separated globs; our pattern is ';'-separated.
+      std::string globs = f.pattern;
+      std::replace(globs.begin(), globs.end(), ';', ' ');
+      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+    }
+  }
+  else if (commandExists("kdialog"))
+  {
+    // kdialog's filter syntax is "*.png *.jpg|Images\n*.mp3|Audio" — build
+    // it from all filters at once, appended as a single trailing arg.
+    cmd = "kdialog --getopenfilename . --title " + shellQuote(title);
+    if (!filters.empty())
+    {
+      std::string spec;
+      for (size_t i = 0; i < filters.size(); ++i)
+      {
+        std::string globs = filters[i].pattern;
+        std::replace(globs.begin(), globs.end(), ';', ' ');
+        if (i)
+          spec += "\n";
+        spec += globs + "|" + filters[i].name;
+      }
+      cmd += " " + shellQuote(spec);
+    }
+  }
+  else
+  {
+    return std::nullopt; // no picker binary available
+  }
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+#endif
+
+#if defined(_WIN32)
+
+std::optional<std::string>
+saveFilePicker(const std::string &title, const std::string &defaultName,
+               const std::vector<FileFilter> &filters,
+               const std::string &defaultExt)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileSaveDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  if (!defaultName.empty())
+    dlg->SetFileName(toWide(defaultName).c_str());
+  if (!defaultExt.empty())
+    dlg->SetDefaultExtension(toWide(defaultExt).c_str());
+
+  // Prompt-on-overwrite is IFileSaveDialog's default behavior already
+  // (unlike zenity below, which needs it requested explicitly), so
+  // nothing extra is needed here.
+
+  std::vector<std::wstring> names, patterns;
+  std::vector<COMDLG_FILTERSPEC> specs;
+  names.reserve(filters.size());
+  patterns.reserve(filters.size());
+  for (auto &f : filters)
+  {
+    names.push_back(toWide(f.name));
+    patterns.push_back(toWide(f.pattern));
+  }
+  for (size_t i = 0; i < filters.size(); ++i)
+    specs.push_back({names[i].c_str(), patterns[i].c_str()});
+  if (!specs.empty())
+    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr); // blocks until closed
+  if (SUCCEEDED(hr))
+  {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)))
+    {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+      {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+namespace liteui_filepicker
+{
+
+  // Appends defaultExt to path if it doesn't already end in one of the
+  // extensions listed in `filters`' patterns. Keeps zenity/kdialog (which
+  // don't reliably force an extension the way Windows' dialog does) from
+  // producing "export" instead of "export.png".
+  inline std::string ensureExtension(std::string path,
+                                     const std::string &defaultExt,
+                                     const std::vector<FileFilter> &filters)
+  {
+    if (defaultExt.empty() || path.empty())
+      return path;
+    auto endsWithAny = [&](const std::string &p)
+    {
+      for (auto &f : filters)
+      {
+        size_t start = 0;
+        while (start < f.pattern.size())
+        {
+          size_t sep = f.pattern.find(';', start);
+          std::string glob = f.pattern.substr(start, sep - start);
+          // glob is like "*.png" — check the suffix after '*'
+          size_t star = glob.find('*');
+          if (star != std::string::npos)
+          {
+            std::string suffix = glob.substr(star + 1);
+            if (suffix.size() <= p.size() &&
+                std::equal(suffix.rbegin(), suffix.rend(), p.rbegin(),
+                           [](char a, char b)
+                           {
+                             return std::tolower(a) == std::tolower(b);
+                           }))
+              return true;
+          }
+          if (sep == std::string::npos)
+            break;
+          start = sep + 1;
+        }
+      }
+      return false;
+    };
+    if (!filters.empty() && endsWithAny(path))
+      return path;
+    if (path.size() >= defaultExt.size() + 1 &&
+        path[path.size() - defaultExt.size() - 1] == '.' &&
+        std::equal(
+            defaultExt.rbegin(), defaultExt.rend(), path.rbegin(),
+            [](char a, char b)
+            { return std::tolower(a) == std::tolower(b); }))
+      return path;
+    return path + "." + defaultExt;
+  }
+
+} // namespace liteui_filepicker
+
+std::optional<std::string>
+saveFilePicker(const std::string &title, const std::string &defaultName,
+               const std::vector<FileFilter> &filters,
+               const std::string &defaultExt)
+{
+  using namespace liteui_filepicker;
+
+  std::string cmd;
+  if (commandExists("zenity"))
+  {
+    cmd = "zenity --file-selection --save --confirm-overwrite --title=" +
+          shellQuote(title);
+    if (!defaultName.empty())
+      cmd += " --filename=" + shellQuote(defaultName);
+    for (auto &f : filters)
+    {
+      std::string globs = f.pattern;
+      std::replace(globs.begin(), globs.end(), ';', ' ');
+      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+    }
+  }
+  else if (commandExists("kdialog"))
+  {
+    cmd = "kdialog --getsavefilename";
+    cmd += " " + shellQuote(defaultName.empty() ? "." : defaultName);
+    if (!filters.empty())
+    {
+      std::string spec;
+      for (size_t i = 0; i < filters.size(); ++i)
+      {
+        std::string globs = filters[i].pattern;
+        std::replace(globs.begin(), globs.end(), ';', ' ');
+        if (i)
+          spec += "\n";
+        spec += globs + "|" + filters[i].name;
+      }
+      cmd += " " + shellQuote(spec);
+    }
+    cmd += " --title " + shellQuote(title);
+    // kdialog itself prompts on overwrite by default.
+  }
+  else
+  {
+    return std::nullopt;
+  }
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return ensureExtension(result, defaultExt, filters);
+}
+
+#endif
+
+#if defined(_WIN32)
+
+std::optional<std::string> openFolderPicker(const std::string &title)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileOpenDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS);
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr);
+  if (SUCCEEDED(hr))
+  {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)))
+    {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+      {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+// Same as openFolderPicker but via IFileSaveDialog, so the dialog's
+// action button reads "Save"/"Select" rather than "Open" — the only
+// difference; folders have no other save-specific behavior.
+std::optional<std::string> saveFolderPicker(const std::string &title)
+{
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                             COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = coHr == S_OK;
+
+  IFileSaveDialog *dlg = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+  if (FAILED(hr))
+  {
+    if (weInitialized)
+      CoUninitialize();
+    return std::nullopt;
+  }
+
+  dlg->SetTitle(toWide(title).c_str());
+  DWORD opts = 0;
+  dlg->GetOptions(&opts);
+  dlg->SetOptions(opts | FOS_PICKFOLDERS);
+
+  std::optional<std::string> result;
+  hr = dlg->Show(nullptr);
+  if (SUCCEEDED(hr))
+  {
+    IShellItem *item = nullptr;
+    if (SUCCEEDED(dlg->GetResult(&item)))
+    {
+      PWSTR path = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+      {
+        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                      nullptr);
+        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+        if (len > 0)
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                              nullptr);
+        result = std::move(s);
+        CoTaskMemFree(path);
+      }
+      item->Release();
+    }
+  }
+  dlg->Release();
+  if (weInitialized)
+    CoUninitialize();
+  return result;
+}
+
+#else // Linux
+
+std::optional<std::string> openFolderPicker(const std::string &title)
+{
+  using namespace liteui_filepicker;
+  std::string cmd;
+  if (commandExists("zenity"))
+    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
+  else if (commandExists("kdialog"))
+    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
+  else
+    return std::nullopt;
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+// zenity/kdialog have no separate "save" mode for directories, so this
+// is identical to openFolderPicker aside from the default title string
+// the caller passes.
+std::optional<std::string> saveFolderPicker(const std::string &title)
+{
+  using namespace liteui_filepicker;
+  std::string cmd;
+  if (commandExists("zenity"))
+    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
+  else if (commandExists("kdialog"))
+    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
+  else
+    return std::nullopt;
+  cmd += " 2>/dev/null";
+
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return std::nullopt;
+  std::string result;
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), pipe))
+    result += buf;
+  int rc = pclose(pipe);
+  if (rc != 0 || result.empty())
+    return std::nullopt;
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+    result.pop_back();
+  return result;
+}
+
+#endif
+
+// ==================== Clipboard ====================
+namespace liteui_clipboard
+{
+
+  // Same-process fallback: only used when NO working OS clipboard mechanism
+  // exists (headless container, no wl-copy/xclip/xsel, Windows clipboard
+  // permanently locked). It is never consulted when the OS clipboard works,
+  // so it can't paste stale text over something the user copied elsewhere.
+  inline std::string &internalFallback()
+  {
+    static std::string s;
+    return s;
+  }
+
+  // Normalizes "\r\n" and lone "\r" to "\n" — the editor splits lines on
+  // '\n' only, so any '\r' left in pasted text would end up at the end of
+  // every line.
+  std::string toLF(const std::string &in)
+  {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+      if (in[i] == '\r')
+      {
+        if (i + 1 < in.size() && in[i + 1] == '\n')
+          continue;  // CRLF: drop the CR, the LF is kept on the next iteration
+        out += '\n'; // lone CR (classic Mac line ending)
+        continue;
+      }
+      out += in[i];
+    }
+    return out;
+  }
+
+  // Converts "\n" to "\r\n" without doubling any that are already CRLF.
+  std::string toCRLF(const std::string &in)
+  {
+    std::string out;
+    out.reserve(in.size() + in.size() / 16 + 1);
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+      if (in[i] == '\n' && (i == 0 || in[i - 1] != '\r'))
+        out += '\r';
+      out += in[i];
+    }
+    return out;
+  }
+
+#if defined(_WIN32)
+
+  namespace detail
+  {
+    // Another process can briefly hold the clipboard open; a few short
+    // retries avoids spurious failures without ever blocking noticeably.
+    inline bool openClipboardRetry()
+    {
+      for (int i = 0; i < 5; ++i)
+      {
+        if (OpenClipboard(nullptr))
+          return true;
+        Sleep(10);
+      }
+      return false;
+    }
+  } // namespace detail
+
+  // Returns false if the clipboard couldn't be written.
+  bool setText(const std::string &utf8)
+  {
+    // Windows apps (Notepad, Word, browsers) expect CRLF line endings.
+    std::string crlf = toCRLF(utf8);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, nullptr, 0);
+    if (wlen <= 0)
+      return false;
+    if (!detail::openClipboardRetry())
+      return false;
+    EmptyClipboard();
+    HGLOBAL hMem =
+        GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(wlen) * sizeof(wchar_t));
+    if (!hMem)
+    {
+      CloseClipboard();
+      return false;
+    }
+    wchar_t *dst = static_cast<wchar_t *>(GlobalLock(hMem));
+    if (!dst)
+    {
+      GlobalFree(hMem);
+      CloseClipboard();
+      return false;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, crlf.c_str(), -1, dst, wlen);
+    GlobalUnlock(hMem);
+    if (!SetClipboardData(CF_UNICODETEXT, hMem))
+    {
+      GlobalFree(hMem); // clipboard did NOT take ownership on failure
+      CloseClipboard();
+      return false;
+    }
+    CloseClipboard(); // on success the clipboard owns hMem
+    return true;
+  }
+
+  // nullopt  = clipboard couldn't be opened (caller may use the fallback)
+  // ""       = clipboard opened fine but holds no text (e.g. an image)
+  std::optional<std::string> getText()
+  {
+    if (!detail::openClipboardRetry())
+      return std::nullopt;
+    std::string result;
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+    {
+      HANDLE h = GetClipboardData(CF_UNICODETEXT);
+      if (h)
+      {
+        const wchar_t *w = static_cast<const wchar_t *>(GlobalLock(h));
+        if (w)
+        {
+          int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr,
+                                        nullptr);
+          if (len > 1)
+          {
+            result.assign(static_cast<size_t>(len - 1), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(), len, nullptr,
+                                nullptr);
+          }
+          GlobalUnlock(h);
+        }
+      }
+    }
+    CloseClipboard();
+    return result;
+  }
+
+#else // Linux: shell out to whatever clipboard tool is usable here.
+
+  namespace detail
+  {
+
+    inline bool commandExists(const char *name)
+    {
+      std::string check = std::string("command -v ") + name + " >/dev/null 2>&1";
+      return std::system(check.c_str()) == 0;
+    }
+
+    inline bool envSet(const char *name)
+    {
+      const char *v = std::getenv(name);
+      return v && *v;
+    }
+
+    struct Tools
+    {
+      std::string copyCmd, pasteCmd; // both empty = no usable clipboard tool
+    };
+
+    // Detected once and cached. A tool only counts if its display server is
+    // actually present: wl-copy installed inside a headless container is
+    // useless, and treating it as "available" would suppress the fallback.
+    inline const Tools &tools()
+    {
+      static const Tools t = []
+      {
+        Tools r;
+        if (envSet("WAYLAND_DISPLAY") && commandExists("wl-copy") &&
+            commandExists("wl-paste"))
+        {
+          r.copyCmd = "wl-copy";
+          // "--type text" makes wl-paste refuse non-text contents (an image)
+          // instead of dumping binary data into the editor.
+          r.pasteCmd = "wl-paste --no-newline --type text";
+        }
+        else if (envSet("DISPLAY") && commandExists("xclip"))
+        {
+          r.copyCmd = "xclip -selection clipboard";
+          r.pasteCmd = "xclip -selection clipboard -o";
+        }
+        else if (envSet("DISPLAY") && commandExists("xsel"))
+        {
+          r.copyCmd = "xsel --clipboard --input";
+          r.pasteCmd = "xsel --clipboard --output";
+        }
+        return r;
+      }();
+      return t;
+    }
+
+  } // namespace detail
+
+  // Returns false if no clipboard tool is available or it couldn't be run.
+  bool setText(const std::string &utf8)
+  {
+    const auto &t = detail::tools();
+    if (t.copyCmd.empty())
+      return false;
+    FILE *pipe = popen((t.copyCmd + " 2>/dev/null").c_str(), "w");
+    if (!pipe)
+      return false;
+    if (!utf8.empty())
+      fwrite(utf8.data(), 1, utf8.size(), pipe);
+    pclose(pipe); // wl-copy/xclip/xsel fork and detach to hold ownership,
+                  // so this returns promptly
+    return true;
+  }
+
+  // nullopt  = no usable clipboard tool (caller may use the fallback)
+  // ""       = tool ran fine but the clipboard has no text (e.g. an image)
+  std::optional<std::string> getText()
+  {
+    const auto &t = detail::tools();
+    if (t.pasteCmd.empty())
+      return std::nullopt;
+    FILE *pipe = popen((t.pasteCmd + " 2>/dev/null").c_str(), "r");
+    if (!pipe)
+      return std::nullopt;
+    std::string result;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+      result.append(buf, n);
+    pclose(pipe);
+    return result;
+  }
+
+#endif
+
+  // What CodeEditor actually calls.
+  //
+  // Set:  always mirrors into the in-process fallback, then tries the OS.
+  // Get:  if the OS clipboard is reachable, its answer is final, even when
+  //       that answer is "empty". The fallback is used only when there is
+  //       no OS clipboard to ask. Line endings are normalized to '\n'.
+  void setTextWithFallback(const std::string &s)
+  {
+    internalFallback() = s;
+    setText(s);
+  }
+
+  std::string getTextWithFallback()
+  {
+    if (std::optional<std::string> os = getText())
+      return toLF(*os);
+    return internalFallback();
+  }
+
+} // namespace liteui_clipboard
+
+namespace liteui_image
+{
+
+#if defined(_WIN32)
+
+  std::optional<CanvasImage>
+  decodeMemory(const uint8_t *data, size_t size,
+               std::string *errorOut)
+  {
+    if (!data || size == 0)
+    {
+      if (errorOut)
+        *errorOut = "empty buffer";
+      return std::nullopt;
+    }
+
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool weInitialized = coHr == S_OK;
+
+    IWICImagingFactory *factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr))
+    {
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: CoCreateInstance failed";
+      return std::nullopt;
+    }
+
+    // IWICStream::InitializeFromMemory wraps the buffer in place (no copy),
+    // so `data` must stay valid for the lifetime of this call — fine here
+    // since decoding happens synchronously before we return.
+    IWICStream *stream = nullptr;
+    hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr))
+      hr = stream->InitializeFromMemory(const_cast<BYTE *>(data),
+                                        static_cast<DWORD>(size));
+    if (FAILED(hr))
+    {
+      if (stream)
+        stream->Release();
+      factory->Release();
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: InitializeFromMemory failed";
+      return std::nullopt;
+    }
+
+    IWICBitmapDecoder *decoder = nullptr;
+    hr = factory->CreateDecoderFromStream(
+        stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    if (FAILED(hr))
+    {
+      stream->Release();
+      factory->Release();
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: failed to decode buffer (unrecognized format?)";
+      return std::nullopt;
+    }
+
+    IWICBitmapFrameDecode *frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    IWICFormatConverter *converter = nullptr;
+    if (SUCCEEDED(hr))
+    {
+      hr = factory->CreateFormatConverter(&converter);
+      if (SUCCEEDED(hr))
+        hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    }
+    if (FAILED(hr))
+    {
+      if (converter)
+        converter->Release();
+      if (frame)
+        frame->Release();
+      decoder->Release();
+      stream->Release();
+      factory->Release();
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: decode/convert failed";
+      return std::nullopt;
+    }
+
+    UINT w = 0, h = 0;
+    converter->GetSize(&w, &h);
+    CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+    hr = converter->CopyPixels(
+        nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
+
+    converter->Release();
+    frame->Release();
+    decoder->Release();
+    stream->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+
+    if (FAILED(hr))
+    {
+      if (errorOut)
+        *errorOut = "WIC: CopyPixels failed";
+      return std::nullopt;
+    }
+    return img;
+  }
+
+  std::optional<CanvasImage> decodeFile(const std::string &path,
+                                        std::string *errorOut)
+  {
+    // WIC needs an apartment; tolerate "already initialized differently"
+    // rather than fail, since the host app may have called this itself.
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool weInitialized = coHr == S_OK;
+
+    IWICImagingFactory *factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr))
+    {
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: CoCreateInstance failed";
+      return std::nullopt;
+    }
+
+    std::wstring wpath = toWide(path);
+    IWICBitmapDecoder *decoder = nullptr;
+    hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ,
+                                            WICDecodeMetadataCacheOnDemand,
+                                            &decoder);
+    if (FAILED(hr))
+    {
+      factory->Release();
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: failed to open/decode file";
+      return std::nullopt;
+    }
+
+    IWICBitmapFrameDecode *frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    IWICFormatConverter *converter = nullptr;
+    if (SUCCEEDED(hr))
+    {
+      hr = factory->CreateFormatConverter(&converter);
+      if (SUCCEEDED(hr))
+        // Straight (non-premultiplied) alpha, matching CanvasImage's contract.
+        hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    }
+    if (FAILED(hr))
+    {
+      if (converter)
+        converter->Release();
+      if (frame)
+        frame->Release();
+      decoder->Release();
+      factory->Release();
+      if (weInitialized)
+        CoUninitialize();
+      if (errorOut)
+        *errorOut = "WIC: decode/convert failed";
+      return std::nullopt;
+    }
+
+    UINT w = 0, h = 0;
+    converter->GetSize(&w, &h);
+    CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+    hr = converter->CopyPixels(
+        nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
+
+    converter->Release();
+    frame->Release();
+    decoder->Release();
+    factory->Release();
+    if (weInitialized)
+      CoUninitialize();
+
+    if (FAILED(hr))
+    {
+      if (errorOut)
+        *errorOut = "WIC: CopyPixels failed";
+      return std::nullopt;
+    }
+    return img;
+  }
+
+#else // Linux
+
+  namespace detail
+  {
+
+    inline std::string lowerExt(const std::string &path)
+    {
+      auto dot = path.find_last_of('.');
+      if (dot == std::string::npos)
+        return "";
+      std::string ext = path.substr(dot + 1);
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c)
+                     { return std::tolower(c); });
+      return ext;
+    }
+
+    // Since there's no filename/extension for a memory buffer, sniff the
+    // format from its magic bytes instead — same signatures libpng/libjpeg
+    // themselves check internally.
+    enum class ImageFormat
+    {
+      Unknown,
+      Png,
+      Jpeg
+    };
+    inline ImageFormat sniffFormat(const uint8_t *data, size_t size)
+    {
+      static const uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47,
+                                         0x0D, 0x0A, 0x1A, 0x0A};
+      if (size >= 8 && std::memcmp(data, kPngSig, 8) == 0)
+        return ImageFormat::Png;
+      if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+        return ImageFormat::Jpeg;
+      return ImageFormat::Unknown;
+    }
+
+    // Read-callback state for libpng's png_set_read_fn — tracks how far
+    // we've consumed into the caller's buffer.
+    struct PngMemReader
+    {
+      const uint8_t *data;
+      size_t size, offset = 0;
+    };
+    inline void pngMemRead(png_structp png, png_bytep out, png_size_t count)
+    {
+      auto *r = static_cast<PngMemReader *>(png_get_io_ptr(png));
+      if (r->offset + count > r->size)
+      {
+        png_error(png, "liteui: PNG read past end of buffer");
+        return;
+      }
+      std::memcpy(out, r->data + r->offset, count);
+      r->offset += count;
+    }
+
+    // Custom error manager so a corrupt/truncated JPEG returns nullopt instead
+    // of libjpeg's default error_exit calling exit() and killing the process.
+    // Mirrors the setjmp/longjmp escape libpng uses via png_jmpbuf above.
+    struct JpegErrorMgr
+    {
+      jpeg_error_mgr pub; // must be first member — libjpeg treats this struct
+                          // as a jpeg_error_mgr* via reinterpret_cast
+      jmp_buf escape;
+      std::string message;
+    };
+
+    inline void jpegErrorExit(j_common_ptr cinfo)
+    {
+      auto *err = reinterpret_cast<JpegErrorMgr *>(cinfo->err);
+      char buf[JMSG_LENGTH_MAX];
+      (*cinfo->err->format_message)(cinfo, buf);
+      err->message = buf;
+      longjmp(err->escape, 1);
+    }
+
+    inline std::optional<CanvasImage>
+    decodePngMemory(const uint8_t *data, size_t size, std::string *errorOut)
+    {
+      if (size < 8 || png_sig_cmp(data, 0, 8))
+      {
+        if (errorOut)
+          *errorOut = "not a valid PNG buffer";
+        return std::nullopt;
+      }
+      png_structp png =
+          png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+      png_infop info = png ? png_create_info_struct(png) : nullptr;
+      if (!png || !info)
+      {
+        if (png)
+          png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
+        if (errorOut)
+          *errorOut = "libpng init failed";
+        return std::nullopt;
+      }
+      if (setjmp(png_jmpbuf(png)))
+      {
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (errorOut)
+          *errorOut = "libpng decode error";
+        return std::nullopt;
+      }
+
+      PngMemReader reader{data, size};
+      png_set_read_fn(png, &reader, pngMemRead);
+      png_read_info(png, info);
+
+      png_uint_32 w = png_get_image_width(png, info);
+      png_uint_32 h = png_get_image_height(png, info);
+      int bitDepth = png_get_bit_depth(png, info);
+      int colorType = png_get_color_type(png, info);
+
+      if (bitDepth == 16)
+        png_set_strip_16(png);
+      if (colorType == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(png);
+      if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
+        png_set_expand_gray_1_2_4_to_8(png);
+      if (png_get_valid(png, info, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(png);
+      if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
+          colorType == PNG_COLOR_TYPE_PALETTE)
+        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+      if (colorType == PNG_COLOR_TYPE_GRAY ||
+          colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png);
+      png_set_interlace_handling(png);
+      png_read_update_info(png, info);
+
+      CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+      size_t rowBytes = png_get_rowbytes(png, info);
+      std::vector<png_bytep> rows(h);
+      for (png_uint_32 y = 0; y < h; ++y)
+        rows[y] = img.pixels.data() + y * rowBytes;
+      png_read_image(png, rows.data());
+
+      png_destroy_read_struct(&png, &info, nullptr);
+      return img;
+    }
+
+    inline std::optional<CanvasImage>
+    decodeJpegMemory(const uint8_t *data, size_t size, std::string *errorOut)
+    {
+      jpeg_decompress_struct cinfo;
+      JpegErrorMgr jerr;
+      cinfo.err = jpeg_std_error(&jerr.pub);
+      jerr.pub.error_exit = jpegErrorExit;
+
+      if (setjmp(jerr.escape))
+      {
+        jpeg_destroy_decompress(&cinfo);
+        if (errorOut)
+          *errorOut = jerr.message;
+        return std::nullopt;
+      }
+
+      jpeg_create_decompress(&cinfo);
+      // jpeg_mem_src takes a non-const unsigned char* in some libjpeg
+      // versions; it never writes through it, so the cast is safe.
+      jpeg_mem_src(&cinfo, const_cast<unsigned char *>(data),
+                   static_cast<unsigned long>(size));
+      jpeg_read_header(&cinfo, TRUE);
+      jpeg_start_decompress(&cinfo);
+
+      int w = static_cast<int>(cinfo.output_width);
+      int h = static_cast<int>(cinfo.output_height);
+      int channels = cinfo.output_components;
+
+      CanvasImage img(w, h);
+      std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
+      unsigned char *rowPtr = row.data();
+      while (cinfo.output_scanline < cinfo.output_height)
+      {
+        int y = static_cast<int>(cinfo.output_scanline);
+        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+        unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x)
+        {
+          if (channels == 1)
+          {
+            dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
+          }
+          else
+          {
+            dst[x * 4 + 0] = row[x * 3 + 0];
+            dst[x * 4 + 1] = row[x * 3 + 1];
+            dst[x * 4 + 2] = row[x * 3 + 2];
+          }
+          dst[x * 4 + 3] = 255;
+        }
+      }
+
+      jpeg_finish_decompress(&cinfo);
+      jpeg_destroy_decompress(&cinfo);
+      return img;
+    }
+
+    inline std::optional<CanvasImage> decodePngFile(const std::string &path,
+                                                    std::string *errorOut)
+    {
+      FILE *fp = fopen(path.c_str(), "rb");
+      if (!fp)
+      {
+        if (errorOut)
+          *errorOut = "failed to open file";
+        return std::nullopt;
+      }
+      png_byte header[8];
+      if (fread(header, 1, 8, fp) != 8 || png_sig_cmp(header, 0, 8))
+      {
+        fclose(fp);
+        if (errorOut)
+          *errorOut = "not a valid PNG file";
+        return std::nullopt;
+      }
+      png_structp png =
+          png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+      png_infop info = png ? png_create_info_struct(png) : nullptr;
+      if (!png || !info)
+      {
+        if (png)
+          png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
+        fclose(fp);
+        if (errorOut)
+          *errorOut = "libpng init failed";
+        return std::nullopt;
+      }
+      if (setjmp(png_jmpbuf(png)))
+      {
+        png_destroy_read_struct(&png, &info, nullptr);
+        fclose(fp);
+        if (errorOut)
+          *errorOut = "libpng decode error";
+        return std::nullopt;
+      }
+      png_init_io(png, fp);
+      png_set_sig_bytes(png, 8);
+      png_read_info(png, info);
+
+      png_uint_32 w = png_get_image_width(png, info);
+      png_uint_32 h = png_get_image_height(png, info);
+      int bitDepth = png_get_bit_depth(png, info);
+      int colorType = png_get_color_type(png, info);
+
+      // Normalize every PNG variant (palette/gray/gray+alpha/RGB/RGBA, 1-16 bit)
+      // down to straight-alpha 8-bit RGBA.
+      if (bitDepth == 16)
+        png_set_strip_16(png);
+      if (colorType == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(png);
+      if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
+        png_set_expand_gray_1_2_4_to_8(png);
+      if (png_get_valid(png, info, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(png);
+      if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
+          colorType == PNG_COLOR_TYPE_PALETTE)
+        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+      if (colorType == PNG_COLOR_TYPE_GRAY ||
+          colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png);
+      png_set_interlace_handling(png);
+      png_read_update_info(png, info);
+
+      CanvasImage img(static_cast<int>(w), static_cast<int>(h));
+      size_t rowBytes = png_get_rowbytes(png, info);
+      std::vector<png_bytep> rows(h);
+      for (png_uint_32 y = 0; y < h; ++y)
+        rows[y] = img.pixels.data() + y * rowBytes;
+      png_read_image(png, rows.data());
+
+      png_destroy_read_struct(&png, &info, nullptr);
+      fclose(fp);
+      return img;
+    }
+
+    inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
+                                                     std::string *errorOut)
+    {
+      FILE *fp = fopen(path.c_str(), "rb");
+      if (!fp)
+      {
+        if (errorOut)
+          *errorOut = "failed to open file";
+        return std::nullopt;
+      }
+
+      jpeg_decompress_struct cinfo;
+      JpegErrorMgr jerr;
+      cinfo.err = jpeg_std_error(&jerr.pub);
+      jerr.pub.error_exit = jpegErrorExit;
+
+      // Any libjpeg call inside this guarded region that would otherwise
+      // exit() instead longjmps back here — jpeg_create_decompress itself is
+      // included, per libjpeg's own documented pattern, since a version
+      // mismatch can in principle fail there too.
+      if (setjmp(jerr.escape))
+      {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(fp);
+        if (errorOut)
+          *errorOut = jerr.message;
+        return std::nullopt;
+      }
+
+      jpeg_create_decompress(&cinfo);
+      jpeg_stdio_src(&cinfo, fp);
+      jpeg_read_header(&cinfo, TRUE);
+      jpeg_start_decompress(&cinfo);
+
+      int w = static_cast<int>(cinfo.output_width);
+      int h = static_cast<int>(cinfo.output_height);
+      int channels = cinfo.output_components; // 1 (gray) or 3 (RGB) — no alpha
+
+      CanvasImage img(w, h);
+      std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
+      unsigned char *rowPtr = row.data();
+      while (cinfo.output_scanline < cinfo.output_height)
+      {
+        int y = static_cast<int>(cinfo.output_scanline);
+        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+        unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x)
+        {
+          if (channels == 1)
+          {
+            dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
+          }
+          else
+          {
+            dst[x * 4 + 0] = row[x * 3 + 0];
+            dst[x * 4 + 1] = row[x * 3 + 1];
+            dst[x * 4 + 2] = row[x * 3 + 2];
+          }
+          dst[x * 4 + 3] = 255; // JPEG carries no alpha channel
+        }
+      }
+
+      jpeg_finish_decompress(&cinfo);
+      jpeg_destroy_decompress(&cinfo);
+      fclose(fp);
+      return img;
+    }
+
+  } // namespace detail
+
+  std::optional<CanvasImage>
+  decodeMemory(const uint8_t *data, size_t size,
+               std::string *errorOut)
+  {
+    switch (detail::sniffFormat(data, size))
+    {
+    case detail::ImageFormat::Png:
+      return detail::decodePngMemory(data, size, errorOut);
+    case detail::ImageFormat::Jpeg:
+      return detail::decodeJpegMemory(data, size, errorOut);
+    default:
+      if (errorOut)
+        *errorOut = "unrecognized image format (not PNG or JPEG)";
+      return std::nullopt;
+    }
+  }
+
+  std::optional<CanvasImage> decodeFile(const std::string &path,
+                                        std::string *errorOut)
+  {
+    std::string ext = detail::lowerExt(path);
+    if (ext == "png")
+      return detail::decodePngFile(path, errorOut);
+    if (ext == "jpg" || ext == "jpeg")
+      return detail::decodeJpegFile(path, errorOut);
+    if (errorOut)
+      *errorOut = "unsupported image extension: ." + ext;
+    return std::nullopt;
+  }
+
+#endif
+
+} // namespace liteui_image
+
+// ---------------- Minimal XML parser (general-purpose subset) -----------
+// Supports: elements, attributes, nested content, comments, PIs, DOCTYPE
+// (with bracketed internal subset), CDATA sections, named + numeric
+// character references, and concatenated text content per element.
+// Still not a full XML implementation: no external entities, no DTD
+// validation, no namespace resolution (prefixes are kept as plain name
+// text, e.g. "xlink:href"), and mixed content order (interleaved text vs.
+// child elements) is not preserved — all text at a given level is
+// concatenated into that node's `text`, in document order, regardless of
+// where child elements fall between the runs. That's sufficient for
+// SVG (which never relies on interleaving) and most simple config/markup
+// use; a caller needing faithful mixed-content order would need a
+// different Node design (e.g. a single ordered vector of variant
+// text/element children).
+namespace liteui_xml
+{
+  struct Node
+  {
+    std::string tag;
+    std::unordered_map<std::string, std::string> attrs;
+    std::vector<Node> children;
+    std::string text; // concatenated character data (CDATA + decoded entities)
+  };
+
+  inline void skipWs(const std::string &s, size_t &i)
+  {
+    while (i < s.size() && (unsigned char)s[i] <= ' ')
+      ++i;
+  }
+
+  inline void appendUtf8(std::string &out, unsigned long cp)
+  {
+    if (cp <= 0x7F)
+    {
+      out += (char)cp;
+    }
+    else if (cp <= 0x7FF)
+    {
+      out += (char)(0xC0 | (cp >> 6));
+      out += (char)(0x80 | (cp & 0x3F));
+    }
+    else if (cp <= 0xFFFF)
+    {
+      out += (char)(0xE0 | (cp >> 12));
+      out += (char)(0x80 | ((cp >> 6) & 0x3F));
+      out += (char)(0x80 | (cp & 0x3F));
+    }
+    else
+    {
+      out += (char)(0xF0 | (cp >> 18));
+      out += (char)(0x80 | ((cp >> 12) & 0x3F));
+      out += (char)(0x80 | ((cp >> 6) & 0x3F));
+      out += (char)(0x80 | (cp & 0x3F));
+    }
+  }
+
+  inline std::string decodeEntities(const std::string &in)
+  {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size();)
+    {
+      if (in[i] == '&')
+      {
+        size_t semi = in.find(';', i);
+        if (semi != std::string::npos && semi - i <= 12)
+        {
+          std::string ent = in.substr(i + 1, semi - i - 1);
+          if (ent == "amp")
+          {
+            out += '&';
+            i = semi + 1;
+            continue;
+          }
+          if (ent == "lt")
+          {
+            out += '<';
+            i = semi + 1;
+            continue;
+          }
+          if (ent == "gt")
+          {
+            out += '>';
+            i = semi + 1;
+            continue;
+          }
+          if (ent == "quot")
+          {
+            out += '"';
+            i = semi + 1;
+            continue;
+          }
+          if (ent == "apos")
+          {
+            out += '\'';
+            i = semi + 1;
+            continue;
+          }
+          if (ent.size() > 1 && ent[0] == '#')
+          {
+            bool hex = ent.size() > 2 && (ent[1] == 'x' || ent[1] == 'X');
+            const char *numStart = ent.c_str() + (hex ? 2 : 1);
+            char *end = nullptr;
+            unsigned long cp = std::strtoul(numStart, &end, hex ? 16 : 10);
+            if (end && *end == '\0')
+            {
+              appendUtf8(out, cp);
+              i = semi + 1;
+              continue;
+            }
+          }
+        }
+      }
+      out += in[i++];
+    }
+    return out;
+  }
+
+  inline std::string parseAttrValue(const std::string &s, size_t &i)
+  {
+    char q = s[i++];
+    size_t start = i;
+    while (i < s.size() && s[i] != q)
+      ++i;
+    std::string raw = s.substr(start, i - start);
+    if (i < s.size())
+      ++i;
+    return decodeEntities(raw);
+  }
+
+  inline void parseAttrs(const std::string &s, size_t &i, Node &node)
+  {
+    while (true)
+    {
+      skipWs(s, i);
+      if (i >= s.size() || s[i] == '>' || s[i] == '/' || s[i] == '?')
+        break;
+      size_t nameStart = i;
+      while (i < s.size() && s[i] != '=' && (unsigned char)s[i] > ' ' &&
+             s[i] != '>' && s[i] != '/')
+        ++i;
+      std::string name = s.substr(nameStart, i - nameStart);
+      skipWs(s, i);
+      std::string value;
+      if (i < s.size() && s[i] == '=')
+      {
+        ++i;
+        skipWs(s, i);
+        if (i < s.size() && (s[i] == '"' || s[i] == '\''))
+          value = parseAttrValue(s, i);
+        else
+        {
+          // Unquoted attribute value (invalid XML, but tolerate it — common
+          // in hand-written or HTML-ish markup).
+          size_t vs = i;
+          while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
+                 s[i] != '/')
+            ++i;
+          value = decodeEntities(s.substr(vs, i - vs));
+        }
+      }
+      if (!name.empty())
+        node.attrs[name] = value;
+    }
+  }
+
+  // Skips a comment, processing instruction, or DOCTYPE (including a
+  // bracketed internal subset, which may itself contain '>' characters
+  // before the subset's closing ']'). Returns true if it consumed something.
+  inline bool skipMisc(const std::string &s, size_t &i)
+  {
+    if (s.compare(i, 4, "<!--") == 0)
+    {
+      size_t end = s.find("-->", i);
+      i = (end == std::string::npos) ? s.size() : end + 3;
+      return true;
+    }
+    if (s.compare(i, 2, "<?") == 0)
+    {
+      size_t end = s.find("?>", i);
+      i = (end == std::string::npos) ? s.size() : end + 2;
+      return true;
+    }
+    if (s.compare(i, 9, "<![CDATA[") != 0 && s.compare(i, 2, "<!") == 0)
+    {
+      size_t j = i + 2;
+      int depth = 0;
+      while (j < s.size())
+      {
+        if (s[j] == '[')
+          ++depth;
+        else if (s[j] == ']')
+          --depth;
+        else if (s[j] == '>' && depth <= 0)
+        {
+          ++j;
+          break;
+        }
+        ++j;
+      }
+      i = j;
+      return true;
+    }
+    return false;
+  }
+
+  inline bool parseElement(const std::string &s, size_t &i, Node &out)
+  {
+    skipWs(s, i);
+    while (i < s.size() && s[i] == '<' && skipMisc(s, i))
+      skipWs(s, i);
+    if (i >= s.size() || s[i] != '<')
+      return false;
+    ++i;
+    size_t nameStart = i;
+    while (i < s.size() && (unsigned char)s[i] > ' ' && s[i] != '>' &&
+           s[i] != '/')
+      ++i;
+    out.tag = s.substr(nameStart, i - nameStart);
+    parseAttrs(s, i, out);
+    skipWs(s, i);
+    if (i < s.size() && s[i] == '/')
+    {
+      ++i;
+      if (i < s.size() && s[i] == '>')
+        ++i;
+      return true;
+    }
+    if (i < s.size() && s[i] == '>')
+      ++i;
+    while (true)
+    {
+      if (i >= s.size())
+        break;
+      if (s.compare(i, 2, "</") == 0)
+      {
+        size_t end = s.find('>', i);
+        i = (end == std::string::npos) ? s.size() : end + 1;
+        break;
+      }
+      if (s.compare(i, 9, "<![CDATA[") == 0)
+      {
+        size_t start = i + 9;
+        size_t end = s.find("]]>", start);
+        size_t stop = (end == std::string::npos) ? s.size() : end;
+        out.text += s.substr(start, stop - start); // raw, no entity decoding
+        i = (end == std::string::npos) ? s.size() : end + 3;
+        continue;
+      }
+      if (s[i] == '<')
+      {
+        if (skipMisc(s, i))
+          continue;
+        Node child;
+        if (!parseElement(s, i, child))
+          break;
+        out.children.push_back(std::move(child));
+        continue;
+      }
+      size_t next = s.find('<', i);
+      size_t stop = (next == std::string::npos) ? s.size() : next;
+      out.text += decodeEntities(s.substr(i, stop - i));
+      i = stop;
+    }
+    return true;
+  }
+
+  inline std::optional<Node> parse(const std::string &xml)
+  {
+    size_t i = 0;
+    Node root;
+    if (!parseElement(xml, i, root))
+      return std::nullopt;
+    return root;
+  }
+} // namespace liteui_xml
+
+namespace liteui_svg
+{
+
+  struct Mat2x3
+  {
+    float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+    static Mat2x3 identity() { return {}; }
+    static Mat2x3 translate(float tx, float ty) { return {1, 0, 0, 1, tx, ty}; }
+    static Mat2x3 scaleM(float sx, float sy) { return {sx, 0, 0, sy, 0, 0}; }
+    static Mat2x3 rotate(float rad)
+    {
+      float c = std::cos(rad), s = std::sin(rad);
+      return {c, s, -s, c, 0, 0};
+    }
+    static Mat2x3 skewX(float rad) { return {1, 0, std::tan(rad), 1, 0, 0}; }
+    static Mat2x3 skewY(float rad) { return {1, std::tan(rad), 0, 1, 0, 0}; }
+    Mat2x3 multiply(const Mat2x3 &r) const
+    {
+      return {a * r.a + c * r.b, b * r.a + d * r.b, a * r.c + c * r.d,
+              b * r.c + d * r.d, a * r.e + c * r.f + e, b * r.e + d * r.f + f};
+    }
+  };
+
+  inline void skipSep(const std::string &s, size_t &i)
+  {
+    while (i < s.size() && (s[i] == ',' || (unsigned char)s[i] <= ' '))
+      ++i;
+  }
+  inline bool scanNumber(const std::string &s, size_t &i, float &out)
+  {
+    skipSep(s, i);
+    size_t start = i;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+      ++i;
+    bool any = false;
+    while (i < s.size() && isdigit((unsigned char)s[i]))
+    {
+      ++i;
+      any = true;
+    }
+    if (i < s.size() && s[i] == '.')
+    {
+      ++i;
+      while (i < s.size() && isdigit((unsigned char)s[i]))
+      {
+        ++i;
+        any = true;
+      }
+    }
+    if (!any)
+    {
+      i = start;
+      return false;
+    }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E'))
+    {
+      size_t save = i;
+      ++i;
+      if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+        ++i;
+      bool expDigits = false;
+      while (i < s.size() && isdigit((unsigned char)s[i]))
+      {
+        ++i;
+        expDigits = true;
+      }
+      if (!expDigits)
+        i = save;
+    }
+    out = std::strtof(s.c_str() + start, nullptr);
+    return true;
+  }
+
+  inline Mat2x3 parseTransform(const std::string &str)
+  {
+    Mat2x3 m = Mat2x3::identity();
+    size_t i = 0;
+    while (i < str.size())
+    {
+      skipSep(str, i);
+      size_t nameStart = i;
+      while (i < str.size() && isalpha((unsigned char)str[i]))
+        ++i;
+      std::string fn = str.substr(nameStart, i - nameStart);
+      if (fn.empty())
+        break;
+      skipSep(str, i);
+      if (i >= str.size() || str[i] != '(')
+        break;
+      ++i;
+      std::vector<float> args;
+      float v;
+      while (scanNumber(str, i, v))
+        args.push_back(v);
+      skipSep(str, i);
+      if (i < str.size() && str[i] == ')')
+        ++i;
+      constexpr float kDeg2Rad = 3.14159265358979f / 180.0f;
+      if (fn == "translate" && args.size() >= 1)
+        m = m.multiply(Mat2x3::translate(args[0], args.size() > 1 ? args[1] : 0));
+      else if (fn == "scale" && args.size() >= 1)
+        m = m.multiply(
+            Mat2x3::scaleM(args[0], args.size() > 1 ? args[1] : args[0]));
+      else if (fn == "rotate" && args.size() >= 1)
+      {
+        float rad = args[0] * kDeg2Rad;
+        if (args.size() >= 3)
+        {
+          m = m.multiply(Mat2x3::translate(args[1], args[2]));
+          m = m.multiply(Mat2x3::rotate(rad));
+          m = m.multiply(Mat2x3::translate(-args[1], -args[2]));
+        }
+        else
+          m = m.multiply(Mat2x3::rotate(rad));
+      }
+      else if (fn == "skewX" && args.size() >= 1)
+        m = m.multiply(Mat2x3::skewX(args[0] * kDeg2Rad));
+      else if (fn == "skewY" && args.size() >= 1)
+        m = m.multiply(Mat2x3::skewY(args[0] * kDeg2Rad));
+      else if (fn == "matrix" && args.size() >= 6)
+        m = m.multiply(
+            Mat2x3{args[0], args[1], args[2], args[3], args[4], args[5]});
+    }
+    return m;
+  }
+
+  inline bool parseHexColor(const std::string &s, Color &out)
+  {
+    auto hex1 = [](char c) -> int
+    {
+      if (c >= '0' && c <= '9')
+        return c - '0';
+      if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+      return -1;
+    };
+    if (s.size() == 4)
+    {
+      int r = hex1(s[1]), g = hex1(s[2]), b = hex1(s[3]);
+      if (r < 0 || g < 0 || b < 0)
+        return false;
+      out = {(uint8_t)(r * 17), (uint8_t)(g * 17), (uint8_t)(b * 17), 255};
+      return true;
+    }
+    if (s.size() == 7 || s.size() == 9)
+    {
+      int vals[4] = {255, 255, 255, 255};
+      for (size_t k = 0; k * 2 + 1 < s.size() - 1; ++k)
+      {
+        int hi = hex1(s[1 + k * 2]), lo = hex1(s[2 + k * 2]);
+        if (hi < 0 || lo < 0)
+          return false;
+        vals[k] = hi * 16 + lo;
+      }
+      out = {(uint8_t)vals[0], (uint8_t)vals[1], (uint8_t)vals[2],
+             (uint8_t)vals[3]};
+      return true;
+    }
+    return false;
+  }
+
+  // Extend as needed — small deliberately.
+  inline bool namedColor(const std::string &name, Color &out)
+  {
+    static const std::unordered_map<std::string, Color> kNames = {
+        {"black", {0, 0, 0, 255}},
+        {"white", {255, 255, 255, 255}},
+        {"red", {255, 0, 0, 255}},
+        {"green", {0, 128, 0, 255}},
+        {"blue", {0, 0, 255, 255}},
+        {"yellow", {255, 255, 0, 255}},
+        {"gray", {128, 128, 128, 255}},
+        {"grey", {128, 128, 128, 255}},
+        {"orange", {255, 165, 0, 255}},
+        {"purple", {128, 0, 128, 255}},
+        {"cyan", {0, 255, 255, 255}},
+        {"magenta", {255, 0, 255, 255}},
+        {"lime", {0, 255, 0, 255}},
+        {"navy", {0, 0, 128, 255}},
+        {"transparent", {0, 0, 0, 0}},
+    };
+    auto it = kNames.find(name);
+    if (it == kNames.end())
+      return false;
+    out = it->second;
+    return true;
+  }
+
+  inline bool parsePaint(const std::string &raw, Color &out)
+  {
+    std::string s = raw;
+    size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos)
+      return false;
+    s = s.substr(b, e - b + 1);
+    if (s == "none" || s.empty())
+      return false;
+    if (s[0] == '#')
+      return parseHexColor(s, out);
+    if (s.compare(0, 4, "rgb(") == 0 || s.compare(0, 5, "rgba(") == 0)
+    {
+      size_t p = s.find('(');
+      std::string inner = s.substr(p + 1, s.size() - p - 2);
+      std::vector<float> vals;
+      size_t i = 0;
+      float v;
+      while (scanNumber(inner, i, v))
+      {
+        skipSep(inner, i);
+        if (i < inner.size() && inner[i] == '%')
+        {
+          v = v * 255.0f / 100.0f;
+          ++i;
+        }
+        vals.push_back(v);
+        skipSep(inner, i);
+      }
+      if (vals.size() < 3)
+        return false;
+      out = {(uint8_t)std::clamp(vals[0], 0.0f, 255.0f),
+             (uint8_t)std::clamp(vals[1], 0.0f, 255.0f),
+             (uint8_t)std::clamp(vals[2], 0.0f, 255.0f),
+             (uint8_t)std::clamp(vals.size() > 3 ? vals[3] * 255.0f : 255.0f,
+                                 0.0f, 255.0f)};
+      return true;
+    }
+    return namedColor(s, out);
+  }
+
+  inline float parseOpacity(const std::string &s)
+  {
+    if (s.empty())
+      return 1.0f;
+    float v = std::strtof(s.c_str(), nullptr);
+    if (s.back() == '%')
+      v /= 100.0f;
+    return std::clamp(v, 0.0f, 1.0f);
+  }
+
+  struct PathOp
+  {
+    enum class Kind
+    {
+      Move,
+      Line,
+      Cubic,
+      Quad,
+      Close
+    } kind;
+    float x = 0, y = 0;
+    float c1x = 0, c1y = 0, c2x = 0, c2y = 0; // Cubic
+    float qx = 0, qy = 0;                     // Quad control point
+  };
+
+  // SVG-1.1 Appendix-F endpoint->center arc conversion, then split into
+  // <=90-degree cubic segments (same kappa approach CanvasContext's own
+  // appendArc uses for arc()/ellipse()) — kept independent of that internal
+  // helper since path parsing only talks to CanvasContext's public API.
+  inline void arcToCubics(std::vector<PathOp> &out, float x0, float y0, float rx,
+                          float ry, float xAxisRotDeg, bool largeArc, bool sweep,
+                          float x1, float y1)
+  {
+    if (rx == 0 || ry == 0)
+    {
+      out.push_back({PathOp::Kind::Line, x1, y1});
+      return;
+    }
+    rx = std::abs(rx);
+    ry = std::abs(ry);
+    float phi = xAxisRotDeg * 3.14159265358979f / 180.0f;
+    float cosPhi = std::cos(phi), sinPhi = std::sin(phi);
+    float dx2 = (x0 - x1) / 2.0f, dy2 = (y0 - y1) / 2.0f;
+    float x1p = cosPhi * dx2 + sinPhi * dy2, y1p = -sinPhi * dx2 + cosPhi * dy2;
+    float rxsq = rx * rx, rysq = ry * ry, x1psq = x1p * x1p, y1psq = y1p * y1p;
+    float lambda = x1psq / rxsq + y1psq / rysq;
+    if (lambda > 1.0f)
+    {
+      float s = std::sqrt(lambda);
+      rx *= s;
+      ry *= s;
+      rxsq = rx * rx;
+      rysq = ry * ry;
+    }
+    float sign = (largeArc != sweep) ? 1.0f : -1.0f;
+    float num = rxsq * rysq - rxsq * y1psq - rysq * x1psq;
+    float den = rxsq * y1psq + rysq * x1psq;
+    float coef = den > 1e-9f ? sign * std::sqrt(std::max(0.0f, num / den)) : 0.0f;
+    float cxp = coef * (rx * y1p / ry), cyp = coef * -(ry * x1p / rx);
+    float cx = cosPhi * cxp - sinPhi * cyp + (x0 + x1) / 2.0f;
+    float cy = sinPhi * cxp + cosPhi * cyp + (y0 + y1) / 2.0f;
+    auto angle = [](float ux, float uy, float vx, float vy)
+    {
+      float dot = ux * vx + uy * vy,
+            len = std::sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+      float a = std::acos(std::clamp(dot / len, -1.0f, 1.0f));
+      return (ux * vy - uy * vx) < 0 ? -a : a;
+    };
+    float theta1 = angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    float dtheta = angle((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx,
+                         (-y1p - cyp) / ry);
+    if (!sweep && dtheta > 0)
+      dtheta -= 6.28318530718f;
+    if (sweep && dtheta < 0)
+      dtheta += 6.28318530718f;
+    int segCount =
+        std::max(1, (int)std::ceil(std::abs(dtheta) / (3.14159265f / 2)));
+    float segAngle = dtheta / segCount, t = theta1;
+    for (int i = 0; i < segCount; ++i)
+    {
+      float t2 = t + segAngle;
+      float alpha = std::sin(segAngle) *
+                    (std::sqrt(4.0f + 3.0f * std::tan(segAngle / 4.0f) *
+                                          std::tan(segAngle / 4.0f)) -
+                     1.0f) /
+                    3.0f;
+      auto ellipsePt = [&](float ang, float &px, float &py)
+      {
+        float ex = rx * std::cos(ang), ey = ry * std::sin(ang);
+        px = cx + ex * cosPhi - ey * sinPhi;
+        py = cy + ex * sinPhi + ey * cosPhi;
+      };
+      auto ellipseDeriv = [&](float ang, float &dx, float &dy)
+      {
+        float ex = -rx * std::sin(ang), ey = ry * std::cos(ang);
+        dx = ex * cosPhi - ey * sinPhi;
+        dy = ex * sinPhi + ey * cosPhi;
+      };
+      float p1x, p1y, p2x, p2y, d1x, d1y, d2x, d2y;
+      ellipsePt(t, p1x, p1y);
+      ellipsePt(t2, p2x, p2y);
+      ellipseDeriv(t, d1x, d1y);
+      ellipseDeriv(t2, d2x, d2y);
+      out.push_back({PathOp::Kind::Cubic, p2x, p2y, p1x + alpha * d1x,
+                     p1y + alpha * d1y, p2x - alpha * d2x, p2y - alpha * d2y});
+      t = t2;
+    }
+  }
+
+  inline std::vector<PathOp> parsePathData(const std::string &d)
+  {
+    std::vector<PathOp> ops;
+    size_t i = 0;
+    float cx = 0, cy = 0, startX = 0, startY = 0, lastCtrlX = 0, lastCtrlY = 0;
+    char lastCmd = 0;
+    auto isCmd = [](char c)
+    {
+      return std::string("MmLlHhVvCcSsQqTtAaZz").find(c) != std::string::npos;
+    };
+    while (i < d.size())
+    {
+      skipSep(d, i);
+      if (i >= d.size())
+        break;
+      char cmd = d[i];
+      if (isCmd(cmd))
+        ++i;
+      else
+      {
+        cmd = lastCmd;
+        if (cmd == 0)
+          break;
+        if (cmd == 'M')
+          cmd = 'L';
+        if (cmd == 'm')
+          cmd = 'l';
+      }
+      bool rel = islower((unsigned char)cmd);
+      char up = (char)toupper(cmd);
+      float n[7];
+      auto need = [&](int count)
+      {
+        for (int k = 0; k < count; ++k)
+          if (!scanNumber(d, i, n[k]))
+            return false;
+        return true;
+      };
+      switch (up)
+      {
+      case 'M':
+        if (!need(2))
+        {
+          i = d.size();
+          break;
+        }
+        cx = rel ? cx + n[0] : n[0];
+        cy = rel ? cy + n[1] : n[1];
+        startX = cx;
+        startY = cy;
+        ops.push_back({PathOp::Kind::Move, cx, cy});
+        break;
+      case 'L':
+        if (!need(2))
+        {
+          i = d.size();
+          break;
+        }
+        cx = rel ? cx + n[0] : n[0];
+        cy = rel ? cy + n[1] : n[1];
+        ops.push_back({PathOp::Kind::Line, cx, cy});
+        break;
+      case 'H':
+        if (!need(1))
+        {
+          i = d.size();
+          break;
+        }
+        cx = rel ? cx + n[0] : n[0];
+        ops.push_back({PathOp::Kind::Line, cx, cy});
+        break;
+      case 'V':
+        if (!need(1))
+        {
+          i = d.size();
+          break;
+        }
+        cy = rel ? cy + n[0] : n[0];
+        ops.push_back({PathOp::Kind::Line, cx, cy});
+        break;
+      case 'C':
+      {
+        if (!need(6))
+        {
+          i = d.size();
+          break;
+        }
+        float c1x = rel ? cx + n[0] : n[0], c1y = rel ? cy + n[1] : n[1],
+              c2x = rel ? cx + n[2] : n[2], c2y = rel ? cy + n[3] : n[3];
+        float ex = rel ? cx + n[4] : n[4], ey = rel ? cy + n[5] : n[5];
+        ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
+        lastCtrlX = c2x;
+        lastCtrlY = c2y;
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 'S':
+      {
+        if (!need(4))
+        {
+          i = d.size();
+          break;
+        }
+        bool prevCubic =
+            lastCmd == 'C' || lastCmd == 'c' || lastCmd == 'S' || lastCmd == 's';
+        float c1x = prevCubic ? 2 * cx - lastCtrlX : cx,
+              c1y = prevCubic ? 2 * cy - lastCtrlY : cy;
+        float c2x = rel ? cx + n[0] : n[0], c2y = rel ? cy + n[1] : n[1];
+        float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
+        ops.push_back({PathOp::Kind::Cubic, ex, ey, c1x, c1y, c2x, c2y});
+        lastCtrlX = c2x;
+        lastCtrlY = c2y;
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 'Q':
+      {
+        if (!need(4))
+        {
+          i = d.size();
+          break;
+        }
+        float qx = rel ? cx + n[0] : n[0], qy = rel ? cy + n[1] : n[1];
+        float ex = rel ? cx + n[2] : n[2], ey = rel ? cy + n[3] : n[3];
+        ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
+        lastCtrlX = qx;
+        lastCtrlY = qy;
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 'T':
+      {
+        if (!need(2))
+        {
+          i = d.size();
+          break;
+        }
+        bool prevQuad =
+            lastCmd == 'Q' || lastCmd == 'q' || lastCmd == 'T' || lastCmd == 't';
+        float qx = prevQuad ? 2 * cx - lastCtrlX : cx,
+              qy = prevQuad ? 2 * cy - lastCtrlY : cy;
+        float ex = rel ? cx + n[0] : n[0], ey = rel ? cy + n[1] : n[1];
+        ops.push_back({PathOp::Kind::Quad, ex, ey, 0, 0, 0, 0, qx, qy});
+        lastCtrlX = qx;
+        lastCtrlY = qy;
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 'A':
+      {
+        if (!need(7))
+        {
+          i = d.size();
+          break;
+        }
+        float ex = rel ? cx + n[5] : n[5], ey = rel ? cy + n[6] : n[6];
+        arcToCubics(ops, cx, cy, n[0], n[1], n[2], n[3] != 0, n[4] != 0, ex, ey);
+        cx = ex;
+        cy = ey;
+        break;
+      }
+      case 'Z':
+        ops.push_back({PathOp::Kind::Close});
+        cx = startX;
+        cy = startY;
+        break;
+      default:
+        i = d.size();
+        break;
+      }
+      lastCmd = cmd;
+    }
+    return ops;
+  }
+
+  inline std::vector<PathOp> rectToOps(float x, float y, float w, float h,
+                                       float rx, float ry)
+  {
+    std::vector<PathOp> ops;
+    if (w <= 0 || h <= 0)
+      return ops;
+    rx = std::clamp(rx, 0.0f, w / 2.0f);
+    ry = std::clamp(ry, 0.0f, h / 2.0f);
+    if (rx <= 0 || ry <= 0)
+    {
+      ops = {{PathOp::Kind::Move, x, y},
+             {PathOp::Kind::Line, x + w, y},
+             {PathOp::Kind::Line, x + w, y + h},
+             {PathOp::Kind::Line, x, y + h},
+             {PathOp::Kind::Close}};
+      return ops;
+    }
+    constexpr float k = 0.5522847498f;
+    ops.push_back({PathOp::Kind::Move, x + rx, y});
+    ops.push_back({PathOp::Kind::Line, x + w - rx, y});
+    ops.push_back({PathOp::Kind::Cubic, x + w, y + ry, x + w - rx + k * rx, y,
+                   x + w, y + ry - k * ry});
+    ops.push_back({PathOp::Kind::Line, x + w, y + h - ry});
+    ops.push_back({PathOp::Kind::Cubic, x + w - rx, y + h, x + w,
+                   y + h - ry + k * ry, x + w - rx + k * rx, y + h});
+    ops.push_back({PathOp::Kind::Line, x + rx, y + h});
+    ops.push_back({PathOp::Kind::Cubic, x, y + h - ry, x + rx - k * rx, y + h, x,
+                   y + h - ry + k * ry});
+    ops.push_back({PathOp::Kind::Line, x, y + ry});
+    ops.push_back(
+        {PathOp::Kind::Cubic, x + rx, y, x, y + ry - k * ry, x + rx - k * rx, y});
+    ops.push_back({PathOp::Kind::Close});
+    return ops;
+  }
+
+  inline std::vector<PathOp> ellipseToOps(float cx, float cy, float rx,
+                                          float ry)
+  {
+    std::vector<PathOp> ops;
+    if (rx <= 0 || ry <= 0)
+      return ops;
+    constexpr float k = 0.5522847498f;
+    ops.push_back({PathOp::Kind::Move, cx + rx, cy});
+    ops.push_back({PathOp::Kind::Cubic, cx, cy + ry, cx + rx, cy + k * ry,
+                   cx + k * rx, cy + ry});
+    ops.push_back({PathOp::Kind::Cubic, cx - rx, cy, cx - k * rx, cy + ry,
+                   cx - rx, cy + k * ry});
+    ops.push_back({PathOp::Kind::Cubic, cx, cy - ry, cx - rx, cy - k * ry,
+                   cx - k * rx, cy - ry});
+    ops.push_back({PathOp::Kind::Cubic, cx + rx, cy, cx + k * rx, cy - ry,
+                   cx + rx, cy - k * ry});
+    ops.push_back({PathOp::Kind::Close});
+    return ops;
+  }
+
+  inline std::vector<PathOp> polyToOps(const std::string &pts, bool close)
+  {
+    std::vector<PathOp> ops;
+    size_t i = 0;
+    bool first = true;
+    float x, y;
+    while (scanNumber(pts, i, x) && scanNumber(pts, i, y))
+    {
+      ops.push_back({first ? PathOp::Kind::Move : PathOp::Kind::Line, x, y});
+      first = false;
+    }
+    if (close && !ops.empty())
+      ops.push_back({PathOp::Kind::Close});
+    return ops;
+  }
+
+  struct Shape
+  {
+    std::vector<PathOp> ops;
+    Mat2x3 transform;
+    bool hasFill = false;
+    Color fill{0, 0, 0, 255};
+    bool hasStroke = false;
+    Color stroke{0, 0, 0, 255};
+    float strokeWidth = 1.0f;
+    bool evenOdd = false;
+    int lineCap = 0;
+    int lineJoin = 0;
+    float miterLimit = 4.0f;
+    std::vector<float> dashArray;
+    float dashOffset = 0.0f;
+  };
+
+  struct Document
+  {
+    std::vector<Shape> shapes;
+    float width = 0, height = 0;
+    float viewBoxX = 0, viewBoxY = 0;
+  };
+
+  struct InheritedStyle
+  {
+    bool hasFill = true;
+    Color fill{0, 0, 0, 255};
+    float fillOpacity = 1.0f;
+    bool hasStroke = false;
+    Color stroke{0, 0, 0, 255};
+    float strokeOpacity = 1.0f;
+    float strokeWidth = 1.0f;
+    float opacity = 1.0f;
+    bool evenOdd = false;
+    int lineCap = 0;              // 0=butt, 1=round, 2=square (SVG default: butt)
+    int lineJoin = 0;             // 0=miter, 1=round, 2=bevel (SVG default: miter)
+    float miterLimit = 4.0f;      // SVG default
+    std::vector<float> dashArray; // empty = solid (SVG default: none)
+    float dashOffset = 0.0f;
+  };
+
+  inline std::vector<float> parseDashArray(const std::string &val)
+  {
+    std::vector<float> out;
+    if (val.empty() || val == "none")
+      return out;
+    size_t i = 0;
+    float v;
+    while (scanNumber(val, i, v))
+    {
+      skipSep(val, i);
+      if (i < val.size() &&
+          val[i] == '%') // percentages unsupported; skip the sign
+        ++i;
+      out.push_back(v);
+      skipSep(val, i);
+    }
+    return out;
+  }
+
+  // selector ("." + class name) -> raw declaration-block text (same
+  // syntax as an inline style="" attribute, e.g. "fill:none;stroke:#000").
+  using Stylesheet = std::unordered_map<std::string, std::string>;
+
+  // Splits a semicolon-separated "prop:value;prop:value" block into pairs,
+  // trimmed. Shared by both style="" attributes and stylesheet rules so
+  // there's exactly one place that knows this syntax.
+  inline std::vector<std::pair<std::string, std::string>>
+  parseDeclarations(const std::string &block)
+  {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t i = 0;
+    while (i < block.size())
+    {
+      size_t semi = block.find(';', i);
+      std::string decl = block.substr(
+          i, semi == std::string::npos ? std::string::npos : semi - i);
+      size_t colon = decl.find(':');
+      if (colon != std::string::npos)
+      {
+        std::string k = decl.substr(0, colon), v = decl.substr(colon + 1);
+        auto trim = [](std::string &x)
+        {
+          size_t b = x.find_first_not_of(" \t\r\n"),
+                 e = x.find_last_not_of(" \t\r\n");
+          x = b == std::string::npos ? "" : x.substr(b, e - b + 1);
+        };
+        trim(k);
+        trim(v);
+        if (!k.empty())
+          out.push_back({k, v});
+      }
+      if (semi == std::string::npos)
+        break;
+      i = semi + 1;
+    }
+    return out;
+  }
+
+  // Concatenates the text content of every <style> element anywhere in
+  // the tree (there's normally just one, inside <defs>, but nothing stops
+  // an author from writing more than one).
+  inline void collectStyleText(const liteui_xml::Node &node, std::string &out)
+  {
+    if (node.tag == "style")
+    {
+      out += node.text;
+      out += '\n';
+    }
+    for (auto &child : node.children)
+      collectStyleText(child, out);
+  }
+
+  // Deliberately minimal: only ".class { decl: value; ... }" rules are
+  // recognized (comma-separated selector lists are split, and each class
+  // gets its own entry) — covers the overwhelmingly common case of SVG
+  // exporters (Illustrator, Figma, Inkscape, etc.) emitting
+  // "<style>.cls-1{fill:none;...}</style>". Tag/id/attribute/descendant
+  // selectors, @media, and specificity rules are all out of scope for v1
+  // and are silently ignored. A class redefined by a later rule has its
+  // declarations appended after the earlier ones, so parseDeclarations'
+  // last-one-wins iteration order approximates ordinary CSS cascade
+  // behavior for that (extremely common) case.
+  inline Stylesheet parseStylesheet(const std::string &css)
+  {
+    Stylesheet sheet;
+    std::string text;
+    text.reserve(css.size());
+    for (size_t i = 0; i < css.size();)
+    {
+      if (css.compare(i, 2, "/*") == 0)
+      {
+        size_t end = css.find("*/", i + 2);
+        i = (end == std::string::npos) ? css.size() : end + 2;
+      }
+      else
+      {
+        text += css[i++];
+      }
+    }
+    size_t i = 0;
+    while (i < text.size())
+    {
+      size_t open = text.find('{', i);
+      if (open == std::string::npos)
+        break;
+      size_t close = text.find('}', open);
+      if (close == std::string::npos)
+        break;
+      std::string selectors = text.substr(i, open - i);
+      std::string decls = text.substr(open + 1, close - open - 1);
+      size_t s = 0;
+      while (s <= selectors.size())
+      {
+        size_t comma = selectors.find(',', s);
+        std::string sel = selectors.substr(
+            s, comma == std::string::npos ? std::string::npos : comma - s);
+        size_t b = sel.find_first_not_of(" \t\r\n");
+        size_t e = sel.find_last_not_of(" \t\r\n");
+        if (b != std::string::npos)
+        {
+          sel = sel.substr(b, e - b + 1);
+          if (!sel.empty() && sel[0] == '.')
+          {
+            std::string &existing = sheet[sel];
+            if (!existing.empty() && existing.back() != ';')
+              existing += ';';
+            existing += decls;
+          }
+        }
+        if (comma == std::string::npos)
+          break;
+        s = comma + 1;
+      }
+      i = close + 1;
+    }
+    return sheet;
+  }
+
+  inline InheritedStyle
+  applyStyle(const std::unordered_map<std::string, std::string> &attrs,
+             const InheritedStyle &inherited,
+             const Stylesheet *stylesheet = nullptr)
+  {
+    InheritedStyle s = inherited;
+    auto apply = [&](const std::string &key, const std::string &val)
+    {
+      Color c;
+      if (key == "fill")
+      {
+        if (val == "none")
+          s.hasFill = false;
+        else if (parsePaint(val, c))
+        {
+          s.hasFill = true;
+          s.fill = c;
+        }
+      }
+      else if (key == "stroke")
+      {
+        if (val == "none")
+          s.hasStroke = false;
+        else if (parsePaint(val, c))
+        {
+          s.hasStroke = true;
+          s.stroke = c;
+        }
+      }
+      else if (key == "fill-opacity")
+        s.fillOpacity = parseOpacity(val);
+      else if (key == "stroke-opacity")
+        s.strokeOpacity = parseOpacity(val);
+      else if (key == "opacity")
+        s.opacity = parseOpacity(val);
+      else if (key == "stroke-width")
+        s.strokeWidth = std::strtof(val.c_str(), nullptr);
+      else if (key == "fill-rule")
+        s.evenOdd = (val == "evenodd");
+      else if (key == "stroke-linecap")
+        s.lineCap = val == "round" ? 1 : val == "square" ? 2
+                                                         : 0;
+      else if (key == "stroke-linejoin")
+        s.lineJoin = val == "round"   ? 1
+                     : val == "bevel" ? 2
+                                      : 0; // miter,
+                                           // miter-clip,
+                                           // arcs all
+                                           // fall back
+                                           // to miter
+      else if (key == "stroke-miterlimit")
+        s.miterLimit = std::strtof(val.c_str(), nullptr);
+      else if (key == "stroke-dasharray")
+        s.dashArray = parseDashArray(val);
+      else if (key == "stroke-dashoffset")
+        s.dashOffset = std::strtof(val.c_str(), nullptr);
+    };
+    auto tryAttr = [&](const char *key)
+    {
+      auto it = attrs.find(key);
+      if (it != attrs.end())
+        apply(key, it->second);
+    };
+    tryAttr("fill");
+    tryAttr("stroke");
+    tryAttr("fill-opacity");
+    tryAttr("stroke-opacity");
+    tryAttr("opacity");
+    tryAttr("stroke-width");
+    tryAttr("fill-rule");
+    tryAttr("stroke-linecap");
+    tryAttr("stroke-linejoin");
+    tryAttr("stroke-miterlimit");
+    tryAttr("stroke-dasharray");
+    tryAttr("stroke-dashoffset");
+
+    // Stylesheet class rules override presentation attributes but are
+    // themselves overridden by an inline style="" — same precedence
+    // order CSS gives inline style over a stylesheet, approximated.
+    if (stylesheet && !stylesheet->empty())
+    {
+      auto classIt = attrs.find("class");
+      if (classIt != attrs.end())
+      {
+        const std::string &cls = classIt->second;
+        size_t i = 0;
+        while (i < cls.size())
+        {
+          while (i < cls.size() && (unsigned char)cls[i] <= ' ')
+            ++i;
+          size_t start = i;
+          while (i < cls.size() && (unsigned char)cls[i] > ' ')
+            ++i;
+          if (i > start)
+          {
+            std::string name = cls.substr(start, i - start);
+            auto sit = stylesheet->find("." + name);
+            if (sit != stylesheet->end())
+              for (auto &decl : parseDeclarations(sit->second))
+                apply(decl.first, decl.second);
+          }
+        }
+      }
+    }
+
+    auto styleIt = attrs.find("style");
+    if (styleIt != attrs.end())
+      for (auto &decl : parseDeclarations(styleIt->second))
+        apply(decl.first, decl.second);
+
+    return s;
+  }
+
+  inline std::string attrOr(const std::unordered_map<std::string, std::string> &a,
+                            const std::string &k, const std::string &def = "")
+  {
+    auto it = a.find(k);
+    return it == a.end() ? def : it->second;
+  }
+  inline float attrF(const std::unordered_map<std::string, std::string> &a,
+                     const std::string &k, float def = 0)
+  {
+    auto it = a.find(k);
+    return it == a.end() || it->second.empty()
+               ? def
+               : std::strtof(it->second.c_str(), nullptr);
+  }
+
+  // Builds an id -> node index over the whole tree (including inside <defs>,
+  // which is exactly where <use> targets usually live). Called once per
+  // document before walking; the returned pointers stay valid for the
+  // lifetime of the root Node they point into, which parseString keeps
+  // alive for the whole parse — Document itself stores no tree pointers.
+  inline void
+  collectIds(const liteui_xml::Node &node,
+             std::unordered_map<std::string, const liteui_xml::Node *> &idMap)
+  {
+    auto it = node.attrs.find("id");
+    if (it != node.attrs.end() && !it->second.empty())
+      idMap.emplace(it->second, &node); // first occurrence wins on duplicate ids
+    for (auto &child : node.children)
+      collectIds(child, idMap);
+  }
+
+  // Threaded through every walk() call. idMap resolves <use href="#id">
+  // targets; useStack guards against reference cycles (A uses B uses A) and
+  // caps total nesting depth so a pathological file can't recurse unbounded.
+  struct WalkContext
+  {
+    const std::unordered_map<std::string, const liteui_xml::Node *> *idMap;
+    std::vector<const liteui_xml::Node *> useStack;
+    const Stylesheet *stylesheet = nullptr;
+  };
+
+  inline void walk(const liteui_xml::Node &node, Mat2x3 parentTransform,
+                   InheritedStyle inherited, Document &doc, WalkContext &ctx,
+                   bool isUseTarget = false)
+  {
+    Mat2x3 transform = parentTransform;
+    auto txIt = node.attrs.find("transform");
+    if (txIt != node.attrs.end())
+      transform = transform.multiply(parseTransform(txIt->second));
+    InheritedStyle style = applyStyle(node.attrs, inherited, ctx.stylesheet);
+
+    // <defs> and <symbol> are template containers — only rendered when
+    // reached as the direct resolution target of a <use> (isUseTarget),
+    // never when walked as ordinary document content.
+    if (!isUseTarget && (node.tag == "defs" || node.tag == "symbol"))
+      return;
+
+    if (node.tag == "use")
+    {
+      std::string href = attrOr(node.attrs, "href");
+      if (href.empty())
+        href = attrOr(node.attrs, "xlink:href");
+      if (!href.empty() && href[0] == '#' && ctx.idMap)
+      {
+        std::string id = href.substr(1);
+        auto it = ctx.idMap->find(id);
+        if (it != ctx.idMap->end())
+        {
+          const liteui_xml::Node *target = it->second;
+          bool cycle = false;
+          for (auto *n : ctx.useStack)
+            if (n == target)
+            {
+              cycle = true;
+              break;
+            }
+          constexpr size_t kMaxUseDepth =
+              32; // guards runaway/pathological nesting
+          if (!cycle && ctx.useStack.size() < kMaxUseDepth)
+          {
+            // <use x="".."" y=""..""> is an implicit extra translate applied
+            // on top of the <use> element's own transform="" (already folded
+            // into `transform` above).
+            float ux = attrF(node.attrs, "x"), uy = attrF(node.attrs, "y");
+            Mat2x3 useTransform = transform.multiply(Mat2x3::translate(ux, uy));
+            ctx.useStack.push_back(target);
+            walk(*target, useTransform, style, doc, ctx, /*isUseTarget=*/true);
+            ctx.useStack.pop_back();
+          }
+        }
+      }
+      return; // <use> has no children of its own to walk
+    }
+
+    auto emit = [&](std::vector<PathOp> ops)
+    {
+      if (ops.empty())
+        return;
+      Shape shape;
+      shape.ops = std::move(ops);
+      shape.transform = transform;
+      shape.hasFill = style.hasFill;
+      if (style.hasFill)
+      {
+        shape.fill = style.fill;
+        shape.fill.a =
+            (uint8_t)(shape.fill.a * style.fillOpacity * style.opacity);
+      }
+      shape.hasStroke = style.hasStroke;
+      if (style.hasStroke)
+      {
+        shape.stroke = style.stroke;
+        shape.stroke.a =
+            (uint8_t)(shape.stroke.a * style.strokeOpacity * style.opacity);
+        shape.strokeWidth = style.strokeWidth;
+        shape.lineCap = style.lineCap;
+        shape.lineJoin = style.lineJoin;
+        shape.miterLimit = style.miterLimit;
+        shape.dashArray = style.dashArray;
+        shape.dashOffset = style.dashOffset;
+      }
+      shape.evenOdd = style.evenOdd;
+      doc.shapes.push_back(std::move(shape));
+    };
+
+    bool isShape = true;
+    if (node.tag == "path")
+      emit(parsePathData(attrOr(node.attrs, "d")));
+    else if (node.tag == "rect")
+    {
+      float rx = attrF(node.attrs, "rx"), ry = attrF(node.attrs, "ry", rx);
+      if (node.attrs.count("rx") && !node.attrs.count("ry"))
+        ry = rx;
+      emit(rectToOps(attrF(node.attrs, "x"), attrF(node.attrs, "y"),
+                     attrF(node.attrs, "width"), attrF(node.attrs, "height"), rx,
+                     ry));
+    }
+    else if (node.tag == "circle")
+      emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
+                        attrF(node.attrs, "r"), attrF(node.attrs, "r")));
+    else if (node.tag == "ellipse")
+      emit(ellipseToOps(attrF(node.attrs, "cx"), attrF(node.attrs, "cy"),
+                        attrF(node.attrs, "rx"), attrF(node.attrs, "ry")));
+    else if (node.tag == "line")
+      emit(
+          {{PathOp::Kind::Move, attrF(node.attrs, "x1"), attrF(node.attrs, "y1")},
+           {PathOp::Kind::Line, attrF(node.attrs, "x2"),
+            attrF(node.attrs, "y2")}});
+    else if (node.tag == "polyline")
+      emit(polyToOps(attrOr(node.attrs, "points"), false));
+    else if (node.tag == "polygon")
+      emit(polyToOps(attrOr(node.attrs, "points"), true));
+    else
+      isShape = false;
+
+    // <g>, <symbol> (only reached here when isUseTarget was true above),
+    // nested <svg>, and unsupported containers all just recurse with the
+    // accumulated transform/style. Children recurse with isUseTarget reset
+    // to false (the default) — a <defs> nested inside a used <symbol> still
+    // shouldn't render on its own, only via its own <use>.
+    if (!isShape)
+      for (auto &child : node.children)
+        walk(child, transform, style, doc, ctx);
+  }
+
+  inline std::optional<Document> parseString(const std::string &xml)
+  {
+    auto root = liteui_xml::parse(xml);
+    if (!root || root->tag != "svg")
+      return std::nullopt;
+    Document doc;
+    float vbX = 0, vbY = 0, vbW = 0, vbH = 0;
+    bool hasViewBox = false;
+    auto vbIt = root->attrs.find("viewBox");
+    if (vbIt != root->attrs.end())
+    {
+      size_t i = 0;
+      float vals[4];
+      int n = 0;
+      while (n < 4 && scanNumber(vbIt->second, i, vals[n]))
+        ++n;
+      if (n == 4)
+      {
+        vbX = vals[0];
+        vbY = vals[1];
+        vbW = vals[2];
+        vbH = vals[3];
+        hasViewBox = true;
+      }
+    }
+    float attrW = attrF(root->attrs, "width", 0),
+          attrH = attrF(root->attrs, "height", 0);
+    doc.width = hasViewBox ? vbW : (attrW > 0 ? attrW : 100.0f);
+    doc.height = hasViewBox ? vbH : (attrH > 0 ? attrH : 100.0f);
+    doc.viewBoxX = hasViewBox ? vbX : 0;
+    doc.viewBoxY = hasViewBox ? vbY : 0;
+
+    std::unordered_map<std::string, const liteui_xml::Node *> idMap;
+    collectIds(*root, idMap);
+
+    std::string cssText;
+    collectStyleText(*root, cssText);
+    Stylesheet stylesheet = parseStylesheet(cssText);
+
+    WalkContext ctx{&idMap, {}, &stylesheet};
+
+    InheritedStyle rootStyle =
+        applyStyle(root->attrs, InheritedStyle(), &stylesheet);
+    Mat2x3 rootTf = Mat2x3::translate(-doc.viewBoxX, -doc.viewBoxY);
+    for (auto &child : root->children)
+      walk(child, rootTf, rootStyle, doc, ctx);
+    return doc;
+  }
+
+  inline std::optional<Document> parseFile(const std::string &path,
+                                           std::string *errorOut = nullptr)
+  {
+    FILE *fp = fopen(path.c_str(), "rb");
+    if (!fp)
+    {
+      if (errorOut)
+        *errorOut = "liteui_svg: failed to open " + path;
+      return std::nullopt;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    std::string data((size_t)std::max(0L, sz), '\0');
+    if (sz > 0)
+    {
+      size_t got = fread(data.data(), 1, (size_t)sz, fp);
+      data.resize(got);
+    }
+    fclose(fp);
+    auto doc = parseString(data);
+    if (!doc && errorOut)
+      *errorOut = "liteui_svg: failed to parse " + path;
+    return doc;
+  }
+
+} // namespace liteui_svg
+
+View View::toView(Text t)
+{
   View v;
   v.style = std::move(t.style);
   v.isText = true;
@@ -3729,7 +4360,8 @@ inline View View::toView(Text t) {
   return v;
 }
 
-inline View View::toView(Canvas c) {
+View View::toView(Canvas c)
+{
   View v;
   v.style = std::move(c.style);
   v.isCanvas = true;
@@ -3761,288 +4393,318 @@ inline View View::toView(Canvas c) {
 // Platform-specific: DirectWrite on Windows, Pango/Cairo on Linux. Only
 // liteui_layout::measureNatural (for sizing) and LiteUI's renderers (for
 // painting) call into this.
-namespace liteui_text {
+namespace liteui_text
+{
 
-struct Measurement {
-  float width, height;
-};
+  struct Measurement
+  {
+    float width, height;
+  };
 
 #if defined(_WIN32)
 
-// Lazily-created, process-wide DirectWrite factory. DirectWrite objects
-// aren't tied to any particular HWND/render target, so one factory serves
-// every LiteUI window in the process.
-inline IDWriteFactory *factory() {
-  static IDWriteFactory *f = [] {
-    IDWriteFactory *p = nullptr;
-    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                                   __uuidof(IDWriteFactory),
-                                   reinterpret_cast<IUnknown **>(&p))))
-      throw std::runtime_error("DWriteCreateFactory failed");
-    return p;
-  }();
-  return f;
-}
-
-inline DWRITE_FONT_WEIGHT toDWriteWeight(FontWeight w) {
-  return static_cast<DWRITE_FONT_WEIGHT>(static_cast<int>(w));
-}
-inline DWRITE_FONT_STYLE toDWriteStyle(FontStyle s) {
-  return s == FontStyle::Italic ? DWRITE_FONT_STYLE_ITALIC
-                                : DWRITE_FONT_STYLE_NORMAL;
-}
-
-// Builds a ready-to-measure-or-draw layout. `availWidth`/`availHeight`
-// bound wrapping/trimming — pass a huge value for "unbounded" (used when
-// measuring a Fit-width node's intrinsic single-line size). Caller owns
-// the returned pointer.
-inline IDWriteTextLayout *makeLayout(const std::string &text,
-                                     const TextStyle &style, float fontSize,
-                                     FontWeight fontWeight,
-                                     FontStyle fontStyleVal, float availWidth,
-                                     float availHeight) {
-  std::wstring wfam =
-      style.fontFamily.empty() ? L"Segoe UI" : toWide(style.fontFamily);
-  IDWriteTextFormat *format = nullptr;
-  factory()->CreateTextFormat(
-      wfam.c_str(), nullptr, toDWriteWeight(fontWeight),
-      toDWriteStyle(fontStyleVal), DWRITE_FONT_STRETCH_NORMAL,
-      fontSize, L"", &format);
-  if (!format)
-    throw std::runtime_error("CreateTextFormat failed");
-  format->SetWordWrapping(style.wrap == TextWrap::Wrap
-                              ? DWRITE_WORD_WRAPPING_WRAP
-                              : DWRITE_WORD_WRAPPING_NO_WRAP);
-  switch (style.align) {
-  case TextAlign::Center:
-    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    break;
-  case TextAlign::End:
-    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-    break;
-  case TextAlign::Justify:
-    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
-    break;
-  default:
-    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    break;
+  // Lazily-created, process-wide DirectWrite factory. DirectWrite objects
+  // aren't tied to any particular HWND/render target, so one factory serves
+  // every LiteUI window in the process.
+  inline IDWriteFactory *factory()
+  {
+    static IDWriteFactory *f = []
+    {
+      IDWriteFactory *p = nullptr;
+      if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                                     __uuidof(IDWriteFactory),
+                                     reinterpret_cast<IUnknown **>(&p))))
+        throw std::runtime_error("DWriteCreateFactory failed");
+      return p;
+    }();
+    return f;
   }
 
-  std::wstring wtext = toWide(text);
-  IDWriteTextLayout *layout = nullptr;
-  factory()->CreateTextLayout(wtext.c_str(), static_cast<UINT32>(wtext.size()),
-                              format, availWidth, availHeight, &layout);
-  format->Release(); // layout holds what it needs internally
-  if (!layout)
-    throw std::runtime_error("CreateTextLayout failed");
+  inline DWRITE_FONT_WEIGHT toDWriteWeight(FontWeight w)
+  {
+    return static_cast<DWRITE_FONT_WEIGHT>(static_cast<int>(w));
+  }
+  inline DWRITE_FONT_STYLE toDWriteStyle(FontStyle s)
+  {
+    return s == FontStyle::Italic ? DWRITE_FONT_STYLE_ITALIC
+                                  : DWRITE_FONT_STYLE_NORMAL;
+  }
 
-  DWRITE_TEXT_RANGE full{0, static_cast<UINT32>(wtext.size())};
-  if (style.letterSpacing != 0) {
-    // Character spacing is IDWriteTextLayout1 (Windows 8.1+); skip
-    // silently if the interface isn't available rather than failing the
-    // whole layout over a cosmetic feature.
-    IDWriteTextLayout1 *layout1 = nullptr;
-    if (SUCCEEDED(layout->QueryInterface(&layout1)) && layout1) {
-      layout1->SetCharacterSpacing(0, style.letterSpacing, 0, full);
-      layout1->Release();
+  // Builds a ready-to-measure-or-draw layout. `availWidth`/`availHeight`
+  // bound wrapping/trimming — pass a huge value for "unbounded" (used when
+  // measuring a Fit-width node's intrinsic single-line size). Caller owns
+  // the returned pointer.
+  inline IDWriteTextLayout *makeLayout(const std::string &text,
+                                       const TextStyle &style, float fontSize,
+                                       FontWeight fontWeight,
+                                       FontStyle fontStyleVal, float availWidth,
+                                       float availHeight)
+  {
+    std::wstring wfam =
+        style.fontFamily.empty() ? L"Segoe UI" : toWide(style.fontFamily);
+    IDWriteTextFormat *format = nullptr;
+    factory()->CreateTextFormat(
+        wfam.c_str(), nullptr, toDWriteWeight(fontWeight),
+        toDWriteStyle(fontStyleVal), DWRITE_FONT_STRETCH_NORMAL,
+        fontSize, L"", &format);
+    if (!format)
+      throw std::runtime_error("CreateTextFormat failed");
+    format->SetWordWrapping(style.wrap == TextWrap::Wrap
+                                ? DWRITE_WORD_WRAPPING_WRAP
+                                : DWRITE_WORD_WRAPPING_NO_WRAP);
+    switch (style.align)
+    {
+    case TextAlign::Center:
+      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+      break;
+    case TextAlign::End:
+      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+      break;
+    case TextAlign::Justify:
+      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
+      break;
+    default:
+      format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+      break;
     }
-  }
-  if (style.underline)
-    layout->SetUnderline(TRUE, full);
-  if (style.strikethrough)
-    layout->SetStrikethrough(TRUE, full);
-  if (style.overflow == TextOverflow::Ellipsis) {
-    IDWriteInlineObject *ellipsis = nullptr;
-    factory()->CreateEllipsisTrimmingSign(layout, &ellipsis);
-    if (ellipsis) {
-      DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
-      layout->SetTrimming(&trimming, ellipsis);
-      ellipsis->Release();
+
+    std::wstring wtext = toWide(text);
+    IDWriteTextLayout *layout = nullptr;
+    factory()->CreateTextLayout(wtext.c_str(), static_cast<UINT32>(wtext.size()),
+                                format, availWidth, availHeight, &layout);
+    format->Release(); // layout holds what it needs internally
+    if (!layout)
+      throw std::runtime_error("CreateTextLayout failed");
+
+    DWRITE_TEXT_RANGE full{0, static_cast<UINT32>(wtext.size())};
+    if (style.letterSpacing != 0)
+    {
+      // Character spacing is IDWriteTextLayout1 (Windows 8.1+); skip
+      // silently if the interface isn't available rather than failing the
+      // whole layout over a cosmetic feature.
+      IDWriteTextLayout1 *layout1 = nullptr;
+      if (SUCCEEDED(layout->QueryInterface(&layout1)) && layout1)
+      {
+        layout1->SetCharacterSpacing(0, style.letterSpacing, 0, full);
+        layout1->Release();
+      }
     }
+    if (style.underline)
+      layout->SetUnderline(TRUE, full);
+    if (style.strikethrough)
+      layout->SetStrikethrough(TRUE, full);
+    if (style.overflow == TextOverflow::Ellipsis)
+    {
+      IDWriteInlineObject *ellipsis = nullptr;
+      factory()->CreateEllipsisTrimmingSign(layout, &ellipsis);
+      if (ellipsis)
+      {
+        DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        layout->SetTrimming(&trimming, ellipsis);
+        ellipsis->Release();
+      }
+    }
+    if (style.maxLines > 0)
+      layout->SetMaxHeight(availHeight);
+    return layout;
   }
-  if (style.maxLines > 0)
-    layout->SetMaxHeight(availHeight);
-  return layout;
-}
 
-// Used only by measureNatural — builds a throwaway layout purely to read
-// metrics back. The renderer's own cached layout (built per-paint, see
-// LiteUI::ensureTextLayout) is what's actually drawn.
-inline Measurement measure(const std::string &text, const TextStyle &style,
-                           float fontSize, FontWeight fontWeight,
-                           FontStyle fontStyleVal, float availWidth) {
-  float w =
-      availWidth >= 0 ? availWidth : std::numeric_limits<float>::max() / 4;
-  float h = std::numeric_limits<float>::max() / 4;
-  IDWriteTextLayout *layout =
-      makeLayout(text, style, fontSize, fontWeight, fontStyleVal, w, h);
-  DWRITE_TEXT_METRICS m;
-  layout->GetMetrics(&m);
-  float outH = m.height;
-  if (style.lineHeight > 0) {
-    UINT32 lineCount = 0;
-    layout->GetLineMetrics(nullptr, 0, &lineCount);
-    outH = lineCount * style.lineHeight;
-  }
-  if (style.maxLines > 0 && style.lineHeight > 0)
-    outH = std::min(outH, style.maxLines * style.lineHeight);
-  Measurement result{m.widthIncludingTrailingWhitespace, outH};
-  layout->Release();
-  return result;
-}
-
-// Finds the character boundary whose x-position is closest to clickX
-// (clickX measured from the text's own left edge). O(n) — fine for
-// typical single-line field text.
-inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
+  // Used only by measureNatural — builds a throwaway layout purely to read
+  // metrics back. The renderer's own cached layout (built per-paint, see
+  // LiteUI::ensureTextLayout) is what's actually drawn.
+  inline Measurement measure(const std::string &text, const TextStyle &style,
                              float fontSize, FontWeight fontWeight,
-                             FontStyle fontStyleVal, float clickX) {
-  float best = 1e9f;
-  size_t bestIdx = 0;
-  for (size_t i = 0; i <= text.size(); ++i) {
-    Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
-                            fontStyleVal, -1);
-    float d = std::abs(m.width - clickX);
-    if (d < best) {
-      best = d;
-      bestIdx = i;
+                             FontStyle fontStyleVal, float availWidth)
+  {
+    float w =
+        availWidth >= 0 ? availWidth : std::numeric_limits<float>::max() / 4;
+    float h = std::numeric_limits<float>::max() / 4;
+    IDWriteTextLayout *layout =
+        makeLayout(text, style, fontSize, fontWeight, fontStyleVal, w, h);
+    DWRITE_TEXT_METRICS m;
+    layout->GetMetrics(&m);
+    float outH = m.height;
+    if (style.lineHeight > 0)
+    {
+      UINT32 lineCount = 0;
+      layout->GetLineMetrics(nullptr, 0, &lineCount);
+      outH = lineCount * style.lineHeight;
     }
+    if (style.maxLines > 0 && style.lineHeight > 0)
+      outH = std::min(outH, style.maxLines * style.lineHeight);
+    Measurement result{m.widthIncludingTrailingWhitespace, outH};
+    layout->Release();
+    return result;
   }
-  return bestIdx;
-}
+
+  // Finds the character boundary whose x-position is closest to clickX
+  // (clickX measured from the text's own left edge). O(n) — fine for
+  // typical single-line field text.
+  size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                        float fontSize, FontWeight fontWeight,
+                        FontStyle fontStyleVal, float clickX)
+  {
+    float best = 1e9f;
+    size_t bestIdx = 0;
+    for (size_t i = 0; i <= text.size(); ++i)
+    {
+      Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
+                              fontStyleVal, -1);
+      float d = std::abs(m.width - clickX);
+      if (d < best)
+      {
+        best = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
 
 #else // Linux — Pango/Cairo
 
-inline PangoFontDescription *makeFontDescription(const TextStyle &style,
-                                                  float fontSize,
-                                                  FontWeight fontWeight,
-                                                  FontStyle fontStyleVal) {
-  PangoFontDescription *desc = pango_font_description_new();
-  pango_font_description_set_family(
-      desc, style.fontFamily.empty() ? "Sans" : style.fontFamily.c_str());
-  pango_font_description_set_weight(
-      desc, static_cast<PangoWeight>(static_cast<int>(fontWeight)));
-  pango_font_description_set_style(desc, fontStyleVal == FontStyle::Italic
-                                             ? PANGO_STYLE_ITALIC
-                                             : PANGO_STYLE_NORMAL);
-  // Absolute pixel size sidesteps a DPI round-trip — everything else in
-  // this file (layout, GL) already works in plain screen pixels.
-  pango_font_description_set_absolute_size(desc, fontSize * PANGO_SCALE);
-  return desc;
-}
-
-// One shared throwaway cairo context used only to create PangoLayouts for
-// measurement — Pango requires *a* context to build a layout on, even one
-// that's never painted to.
-inline cairo_t *measureCr() {
-  static cairo_surface_t *surf =
-      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-  static cairo_t *cr = cairo_create(surf);
-  return cr;
-}
-
-inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
-                               float fontSize, FontWeight fontWeight,
-                               FontStyle fontStyleVal, float availWidth,
-                               cairo_t *cr) {
-  PangoLayout *layout = pango_cairo_create_layout(cr);
-  pango_layout_set_text(layout, text.c_str(), -1);
-  PangoFontDescription *desc =
-      makeFontDescription(style, fontSize, fontWeight, fontStyleVal);
-  pango_layout_set_font_description(layout, desc);
-  pango_font_description_free(desc);
-  pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-  pango_layout_set_width(layout,
-                         (style.wrap == TextWrap::Wrap && availWidth >= 0)
-                             ? static_cast<int>(availWidth * PANGO_SCALE)
-                             : -1);
-  if (style.maxLines > 0) {
-    pango_layout_set_height(
-        layout, -style.maxLines); // Pango idiom: negative = max line count
-    pango_layout_set_ellipsize(layout, style.overflow == TextOverflow::Ellipsis
-                                           ? PANGO_ELLIPSIZE_END
-                                           : PANGO_ELLIPSIZE_NONE);
-  } else if (style.overflow == TextOverflow::Ellipsis) {
-    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+  inline PangoFontDescription *makeFontDescription(const TextStyle &style,
+                                                   float fontSize,
+                                                   FontWeight fontWeight,
+                                                   FontStyle fontStyleVal)
+  {
+    PangoFontDescription *desc = pango_font_description_new();
+    pango_font_description_set_family(
+        desc, style.fontFamily.empty() ? "Sans" : style.fontFamily.c_str());
+    pango_font_description_set_weight(
+        desc, static_cast<PangoWeight>(static_cast<int>(fontWeight)));
+    pango_font_description_set_style(desc, fontStyleVal == FontStyle::Italic
+                                               ? PANGO_STYLE_ITALIC
+                                               : PANGO_STYLE_NORMAL);
+    // Absolute pixel size sidesteps a DPI round-trip — everything else in
+    // this file (layout, GL) already works in plain screen pixels.
+    pango_font_description_set_absolute_size(desc, fontSize * PANGO_SCALE);
+    return desc;
   }
-  switch (style.align) {
-  case TextAlign::Center:
-    pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
-    break;
-  case TextAlign::End:
-    pango_layout_set_alignment(layout, PANGO_ALIGN_RIGHT);
-    break;
-  case TextAlign::Justify:
-    pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
-    pango_layout_set_justify(layout, TRUE);
-    break;
-  default:
-    pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
-    break;
-  }
-  // Underline/strikethrough/letter-spacing are all plain PangoAttrList
-  // entries — collected into one list and applied once.
-  if (style.letterSpacing != 0 || style.underline || style.strikethrough) {
-    PangoAttrList *attrs = pango_attr_list_new();
-    if (style.letterSpacing != 0)
-      pango_attr_list_insert(
-          attrs, pango_attr_letter_spacing_new(
-                     static_cast<int>(style.letterSpacing * PANGO_SCALE)));
-    if (style.underline)
-      pango_attr_list_insert(attrs,
-                             pango_attr_underline_new(PANGO_UNDERLINE_SINGLE));
-    if (style.strikethrough)
-      pango_attr_list_insert(attrs, pango_attr_strikethrough_new(TRUE));
-    pango_layout_set_attributes(layout, attrs);
-    pango_attr_list_unref(attrs);
-  }
-  if (style.lineHeight > 0) {
-    PangoContext *ctx = pango_layout_get_context(layout);
-    PangoFontMetrics *metrics = pango_context_get_metrics(
-        ctx, pango_layout_get_font_description(layout), nullptr);
-    double natural =
-        pango_font_metrics_get_height(metrics) / (double)PANGO_SCALE;
-    pango_font_metrics_unref(metrics);
-    if (natural > 0)
-      pango_layout_set_line_spacing(
-          layout, static_cast<float>(style.lineHeight / natural));
-  }
-  return layout;
-}
 
-inline Measurement measure(const std::string &text, const TextStyle &style,
-                           float fontSize, FontWeight fontWeight,
-                           FontStyle fontStyleVal, float availWidth) {
-  PangoLayout *layout = makeLayout(text, style, fontSize, fontWeight,
-                                   fontStyleVal, availWidth, measureCr());
-  int w, h;
-  pango_layout_get_pixel_size(layout, &w, &h);
-  Measurement result{static_cast<float>(w), static_cast<float>(h)};
-  g_object_unref(layout);
-  return result;
-}
+  // One shared throwaway cairo context used only to create PangoLayouts for
+  // measurement — Pango requires *a* context to build a layout on, even one
+  // that's never painted to.
+  inline cairo_t *measureCr()
+  {
+    static cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    static cairo_t *cr = cairo_create(surf);
+    return cr;
+  }
 
-// Finds the character boundary whose x-position is closest to clickX
-// (clickX measured from the text's own left edge). O(n) — fine for
-// typical single-line field text. Mirrors the Windows/DirectWrite
-// implementation above; only depends on measure(), so the logic is
-// identical on both platforms.
-inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
-                             float fontSize, FontWeight fontWeight,
-                             FontStyle fontStyleVal, float clickX) {
-  float best = 1e9f;
-  size_t bestIdx = 0;
-  for (size_t i = 0; i <= text.size(); ++i) {
-    Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
-                            fontStyleVal, -1);
-    float d = std::abs(m.width - clickX);
-    if (d < best) {
-      best = d;
-      bestIdx = i;
+  inline PangoLayout *makeLayout(const std::string &text, const TextStyle &style,
+                                 float fontSize, FontWeight fontWeight,
+                                 FontStyle fontStyleVal, float availWidth,
+                                 cairo_t *cr)
+  {
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    pango_layout_set_text(layout, text.c_str(), -1);
+    PangoFontDescription *desc =
+        makeFontDescription(style, fontSize, fontWeight, fontStyleVal);
+    pango_layout_set_font_description(layout, desc);
+    pango_font_description_free(desc);
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_width(layout,
+                           (style.wrap == TextWrap::Wrap && availWidth >= 0)
+                               ? static_cast<int>(availWidth * PANGO_SCALE)
+                               : -1);
+    if (style.maxLines > 0)
+    {
+      pango_layout_set_height(
+          layout, -style.maxLines); // Pango idiom: negative = max line count
+      pango_layout_set_ellipsize(layout, style.overflow == TextOverflow::Ellipsis
+                                             ? PANGO_ELLIPSIZE_END
+                                             : PANGO_ELLIPSIZE_NONE);
     }
+    else if (style.overflow == TextOverflow::Ellipsis)
+    {
+      pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+    }
+    switch (style.align)
+    {
+    case TextAlign::Center:
+      pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+      break;
+    case TextAlign::End:
+      pango_layout_set_alignment(layout, PANGO_ALIGN_RIGHT);
+      break;
+    case TextAlign::Justify:
+      pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
+      pango_layout_set_justify(layout, TRUE);
+      break;
+    default:
+      pango_layout_set_alignment(layout, PANGO_ALIGN_LEFT);
+      break;
+    }
+    // Underline/strikethrough/letter-spacing are all plain PangoAttrList
+    // entries — collected into one list and applied once.
+    if (style.letterSpacing != 0 || style.underline || style.strikethrough)
+    {
+      PangoAttrList *attrs = pango_attr_list_new();
+      if (style.letterSpacing != 0)
+        pango_attr_list_insert(
+            attrs, pango_attr_letter_spacing_new(
+                       static_cast<int>(style.letterSpacing * PANGO_SCALE)));
+      if (style.underline)
+        pango_attr_list_insert(attrs,
+                               pango_attr_underline_new(PANGO_UNDERLINE_SINGLE));
+      if (style.strikethrough)
+        pango_attr_list_insert(attrs, pango_attr_strikethrough_new(TRUE));
+      pango_layout_set_attributes(layout, attrs);
+      pango_attr_list_unref(attrs);
+    }
+    if (style.lineHeight > 0)
+    {
+      PangoContext *ctx = pango_layout_get_context(layout);
+      PangoFontMetrics *metrics = pango_context_get_metrics(
+          ctx, pango_layout_get_font_description(layout), nullptr);
+      double natural =
+          pango_font_metrics_get_height(metrics) / (double)PANGO_SCALE;
+      pango_font_metrics_unref(metrics);
+      if (natural > 0)
+        pango_layout_set_line_spacing(
+            layout, static_cast<float>(style.lineHeight / natural));
+    }
+    return layout;
   }
-  return bestIdx;
-}
+
+  inline Measurement measure(const std::string &text, const TextStyle &style,
+                             float fontSize, FontWeight fontWeight,
+                             FontStyle fontStyleVal, float availWidth)
+  {
+    PangoLayout *layout = makeLayout(text, style, fontSize, fontWeight,
+                                     fontStyleVal, availWidth, measureCr());
+    int w, h;
+    pango_layout_get_pixel_size(layout, &w, &h);
+    Measurement result{static_cast<float>(w), static_cast<float>(h)};
+    g_object_unref(layout);
+    return result;
+  }
+
+  // Finds the character boundary whose x-position is closest to clickX
+  // (clickX measured from the text's own left edge). O(n) — fine for
+  // typical single-line field text. Mirrors the Windows/DirectWrite
+  // implementation above; only depends on measure(), so the logic is
+  // identical on both platforms.
+  size_t caretIndexForX(const std::string &text, const TextStyle &style,
+                        float fontSize, FontWeight fontWeight,
+                        FontStyle fontStyleVal, float clickX)
+  {
+    float best = 1e9f;
+    size_t bestIdx = 0;
+    for (size_t i = 0; i <= text.size(); ++i)
+    {
+      Measurement m = measure(text.substr(0, i), style, fontSize, fontWeight,
+                              fontStyleVal, -1);
+      float d = std::abs(m.width - clickX);
+      if (d < best)
+      {
+        best = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
 
 #endif
 } // namespace liteui_text
@@ -4055,7 +4717,8 @@ inline size_t caretIndexForX(const std::string &text, const TextStyle &style,
 // public API compiles unchanged on either platform.
 #if defined(_WIN32)
 
-class CanvasContext {
+class CanvasContextImpl : public CanvasContext
+{
 public:
   // `rt` is a render target sized exactly to the canvas node's inner
   // (padding-excluded) content box, already BeginDraw()'d and cleared to
@@ -4075,19 +4738,22 @@ public:
   // null for any CanvasContext not backed by a persistent per-node
   // Computed, in which case drawImage falls back to its old (uncached,
   // always reupload) behavior.
-  CanvasContext(ID2D1RenderTarget *rt, float width, float height,
-                IWICBitmap *wicBitmap = nullptr,
-                const View::Computed *imageCacheOwner = nullptr)
+  CanvasContextImpl(ID2D1RenderTarget *rt, float width, float height,
+                    IWICBitmap *wicBitmap = nullptr,
+                    const View::Computed *imageCacheOwner = nullptr)
       : rt_(rt), width_(width), height_(height), wicBitmap_(wicBitmap),
-        imageCacheOwner_(imageCacheOwner) {
+        imageCacheOwner_(imageCacheOwner)
+  {
     rt_->GetFactory(&factory_);
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
   }
-  ~CanvasContext() {
+  ~CanvasContextImpl()
+  {
     // Leave the render target's layer stack balanced even if onPaint
     // forgot to restore() every save()/clip() — an imbalanced PushLayer
     // would corrupt every subsequent frame drawn into this same target.
-    while (!clipLayers_.empty()) {
+    while (!clipLayers_.empty())
+    {
       rt_->PopLayer();
       clipLayers_.back()->Release();
       clipLayers_.pop_back();
@@ -4095,14 +4761,15 @@ public:
     if (factory_)
       factory_->Release();
   }
-  CanvasContext(const CanvasContext &) = delete;
-  CanvasContext &operator=(const CanvasContext &) = delete;
+  CanvasContextImpl(const CanvasContextImpl &) = delete;
+  CanvasContextImpl &operator=(const CanvasContextImpl &) = delete;
 
   float width() const { return width_; }
   float height() const { return height_; }
 
   // ---- state stack ----
-  void save() {
+  void save()
+  {
     State s;
     s.transform = transform_;
     s.fill = fillPaint_;
@@ -4124,12 +4791,14 @@ public:
     s.clipDepth = clipLayers_.size();
     stack_.push_back(std::move(s));
   }
-  void restore() {
+  void restore()
+  {
     if (stack_.empty())
       return;
     State s = std::move(stack_.back());
     stack_.pop_back();
-    while (clipLayers_.size() > s.clipDepth) {
+    while (clipLayers_.size() > s.clipDepth)
+    {
       rt_->PopLayer();
       clipLayers_.back()->Release();
       clipLayers_.pop_back();
@@ -4154,21 +4823,26 @@ public:
   }
 
   // ---- transform ----
-  void translate(float x, float y) {
+  void translate(float x, float y)
+  {
     transform_ = D2D1::Matrix3x2F::Translation(x, y) * transform_;
   }
-  void rotate(float radians) {
+  void rotate(float radians)
+  {
     transform_ =
         D2D1::Matrix3x2F::Rotation(radians * 180.0f / 3.14159265358979f) *
         transform_;
   }
-  void scale(float sx, float sy) {
+  void scale(float sx, float sy)
+  {
     transform_ = D2D1::Matrix3x2F::Scale(sx, sy) * transform_;
   }
-  void transformBy(float a, float b, float c, float d, float e, float f) {
+  void transformBy(float a, float b, float c, float d, float e, float f)
+  {
     transform_ = D2D1::Matrix3x2F(a, b, c, d, e, f) * transform_;
   }
-  void setTransform(float a, float b, float c, float d, float e, float f) {
+  void setTransform(float a, float b, float c, float d, float e, float f)
+  {
     transform_ = D2D1::Matrix3x2F(a, b, c, d, e, f);
   }
   void resetTransform() { transform_ = D2D1::Matrix3x2F::Identity(); }
@@ -4177,7 +4851,8 @@ public:
   void setFillColor(Color c) { fillPaint_ = Paint::solid(c); }
   void setFillGradient(const CanvasGradient &g) { fillPaint_ = Paint::grad(g); }
   void setStrokeColor(Color c) { strokePaint_ = Paint::solid(c); }
-  void setStrokeGradient(const CanvasGradient &g) {
+  void setStrokeGradient(const CanvasGradient &g)
+  {
     strokePaint_ = Paint::grad(g);
   }
   void setLineWidth(float w) { lineWidth_ = std::max(0.0f, w); }
@@ -4193,14 +4868,16 @@ public:
   // Cairo on Linux, which honors the full operator range.
   void setGlobalCompositeOperation(CompositeOp op) { composite_ = op; }
   void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
-                 float offsetX, float offsetY) {
+                 float offsetX, float offsetY)
+  {
     shadowColor_ = color;
     shadowOffsetX_ = offsetX;
     shadowOffsetY_ = offsetY;
   }
   void setFont(const std::string &family, float sizePx,
                FontWeight weight = FontWeight::Regular,
-               FontStyle style = FontStyle::Normal) {
+               FontStyle style = FontStyle::Normal)
+  {
     font_.fontFamily = family;
     font_.fontSize = sizePx;
     font_.fontWeight = weight;
@@ -4214,30 +4891,35 @@ public:
   // NOT clear the current path (only beginPath() does), so the same
   // shape can be filled then stroked, or extended with more segments,
   // across multiple calls.
-  void beginPath() {
+  void beginPath()
+  {
     segs_.clear();
     figureClosed_.clear();
     curX_ = curY_ = startX_ = startY_ = 0;
   }
-  void closePath() {
+  void closePath()
+  {
     if (!figureClosed_.empty())
       figureClosed_.back() = true;
     curX_ = startX_;
     curY_ = startY_;
   }
-  void moveTo(float x, float y) {
+  void moveTo(float x, float y)
+  {
     segs_.push_back(Seg::move(x, y));
     figureClosed_.push_back(false);
     curX_ = startX_ = x;
     curY_ = startY_ = y;
   }
-  void lineTo(float x, float y) {
+  void lineTo(float x, float y)
+  {
     ensureFigure();
     segs_.push_back(Seg::line(x, y));
     curX_ = x;
     curY_ = y;
   }
-  void quadraticCurveTo(float cpx, float cpy, float x, float y) {
+  void quadraticCurveTo(float cpx, float cpy, float x, float y)
+  {
     ensureFigure();
     float c1x = curX_ + 2.0f / 3.0f * (cpx - curX_);
     float c1y = curY_ + 2.0f / 3.0f * (cpy - curY_);
@@ -4248,29 +4930,34 @@ public:
     curY_ = y;
   }
   void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x,
-                     float y) {
+                     float y)
+  {
     ensureFigure();
     segs_.push_back(Seg::cubic(c1x, c1y, c2x, c2y, x, y));
     curX_ = x;
     curY_ = y;
   }
   void arc(float cx, float cy, float r, float startAngle, float endAngle,
-           bool ccw = false) {
+           bool ccw = false)
+  {
     appendArc(cx, cy, r, r, 0, startAngle, endAngle, ccw,
               figureClosed_.empty());
   }
   void ellipse(float cx, float cy, float rx, float ry, float rotation,
-               float startAngle, float endAngle, bool ccw = false) {
+               float startAngle, float endAngle, bool ccw = false)
+  {
     appendArc(cx, cy, rx, ry, rotation, startAngle, endAngle, ccw,
               figureClosed_.empty());
   }
-  void arcTo(float x1, float y1, float x2, float y2, float radius) {
+  void arcTo(float x1, float y1, float x2, float y2, float radius)
+  {
     float x0 = curX_, y0 = curY_;
     float dx1 = x0 - x1, dy1 = y0 - y1;
     float dx2 = x2 - x1, dy2 = y2 - y1;
     float len1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
     float len2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
-    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0) {
+    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0)
+    {
       lineTo(x1, y1);
       return;
     }
@@ -4280,7 +4967,8 @@ public:
     dy2 /= len2;
     float cosA = std::clamp(dx1 * dx2 + dy1 * dy2, -1.0f, 1.0f);
     float angle = std::acos(cosA);
-    if (angle < 1e-6f) {
+    if (angle < 1e-6f)
+    {
       lineTo(x1, y1);
       return;
     }
@@ -4290,7 +4978,8 @@ public:
     lineTo(t1x, t1y);
     float bisx = dx1 + dx2, bisy = dy1 + dy2;
     float bisLen = std::sqrt(bisx * bisx + bisy * bisy);
-    if (bisLen < 1e-6f) {
+    if (bisLen < 1e-6f)
+    {
       lineTo(x1, y1);
       return;
     }
@@ -4303,14 +4992,16 @@ public:
     float cross = dx1 * dy2 - dy1 * dx2; // winding sign, picks short way
     appendArc(ccx, ccy, radius, radius, 0, a0, a1, cross > 0, false);
   }
-  void rect(float x, float y, float w, float h) {
+  void rect(float x, float y, float w, float h)
+  {
     moveTo(x, y);
     lineTo(x + w, y);
     lineTo(x + w, y + h);
     lineTo(x, y + h);
     closePath();
   }
-  void roundRect(float x, float y, float w, float h, float radius) {
+  void roundRect(float x, float y, float w, float h, float radius)
+  {
     constexpr float kPi = 3.14159265358979f;
     radius = std::max(0.0f, std::min(radius, std::min(w, h) / 2.0f));
     moveTo(x + radius, y);
@@ -4330,23 +5021,27 @@ public:
   }
 
   // ---- drawing ----
-  void fill(FillRule rule = FillRule::NonZero) {
+  void fill(FillRule rule = FillRule::NonZero)
+  {
     ID2D1PathGeometry *geom = buildGeometry(toFillMode(rule));
     if (!geom)
       return;
     rt_->SetTransform(transform_);
-    drawShadowThenReal([&](ID2D1Brush *b) { rt_->FillGeometry(geom, b); },
+    drawShadowThenReal([&](ID2D1Brush *b)
+                       { rt_->FillGeometry(geom, b); },
                        fillPaint_);
     geom->Release();
   }
-  void stroke() {
+  void stroke()
+  {
     ID2D1PathGeometry *geom = buildGeometry(D2D1_FILL_MODE_WINDING);
     if (!geom)
       return;
     rt_->SetTransform(transform_);
     ID2D1StrokeStyle *strokeStyle = makeStrokeStyle();
     drawShadowThenReal(
-        [&](ID2D1Brush *b) {
+        [&](ID2D1Brush *b)
+        {
           rt_->DrawGeometry(geom, b, lineWidth_, strokeStyle);
         },
         strokePaint_);
@@ -4354,7 +5049,8 @@ public:
       strokeStyle->Release();
     geom->Release();
   }
-  void clip(FillRule rule = FillRule::NonZero) {
+  void clip(FillRule rule = FillRule::NonZero)
+  {
     ID2D1PathGeometry *geom = buildGeometry(toFillMode(rule));
     if (!geom)
       return;
@@ -4365,7 +5061,8 @@ public:
     clipLayers_.push_back(layer);
     geom->Release();
   }
-  void fillRect(float x, float y, float w, float h) {
+  void fillRect(float x, float y, float w, float h)
+  {
     std::vector<Seg> savedSegs = segs_;
     std::vector<bool> savedClosed = figureClosed_;
     float savedX = curX_, savedY = curY_, savedSX = startX_, savedSY = startY_;
@@ -4379,7 +5076,8 @@ public:
     startX_ = savedSX;
     startY_ = savedSY;
   }
-  void strokeRect(float x, float y, float w, float h) {
+  void strokeRect(float x, float y, float w, float h)
+  {
     std::vector<Seg> savedSegs = segs_;
     std::vector<bool> savedClosed = figureClosed_;
     float savedX = curX_, savedY = curY_, savedSX = startX_, savedSY = startY_;
@@ -4409,7 +5107,8 @@ public:
   // so rotation/skew are honored exactly — not just translation/scale.
   // Falls back to a no-op if there's no backing WIC bitmap (shouldn't
   // happen for a real canvas node) or the transform isn't invertible.
-  void clearRect(float x, float y, float w, float h) {
+  void clearRect(float x, float y, float w, float h)
+  {
     if (!wicBitmap_)
       return;
     rt_->Flush(nullptr, nullptr);
@@ -4432,7 +5131,8 @@ public:
     };
     float minX = corners[0].x, maxX = corners[0].x;
     float minY = corners[0].y, maxY = corners[0].y;
-    for (int i = 1; i < 4; ++i) {
+    for (int i = 1; i < 4; ++i)
+    {
       minX = std::min(minX, corners[i].x);
       maxX = std::max(maxX, corners[i].x);
       minY = std::min(minY, corners[i].y);
@@ -4452,12 +5152,15 @@ public:
     BYTE *data = nullptr;
     lock->GetStride(&stride);
     lock->GetDataPointer(&bufSize, &data);
-    for (int py = iy0; py < iy1; ++py) {
+    for (int py = iy0; py < iy1; ++py)
+    {
       BYTE *row = data + static_cast<size_t>(py - iy0) * stride;
-      for (int px = ix0; px < ix1; ++px) {
+      for (int px = ix0; px < ix1; ++px)
+      {
         D2D1_POINT_2F local =
             inv.TransformPoint(D2D1::Point2F(px + 0.5f, py + 0.5f));
-        if (local.x >= x0 && local.x < x1 && local.y >= y0 && local.y < y1) {
+        if (local.x >= x0 && local.x < x1 && local.y >= y0 && local.y < y1)
+        {
           BYTE *p = row + static_cast<size_t>(px - ix0) * 4;
           p[0] = p[1] = p[2] = p[3] = 0; // premultiplied BGRA: alpha 0 => all 0
         }
@@ -4467,10 +5170,8 @@ public:
   }
 
   // ---- text ----
-  struct TextMetricsResult {
-    float width;
-  };
-  TextMetricsResult measureText(const std::string &text) {
+  TextMetricsResult measureText(const std::string &text)
+  {
     TextStyle ts = fontToTextStyle();
     liteui_text::Measurement m = liteui_text::measure(
         text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
@@ -4478,22 +5179,26 @@ public:
     return {m.width};
   }
   void fillText(const std::string &text, float x, float y,
-                float maxWidth = -1) {
+                float maxWidth = -1)
+  {
     drawTextImpl(text, x, y, maxWidth, false);
   }
   void strokeText(const std::string &text, float x, float y,
-                  float maxWidth = -1) {
+                  float maxWidth = -1)
+  {
     drawTextImpl(text, x, y, maxWidth, true);
   }
 
   // ---- images ----
-  void drawImage(const CanvasImage &img, float dx, float dy) {
+  void drawImage(const CanvasImage &img, float dx, float dy)
+  {
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy,
               static_cast<float>(img.width), static_cast<float>(img.height));
   }
   void drawImage(const CanvasImage &img, float dx, float dy, float dw,
-                 float dh) {
+                 float dh)
+  {
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy, dw, dh);
   }
@@ -4510,7 +5215,8 @@ public:
   // way between drawImage calls; an app that does would need to force a
   // miss itself (e.g. by giving the image a fresh pixels vector).
   void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
-                 float dx, float dy, float dw, float dh) {
+                 float dx, float dy, float dw, float dh)
+  {
     if (img.width <= 0 || img.height <= 0)
       return;
     ID2D1Bitmap *bmp = nullptr;
@@ -4520,13 +5226,17 @@ public:
         imageCacheOwner_->cachedImagePixelsSize == img.pixels.size() &&
         imageCacheOwner_->cachedImageW == img.width &&
         imageCacheOwner_->cachedImageH == img.height;
-    if (cacheHit) {
+    if (cacheHit)
+    {
       bmp = imageCacheOwner_->cachedImageBitmap;
-    } else {
+    }
+    else
+    {
       bmp = makeBitmap(img);
       if (!bmp)
         return;
-      if (imageCacheOwner_) {
+      if (imageCacheOwner_)
+      {
         if (imageCacheOwner_->cachedImageBitmap)
           imageCacheOwner_->cachedImageBitmap->Release();
         imageCacheOwner_->cachedImageBitmap = bmp;
@@ -4561,7 +5271,8 @@ public:
   // CanvasImage's straight RGBA here, mirroring the Cairo path exactly.
   // Returns std::nullopt only if there's no backing WIC bitmap at all
   // (shouldn't happen for a real canvas node).
-  std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
+  std::optional<CanvasImage> getImageData(float x, float y, float w, float h)
+  {
     if (!wicBitmap_)
       return std::nullopt;
     rt_->Flush(nullptr, nullptr);
@@ -4587,10 +5298,12 @@ public:
     BYTE *data = nullptr;
     lock->GetStride(&stride);
     lock->GetDataPointer(&bufSize, &data);
-    for (int row = 0; row < rect.Height; ++row) {
+    for (int row = 0; row < rect.Height; ++row)
+    {
       const BYTE *src = data + static_cast<size_t>(row) * stride;
       int destRow = (clipY0 + row) - iy;
-      for (int col = 0; col < rect.Width; ++col) {
+      for (int col = 0; col < rect.Width; ++col)
+      {
         const BYTE *p = src + static_cast<size_t>(col) * 4;
         int destCol = (clipX0 + col) - ix;
         unsigned char b = p[0], g = p[1], r = p[2], a = p[3];
@@ -4607,7 +5320,8 @@ public:
   }
   // putImageData ignores the current transform and paints the pixels
   // directly at (dx,dy), matching HTML canvas semantics.
-  void putImageData(const CanvasImage &img, float dx, float dy) {
+  void putImageData(const CanvasImage &img, float dx, float dy)
+  {
     if (img.width <= 0 || img.height <= 0)
       return;
     ID2D1Bitmap *bmp = makeBitmap(img);
@@ -4623,29 +5337,39 @@ public:
 
 private:
   // ---- internal path representation ----
-  struct Seg {
-    enum class Kind { Move, Line, Cubic } kind;
+  struct Seg
+  {
+    enum class Kind
+    {
+      Move,
+      Line,
+      Cubic
+    } kind;
     float x, y;               // endpoint (all kinds)
     float c1x, c1y, c2x, c2y; // control points (Cubic only)
     static Seg move(float x, float y) { return {Kind::Move, x, y, 0, 0, 0, 0}; }
     static Seg line(float x, float y) { return {Kind::Line, x, y, 0, 0, 0, 0}; }
     static Seg cubic(float c1x, float c1y, float c2x, float c2y, float x,
-                     float y) {
+                     float y)
+    {
       return {Kind::Cubic, x, y, c1x, c1y, c2x, c2y};
     }
   };
 
-  struct Paint {
+  struct Paint
+  {
     bool isGradient = false;
     Color color{0, 0, 0, 255};
     CanvasGradient gradient;
-    static Paint solid(Color c) {
+    static Paint solid(Color c)
+    {
       Paint p;
       p.isGradient = false;
       p.color = c;
       return p;
     }
-    static Paint grad(const CanvasGradient &g) {
+    static Paint grad(const CanvasGradient &g)
+    {
       Paint p;
       p.isGradient = true;
       p.gradient = g;
@@ -4653,7 +5377,8 @@ private:
     }
   };
 
-  struct State {
+  struct State
+  {
     D2D1_MATRIX_3X2_F transform;
     Paint fill, stroke;
     float lineWidth;
@@ -4672,14 +5397,16 @@ private:
     size_t clipDepth;
   };
 
-  static Color colorOf(const Paint &p) {
+  static Color colorOf(const Paint &p)
+  {
     if (!p.isGradient)
       return p.color;
     return p.gradient.stops.empty() ? Color{0, 0, 0, 255}
                                     : p.gradient.stops.front().color;
   }
 
-  void ensureFigure() {
+  void ensureFigure()
+  {
     if (figureClosed_.empty())
       moveTo(curX_, curY_);
   }
@@ -4690,18 +5417,23 @@ private:
   // rotation+non-uniform-scale+translate — this is what lets the same
   // helper serve arc(), ellipse(), arcTo(), and roundRect()'s corners.
   void appendArc(float cx, float cy, float rx, float ry, float rotation,
-                 float a0, float a1, bool ccw, bool asMove) {
+                 float a0, float a1, bool ccw, bool asMove)
+  {
     constexpr float kTwoPi = 6.28318530717959f;
     float delta = a1 - a0;
-    if (!ccw) {
+    if (!ccw)
+    {
       while (delta < 0)
         delta += kTwoPi;
-    } else {
+    }
+    else
+    {
       while (delta > 0)
         delta -= kTwoPi;
     }
     float cosR = std::cos(rotation), sinR = std::sin(rotation);
-    auto mapPt = [&](float ux, float uy, float &px, float &py) {
+    auto mapPt = [&](float ux, float uy, float &px, float &py)
+    {
       float ex = rx * ux, ey = ry * uy;
       px = cx + ex * cosR - ey * sinR;
       py = cy + ex * sinR + ey * cosR;
@@ -4718,7 +5450,8 @@ private:
         1, static_cast<int>(std::ceil(std::abs(delta) / (3.14159265f / 2))));
     float segAngle = delta / segCount;
     float ang = a0;
-    for (int i = 0; i < segCount; ++i) {
+    for (int i = 0; i < segCount; ++i)
+    {
       float ang1 = ang + segAngle;
       float t = std::tan((ang1 - ang) / 4.0f);
       float alpha =
@@ -4740,12 +5473,14 @@ private:
     }
   }
 
-  static D2D1_FILL_MODE toFillMode(FillRule rule) {
+  static D2D1_FILL_MODE toFillMode(FillRule rule)
+  {
     return rule == FillRule::EvenOdd ? D2D1_FILL_MODE_ALTERNATE
                                      : D2D1_FILL_MODE_WINDING;
   }
 
-  ID2D1PathGeometry *buildGeometry(D2D1_FILL_MODE fillMode) {
+  ID2D1PathGeometry *buildGeometry(D2D1_FILL_MODE fillMode)
+  {
     if (segs_.empty())
       return nullptr;
     ID2D1PathGeometry *geom = nullptr;
@@ -4758,8 +5493,10 @@ private:
     bool figureOpen = false;
     size_t figIdx = 0;
     bool first = true;
-    for (auto &s : segs_) {
-      if (s.kind == Seg::Kind::Move) {
+    for (auto &s : segs_)
+    {
+      if (s.kind == Seg::Kind::Move)
+      {
         if (figureOpen)
           sink->EndFigure(figureClosed_[figIdx] ? D2D1_FIGURE_END_CLOSED
                                                 : D2D1_FIGURE_END_OPEN);
@@ -4767,9 +5504,13 @@ private:
         figureOpen = true;
         figIdx = first ? 0 : figIdx + 1;
         first = false;
-      } else if (s.kind == Seg::Kind::Line) {
+      }
+      else if (s.kind == Seg::Kind::Line)
+      {
         sink->AddLine(D2D1::Point2F(s.x, s.y));
-      } else {
+      }
+      else
+      {
         sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(s.c1x, s.c1y),
                                             D2D1::Point2F(s.c2x, s.c2y),
                                             D2D1::Point2F(s.x, s.y)));
@@ -4783,8 +5524,10 @@ private:
     return geom;
   }
 
-  ID2D1Brush *makeBrush(const Paint &p) {
-    if (!p.isGradient) {
+  ID2D1Brush *makeBrush(const Paint &p)
+  {
+    if (!p.isGradient)
+    {
       ID2D1SolidColorBrush *b = nullptr;
       Color c = p.color;
       rt_->CreateSolidColorBrush(D2D1::ColorF(c.r / 255.0f, c.g / 255.0f,
@@ -4796,7 +5539,8 @@ private:
     if (p.gradient.stops.empty())
       return nullptr;
     std::vector<D2D1_GRADIENT_STOP> stops;
-    for (auto &s : p.gradient.stops) {
+    for (auto &s : p.gradient.stops)
+    {
       D2D1_GRADIENT_STOP gs;
       gs.position = std::clamp(s.offset, 0.0f, 1.0f);
       gs.color =
@@ -4804,7 +5548,8 @@ private:
                        s.color.b / 255.0f, (s.color.a / 255.0f) * globalAlpha_);
       stops.push_back(gs);
     }
-    if (p.gradient.kind == CanvasGradient::Kind::Radial) {
+    if (p.gradient.kind == CanvasGradient::Kind::Radial)
+    {
       // D2D1's radial brush models a single circle plus a focal offset
       // point, unlike canvas's two-circle (r0..r1) model — approximate
       // by rescaling stop offsets so t=0 lands at r0/r1 of the way into
@@ -4820,7 +5565,8 @@ private:
     if (!coll)
       return nullptr;
     ID2D1Brush *brush = nullptr;
-    if (p.gradient.kind == CanvasGradient::Kind::Linear) {
+    if (p.gradient.kind == CanvasGradient::Kind::Linear)
+    {
       ID2D1LinearGradientBrush *lb = nullptr;
       rt_->CreateLinearGradientBrush(
           D2D1::LinearGradientBrushProperties(
@@ -4828,7 +5574,9 @@ private:
               D2D1::Point2F(p.gradient.x1, p.gradient.y1)),
           coll, &lb);
       brush = lb;
-    } else {
+    }
+    else
+    {
       float r1 = std::max(1.0f, p.gradient.r1);
       float ox =
           std::clamp(p.gradient.x0 - p.gradient.x1, -r1 * 0.99f, r1 * 0.99f);
@@ -4846,27 +5594,33 @@ private:
     return brush;
   }
 
-  template <class Fn> void drawShadowThenReal(Fn drawFn, const Paint &paint) {
-    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0)) {
+  template <class Fn>
+  void drawShadowThenReal(Fn drawFn, const Paint &paint)
+  {
+    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0))
+    {
       D2D1_MATRIX_3X2_F saved = transform_;
       rt_->SetTransform(
           D2D1::Matrix3x2F::Translation(shadowOffsetX_, shadowOffsetY_) *
           transform_);
       ID2D1Brush *shadowBrush = makeBrush(Paint::solid(shadowColor_));
-      if (shadowBrush) {
+      if (shadowBrush)
+      {
         drawFn(shadowBrush);
         shadowBrush->Release();
       }
       rt_->SetTransform(saved);
     }
     ID2D1Brush *brush = makeBrush(paint);
-    if (brush) {
+    if (brush)
+    {
       drawFn(brush);
       brush->Release();
     }
   }
 
-  ID2D1StrokeStyle *makeStrokeStyle() {
+  ID2D1StrokeStyle *makeStrokeStyle()
+  {
     D2D1_CAP_STYLE cap = lineCap_ == LineCap::Round    ? D2D1_CAP_STYLE_ROUND
                          : lineCap_ == LineCap::Square ? D2D1_CAP_STYLE_SQUARE
                                                        : D2D1_CAP_STYLE_FLAT;
@@ -4891,7 +5645,8 @@ private:
     return style;
   }
 
-  ID2D1Bitmap *makeBitmap(const CanvasImage &img) {
+  ID2D1Bitmap *makeBitmap(const CanvasImage &img)
+  {
     ID2D1Bitmap *bmp = nullptr;
     // D2D1 bitmaps require BGRA byte order AND premultiplied alpha for
     // CreateBitmap on an ID2D1RenderTarget (straight alpha is rejected
@@ -4906,17 +5661,21 @@ private:
     // premultiply math — b * 255 / 255 == b, so the result is identical.
     const uint8_t *src = img.pixels.data();
     uint8_t *dst = bgra.data();
-    for (size_t i = 0; i + 3 < n; i += 4) {
+    for (size_t i = 0; i + 3 < n; i += 4)
+    {
       uint8_t r = src[i + 0];
       uint8_t g = src[i + 1];
       uint8_t b = src[i + 2];
       uint8_t a = src[i + 3];
-      if (a == 255) {
+      if (a == 255)
+      {
         dst[i + 0] = b;
         dst[i + 1] = g;
         dst[i + 2] = r;
         dst[i + 3] = 255;
-      } else {
+      }
+      else
+      {
         dst[i + 0] = static_cast<uint8_t>(b * a / 255);
         dst[i + 1] = static_cast<uint8_t>(g * a / 255);
         dst[i + 2] = static_cast<uint8_t>(r * a / 255);
@@ -4931,7 +5690,8 @@ private:
         bgra.data(), static_cast<UINT32>(img.width) * 4, props, &bmp);
     return FAILED(hr) ? nullptr : bmp;
   }
-  TextStyle fontToTextStyle() const {
+  TextStyle fontToTextStyle() const
+  {
     TextStyle ts = font_;
     ts.wrap = TextWrap::NoWrap;
     return ts;
@@ -4940,7 +5700,8 @@ private:
   // maxWidth is accepted for API familiarity with HTML canvas but not
   // currently applied (no horizontal squeeze-to-fit is performed).
   void drawTextImpl(const std::string &text, float x, float y, float,
-                    bool stroked) {
+                    bool stroked)
+  {
     TextStyle ts = fontToTextStyle();
     IDWriteTextLayout *layout = liteui_text::makeLayout(
         text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
@@ -4948,7 +5709,8 @@ private:
     DWRITE_TEXT_METRICS m;
     layout->GetMetrics(&m);
     float drawX = x, drawY = y;
-    switch (textAlign_) {
+    switch (textAlign_)
+    {
     case TextAlign::Center:
       drawX -= m.widthIncludingTrailingWhitespace / 2.0f;
       break;
@@ -4958,7 +5720,8 @@ private:
     default:
       break;
     }
-    switch (textBaseline_) {
+    switch (textBaseline_)
+    {
     case TextBaseline::Top:
       break;
     case TextBaseline::Middle:
@@ -4975,18 +5738,21 @@ private:
       break;
     }
     rt_->SetTransform(transform_);
-    auto paintOnce = [&](Color c) {
+    auto paintOnce = [&](Color c)
+    {
       ID2D1SolidColorBrush *brush = nullptr;
       rt_->CreateSolidColorBrush(D2D1::ColorF(c.r / 255.0f, c.g / 255.0f,
                                               c.b / 255.0f,
                                               (c.a / 255.0f) * globalAlpha_),
                                  &brush);
-      if (brush) {
+      if (brush)
+      {
         rt_->DrawTextLayout(D2D1::Point2F(drawX, drawY), layout, brush);
         brush->Release();
       }
     };
-    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0)) {
+    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0))
+    {
       D2D1_MATRIX_3X2_F saved = transform_;
       rt_->SetTransform(
           D2D1::Matrix3x2F::Translation(shadowOffsetX_, shadowOffsetY_) *
@@ -4994,18 +5760,21 @@ private:
       paintOnce(shadowColor_);
       rt_->SetTransform(saved);
     }
-    if (!stroked) {
+    if (!stroked)
+    {
       paintOnce(colorOf(fillPaint_));
-    } else {
+    }
+    else
+    {
       // Approximates a stroked glyph outline by drawing the fill text in
       // the stroke color, nudged across a ring of directions — not a
       // true outline of the glyph contours (see Canvas limitations note).
       Color base = colorOf(strokePaint_);
       float r = std::max(1.0f, lineWidth_ / 2.0f);
       static const float offs[8][2] = {
-          {1, 0},       {-1, 0},       {0, 1},        {0, -1},
-          {0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f, -0.7f}, {-0.7f, -0.7f}};
-      for (auto &o : offs) {
+          {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f, -0.7f}, {-0.7f, -0.7f}};
+      for (auto &o : offs)
+      {
         D2D1_MATRIX_3X2_F saved = transform_;
         rt_->SetTransform(D2D1::Matrix3x2F::Translation(o[0] * r, o[1] * r) *
                           transform_);
@@ -5054,7 +5823,8 @@ private:
 
 #else // Linux — Cairo
 
-class CanvasContext {
+class CanvasContextImpl : public CanvasContext
+{
 public:
   // `cr` is a Cairo context targeting an image surface sized exactly to
   // the canvas node's inner (padding-excluded) content box, already
@@ -5064,13 +5834,13 @@ public:
   // to skip reconverting the same CanvasImage on a repeat draw (see
   // drawImage's own comment). Left null for any CanvasContext not backed
   // by a persistent per-node Computed.
-  CanvasContext(cairo_t *cr, float width, float height,
-                const View::Computed *imageCacheOwner = nullptr)
+  CanvasContextImpl(cairo_t *cr, float width, float height,
+                    const View::Computed *imageCacheOwner = nullptr)
       : cr_(cr), width_(width), height_(height),
         imageCacheOwner_(imageCacheOwner) {}
-  ~CanvasContext() = default;
-  CanvasContext(const CanvasContext &) = delete;
-  CanvasContext &operator=(const CanvasContext &) = delete;
+  ~CanvasContextImpl() = default;
+  CanvasContextImpl(const CanvasContextImpl &) = delete;
+  CanvasContextImpl &operator=(const CanvasContextImpl &) = delete;
 
   float width() const { return width_; }
   float height() const { return height_; }
@@ -5080,7 +5850,8 @@ public:
   // cap/join/miter/dash — only the fields HTML canvas tracks that Cairo
   // has no native slot for (fill vs. stroke paint, globalAlpha, font,
   // text align/baseline, shadow) need to be mirrored by hand here.
-  void save() {
+  void save()
+  {
     cairo_save(cr_);
     ExtraState s;
     s.fill = fillPaint_;
@@ -5094,7 +5865,8 @@ public:
     s.shadowOffsetY = shadowOffsetY_;
     extraStack_.push_back(std::move(s));
   }
-  void restore() {
+  void restore()
+  {
     cairo_restore(cr_);
     if (extraStack_.empty())
       return;
@@ -5115,7 +5887,8 @@ public:
   void translate(float x, float y) { cairo_translate(cr_, x, y); }
   void rotate(float radians) { cairo_rotate(cr_, radians); }
   void scale(float sx, float sy) { cairo_scale(cr_, sx, sy); }
-  void transformBy(float a, float b, float c, float d, float e, float f) {
+  void transformBy(float a, float b, float c, float d, float e, float f)
+  {
     cairo_matrix_t m;
     m.xx = a;
     m.yx = b;
@@ -5125,7 +5898,8 @@ public:
     m.y0 = f;
     cairo_transform(cr_, &m);
   }
-  void setTransform(float a, float b, float c, float d, float e, float f) {
+  void setTransform(float a, float b, float c, float d, float e, float f)
+  {
     cairo_matrix_t m;
     m.xx = a;
     m.yx = b;
@@ -5141,27 +5915,32 @@ public:
   void setFillColor(Color c) { fillPaint_ = Paint::solid(c); }
   void setFillGradient(const CanvasGradient &g) { fillPaint_ = Paint::grad(g); }
   void setStrokeColor(Color c) { strokePaint_ = Paint::solid(c); }
-  void setStrokeGradient(const CanvasGradient &g) {
+  void setStrokeGradient(const CanvasGradient &g)
+  {
     strokePaint_ = Paint::grad(g);
   }
   void setLineWidth(float w) { cairo_set_line_width(cr_, std::max(0.0f, w)); }
-  void setLineCap(LineCap c) {
+  void setLineCap(LineCap c)
+  {
     cairo_set_line_cap(cr_, c == LineCap::Round    ? CAIRO_LINE_CAP_ROUND
                             : c == LineCap::Square ? CAIRO_LINE_CAP_SQUARE
                                                    : CAIRO_LINE_CAP_BUTT);
   }
-  void setLineJoin(LineJoin j) {
+  void setLineJoin(LineJoin j)
+  {
     cairo_set_line_join(cr_, j == LineJoin::Round   ? CAIRO_LINE_JOIN_ROUND
                              : j == LineJoin::Bevel ? CAIRO_LINE_JOIN_BEVEL
                                                     : CAIRO_LINE_JOIN_MITER);
   }
   void setMiterLimit(float m) { cairo_set_miter_limit(cr_, m); }
-  void setLineDash(const std::vector<float> &dashes) {
+  void setLineDash(const std::vector<float> &dashes)
+  {
     std::vector<double> d(dashes.begin(), dashes.end());
     cairo_set_dash(cr_, d.empty() ? nullptr : d.data(),
                    static_cast<int>(d.size()), dashOffset_);
   }
-  void setLineDashOffset(float offset) {
+  void setLineDashOffset(float offset)
+  {
     dashOffset_ = offset;
     int n = cairo_get_dash_count(cr_);
     std::vector<double> d(static_cast<size_t>(std::max(0, n)));
@@ -5170,18 +5949,21 @@ public:
     cairo_set_dash(cr_, n > 0 ? d.data() : nullptr, n, offset);
   }
   void setGlobalAlpha(float a) { globalAlpha_ = std::clamp(a, 0.0f, 1.0f); }
-  void setGlobalCompositeOperation(CompositeOp op) {
+  void setGlobalCompositeOperation(CompositeOp op)
+  {
     cairo_set_operator(cr_, toCairoOp(op));
   }
   void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
-                 float offsetX, float offsetY) {
+                 float offsetX, float offsetY)
+  {
     shadowColor_ = color;
     shadowOffsetX_ = offsetX;
     shadowOffsetY_ = offsetY;
   }
   void setFont(const std::string &family, float sizePx,
                FontWeight weight = FontWeight::Regular,
-               FontStyle style = FontStyle::Normal) {
+               FontStyle style = FontStyle::Normal)
+  {
     font_.fontFamily = family;
     font_.fontSize = sizePx;
     font_.fontWeight = weight;
@@ -5195,7 +5977,8 @@ public:
   void closePath() { cairo_close_path(cr_); }
   void moveTo(float x, float y) { cairo_move_to(cr_, x, y); }
   void lineTo(float x, float y) { cairo_line_to(cr_, x, y); }
-  void quadraticCurveTo(float cpx, float cpy, float x, float y) {
+  void quadraticCurveTo(float cpx, float cpy, float x, float y)
+  {
     double cx0 = 0, cy0 = 0;
     if (cairo_has_current_point(cr_))
       cairo_get_current_point(cr_, &cx0, &cy0);
@@ -5208,17 +5991,20 @@ public:
     cairo_curve_to(cr_, c1x, c1y, c2x, c2y, x, y);
   }
   void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x,
-                     float y) {
+                     float y)
+  {
     cairo_curve_to(cr_, c1x, c1y, c2x, c2y, x, y);
   }
   void arc(float cx, float cy, float r, float startAngle, float endAngle,
-           bool ccw = false) {
+           bool ccw = false)
+  {
     if (ccw)
       cairo_arc_negative(cr_, cx, cy, r, startAngle, endAngle);
     else
       cairo_arc(cr_, cx, cy, r, startAngle, endAngle);
   }
-  void arcTo(float x1, float y1, float x2, float y2, float radius) {
+  void arcTo(float x1, float y1, float x2, float y2, float radius)
+  {
     double x0 = 0, y0 = 0;
     if (cairo_has_current_point(cr_))
       cairo_get_current_point(cr_, &x0, &y0);
@@ -5226,7 +6012,8 @@ public:
     float dx2 = x2 - x1, dy2 = y2 - y1;
     float len1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
     float len2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
-    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0) {
+    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0)
+    {
       cairo_line_to(cr_, x1, y1);
       return;
     }
@@ -5236,7 +6023,8 @@ public:
     dy2 /= len2;
     float cosA = std::clamp(dx1 * dx2 + dy1 * dy2, -1.0f, 1.0f);
     float angle = std::acos(cosA);
-    if (angle < 1e-6f) {
+    if (angle < 1e-6f)
+    {
       cairo_line_to(cr_, x1, y1);
       return;
     }
@@ -5246,7 +6034,8 @@ public:
     cairo_line_to(cr_, t1x, t1y);
     float bisx = dx1 + dx2, bisy = dy1 + dy2;
     float bisLen = std::sqrt(bisx * bisx + bisy * bisy);
-    if (bisLen < 1e-6f) {
+    if (bisLen < 1e-6f)
+    {
       cairo_line_to(cr_, x1, y1);
       return;
     }
@@ -5263,7 +6052,8 @@ public:
       cairo_arc(cr_, ccx, ccy, radius, a0, a1);
   }
   void ellipse(float cx, float cy, float rx, float ry, float rotation,
-               float startAngle, float endAngle, bool ccw = false) {
+               float startAngle, float endAngle, bool ccw = false)
+  {
     // Standard Cairo idiom: build the arc against a unit circle under a
     // temporarily scaled/rotated/translated CTM, then restore — the path
     // points get baked into the OUTER coordinate system as this shape's
@@ -5279,10 +6069,12 @@ public:
       cairo_arc(cr_, 0, 0, 1, startAngle, endAngle);
     cairo_restore(cr_);
   }
-  void rect(float x, float y, float w, float h) {
+  void rect(float x, float y, float w, float h)
+  {
     cairo_rectangle(cr_, x, y, w, h);
   }
-  void roundRect(float x, float y, float w, float h, float radius) {
+  void roundRect(float x, float y, float w, float h, float radius)
+  {
     constexpr float kPi = 3.14159265358979f;
     radius = std::max(0.0f, std::min(radius, std::min(w, h) / 2.0f));
     cairo_move_to(cr_, x + radius, y);
@@ -5301,42 +6093,52 @@ public:
   // fill()/stroke()/clip() preserve the current path (via the *_preserve
   // variants), matching HTML canvas semantics where only beginPath()
   // clears it.
-  void fill(FillRule rule = FillRule::NonZero) {
+  void fill(FillRule rule = FillRule::NonZero)
+  {
     cairo_set_fill_rule(cr_, rule == FillRule::EvenOdd
                                  ? CAIRO_FILL_RULE_EVEN_ODD
                                  : CAIRO_FILL_RULE_WINDING);
-    drawShadowThenReal([&] { cairo_fill_preserve(cr_); }, fillPaint_);
+    drawShadowThenReal([&]
+                       { cairo_fill_preserve(cr_); }, fillPaint_);
   }
-  void stroke() {
-    drawShadowThenReal([&] { cairo_stroke_preserve(cr_); }, strokePaint_);
+  void stroke()
+  {
+    drawShadowThenReal([&]
+                       { cairo_stroke_preserve(cr_); }, strokePaint_);
   }
-  void clip(FillRule rule = FillRule::NonZero) {
+  void clip(FillRule rule = FillRule::NonZero)
+  {
     cairo_set_fill_rule(cr_, rule == FillRule::EvenOdd
                                  ? CAIRO_FILL_RULE_EVEN_ODD
                                  : CAIRO_FILL_RULE_WINDING);
     cairo_clip_preserve(cr_);
   }
-  void fillRect(float x, float y, float w, float h) {
+  void fillRect(float x, float y, float w, float h)
+  {
     cairo_path_t *orig = cairo_copy_path(cr_);
     cairo_new_path(cr_);
     cairo_rectangle(cr_, x, y, w, h);
-    drawShadowThenReal([&] { cairo_fill(cr_); }, fillPaint_);
+    drawShadowThenReal([&]
+                       { cairo_fill(cr_); }, fillPaint_);
     cairo_new_path(cr_);
     cairo_append_path(cr_, orig);
     cairo_path_destroy(orig);
   }
-  void strokeRect(float x, float y, float w, float h) {
+  void strokeRect(float x, float y, float w, float h)
+  {
     cairo_path_t *orig = cairo_copy_path(cr_);
     cairo_new_path(cr_);
     cairo_rectangle(cr_, x, y, w, h);
-    drawShadowThenReal([&] { cairo_stroke(cr_); }, strokePaint_);
+    drawShadowThenReal([&]
+                       { cairo_stroke(cr_); }, strokePaint_);
     cairo_new_path(cr_);
     cairo_append_path(cr_, orig);
     cairo_path_destroy(orig);
   }
   // A true partial-area clear (unlike the Windows backend — see the
   // Canvas limitations note), implemented via CAIRO_OPERATOR_CLEAR.
-  void clearRect(float x, float y, float w, float h) {
+  void clearRect(float x, float y, float w, float h)
+  {
     cairo_path_t *orig = cairo_copy_path(cr_);
     cairo_new_path(cr_);
     cairo_rectangle(cr_, x, y, w, h);
@@ -5350,10 +6152,8 @@ public:
   }
 
   // ---- text ----
-  struct TextMetricsResult {
-    float width;
-  };
-  TextMetricsResult measureText(const std::string &text) {
+  TextMetricsResult measureText(const std::string &text)
+  {
     TextStyle ts = fontToTextStyle();
     PangoLayout *layout = liteui_text::makeLayout(
         text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
@@ -5364,22 +6164,26 @@ public:
     return {static_cast<float>(w)};
   }
   void fillText(const std::string &text, float x, float y,
-                float maxWidth = -1) {
+                float maxWidth = -1)
+  {
     drawTextImpl(text, x, y, maxWidth, false);
   }
   void strokeText(const std::string &text, float x, float y,
-                  float maxWidth = -1) {
+                  float maxWidth = -1)
+  {
     drawTextImpl(text, x, y, maxWidth, true);
   }
 
   // ---- images ----
-  void drawImage(const CanvasImage &img, float dx, float dy) {
+  void drawImage(const CanvasImage &img, float dx, float dy)
+  {
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy,
               static_cast<float>(img.width), static_cast<float>(img.height));
   }
   void drawImage(const CanvasImage &img, float dx, float dy, float dw,
-                 float dh) {
+                 float dh)
+  {
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy, dw, dh);
   }
@@ -5389,7 +6193,8 @@ public:
   // caching heuristic and the same caveat about in-place pixel mutation
   // applies here).
   void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
-                 float dx, float dy, float dw, float dh) {
+                 float dx, float dy, float dw, float dh)
+  {
     if (img.width <= 0 || img.height <= 0)
       return;
     cairo_surface_t *surf = nullptr;
@@ -5399,11 +6204,15 @@ public:
         imageCacheOwner_->cachedImagePixelsSize == img.pixels.size() &&
         imageCacheOwner_->cachedImageW == img.width &&
         imageCacheOwner_->cachedImageH == img.height;
-    if (cacheHit) {
+    if (cacheHit)
+    {
       surf = imageCacheOwner_->cachedImageSurface;
-    } else {
+    }
+    else
+    {
       surf = imageToCairoSurface(img);
-      if (imageCacheOwner_) {
+      if (imageCacheOwner_)
+      {
         if (imageCacheOwner_->cachedImageSurface)
           cairo_surface_destroy(imageCacheOwner_->cachedImageSurface);
         imageCacheOwner_->cachedImageSurface = surf;
@@ -5430,7 +6239,8 @@ public:
   // ---- pixel data ----
   // Fully supported: reads straight out of this canvas's own backing
   // Cairo image surface (the render target `cr_` draws into).
-  std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
+  std::optional<CanvasImage> getImageData(float x, float y, float w, float h)
+  {
     cairo_surface_t *target = cairo_get_target(cr_);
     cairo_surface_flush(target);
     int sw = cairo_image_surface_get_width(target);
@@ -5442,11 +6252,13 @@ public:
     CanvasImage out(iw, ih);
     unsigned char *src = cairo_image_surface_get_data(target);
     int stride = cairo_image_surface_get_stride(target);
-    for (int row = 0; row < ih; ++row) {
+    for (int row = 0; row < ih; ++row)
+    {
       int sy = iy + row;
       if (sy < 0 || sy >= sh)
         continue;
-      for (int col = 0; col < iw; ++col) {
+      for (int col = 0; col < iw; ++col)
+      {
         int sx = ix + col;
         if (sx < 0 || sx >= sw)
           continue;
@@ -5464,7 +6276,8 @@ public:
   }
   // putImageData ignores the current transform/compositing and pokes
   // pixels directly, matching HTML canvas semantics.
-  void putImageData(const CanvasImage &img, float dx, float dy) {
+  void putImageData(const CanvasImage &img, float dx, float dy)
+  {
     if (img.width <= 0 || img.height <= 0)
       return;
     cairo_surface_t *target = cairo_get_target(cr_);
@@ -5475,11 +6288,13 @@ public:
     int stride = cairo_image_surface_get_stride(target);
     int ix = static_cast<int>(std::round(dx)),
         iy = static_cast<int>(std::round(dy));
-    for (int row = 0; row < img.height; ++row) {
+    for (int row = 0; row < img.height; ++row)
+    {
       int ty = iy + row;
       if (ty < 0 || ty >= sh)
         continue;
-      for (int col = 0; col < img.width; ++col) {
+      for (int col = 0; col < img.width; ++col)
+      {
         int tx = ix + col;
         if (tx < 0 || tx >= sw)
           continue;
@@ -5498,17 +6313,20 @@ public:
   }
 
 private:
-  struct Paint {
+  struct Paint
+  {
     bool isGradient = false;
     Color color{0, 0, 0, 255};
     CanvasGradient gradient;
-    static Paint solid(Color c) {
+    static Paint solid(Color c)
+    {
       Paint p;
       p.isGradient = false;
       p.color = c;
       return p;
     }
-    static Paint grad(const CanvasGradient &g) {
+    static Paint grad(const CanvasGradient &g)
+    {
       Paint p;
       p.isGradient = true;
       p.gradient = g;
@@ -5516,7 +6334,8 @@ private:
     }
   };
 
-  struct ExtraState {
+  struct ExtraState
+  {
     Paint fill, stroke;
     float globalAlpha;
     TextStyle font;
@@ -5526,15 +6345,18 @@ private:
     float shadowOffsetX, shadowOffsetY;
   };
 
-  static Color colorOf(const Paint &p) {
+  static Color colorOf(const Paint &p)
+  {
     if (!p.isGradient)
       return p.color;
     return p.gradient.stops.empty() ? Color{0, 0, 0, 255}
                                     : p.gradient.stops.front().color;
   }
 
-  static cairo_operator_t toCairoOp(CompositeOp op) {
-    switch (op) {
+  static cairo_operator_t toCairoOp(CompositeOp op)
+  {
+    switch (op)
+    {
     case CompositeOp::SourceOver:
       return CAIRO_OPERATOR_OVER;
     case CompositeOp::SourceIn:
@@ -5565,8 +6387,10 @@ private:
     return CAIRO_OPERATOR_OVER;
   }
 
-  void applyPaint(const Paint &p) {
-    if (!p.isGradient) {
+  void applyPaint(const Paint &p)
+  {
+    if (!p.isGradient)
+    {
       Color c = p.color;
       cairo_set_source_rgba(cr_, c.r / 255.0, c.g / 255.0, c.b / 255.0,
                             (c.a / 255.0) * globalAlpha_);
@@ -5595,9 +6419,12 @@ private:
   // the app's original path back afterward, since fill()/stroke() must
   // leave the current path exactly as HTML canvas would (untouched,
   // aside from the intentional *_preserve semantics).
-  template <class Fn> void drawShadowThenReal(Fn drawFn, const Paint &paint) {
+  template <class Fn>
+  void drawShadowThenReal(Fn drawFn, const Paint &paint)
+  {
     cairo_path_t *orig = cairo_copy_path(cr_);
-    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0)) {
+    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0))
+    {
       cairo_save(cr_);
       cairo_translate(cr_, shadowOffsetX_, shadowOffsetY_);
       cairo_new_path(cr_);
@@ -5613,30 +6440,36 @@ private:
     cairo_path_destroy(orig);
   }
 
-  static cairo_surface_t *imageToCairoSurface(const CanvasImage &img) {
+  static cairo_surface_t *imageToCairoSurface(const CanvasImage &img)
+  {
     int w = img.width, h = img.height;
     cairo_surface_t *surf =
         cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     cairo_surface_flush(surf);
     unsigned char *data = cairo_image_surface_get_data(surf);
     int stride = cairo_image_surface_get_stride(surf);
-    for (int row = 0; row < h; ++row) {
+    for (int row = 0; row < h; ++row)
+    {
       unsigned char *dst = data + row * stride;
       const unsigned char *src =
           img.pixels.data() + static_cast<size_t>(row) * w * 4;
-      for (int col = 0; col < w; ++col) {
+      for (int col = 0; col < w; ++col)
+      {
         unsigned char r = src[col * 4 + 0], g = src[col * 4 + 1],
                       b = src[col * 4 + 2], a = src[col * 4 + 3];
         // Cairo's ARGB32 wants premultiplied, native-endian 32-bit
         // pixels — byte order B,G,R,A on the little-endian platforms
         // this file targets (same convention as ensureTextTexture above).
         unsigned char *px = dst + col * 4;
-        if (a == 255) { // opaque: premultiply is a no-op (x * 255 / 255 == x)
+        if (a == 255)
+        { // opaque: premultiply is a no-op (x * 255 / 255 == x)
           px[0] = b;
           px[1] = g;
           px[2] = r;
           px[3] = 255;
-        } else {
+        }
+        else
+        {
           px[0] = static_cast<unsigned char>(b * a / 255);
           px[1] = static_cast<unsigned char>(g * a / 255);
           px[2] = static_cast<unsigned char>(r * a / 255);
@@ -5648,7 +6481,8 @@ private:
     return surf;
   }
 
-  TextStyle fontToTextStyle() const {
+  TextStyle fontToTextStyle() const
+  {
     TextStyle ts = font_;
     ts.wrap = TextWrap::NoWrap;
     return ts;
@@ -5657,7 +6491,8 @@ private:
   // maxWidth is accepted for API familiarity with HTML canvas but not
   // currently applied (no horizontal squeeze-to-fit is performed).
   void drawTextImpl(const std::string &text, float x, float y, float,
-                    bool stroked) {
+                    bool stroked)
+  {
     TextStyle ts = fontToTextStyle();
     PangoLayout *layout = liteui_text::makeLayout(
         text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
@@ -5668,7 +6503,8 @@ private:
     int baseline = pango_layout_iter_get_baseline(iter) / PANGO_SCALE;
     pango_layout_iter_free(iter);
     float baseX = x, baseY = y;
-    switch (textAlign_) {
+    switch (textAlign_)
+    {
     case TextAlign::Center:
       baseX -= pw / 2.0f;
       break;
@@ -5678,7 +6514,8 @@ private:
     default:
       break;
     }
-    switch (textBaseline_) {
+    switch (textBaseline_)
+    {
     case TextBaseline::Top:
       break;
     case TextBaseline::Middle:
@@ -5692,7 +6529,8 @@ private:
       baseY -= static_cast<float>(baseline);
       break;
     }
-    auto paintOnce = [&](Color c, float ox, float oy) {
+    auto paintOnce = [&](Color c, float ox, float oy)
+    {
       cairo_set_source_rgba(cr_, c.r / 255.0, c.g / 255.0, c.b / 255.0,
                             (c.a / 255.0) * globalAlpha_);
       cairo_move_to(cr_, baseX + ox, baseY + oy);
@@ -5700,9 +6538,12 @@ private:
     };
     if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0))
       paintOnce(shadowColor_, shadowOffsetX_, shadowOffsetY_);
-    if (!stroked) {
+    if (!stroked)
+    {
       paintOnce(colorOf(fillPaint_), 0, 0);
-    } else {
+    }
+    else
+    {
       // Approximates a stroked glyph outline the same way the Windows
       // backend does (see its drawTextImpl comment) — not a true glyph
       // contour outline.
@@ -5710,8 +6551,7 @@ private:
       double lw = cairo_get_line_width(cr_);
       float r = static_cast<float>(std::max(1.0, lw / 2.0));
       static const float offs[8][2] = {
-          {1, 0},       {-1, 0},       {0, 1},        {0, -1},
-          {0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f, -0.7f}, {-0.7f, -0.7f}};
+          {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f, -0.7f}, {-0.7f, -0.7f}};
       for (auto &o : offs)
         paintOnce(base, o[0] * r, o[1] * r);
     }
@@ -5758,596 +6598,640 @@ private:
 // assumes a single line, since a Fit main axis has no definite width to
 // wrap against in the first place; give the container a definite/Full main
 // size if you want Fit-height wrapping content to actually wrap.
-namespace liteui_layout {
+namespace liteui_layout
+{
 
-struct Natural {
-  float w, h;
-};
+  struct Natural
+  {
+    float w, h;
+  };
 
-inline float resolveAxis(const Size &s, float available, bool definite,
-                         float fitValue) {
-  switch (s.kind) {
-  case Size::Kind::Fixed:
-    return s.value;
-  case Size::Kind::Percentage:
-    return definite ? available * s.value / 100.0f : fitValue;
-  case Size::Kind::Full:
-    return definite ? available : fitValue;
-  case Size::Kind::Fit:
+  inline float resolveAxis(const Size &s, float available, bool definite,
+                           float fitValue)
+  {
+    switch (s.kind)
+    {
+    case Size::Kind::Fixed:
+      return s.value;
+    case Size::Kind::Percentage:
+      return definite ? available * s.value / 100.0f : fitValue;
+    case Size::Kind::Full:
+      return definite ? available : fitValue;
+    case Size::Kind::Fit:
+      return fitValue;
+    }
     return fitValue;
   }
-  return fitValue;
-}
 
-// Clamps a resolved axis size into [minV, maxV], guarding against a
-// misconfigured maxV < minV by falling back to minV.
-inline float clampSize(float v, float minV, float maxV) {
-  return std::clamp(v, minV, std::max(minV, maxV));
-}
+  // Clamps a resolved axis size into [minV, maxV], guarding against a
+  // misconfigured maxV < minV by falling back to minV.
+  inline float clampSize(float v, float minV, float maxV)
+  {
+    return std::clamp(v, minV, std::max(minV, maxV));
+  }
 
-// Whether a given axis's scrollbar should actually be drawn/interactive:
-// Scroll always shows it, Auto shows it only once content overflows the
-// viewport (the "+ 0.5" is just slack against float rounding so a
-// perfectly-fitting container doesn't flicker a bar on and off), and
-// Hidden/Visible never do. Used by both placeNode (to decide whether to
-// reserve gutter space for it) and every renderer/hit-tester (to decide
-// whether to draw/click it) — kept as one function so those two places
-// can never disagree about whether a bar is showing.
-inline bool axisScrollbarVisible(Overflow ov, float content, float viewport) {
-  if (ov == Overflow::Scroll)
-    return true;
-  if (ov == Overflow::Auto)
-    return content > viewport + 0.5f;
-  return false; // Visible, Hidden
-}
+  // Whether a given axis's scrollbar should actually be drawn/interactive:
+  // Scroll always shows it, Auto shows it only once content overflows the
+  // viewport (the "+ 0.5" is just slack against float rounding so a
+  // perfectly-fitting container doesn't flicker a bar on and off), and
+  // Hidden/Visible never do. Used by both placeNode (to decide whether to
+  // reserve gutter space for it) and every renderer/hit-tester (to decide
+  // whether to draw/click it) — kept as one function so those two places
+  // can never disagree about whether a bar is showing.
+  inline bool axisScrollbarVisible(Overflow ov, float content, float viewport)
+  {
+    if (ov == Overflow::Scroll)
+      return true;
+    if (ov == Overflow::Auto)
+      return content > viewport + 0.5f;
+    return false; // Visible, Hidden
+  }
 
-// Takes node by non-const reference (unlike the rest of this "measure"
-// pass, which is conceptually read-only) for exactly one reason: a scroll
-// container's natural content size — the scrollable extent — needs to be
-// recorded somewhere for later use by placeNode() (to offset/clip
-// children), by the scrollbar-thumb sizing code, and by input handling
-// (to know how far a drag/wheel event is allowed to move the scroll
-// offset). node.computed.contentW/contentH is that somewhere. Everything
-// else this function does is still the same bottom-up size query it always
-// was.
-inline Natural measureNatural(View &node, float availW, float availH,
-                              bool wDefinite, bool hDefinite) {
-  const Size &styleWidth =
-      resolveDynamic(node.style.width, node.computed.resolvedWidth);
-  const Size &styleHeight =
-      resolveDynamic(node.style.height, node.computed.resolvedHeight);
-  if (node.isText) {
+  // Takes node by non-const reference (unlike the rest of this "measure"
+  // pass, which is conceptually read-only) for exactly one reason: a scroll
+  // container's natural content size — the scrollable extent — needs to be
+  // recorded somewhere for later use by placeNode() (to offset/clip
+  // children), by the scrollbar-thumb sizing code, and by input handling
+  // (to know how far a drag/wheel event is allowed to move the scroll
+  // offset). node.computed.contentW/contentH is that somewhere. Everything
+  // else this function does is still the same bottom-up size query it always
+  // was.
+  inline Natural measureNatural(View &node, float availW, float availH,
+                                bool wDefinite, bool hDefinite)
+  {
+    const Size &styleWidth =
+        resolveDynamic(node.style.width, node.computed.resolvedWidth);
+    const Size &styleHeight =
+        resolveDynamic(node.style.height, node.computed.resolvedHeight);
+    if (node.isText)
+    {
+      const EdgeInsets &pad =
+          resolveDynamic(node.style.padding, node.computed.resolvedPadding);
+      bool widthIsFit = styleWidth.kind == Size::Kind::Fit;
+      bool widthIndefinitePercentage =
+          styleWidth.kind == Size::Kind::Percentage && !wDefinite;
+      float outerW = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
+                               node.style.minWidth, node.style.maxWidth);
+      float measureWidth = (widthIsFit || widthIndefinitePercentage)
+                               ? -1.0f
+                               : std::max(0.0f, outerW - pad.left - pad.right);
+      liteui_text::Measurement m = liteui_text::measure(
+          resolveDynamic(node.text, node.computed.resolvedText), node.textStyle,
+          resolveDynamic(node.textStyle.fontSize, node.computed.resolvedFontSize),
+          resolveDynamic(node.textStyle.fontWeight,
+                         node.computed.resolvedFontWeight),
+          resolveDynamic(node.textStyle.fontStyle,
+                         node.computed.resolvedFontStyle),
+          measureWidth);
+      float w = (widthIsFit || widthIndefinitePercentage)
+                    ? clampSize(m.width + pad.left + pad.right,
+                                node.style.minWidth, node.style.maxWidth)
+                    : outerW;
+      float naturalH = m.height + pad.top + pad.bottom;
+      float h =
+          clampSize(styleHeight.kind == Size::Kind::Fit
+                        ? naturalH
+                        : resolveAxis(styleHeight, availH, hDefinite, naturalH),
+                    node.style.minHeight, node.style.maxHeight);
+      return {w, h};
+    }
+    bool horizontal = node.style.direction == FlexDirection::Row;
     const EdgeInsets &pad =
         resolveDynamic(node.style.padding, node.computed.resolvedPadding);
-    bool widthIsFit = styleWidth.kind == Size::Kind::Fit;
-    bool widthIndefinitePercentage =
-        styleWidth.kind == Size::Kind::Percentage && !wDefinite;
-    float outerW = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
-                             node.style.minWidth, node.style.maxWidth);
-    float measureWidth = (widthIsFit || widthIndefinitePercentage)
-                             ? -1.0f
-                             : std::max(0.0f, outerW - pad.left - pad.right);
-    liteui_text::Measurement m = liteui_text::measure(
-        resolveDynamic(node.text, node.computed.resolvedText), node.textStyle,
-        resolveDynamic(node.textStyle.fontSize, node.computed.resolvedFontSize),
-        resolveDynamic(node.textStyle.fontWeight,
-                       node.computed.resolvedFontWeight),
-        resolveDynamic(node.textStyle.fontStyle,
-                       node.computed.resolvedFontStyle),
-        measureWidth);
-    float w = (widthIsFit || widthIndefinitePercentage)
-                  ? clampSize(m.width + pad.left + pad.right,
-                              node.style.minWidth, node.style.maxWidth)
-                  : outerW;
-    float naturalH = m.height + pad.top + pad.bottom;
-    float h =
-        clampSize(styleHeight.kind == Size::Kind::Fit
-                      ? naturalH
-                      : resolveAxis(styleHeight, availH, hDefinite, naturalH),
-                  node.style.minHeight, node.style.maxHeight);
+    bool needW = styleWidth.kind == Size::Kind::Fit;
+    bool needH = styleHeight.kind == Size::Kind::Fit;
+    bool scrollX = node.scrollsX();
+    bool scrollY = node.scrollsY();
+
+    float w = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
+                        node.style.minWidth, node.style.maxWidth);
+    float h = clampSize(resolveAxis(styleHeight, availH, hDefinite, 0),
+                        node.style.minHeight, node.style.maxHeight);
+    // A scroll container must still visit its children even when neither
+    // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
+    // point: we need to know how big the content *wants* to be so we know
+    // how far it can scroll, even though the container's own box size
+    // doesn't depend on that at all.
+    if ((!needW && !needH && !scrollX && !scrollY) || node.children.empty())
+      return {w, h};
+
+    // Along an axis this node scrolls, children are measured against
+    // effectively unbounded space so they report their true desired size
+    // instead of being squeezed into the viewport — that natural total is
+    // exactly the "scrollable extent". Along a non-scrolling axis, sizing is
+    // unchanged from before (children measured against the resolved inner
+    // box, or against availW/availH while this node's own size is still
+    // being figured out).
+    constexpr float kUnbounded = std::numeric_limits<float>::max() / 4;
+    float innerW = scrollX ? kUnbounded
+                   : (wDefinite && !needW)
+                       ? std::max(0.0f, w - pad.left - pad.right)
+                       : availW;
+    float innerH = scrollY ? kUnbounded
+                   : (hDefinite && !needH)
+                       ? std::max(0.0f, h - pad.top - pad.bottom)
+                       : availH;
+
+    float mainTotal = 0, crossMax = 0;
+    bool firstFlow = true;
+    for (size_t i = 0; i < node.children.size(); ++i)
+    {
+      View &c = node.children[i];
+      if (c.style.position == Position::Absolute ||
+          resolveDynamic(c.style.display, c.computed.resolvedDisplay) ==
+              Display::None)
+        continue;
+      Natural cn = measureNatural(c, innerW, innerH,
+                                  scrollX ? false : (wDefinite || !needW),
+                                  scrollY ? false : (hDefinite || !needH));
+      const EdgeInsets &cMargin =
+          resolveDynamic(c.style.margin, c.computed.resolvedMargin);
+      float mm = cMargin.left + cMargin.right;
+      float mv = cMargin.top + cMargin.bottom;
+      float childMain = horizontal ? cn.w + mm : cn.h + mv;
+      float childCross = horizontal ? cn.h + mv : cn.w + mm;
+      if (!firstFlow)
+        mainTotal += node.style.gap;
+      mainTotal += childMain;
+      crossMax = std::max(crossMax, childCross);
+      firstFlow = false;
+    }
+    if (needW)
+      w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
+                    node.style.minWidth, node.style.maxWidth);
+
+    if (needH)
+      h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
+                    node.style.minHeight, node.style.maxHeight);
+
+    // Content extent is deliberately NOT run through clampSize/min-max: a
+    // container's max-width doesn't shrink its *content*, only its own box
+    // (that's the entire reason overflow is a thing).
+    if (scrollX)
+      node.computed.contentW =
+          (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
+    if (scrollY)
+      node.computed.contentH =
+          (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
     return {w, h};
   }
-  bool horizontal = node.style.direction == FlexDirection::Row;
-  const EdgeInsets &pad =
-      resolveDynamic(node.style.padding, node.computed.resolvedPadding);
-  bool needW = styleWidth.kind == Size::Kind::Fit;
-  bool needH = styleHeight.kind == Size::Kind::Fit;
-  bool scrollX = node.scrollsX();
-  bool scrollY = node.scrollsY();
 
-  float w = clampSize(resolveAxis(styleWidth, availW, wDefinite, 0),
-                      node.style.minWidth, node.style.maxWidth);
-  float h = clampSize(resolveAxis(styleHeight, availH, hDefinite, 0),
-                      node.style.minHeight, node.style.maxHeight);
-  // A scroll container must still visit its children even when neither
-  // axis is Fit (e.g. a fixed-size scrollable box) — that's the whole
-  // point: we need to know how big the content *wants* to be so we know
-  // how far it can scroll, even though the container's own box size
-  // doesn't depend on that at all.
-  if ((!needW && !needH && !scrollX && !scrollY) || node.children.empty())
-    return {w, h};
-
-  // Along an axis this node scrolls, children are measured against
-  // effectively unbounded space so they report their true desired size
-  // instead of being squeezed into the viewport — that natural total is
-  // exactly the "scrollable extent". Along a non-scrolling axis, sizing is
-  // unchanged from before (children measured against the resolved inner
-  // box, or against availW/availH while this node's own size is still
-  // being figured out).
-  constexpr float kUnbounded = std::numeric_limits<float>::max() / 4;
-  float innerW = scrollX ? kUnbounded
-                 : (wDefinite && !needW)
-                     ? std::max(0.0f, w - pad.left - pad.right)
-                     : availW;
-  float innerH = scrollY ? kUnbounded
-                 : (hDefinite && !needH)
-                     ? std::max(0.0f, h - pad.top - pad.bottom)
-                     : availH;
-
-  float mainTotal = 0, crossMax = 0;
-  bool firstFlow = true;
-  for (size_t i = 0; i < node.children.size(); ++i) {
-    View &c = node.children[i];
-    if (c.style.position == Position::Absolute ||
-        resolveDynamic(c.style.display, c.computed.resolvedDisplay) ==
-            Display::None)
-      continue;
-    Natural cn = measureNatural(c, innerW, innerH,
-                                scrollX ? false : (wDefinite || !needW),
-                                scrollY ? false : (hDefinite || !needH));
-    const EdgeInsets &cMargin =
-        resolveDynamic(c.style.margin, c.computed.resolvedMargin);
-    float mm = cMargin.left + cMargin.right;
-    float mv = cMargin.top + cMargin.bottom;
-    float childMain = horizontal ? cn.w + mm : cn.h + mv;
-    float childCross = horizontal ? cn.h + mv : cn.w + mm;
-    if (!firstFlow)
-      mainTotal += node.style.gap;
-    mainTotal += childMain;
-    crossMax = std::max(crossMax, childCross);
-    firstFlow = false;
-  }
-  if (needW)
-    w = clampSize((horizontal ? mainTotal : crossMax) + pad.left + pad.right,
-                  node.style.minWidth, node.style.maxWidth);
-
-  if (needH)
-    h = clampSize((horizontal ? crossMax : mainTotal) + pad.top + pad.bottom,
-                  node.style.minHeight, node.style.maxHeight);
-
-  // Content extent is deliberately NOT run through clampSize/min-max: a
-  // container's max-width doesn't shrink its *content*, only its own box
-  // (that's the entire reason overflow is a thing).
-  if (scrollX)
-    node.computed.contentW =
-        (horizontal ? mainTotal : crossMax) + pad.left + pad.right;
-  if (scrollY)
-    node.computed.contentH =
-        (horizontal ? crossMax : mainTotal) + pad.top + pad.bottom;
-  return {w, h};
-}
-
-inline void placeNode(View &node, float x, float y, float w, float h) {
-  // contentW/contentH here already existed as "content's natural size" on
-  // node.computed before this call, set by the measureNatural() pass that
-  // ran over this same node earlier (either from the parent's per-child
-  // loop, or from layoutRoot() for the root). We're about to overwrite
-  // x/y/w/h with the final viewport box; contentW/contentH and
-  // scrollX/scrollY are left untouched by this assignment.
-  node.computed.x = x;
-  node.computed.y = y;
-  node.computed.w = w;
-  node.computed.h = h;
-  if (node.onLayout)
-    node.onLayout(x, y, w, h);
-
-  if (node.children.empty()) {
-    // No children means nothing to scroll regardless of overflow setting;
-    // pin the offset at 0 so a container that briefly had children (and
-    // therefore a scroll offset) doesn't leave a stale one behind if it's
-    // ever emptied out.
-    node.computed.scrollX = node.computed.scrollY = 0;
-    return;
-  }
-
-  bool horizontal = node.style.direction == FlexDirection::Row;
-  const EdgeInsets &pad =
-      resolveDynamic(node.style.padding, node.computed.resolvedPadding);
-  float contentW = std::max(0.0f, w - pad.left - pad.right);
-  float contentH = std::max(0.0f, h - pad.top - pad.bottom);
-
-  // ---- Scrolling: gutter reservation, offset clamping, content origin ----
-  // Whether each axis's scrollbar is actually showing determines whether it
-  // eats into the space available for children — same rule CSS uses (a
-  // visible scrollbar shrinks the content box on the OTHER axis; the
-  // scrolling axis itself is unbounded so its own bar doesn't need to
-  // "make room" against itself).
-  bool showVBar =
-      node.scrollsY() &&
-      axisScrollbarVisible(node.style.overflowY, node.computed.contentH, h);
-  bool showHBar =
-      node.scrollsX() &&
-      axisScrollbarVisible(node.style.overflowX, node.computed.contentW, w);
-  if (showVBar)
-    contentW = std::max(0.0f, contentW - kScrollbarThickness);
-  if (showHBar)
-    contentH = std::max(0.0f, contentH - kScrollbarThickness);
-
-  // Scroll offsets are user/input-driven state that can go stale the
-  // instant content size or viewport size changes (a window resize, or
-  // content shrinking), so every relayout re-clamps them into range rather
-  // than trusting whatever a previous frame left behind.
-  if (node.scrollsX())
-    node.computed.scrollX =
-        std::clamp(node.computed.scrollX, 0.0f, node.maxScrollX());
-  else
-    node.computed.scrollX = 0;
-  if (node.scrollsY())
-    node.computed.scrollY =
-        std::clamp(node.computed.scrollY, 0.0f, node.maxScrollY());
-  else
-    node.computed.scrollY = 0;
-
-  // The content origin simply shifts by the (clamped) scroll offset —
-  // children are positioned exactly as they would be at scroll (0,0), then
-  // this single subtraction slides the whole subtree. Clipping (handled by
-  // the renderers/hit-testers, not here) is what actually hides the part
-  // that scrolls out of view.
-  float contentX = x + pad.left - node.computed.scrollX;
-  float contentY = y + pad.top - node.computed.scrollY;
-
-  float mainAvail = horizontal ? contentW : contentH;
-  float crossAvail = horizontal ? contentH : contentW;
-  // A scrolling main axis must never let flexShrink squeeze children below
-  // their natural size just because the viewport is smaller than the
-  // content — that's the entire point of scrolling instead of shrinking.
-  // Widening mainAvail to at least the natural content total makes
-  // "leftover" in the flex-resolution pass below >= 0, which keeps every
-  // shrink factor's candidate at-or-above its unclamped basis.
-  if (horizontal && node.scrollsX())
-    mainAvail =
-        std::max(mainAvail, node.computed.contentW - pad.left - pad.right);
-  if (!horizontal && node.scrollsY())
-    mainAvail =
-        std::max(mainAvail, node.computed.contentH - pad.top - pad.bottom);
-
-  size_t n = node.children.size();
-  bool wrap = node.style.flexWrap == FlexWrap::Wrap;
-  std::vector<size_t> flowIdx;
-  flowIdx.reserve(node.children.size());
-  for (size_t i = 0; i < node.children.size(); ++i) {
-    const Style &cs = node.children[i].style;
-    if (cs.position != Position::Absolute &&
-        resolveDynamic(cs.display, node.children[i].computed.resolvedDisplay) !=
-            Display::None)
-      flowIdx.push_back(i);
-  }
-  n = flowIdx.size();
-  std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
-      mCrossE(n), minMain(n), maxMain(n), marginMain(n);
-
-  for (size_t k = 0; k < n; ++k) {
-    View &c = node.children[flowIdx[k]];
-    Natural cn = measureNatural(c, contentW, contentH, true, true);
-    const EdgeInsets &cMargin =
-        resolveDynamic(c.style.margin, c.computed.resolvedMargin);
-    basis[k] = horizontal ? cn.w : cn.h;
-    cross[k] = horizontal ? cn.h : cn.w;
-    mMainS[k] = horizontal ? cMargin.left : cMargin.top;
-    mMainE[k] = horizontal ? cMargin.right : cMargin.bottom;
-    mCrossS[k] = horizontal ? cMargin.top : cMargin.left;
-    mCrossE[k] = horizontal ? cMargin.bottom : cMargin.right;
-    minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
-    maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
-    marginMain[k] = mMainS[k] + mMainE[k];
-  }
-
-  // ---- Line breaking ----
-  // With wrap disabled this is always one line spanning every child (the
-  // original single-line behavior, byte-for-byte). With wrap enabled,
-  // children are greedily packed onto a line until the next child's basis
-  // would overflow mainAvail, at which point a new line starts. A line
-  // always takes at least one child, even an oversized one, so a single
-  // giant child can't stall the packer.
-  struct Line {
-    size_t begin, end; // half-open [begin, end) into node.children
-  };
-  std::vector<Line> lines;
-  if (!wrap) {
-    lines.push_back({0, n});
-  } else {
-    size_t start = 0;
-    float used = 0;
-    for (size_t i = 0; i < n; ++i) {
-      float itemMain = basis[i] + marginMain[i];
-      float withGap = (i > start) ? node.style.gap : 0.0f;
-      if (i > start && used + withGap + itemMain > mainAvail) {
-        lines.push_back({start, i});
-        start = i;
-        used = itemMain;
-      } else {
-        used += withGap + itemMain;
-      }
-    }
-    lines.push_back({start, n});
-  }
-
-  // ---- Per-line main-axis flex resolution ----
-  // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
-  // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
-  // algorithm, scoped to one line's children at a time. A single pass
-  // (basis + share of leftover, then clamp) would silently drop whatever a
-  // clamped child couldn't absorb; instead, any item whose share would
-  // violate its own bound gets frozen at that bound and removed from the
-  // pool, and the remaining free space is recalculated and redistributed
-  // among the still-flexible siblings. Repeats until nothing new freezes
-  // (at most one extra item freezes per pass, so ln+1 passes always
-  // suffices). Also tracks each line's cross size (max child cross extent)
-  // for the cross-axis distribution pass below.
-  std::vector<float> finalMain(n);
-  std::vector<float> lineCross(lines.size());
-  for (size_t li = 0; li < lines.size(); ++li) {
-    size_t lb = lines[li].begin, le = lines[li].end;
-    size_t ln = le - lb;
-    std::vector<bool> frozen(ln, false);
-    std::vector<float> lineFinal(ln);
-    float gapTotal = ln > 1 ? node.style.gap * (ln - 1) : 0.0f;
-
-    for (size_t pass = 0; pass <= ln; ++pass) {
-      float used = gapTotal, gsum = 0, ssum = 0;
-      for (size_t k = 0; k < ln; ++k) {
-        size_t i = lb + k;
-        used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
-        if (!frozen[k]) {
-          gsum += node.children[flowIdx[i]].style.flexGrow;
-          ssum += node.children[flowIdx[i]].style.flexShrink;
-        }
-      }
-      float leftover = mainAvail - used;
-      if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
-          (leftover < 0 && ssum <= 0)) {
-        for (size_t k = 0; k < ln; ++k)
-          if (!frozen[k])
-            lineFinal[k] =
-                clampSize(basis[lb + k], minMain[lb + k], maxMain[lb + k]);
-        break;
-      }
-      bool frozeAny = false;
-      for (size_t k = 0; k < ln; ++k) {
-        if (frozen[k])
-          continue;
-        size_t i = lb + k;
-        const Style &cs = node.children[flowIdx[i]].style;
-        float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
-                                   : leftover * (cs.flexShrink / ssum);
-        float candidate = std::max(0.0f, basis[i] + extra);
-        float clamped = clampSize(candidate, minMain[i], maxMain[i]);
-        lineFinal[k] = clamped;
-        if (clamped != candidate) {
-          frozen[k] = true;
-          frozeAny = true;
-        }
-      }
-      if (!frozeAny)
-        break; // this pass's candidates all satisfied their bounds — done
-    }
-
-    float maxCross = 0;
-    for (size_t k = 0; k < ln; ++k) {
-      size_t i = lb + k;
-      finalMain[i] = lineFinal[k];
-      maxCross = std::max(maxCross, cross[i] + mCrossS[i] + mCrossE[i]);
-    }
-    lineCross[li] = maxCross;
-  }
-
-  // ---- Distribute lines along the cross axis (align-content) ----
-  // With exactly one line this collapses to the old behavior: Stretch
-  // grows that line to fill crossAvail (matching the previous unconditional
-  // stretch-to-container-cross-size), everything else just packs the one
-  // line at the start.
-  size_t numLines = lines.size();
-  float lineGapTotal = numLines > 1 ? node.style.gap * (numLines - 1) : 0.0f;
-  float linesTotal = lineGapTotal;
-  for (float lc : lineCross)
-    linesTotal += lc;
-  float crossFree = std::max(0.0f, crossAvail - linesTotal);
-
-  std::vector<float> lineOffset(numLines), lineSize(numLines);
-  float crossStart = 0, crossBetween = node.style.gap;
-  switch (node.style.alignContent) {
-  case AlignContent::Start:
-    lineSize = lineCross;
-    break;
-  case AlignContent::End:
-    crossStart = crossFree;
-    lineSize = lineCross;
-    break;
-  case AlignContent::Center:
-    crossStart = crossFree / 2;
-    lineSize = lineCross;
-    break;
-  case AlignContent::SpaceBetween:
-    if (numLines > 1)
-      crossBetween += crossFree / (numLines - 1);
-    lineSize = lineCross;
-    break;
-  case AlignContent::SpaceAround: {
-    float each = numLines ? crossFree / numLines : 0;
-    crossStart = each / 2;
-    crossBetween += each;
-    lineSize = lineCross;
-    break;
-  }
-  case AlignContent::SpaceEvenly: {
-    float each = crossFree / (numLines + 1);
-    crossStart = each;
-    crossBetween += each;
-    lineSize = lineCross;
-    break;
-  }
-  case AlignContent::Stretch: {
-    float extra = numLines ? crossFree / numLines : 0;
-    for (size_t li = 0; li < numLines; ++li)
-      lineSize[li] = lineCross[li] + extra;
-    break;
-  }
-  }
+  inline void placeNode(View &node, float x, float y, float w, float h)
   {
-    float pos = crossStart;
-    for (size_t li = 0; li < numLines; ++li) {
-      lineOffset[li] = pos;
-      pos += lineSize[li] + crossBetween;
-    }
-  }
+    // contentW/contentH here already existed as "content's natural size" on
+    // node.computed before this call, set by the measureNatural() pass that
+    // ran over this same node earlier (either from the parent's per-child
+    // loop, or from layoutRoot() for the root). We're about to overwrite
+    // x/y/w/h with the final viewport box; contentW/contentH and
+    // scrollX/scrollY are left untouched by this assignment.
+    node.computed.x = x;
+    node.computed.y = y;
+    node.computed.w = w;
+    node.computed.h = h;
+    if (node.onLayout)
+      node.onLayout(x, y, w, h);
 
-  // ---- Per-line: justify main axis, align children within the line's
-  // cross extent, then recurse ----
-  for (size_t li = 0; li < numLines; ++li) {
-    size_t lb = lines[li].begin, le = lines[li].end;
-    size_t ln = le - lb;
-    float lineCrossAvail = lineSize[li];
-    float lineCrossPos = (horizontal ? contentY : contentX) + lineOffset[li];
-
-    float totalUsed = 0;
-    for (size_t k = 0; k < ln; ++k) {
-      size_t i = lb + k;
-      totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
-      if (k + 1 < ln)
-        totalUsed += node.style.gap;
-    }
-    float freeSpace = std::max(0.0f, mainAvail - totalUsed);
-    float startOffset = 0, between = node.style.gap;
-    switch (node.style.justifyContent) {
-    case Justify::Start:
-      break;
-    case Justify::End:
-      startOffset = freeSpace;
-      break;
-    case Justify::Center:
-      startOffset = freeSpace / 2;
-      break;
-    case Justify::SpaceBetween:
-      if (ln > 1)
-        between += freeSpace / (ln - 1);
-      break;
-    case Justify::SpaceAround: {
-      float each = ln ? freeSpace / ln : 0;
-      startOffset = each / 2;
-      between += each;
-      break;
-    }
-    case Justify::SpaceEvenly: {
-      float each = freeSpace / (ln + 1);
-      startOffset = each;
-      between += each;
-      break;
-    }
+    if (node.children.empty())
+    {
+      // No children means nothing to scroll regardless of overflow setting;
+      // pin the offset at 0 so a container that briefly had children (and
+      // therefore a scroll offset) doesn't leave a stale one behind if it's
+      // ever emptied out.
+      node.computed.scrollX = node.computed.scrollY = 0;
+      return;
     }
 
-    float cursor = (horizontal ? contentX : contentY) + startOffset;
-    for (size_t k = 0; k < ln; ++k) {
-      size_t i = lb + k;
-      View &ch = node.children[flowIdx[i]];
-      cursor += mMainS[i];
+    bool horizontal = node.style.direction == FlexDirection::Row;
+    const EdgeInsets &pad =
+        resolveDynamic(node.style.padding, node.computed.resolvedPadding);
+    float contentW = std::max(0.0f, w - pad.left - pad.right);
+    float contentH = std::max(0.0f, h - pad.top - pad.bottom);
 
-      bool explicitCross =
-          horizontal
-              ? resolveDynamic(ch.style.height, ch.computed.resolvedHeight)
-                        .kind != Size::Kind::Fit
-              : resolveDynamic(ch.style.width, ch.computed.resolvedWidth)
-                        .kind != Size::Kind::Fit;
-      float finalCross = cross[i];
-      if (node.style.alignItems == Align::Stretch && !explicitCross)
-        finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
+    // ---- Scrolling: gutter reservation, offset clamping, content origin ----
+    // Whether each axis's scrollbar is actually showing determines whether it
+    // eats into the space available for children — same rule CSS uses (a
+    // visible scrollbar shrinks the content box on the OTHER axis; the
+    // scrolling axis itself is unbounded so its own bar doesn't need to
+    // "make room" against itself).
+    bool showVBar =
+        node.scrollsY() &&
+        axisScrollbarVisible(node.style.overflowY, node.computed.contentH, h);
+    bool showHBar =
+        node.scrollsX() &&
+        axisScrollbarVisible(node.style.overflowX, node.computed.contentW, w);
+    if (showVBar)
+      contentW = std::max(0.0f, contentW - kScrollbarThickness);
+    if (showHBar)
+      contentH = std::max(0.0f, contentH - kScrollbarThickness);
 
-      float minCross = horizontal ? ch.style.minHeight : ch.style.minWidth;
-      float maxCross = horizontal ? ch.style.maxHeight : ch.style.maxWidth;
-      finalCross = clampSize(finalCross, minCross, maxCross);
+    // Scroll offsets are user/input-driven state that can go stale the
+    // instant content size or viewport size changes (a window resize, or
+    // content shrinking), so every relayout re-clamps them into range rather
+    // than trusting whatever a previous frame left behind.
+    if (node.scrollsX())
+      node.computed.scrollX =
+          std::clamp(node.computed.scrollX, 0.0f, node.maxScrollX());
+    else
+      node.computed.scrollX = 0;
+    if (node.scrollsY())
+      node.computed.scrollY =
+          std::clamp(node.computed.scrollY, 0.0f, node.maxScrollY());
+    else
+      node.computed.scrollY = 0;
 
-      float crossOffset;
-      switch (node.style.alignItems) {
-      case Align::End:
-        crossOffset = lineCrossAvail - finalCross - mCrossE[i];
-        break;
-      case Align::Center:
-        crossOffset = (lineCrossAvail - finalCross) / 2;
-        break;
-      default:
-        crossOffset = mCrossS[i];
-        break; // Start & Stretch
+    // The content origin simply shifts by the (clamped) scroll offset —
+    // children are positioned exactly as they would be at scroll (0,0), then
+    // this single subtraction slides the whole subtree. Clipping (handled by
+    // the renderers/hit-testers, not here) is what actually hides the part
+    // that scrolls out of view.
+    float contentX = x + pad.left - node.computed.scrollX;
+    float contentY = y + pad.top - node.computed.scrollY;
+
+    float mainAvail = horizontal ? contentW : contentH;
+    float crossAvail = horizontal ? contentH : contentW;
+    // A scrolling main axis must never let flexShrink squeeze children below
+    // their natural size just because the viewport is smaller than the
+    // content — that's the entire point of scrolling instead of shrinking.
+    // Widening mainAvail to at least the natural content total makes
+    // "leftover" in the flex-resolution pass below >= 0, which keeps every
+    // shrink factor's candidate at-or-above its unclamped basis.
+    if (horizontal && node.scrollsX())
+      mainAvail =
+          std::max(mainAvail, node.computed.contentW - pad.left - pad.right);
+    if (!horizontal && node.scrollsY())
+      mainAvail =
+          std::max(mainAvail, node.computed.contentH - pad.top - pad.bottom);
+
+    size_t n = node.children.size();
+    bool wrap = node.style.flexWrap == FlexWrap::Wrap;
+    std::vector<size_t> flowIdx;
+    flowIdx.reserve(node.children.size());
+    for (size_t i = 0; i < node.children.size(); ++i)
+    {
+      const Style &cs = node.children[i].style;
+      if (cs.position != Position::Absolute &&
+          resolveDynamic(cs.display, node.children[i].computed.resolvedDisplay) !=
+              Display::None)
+        flowIdx.push_back(i);
+    }
+    n = flowIdx.size();
+    std::vector<float> basis(n), cross(n), mMainS(n), mMainE(n), mCrossS(n),
+        mCrossE(n), minMain(n), maxMain(n), marginMain(n);
+
+    for (size_t k = 0; k < n; ++k)
+    {
+      View &c = node.children[flowIdx[k]];
+      Natural cn = measureNatural(c, contentW, contentH, true, true);
+      const EdgeInsets &cMargin =
+          resolveDynamic(c.style.margin, c.computed.resolvedMargin);
+      basis[k] = horizontal ? cn.w : cn.h;
+      cross[k] = horizontal ? cn.h : cn.w;
+      mMainS[k] = horizontal ? cMargin.left : cMargin.top;
+      mMainE[k] = horizontal ? cMargin.right : cMargin.bottom;
+      mCrossS[k] = horizontal ? cMargin.top : cMargin.left;
+      mCrossE[k] = horizontal ? cMargin.bottom : cMargin.right;
+      minMain[k] = horizontal ? c.style.minWidth : c.style.minHeight;
+      maxMain[k] = horizontal ? c.style.maxWidth : c.style.maxHeight;
+      marginMain[k] = mMainS[k] + mMainE[k];
+    }
+
+    // ---- Line breaking ----
+    // With wrap disabled this is always one line spanning every child (the
+    // original single-line behavior, byte-for-byte). With wrap enabled,
+    // children are greedily packed onto a line until the next child's basis
+    // would overflow mainAvail, at which point a new line starts. A line
+    // always takes at least one child, even an oversized one, so a single
+    // giant child can't stall the packer.
+    struct Line
+    {
+      size_t begin, end; // half-open [begin, end) into node.children
+    };
+    std::vector<Line> lines;
+    if (!wrap)
+    {
+      lines.push_back({0, n});
+    }
+    else
+    {
+      size_t start = 0;
+      float used = 0;
+      for (size_t i = 0; i < n; ++i)
+      {
+        float itemMain = basis[i] + marginMain[i];
+        float withGap = (i > start) ? node.style.gap : 0.0f;
+        if (i > start && used + withGap + itemMain > mainAvail)
+        {
+          lines.push_back({start, i});
+          start = i;
+          used = itemMain;
+        }
+        else
+        {
+          used += withGap + itemMain;
+        }
+      }
+      lines.push_back({start, n});
+    }
+
+    // ---- Per-line main-axis flex resolution ----
+    // Resolve flexGrow/flexShrink into final main-axis sizes, honoring each
+    // child's own min/max — this is CSS flexbox's "resolve flexible lengths"
+    // algorithm, scoped to one line's children at a time. A single pass
+    // (basis + share of leftover, then clamp) would silently drop whatever a
+    // clamped child couldn't absorb; instead, any item whose share would
+    // violate its own bound gets frozen at that bound and removed from the
+    // pool, and the remaining free space is recalculated and redistributed
+    // among the still-flexible siblings. Repeats until nothing new freezes
+    // (at most one extra item freezes per pass, so ln+1 passes always
+    // suffices). Also tracks each line's cross size (max child cross extent)
+    // for the cross-axis distribution pass below.
+    std::vector<float> finalMain(n);
+    std::vector<float> lineCross(lines.size());
+    for (size_t li = 0; li < lines.size(); ++li)
+    {
+      size_t lb = lines[li].begin, le = lines[li].end;
+      size_t ln = le - lb;
+      std::vector<bool> frozen(ln, false);
+      std::vector<float> lineFinal(ln);
+      float gapTotal = ln > 1 ? node.style.gap * (ln - 1) : 0.0f;
+
+      for (size_t pass = 0; pass <= ln; ++pass)
+      {
+        float used = gapTotal, gsum = 0, ssum = 0;
+        for (size_t k = 0; k < ln; ++k)
+        {
+          size_t i = lb + k;
+          used += (frozen[k] ? lineFinal[k] : basis[i]) + marginMain[i];
+          if (!frozen[k])
+          {
+            gsum += node.children[flowIdx[i]].style.flexGrow;
+            ssum += node.children[flowIdx[i]].style.flexShrink;
+          }
+        }
+        float leftover = mainAvail - used;
+        if (leftover == 0 || (leftover > 0 && gsum <= 0) ||
+            (leftover < 0 && ssum <= 0))
+        {
+          for (size_t k = 0; k < ln; ++k)
+            if (!frozen[k])
+              lineFinal[k] =
+                  clampSize(basis[lb + k], minMain[lb + k], maxMain[lb + k]);
+          break;
+        }
+        bool frozeAny = false;
+        for (size_t k = 0; k < ln; ++k)
+        {
+          if (frozen[k])
+            continue;
+          size_t i = lb + k;
+          const Style &cs = node.children[flowIdx[i]].style;
+          float extra = leftover > 0 ? leftover * (cs.flexGrow / gsum)
+                                     : leftover * (cs.flexShrink / ssum);
+          float candidate = std::max(0.0f, basis[i] + extra);
+          float clamped = clampSize(candidate, minMain[i], maxMain[i]);
+          lineFinal[k] = clamped;
+          if (clamped != candidate)
+          {
+            frozen[k] = true;
+            frozeAny = true;
+          }
+        }
+        if (!frozeAny)
+          break; // this pass's candidates all satisfied their bounds — done
       }
 
-      float cx = horizontal ? cursor : lineCrossPos + crossOffset;
-      float cy = horizontal ? lineCrossPos + crossOffset : cursor;
-      float cw = horizontal ? finalMain[i] : finalCross;
-      float chh = horizontal ? finalCross : finalMain[i];
+      float maxCross = 0;
+      for (size_t k = 0; k < ln; ++k)
+      {
+        size_t i = lb + k;
+        finalMain[i] = lineFinal[k];
+        maxCross = std::max(maxCross, cross[i] + mCrossS[i] + mCrossE[i]);
+      }
+      lineCross[li] = maxCross;
+    }
 
-      placeNode(ch, cx, cy, cw, chh);
-      cursor += finalMain[i] + mMainE[i] + between;
+    // ---- Distribute lines along the cross axis (align-content) ----
+    // With exactly one line this collapses to the old behavior: Stretch
+    // grows that line to fill crossAvail (matching the previous unconditional
+    // stretch-to-container-cross-size), everything else just packs the one
+    // line at the start.
+    size_t numLines = lines.size();
+    float lineGapTotal = numLines > 1 ? node.style.gap * (numLines - 1) : 0.0f;
+    float linesTotal = lineGapTotal;
+    for (float lc : lineCross)
+      linesTotal += lc;
+    float crossFree = std::max(0.0f, crossAvail - linesTotal);
+
+    std::vector<float> lineOffset(numLines), lineSize(numLines);
+    float crossStart = 0, crossBetween = node.style.gap;
+    switch (node.style.alignContent)
+    {
+    case AlignContent::Start:
+      lineSize = lineCross;
+      break;
+    case AlignContent::End:
+      crossStart = crossFree;
+      lineSize = lineCross;
+      break;
+    case AlignContent::Center:
+      crossStart = crossFree / 2;
+      lineSize = lineCross;
+      break;
+    case AlignContent::SpaceBetween:
+      if (numLines > 1)
+        crossBetween += crossFree / (numLines - 1);
+      lineSize = lineCross;
+      break;
+    case AlignContent::SpaceAround:
+    {
+      float each = numLines ? crossFree / numLines : 0;
+      crossStart = each / 2;
+      crossBetween += each;
+      lineSize = lineCross;
+      break;
+    }
+    case AlignContent::SpaceEvenly:
+    {
+      float each = crossFree / (numLines + 1);
+      crossStart = each;
+      crossBetween += each;
+      lineSize = lineCross;
+      break;
+    }
+    case AlignContent::Stretch:
+    {
+      float extra = numLines ? crossFree / numLines : 0;
+      for (size_t li = 0; li < numLines; ++li)
+        lineSize[li] = lineCross[li] + extra;
+      break;
+    }
+    }
+    {
+      float pos = crossStart;
+      for (size_t li = 0; li < numLines; ++li)
+      {
+        lineOffset[li] = pos;
+        pos += lineSize[li] + crossBetween;
+      }
+    }
+
+    // ---- Per-line: justify main axis, align children within the line's
+    // cross extent, then recurse ----
+    for (size_t li = 0; li < numLines; ++li)
+    {
+      size_t lb = lines[li].begin, le = lines[li].end;
+      size_t ln = le - lb;
+      float lineCrossAvail = lineSize[li];
+      float lineCrossPos = (horizontal ? contentY : contentX) + lineOffset[li];
+
+      float totalUsed = 0;
+      for (size_t k = 0; k < ln; ++k)
+      {
+        size_t i = lb + k;
+        totalUsed += finalMain[i] + mMainS[i] + mMainE[i];
+        if (k + 1 < ln)
+          totalUsed += node.style.gap;
+      }
+      float freeSpace = std::max(0.0f, mainAvail - totalUsed);
+      float startOffset = 0, between = node.style.gap;
+      switch (node.style.justifyContent)
+      {
+      case Justify::Start:
+        break;
+      case Justify::End:
+        startOffset = freeSpace;
+        break;
+      case Justify::Center:
+        startOffset = freeSpace / 2;
+        break;
+      case Justify::SpaceBetween:
+        if (ln > 1)
+          between += freeSpace / (ln - 1);
+        break;
+      case Justify::SpaceAround:
+      {
+        float each = ln ? freeSpace / ln : 0;
+        startOffset = each / 2;
+        between += each;
+        break;
+      }
+      case Justify::SpaceEvenly:
+      {
+        float each = freeSpace / (ln + 1);
+        startOffset = each;
+        between += each;
+        break;
+      }
+      }
+
+      float cursor = (horizontal ? contentX : contentY) + startOffset;
+      for (size_t k = 0; k < ln; ++k)
+      {
+        size_t i = lb + k;
+        View &ch = node.children[flowIdx[i]];
+        cursor += mMainS[i];
+
+        bool explicitCross =
+            horizontal
+                ? resolveDynamic(ch.style.height, ch.computed.resolvedHeight)
+                          .kind != Size::Kind::Fit
+                : resolveDynamic(ch.style.width, ch.computed.resolvedWidth)
+                          .kind != Size::Kind::Fit;
+        float finalCross = cross[i];
+        if (node.style.alignItems == Align::Stretch && !explicitCross)
+          finalCross = std::max(0.0f, lineCrossAvail - mCrossS[i] - mCrossE[i]);
+
+        float minCross = horizontal ? ch.style.minHeight : ch.style.minWidth;
+        float maxCross = horizontal ? ch.style.maxHeight : ch.style.maxWidth;
+        finalCross = clampSize(finalCross, minCross, maxCross);
+
+        float crossOffset;
+        switch (node.style.alignItems)
+        {
+        case Align::End:
+          crossOffset = lineCrossAvail - finalCross - mCrossE[i];
+          break;
+        case Align::Center:
+          crossOffset = (lineCrossAvail - finalCross) / 2;
+          break;
+        default:
+          crossOffset = mCrossS[i];
+          break; // Start & Stretch
+        }
+
+        float cx = horizontal ? cursor : lineCrossPos + crossOffset;
+        float cy = horizontal ? lineCrossPos + crossOffset : cursor;
+        float cw = horizontal ? finalMain[i] : finalCross;
+        float chh = horizontal ? finalCross : finalMain[i];
+
+        placeNode(ch, cx, cy, cw, chh);
+        cursor += finalMain[i] + mMainE[i] + between;
+      }
+    }
+
+    // ---- Position::Absolute children ----
+    // Placed against this node's content box, entirely independent of the
+    // flex distribution above. Sizing reuses measureNatural: Fixed/
+    // Percentage/Full resolve normally against contentW/contentH (always
+    // definite here, since this node's own box is already finalized);
+    // Fit falls back to natural content size unless both opposing edges
+    // are set, in which case size is derived from them (CSS's "left+right
+    // implies width" rule).
+    for (auto &ch : node.children)
+    {
+      if (ch.style.position != Position::Absolute ||
+          resolveDynamic(ch.style.display, ch.computed.resolvedDisplay) ==
+              Display::None)
+        continue;
+      const Style &cs = ch.style;
+      const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
+      const Size &csHeight =
+          resolveDynamic(cs.height, ch.computed.resolvedHeight);
+      const EdgeInsets &csMargin =
+          resolveDynamic(cs.margin, ch.computed.resolvedMargin);
+      float csLeft = resolveDynamic(cs.left, ch.computed.resolvedLeft);
+      float csTop = resolveDynamic(cs.top, ch.computed.resolvedTop);
+      float csRight = resolveDynamic(cs.right, ch.computed.resolvedRight);
+      float csBottom = resolveDynamic(cs.bottom, ch.computed.resolvedBottom);
+      bool hasL = !std::isnan(csLeft), hasR = !std::isnan(csRight);
+      bool hasT = !std::isnan(csTop), hasB = !std::isnan(csBottom);
+
+      Natural probe = measureNatural(ch, contentW, contentH, true, true);
+      float aw = (csWidth.kind == Size::Kind::Fit && hasL && hasR)
+                     ? contentW - csLeft - csRight
+                     : probe.w;
+      float ah = (csHeight.kind == Size::Kind::Fit && hasT && hasB)
+                     ? contentH - csTop - csBottom
+                     : probe.h;
+      aw = clampSize(aw, cs.minWidth, cs.maxWidth);
+      ah = clampSize(ah, cs.minHeight, cs.maxHeight);
+
+      float ax = hasL   ? contentX + csLeft + csMargin.left
+                 : hasR ? contentX + contentW - csRight - csMargin.right - aw
+                        : contentX + csMargin.left;
+      float ay = hasT   ? contentY + csTop + csMargin.top
+                 : hasB ? contentY + contentH - csBottom - csMargin.bottom - ah
+                        : contentY + csMargin.top;
+
+      placeNode(ch, ax, ay, aw, ah);
     }
   }
 
-  // ---- Position::Absolute children ----
-  // Placed against this node's content box, entirely independent of the
-  // flex distribution above. Sizing reuses measureNatural: Fixed/
-  // Percentage/Full resolve normally against contentW/contentH (always
-  // definite here, since this node's own box is already finalized);
-  // Fit falls back to natural content size unless both opposing edges
-  // are set, in which case size is derived from them (CSS's "left+right
-  // implies width" rule).
-  for (auto &ch : node.children) {
-    if (ch.style.position != Position::Absolute ||
-        resolveDynamic(ch.style.display, ch.computed.resolvedDisplay) ==
-            Display::None)
-      continue;
-    const Style &cs = ch.style;
-    const Size &csWidth = resolveDynamic(cs.width, ch.computed.resolvedWidth);
-    const Size &csHeight =
-        resolveDynamic(cs.height, ch.computed.resolvedHeight);
-    const EdgeInsets &csMargin =
-        resolveDynamic(cs.margin, ch.computed.resolvedMargin);
-    float csLeft = resolveDynamic(cs.left, ch.computed.resolvedLeft);
-    float csTop = resolveDynamic(cs.top, ch.computed.resolvedTop);
-    float csRight = resolveDynamic(cs.right, ch.computed.resolvedRight);
-    float csBottom = resolveDynamic(cs.bottom, ch.computed.resolvedBottom);
-    bool hasL = !std::isnan(csLeft), hasR = !std::isnan(csRight);
-    bool hasT = !std::isnan(csTop), hasB = !std::isnan(csBottom);
-
-    Natural probe = measureNatural(ch, contentW, contentH, true, true);
-    float aw = (csWidth.kind == Size::Kind::Fit && hasL && hasR)
-                   ? contentW - csLeft - csRight
-                   : probe.w;
-    float ah = (csHeight.kind == Size::Kind::Fit && hasT && hasB)
-                   ? contentH - csTop - csBottom
-                   : probe.h;
-    aw = clampSize(aw, cs.minWidth, cs.maxWidth);
-    ah = clampSize(ah, cs.minHeight, cs.maxHeight);
-
-    float ax = hasL   ? contentX + csLeft + csMargin.left
-               : hasR ? contentX + contentW - csRight - csMargin.right - aw
-                      : contentX + csMargin.left;
-    float ay = hasT   ? contentY + csTop + csMargin.top
-               : hasB ? contentY + contentH - csBottom - csMargin.bottom - ah
-                      : contentY + csMargin.top;
-
-    placeNode(ch, ax, ay, aw, ah);
+  // originX/originY let a caller reserve space above/left of the root — used
+  // on Linux to keep content out of the custom titlebar strip; Windows (no
+  // custom titlebar) always passes the defaults of (0, 0).
+  inline void layoutRoot(View &root, float windowW, float windowH,
+                         float originX = 0, float originY = 0)
+  {
+    Natural n = measureNatural(root, windowW, windowH, true, true);
+    placeNode(root, originX, originY, n.w, n.h);
   }
-}
-
-// originX/originY let a caller reserve space above/left of the root — used
-// on Linux to keep content out of the custom titlebar strip; Windows (no
-// custom titlebar) always passes the defaults of (0, 0).
-inline void layoutRoot(View &root, float windowW, float windowH,
-                       float originX = 0, float originY = 0) {
-  Natural n = measureNatural(root, windowW, windowH, true, true);
-  placeNode(root, originX, originY, n.w, n.h);
-}
 
 } // namespace liteui_layout
 
 #if !defined(_WIN32)
-inline Key xkbKeysymToKey(xkb_keysym_t sym) {
+inline Key xkbKeysymToKey(xkb_keysym_t sym)
+{
   if (sym >= XKB_KEY_a && sym <= XKB_KEY_z)
     return static_cast<Key>(static_cast<int>(Key::A) + (sym - XKB_KEY_a));
   if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z)
@@ -6356,7 +7240,8 @@ inline Key xkbKeysymToKey(xkb_keysym_t sym) {
     return static_cast<Key>(static_cast<int>(Key::N0) + (sym - XKB_KEY_0));
   if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12)
     return static_cast<Key>(static_cast<int>(Key::F1) + (sym - XKB_KEY_F1));
-  switch (sym) {
+  switch (sym)
+  {
   case XKB_KEY_Return:
   case XKB_KEY_KP_Enter:
     return Key::Enter;
@@ -6426,29 +7311,70 @@ inline Key xkbKeysymToKey(xkb_keysym_t sym) {
 }
 #endif
 
-struct TooltipStyle {
-  int delayMs = 500;
-  Color background{50, 50, 50, 230};
-  Color textColor{255, 255, 255, 255};
-  float padding = 6.0f;
-  float fontSize = 13.0f;
-  std::string fontFamily; // empty = platform default
-};
+void View::freeTextResources()
+{
+#if defined(_WIN32)
+  if (computed.textLayout)
+  {
+    computed.textLayout->Release();
+    computed.textLayout = nullptr;
+  }
+  if (computed.canvasTarget)
+  {
+    computed.canvasTarget->Release();
+    computed.canvasTarget = nullptr;
+  }
+  if (computed.canvasWicBitmap)
+  {
+    computed.canvasWicBitmap->Release();
+    computed.canvasWicBitmap = nullptr;
+  }
+  if (computed.cachedImageBitmap)
+  {
+    computed.cachedImageBitmap->Release();
+    computed.cachedImageBitmap = nullptr;
+  }
+#else
+  if (computed.textTexture)
+  {
+    glDeleteTextures(1, &computed.textTexture);
+    computed.textTexture = 0;
+  }
+  if (computed.canvasTexture)
+  {
+    glDeleteTextures(1, &computed.canvasTexture);
+    computed.canvasTexture = 0;
+  }
+  if (computed.canvasSurface)
+  {
+    cairo_surface_destroy(computed.canvasSurface);
+    computed.canvasSurface = nullptr;
+  }
+  if (computed.cachedImageSurface)
+  {
+    cairo_surface_destroy(computed.cachedImageSurface);
+    computed.cachedImageSurface = nullptr;
+  }
+#endif
+  for (auto &c : children)
+    c.freeTextResources();
+}
 
-class LiteUI {
+class LiteUIImpl
+{
 
 public:
   // Constructor: explicit prevents accidental implicit conversions from a bare
 
-  explicit LiteUI(const std::string &title = "Window", int width = -1,
-                  int height = -1, bool hideTitlebar = false);
+  explicit LiteUIImpl(const std::string &title = "Window", int width = -1,
+                      int height = -1, bool hideTitlebar = false);
   // Destructor: tears down whatever platform resources were created.
-  ~LiteUI();
+  ~LiteUIImpl();
   // Copying is disabled — a LiteUI owns unique OS handles that can't be
   // safely duplicated.
-  LiteUI(const LiteUI &) = delete;
+  LiteUIImpl(const LiteUIImpl &) = delete;
   // Copy-assignment is disabled too.
-  LiteUI &operator=(const LiteUI &) = delete;
+  LiteUIImpl &operator=(const LiteUIImpl &) = delete;
 
   // Public entry point that blocks the calling thread and pumps the platform's
   // event loop.
@@ -6461,7 +7387,8 @@ public:
   // and triggers a repaint. Ownership of the tree is copied/moved in.
   void setRoot(View view);
 
-  void requestClose() {
+  void requestClose()
+  {
 #if defined(_WIN32)
     if (hwnd_)
       PostMessageW(hwnd_, WM_CLOSE, 0, 0);
@@ -6470,7 +7397,8 @@ public:
 #endif
   }
 
-  void requestMinimize() {
+  void requestMinimize()
+  {
 #if defined(_WIN32)
     if (hwnd_)
       ShowWindow(hwnd_, SW_MINIMIZE);
@@ -6481,7 +7409,8 @@ public:
   }
 
   // Toggles: maximizes if the window is normal, restores it if it's maximized.
-  void requestMaximize() {
+  void requestMaximize()
+  {
 #if defined(_WIN32)
     if (hwnd_)
       ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
@@ -6496,7 +7425,8 @@ public:
 #endif
   }
 
-  void requestMove() {
+  void requestMove()
+  {
 #if defined(_WIN32)
     // Can't start the move from here: we're still inside WM_LBUTTONDOWN,
     // which is about to grab the mouse. Leave a note for that handler.
@@ -6516,14 +7446,16 @@ public:
   // call forceClose() later once the user has responded. With no handler
   // installed, a close request closes the window immediately (the
   // previous, unconditional behavior).
-  void setOnCloseRequest(std::function<void()> fn) {
+  void setOnCloseRequest(std::function<void()> fn)
+  {
     onCloseRequest_ = std::move(fn);
   }
 
   // Closes the window immediately and unconditionally, bypassing
   // onCloseRequest — call this from within the onCloseRequest handler
   // once it's safe to actually close.
-  void forceClose() {
+  void forceClose()
+  {
 #if defined(_WIN32)
     if (hwnd_)
       DestroyWindow(hwnd_);
@@ -6532,7 +7464,8 @@ public:
 #endif
   }
 
-  KeyModifiers modifiers() const {
+  KeyModifiers modifiers() const
+  {
 #if defined(_WIN32)
     return currentModifiers();
 #else
@@ -6554,11 +7487,12 @@ private:
   std::vector<Box> boxes_;
   View root_;
   bool hasRoot_ = false;
-  static inline LiteUI *activeInstance_ = nullptr;
+  static inline LiteUIImpl *activeInstance_ = nullptr;
 
   std::function<void()> wakeHandler_; // see setWakeHandler
   std::function<void()> onCloseRequest_;
-  void handleCloseRequested() {
+  void handleCloseRequested()
+  {
     if (onCloseRequest_)
       onCloseRequest_();
     else
@@ -6566,7 +7500,8 @@ private:
   }
 
   // Re-runs the layout algorithm over root_ against the current window size.
-  void relayout() {
+  void relayout()
+  {
     if (!hasRoot_)
       return;
 #if defined(_WIN32)
@@ -6595,17 +7530,20 @@ private:
   // hit-testing can both tell "is this point/pixel actually visible, or
   // has it scrolled behind a clipping ancestor". Defaults to "the whole
   // plane" so the root of any walk starts unclipped.
-  struct ClipRect {
+  struct ClipRect
+  {
     float x0 = -std::numeric_limits<float>::infinity();
     float y0 = -std::numeric_limits<float>::infinity();
     float x1 = std::numeric_limits<float>::infinity();
     float y1 = std::numeric_limits<float>::infinity();
-    bool contains(float px, float py) const {
+    bool contains(float px, float py) const
+    {
       return px >= x0 && px < x1 && py >= y0 && py < y1;
     }
     // Narrows this clip to also be inside the given box — used every time
     // we descend into a scroll container's children.
-    ClipRect intersect(float bx, float by, float bw, float bh) const {
+    ClipRect intersect(float bx, float by, float bw, float bh) const
+    {
       return {std::max(x0, bx), std::max(y0, by), std::min(x1, bx + bw),
               std::min(y1, by + bh)};
     }
@@ -6614,7 +7552,8 @@ private:
   // Plain float rectangle for scrollbar geometry (track/thumb), kept
   // separate from Wayland's integer-pixel `Rect` below since scrollbar math
   // wants to stay in the same float space as View::Computed.
-  struct PixRect {
+  struct PixRect
+  {
     float x, y, w, h;
   };
 
@@ -6622,12 +7561,14 @@ private:
   // thin wrappers around axisScrollbarVisible() using v's own already-
   // computed sizes, so callers don't have to repeat the h vs. contentH /
   // w vs. contentW pairing correctly every time.
-  static bool wantVBar(const View &v) {
+  static bool wantVBar(const View &v)
+  {
     return v.scrollsY() &&
            liteui_layout::axisScrollbarVisible(
                v.style.overflowY, v.computed.contentH, v.computed.h);
   }
-  static bool wantHBar(const View &v) {
+  static bool wantHBar(const View &v)
+  {
     return v.scrollsX() &&
            liteui_layout::axisScrollbarVisible(
                v.style.overflowX, v.computed.contentW, v.computed.w);
@@ -6636,12 +7577,14 @@ private:
   // Track rectangles run the full length of their edge, minus the corner
   // square where both bars would otherwise overlap (only relevant when
   // both axes scroll at once).
-  static PixRect vTrackRect(const View &v) {
+  static PixRect vTrackRect(const View &v)
+  {
     float h = v.computed.h - (wantHBar(v) ? kScrollbarThickness : 0.0f);
     return {v.computed.x + v.computed.w - kScrollbarThickness, v.computed.y,
             kScrollbarThickness, std::max(0.0f, h)};
   }
-  static PixRect hTrackRect(const View &v) {
+  static PixRect hTrackRect(const View &v)
+  {
     float w = v.computed.w - (wantVBar(v) ? kScrollbarThickness : 0.0f);
     return {v.computed.x, v.computed.y + v.computed.h - kScrollbarThickness,
             std::max(0.0f, w), kScrollbarThickness};
@@ -6654,7 +7597,8 @@ private:
   // Thumb length is proportional to viewport/content (how much of the
   // content is visible at once); thumb position is proportional to how far
   // through the scrollable range the current offset is.
-  static PixRect vThumbRect(const View &v) {
+  static PixRect vThumbRect(const View &v)
+  {
     PixRect track = vTrackRect(v);
     float minThumb = std::min(kMinThumb, track.h); // never exceeds track
     float thumbH =
@@ -6668,7 +7612,8 @@ private:
                     : 0.0f;
     return {track.x, track.y + pos, track.w, thumbH};
   }
-  static PixRect hThumbRect(const View &v) {
+  static PixRect hThumbRect(const View &v)
+  {
     PixRect track = hTrackRect(v);
     float minThumb = std::min(kMinThumb, track.w);
     float thumbW =
@@ -6682,7 +7627,8 @@ private:
                     : 0.0f;
     return {track.x + pos, track.y, thumbW, track.h};
   }
-  static bool pixRectContains(const PixRect &r, float px, float py) {
+  static bool pixRectContains(const PixRect &r, float px, float py)
+  {
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
   }
 
@@ -6693,8 +7639,17 @@ private:
   // Content means "this is inside some scrollable view's content area
   // (not its scrollbar)" — used both to start a possible pan-to-scroll
   // drag and, for wheel events, as the view to scroll.
-  enum class ScrollHit { None, VThumb, HThumb, VTrack, HTrack, Content };
-  struct ScrollPress {
+  enum class ScrollHit
+  {
+    None,
+    VThumb,
+    HThumb,
+    VTrack,
+    HTrack,
+    Content
+  };
+  struct ScrollPress
+  {
     ScrollHit kind = ScrollHit::None;
     View *view = nullptr;
     float trackFrac = 0; // 0..1 position along the track, for VTrack/HTrack
@@ -6712,15 +7667,18 @@ private:
   // acceptable for v1, matching this file's existing absolute-positioning
   // trade-offs.
   static ScrollPress resolveScrollTarget(View &v, float x, float y,
-                                         ClipRect clip) {
+                                         ClipRect clip)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return {};
     if (!clip.contains(x, y) || !containsPoint(v, x, y))
       return {};
-    if (wantVBar(v)) {
+    if (wantVBar(v))
+    {
       PixRect track = vTrackRect(v);
-      if (pixRectContains(track, x, y)) {
+      if (pixRectContains(track, x, y))
+      {
         PixRect thumb = vThumbRect(v);
         if (pixRectContains(thumb, x, y))
           return {ScrollHit::VThumb, &v, 0};
@@ -6728,9 +7686,11 @@ private:
         return {ScrollHit::VTrack, &v, frac};
       }
     }
-    if (wantHBar(v)) {
+    if (wantHBar(v))
+    {
       PixRect track = hTrackRect(v);
-      if (pixRectContains(track, x, y)) {
+      if (pixRectContains(track, x, y))
+      {
         PixRect thumb = hThumbRect(v);
         if (pixRectContains(thumb, x, y))
           return {ScrollHit::HThumb, &v, 0};
@@ -6742,7 +7702,8 @@ private:
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
+    {
       if (it->style.position == Position::Absolute ||
           resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
               Display::None)
@@ -6758,8 +7719,15 @@ private:
   // How a click-and-drag inside scrollable content is currently being
   // interpreted. Mirrors pressedView_'s press/release pairing, but for
   // scroll interactions instead of onClick.
-  enum class DragMode { None, VThumb, HThumb, ContentPan };
-  struct ScrollDrag {
+  enum class DragMode
+  {
+    None,
+    VThumb,
+    HThumb,
+    ContentPan
+  };
+  struct ScrollDrag
+  {
     DragMode mode = DragMode::None;
     View *target = nullptr;
     float startPointerX = 0, startPointerY = 0;
@@ -6783,22 +7751,25 @@ private:
   // which case a ContentPan drag is armed here but the ordinary click path
   // still runs too, since a small movement should behave as a click, not a
   // pan (see updateScrollDrag/endScrollPress).
-  bool beginScrollPress(float x, float y) {
+  bool beginScrollPress(float x, float y)
+  {
     if (!hasRoot_)
       return false;
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
-    switch (r.kind) {
+    switch (r.kind)
+    {
     case ScrollHit::VThumb:
       scrollDrag_ = {
-          DragMode::VThumb,         r.view, x, y, r.view->computed.scrollX,
+          DragMode::VThumb, r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
       return true;
     case ScrollHit::HThumb:
       scrollDrag_ = {
-          DragMode::HThumb,         r.view, x, y, r.view->computed.scrollX,
+          DragMode::HThumb, r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
       return true;
-    case ScrollHit::VTrack: {
+    case ScrollHit::VTrack:
+    {
       PixRect track = vTrackRect(*r.view), thumb = vThumbRect(*r.view);
       float target = r.trackFrac * track.h - thumb.h / 2;
       float maxScroll = r.view->maxScrollY();
@@ -6808,7 +7779,8 @@ private:
       relayout();
       return true;
     }
-    case ScrollHit::HTrack: {
+    case ScrollHit::HTrack:
+    {
       PixRect track = hTrackRect(*r.view), thumb = hThumbRect(*r.view);
       float target = r.trackFrac * track.w - thumb.w / 2;
       float maxScroll = r.view->maxScrollX();
@@ -6819,9 +7791,10 @@ private:
       return true;
     }
     case ScrollHit::Content:
-      if (r.view->style.contentPanEnabled) {
+      if (r.view->style.contentPanEnabled)
+      {
         scrollDrag_ = {
-            DragMode::ContentPan,     r.view, x, y, r.view->computed.scrollX,
+            DragMode::ContentPan, r.view, x, y, r.view->computed.scrollX,
             r.view->computed.scrollY, false};
       }
       return false; // ordinary click press still proceeds too
@@ -6834,17 +7807,20 @@ private:
   // Call on every pointer-motion event while a button is held. Advances an
   // in-progress scrollbar drag or content pan; a no-op if scrollDrag_ isn't
   // active. Returns true if it changed anything (caller should repaint).
-  bool updateScrollDrag(float x, float y) {
+  bool updateScrollDrag(float x, float y)
+  {
     if (scrollDrag_.mode == DragMode::None)
       return false;
     View &v = *scrollDrag_.target;
     float dx = x - scrollDrag_.startPointerX;
     float dy = y - scrollDrag_.startPointerY;
-    if (scrollDrag_.mode == DragMode::ContentPan) {
+    if (scrollDrag_.mode == DragMode::ContentPan)
+    {
       if (!scrollDrag_.moved && std::abs(dx) < kDragThreshold &&
           std::abs(dy) < kDragThreshold)
         return false; // still within click tolerance — not a pan yet
-      if (!scrollDrag_.moved) {
+      if (!scrollDrag_.moved)
+      {
         scrollDrag_.moved = true;
         // It just became a drag, not a click — cancel any pending onClick
         // so the eventual release doesn't also fire it.
@@ -6856,13 +7832,17 @@ private:
       if (v.scrollsY())
         v.computed.scrollY =
             std::clamp(scrollDrag_.startScrollY - dy, 0.0f, v.maxScrollY());
-    } else if (scrollDrag_.mode == DragMode::VThumb) {
+    }
+    else if (scrollDrag_.mode == DragMode::VThumb)
+    {
       PixRect track = vTrackRect(v), thumb = vThumbRect(v);
       float range = track.h - thumb.h;
       float delta = range > 0 ? (dy / range) * v.maxScrollY() : 0.0f;
       v.computed.scrollY =
           std::clamp(scrollDrag_.startScrollY + delta, 0.0f, v.maxScrollY());
-    } else if (scrollDrag_.mode == DragMode::HThumb) {
+    }
+    else if (scrollDrag_.mode == DragMode::HThumb)
+    {
       PixRect track = hTrackRect(v), thumb = hThumbRect(v);
       float range = track.w - thumb.w;
       float delta = range > 0 ? (dx / range) * v.maxScrollX() : 0.0f;
@@ -6879,7 +7859,8 @@ private:
   // scrollbar grab, or a pan that moved) just ends quietly. Always clears
   // scrollDrag_ so a stale target can't leak into some unrelated later
   // press.
-  bool endScrollPress(float x, float y) {
+  bool endScrollPress(float x, float y)
+  {
     bool changed = false;
     if (scrollDrag_.mode == DragMode::None ||
         (scrollDrag_.mode == DragMode::ContentPan && !scrollDrag_.moved))
@@ -6903,7 +7884,8 @@ private:
   // caller that wants "wheel does something custom instead of scrolling"
   // (e.g. zoom) should turn this off and rely on those handlers, which
   // fire regardless of wheelScrollEnabled.
-  bool applyWheelScroll(float x, float y, float deltaX, float deltaY) {
+  bool applyWheelScroll(float x, float y, float deltaX, float deltaY)
+  {
     if (!hasRoot_)
       return false;
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
@@ -6916,12 +7898,14 @@ private:
                     // onScrollUp/onScrollDown still fire via the
                     // caller's separate dispatchScroll() call
     bool changed = false;
-    if (v.scrollsY() && deltaY != 0.0f) {
+    if (v.scrollsY() && deltaY != 0.0f)
+    {
       float ns = std::clamp(v.computed.scrollY + deltaY, 0.0f, v.maxScrollY());
       changed |= ns != v.computed.scrollY;
       v.computed.scrollY = ns;
     }
-    if (v.scrollsX() && deltaX != 0.0f) {
+    if (v.scrollsX() && deltaX != 0.0f)
+    {
       float ns = std::clamp(v.computed.scrollX + deltaX, 0.0f, v.maxScrollX());
       changed |= ns != v.computed.scrollX;
       v.computed.scrollX = ns;
@@ -6932,7 +7916,8 @@ private:
   }
 
   // Global z-index stacking, shared by both backends.
-  struct AbsoluteEntry {
+  struct AbsoluteEntry
+  {
     const View *view;
     int order; // document/discovery order, for stable z-index ties
   };
@@ -6942,8 +7927,10 @@ private:
   // Recurses into every node regardless of its own position, so nested
   // absolutes (an absolute inside another absolute's subtree) still get
   // their own top-level slot in the global list.
-  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
-    for (const auto &child : v.children) {
+  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out)
+  {
+    for (const auto &child : v.children)
+    {
       if (resolveDynamic(child.style.display, child.computed.resolvedDisplay) ==
           Display::None)
         continue; // a display:none subtree contributes no absolutes either
@@ -6955,9 +7942,11 @@ private:
 
   // Sorts absolute entries by zIndex ascending, document order breaking
   // ties — shared by paintRoot() (Windows) and redraw() (Linux).
-  static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
+  static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes)
+  {
     std::stable_sort(absolutes.begin(), absolutes.end(),
-                     [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
+                     [](const AbsoluteEntry &a, const AbsoluteEntry &b)
+                     {
                        int za = resolveDynamic(a.view->style.zIndex,
                                                a.view->computed.resolvedZIndex);
                        int zb = resolveDynamic(b.view->style.zIndex,
@@ -6969,7 +7958,8 @@ private:
   }
 
   // Returns whether (px, py) lies within v's already-computed border-box.
-  static bool containsPoint(const View &v, float px, float py) {
+  static bool containsPoint(const View &v, float px, float py)
+  {
     return px >= v.computed.x && px < v.computed.x + v.computed.w &&
            py >= v.computed.y && py < v.computed.y + v.computed.h;
   }
@@ -6977,10 +7967,12 @@ private:
   // Whether v itself would respond to a press/click of the given button —
   // shared by hitTestFlow so each button tracks its own independent hit
   // test instead of only ever matching onClick/onPressAt.
-  static bool hasButtonHandler(const View &v, MouseButton btn) {
+  static bool hasButtonHandler(const View &v, MouseButton btn)
+  {
     if (resolveDynamic(v.disabled, v.computed.resolvedDisabled))
       return false;
-    switch (btn) {
+    switch (btn)
+    {
     case MouseButton::Left:
       return (bool)v.onClick || (bool)v.onPressAt;
     case MouseButton::Middle:
@@ -7006,7 +7998,8 @@ private:
   // own box says. Only scrollable nodes narrow the clip further as we
   // descend, exactly mirroring how renderView() decides what to clip.
   static View *hitTestFlow(View &v, float x, float y, ClipRect clip,
-                           MouseButton btn) {
+                           MouseButton btn)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return nullptr;
@@ -7016,7 +8009,8 @@ private:
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
+    {
       if (it->style.position == Position::Absolute ||
           resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
               Display::None)
@@ -7032,7 +8026,8 @@ private:
   // paint order (collectAbsolutes + sortAbsolutes are the same lists used
   // to paint on Windows/Linux). Absolutes are tested unclipped — see the
   // "known limitation" note on resolveScrollTarget() above.
-  View *hitTest(float x, float y, MouseButton btn = MouseButton::Left) {
+  View *hitTest(float x, float y, MouseButton btn = MouseButton::Left)
+  {
     if (!hasRoot_)
       return nullptr;
     std::vector<AbsoluteEntry> absolutes;
@@ -7045,7 +8040,8 @@ private:
     return hitTestFlow(root_, x, y, ClipRect{}, btn);
   }
 
-  static View *hitTestTooltipFlow(View &v, float x, float y, ClipRect clip) {
+  static View *hitTestTooltipFlow(View &v, float x, float y, ClipRect clip)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return nullptr;
@@ -7055,7 +8051,8 @@ private:
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
+    {
       if (it->style.position == Position::Absolute ||
           resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
               Display::None)
@@ -7069,7 +8066,8 @@ private:
     return nullptr;
   }
 
-  View *hitTestTooltip(float x, float y) {
+  View *hitTestTooltip(float x, float y)
+  {
     if (!hasRoot_)
       return nullptr;
     std::vector<AbsoluteEntry> absolutes;
@@ -7088,7 +8086,8 @@ private:
   // notches aren't a MouseButton and can coexist with a view that also
   // has click handlers.
   static View *hitTestScroll(View &v, float x, float y, ClipRect clip,
-                             bool up) {
+                             bool up)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return nullptr;
@@ -7098,7 +8097,8 @@ private:
                              ? clip.intersect(v.computed.x, v.computed.y,
                                               v.computed.w, v.computed.h)
                              : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it)
+    {
       if (it->style.position == Position::Absolute ||
           resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
               Display::None)
@@ -7115,14 +8115,18 @@ private:
   // after a click is dispatched, since the handler may have mutated the
   // plain variables these sources read from. Returns whether anything
   // changed, so the caller knows whether to relayout/repaint.
-  bool checkForUpdates(View &v) {
+  bool checkForUpdates(View &v)
+  {
     bool changed = false;
 
-    if (v.keysSource) {
+    if (v.keysSource)
+    {
       std::vector<std::string> keys = v.keysSource();
-      if (keys != v.computed.resolvedKeys) {
+      if (keys != v.computed.resolvedKeys)
+      {
         v.computed.resolvedKeys = keys;
-        if (reconcileChildren(v, keys)) {
+        if (reconcileChildren(v, keys))
+        {
           v.computed.dirty = true;
           changed = true;
           structureChanged_ = true;
@@ -7130,210 +8134,258 @@ private:
       }
     }
 
-    if (auto *fn = std::get_if<std::function<std::string()>>(&v.text)) {
+    if (auto *fn = std::get_if<std::function<std::string()>>(&v.text))
+    {
       std::string next = (*fn)();
-      if (next != v.computed.resolvedText) {
+      if (next != v.computed.resolvedText)
+      {
         v.computed.resolvedText = std::move(next);
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<Color()>>(&v.textStyle.color)) {
+    if (auto *fn = std::get_if<std::function<Color()>>(&v.textStyle.color))
+    {
       Color next = (*fn)();
       Color &cur = v.computed.resolvedTextColor;
       if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
-          next.a != cur.a) {
+          next.a != cur.a)
+      {
         cur = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.textStyle.fontSize)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.textStyle.fontSize))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedFontSize) {
+      if (next != v.computed.resolvedFontSize)
+      {
         v.computed.resolvedFontSize = next;
         v.computed.dirty = true;
         changed = true; // affects text measurement — relayout() picked up by caller
       }
     }
     if (auto *fn =
-            std::get_if<std::function<FontWeight()>>(&v.textStyle.fontWeight)) {
+            std::get_if<std::function<FontWeight()>>(&v.textStyle.fontWeight))
+    {
       FontWeight next = (*fn)();
-      if (next != v.computed.resolvedFontWeight) {
+      if (next != v.computed.resolvedFontWeight)
+      {
         v.computed.resolvedFontWeight = next;
         v.computed.dirty = true;
         changed = true; // affects text measurement — relayout() picked up by caller
       }
     }
     if (auto *fn =
-            std::get_if<std::function<FontStyle()>>(&v.textStyle.fontStyle)) {
+            std::get_if<std::function<FontStyle()>>(&v.textStyle.fontStyle))
+    {
       FontStyle next = (*fn)();
-      if (next != v.computed.resolvedFontStyle) {
+      if (next != v.computed.resolvedFontStyle)
+      {
         v.computed.resolvedFontStyle = next;
         v.computed.dirty = true;
         changed = true; // affects text measurement — relayout() picked up by caller
       }
     }
-    if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled)) {
+    if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled))
+    {
       bool next = (*fn)();
-      if (next != v.computed.resolvedDisabled) {
+      if (next != v.computed.resolvedDisabled)
+      {
         v.computed.resolvedDisabled = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.width)) {
+    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.width))
+    {
       Size next = (*fn)();
       Size &cur = v.computed.resolvedWidth;
-      if (next.kind != cur.kind || next.value != cur.value) {
+      if (next.kind != cur.kind || next.value != cur.value)
+      {
         cur = next;
         v.computed.dirty = true;
         changed = true; // affects layout — relayout() picked up by caller
       }
     }
-    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.height)) {
+    if (auto *fn = std::get_if<std::function<Size()>>(&v.style.height))
+    {
       Size next = (*fn)();
       Size &cur = v.computed.resolvedHeight;
-      if (next.kind != cur.kind || next.value != cur.value) {
+      if (next.kind != cur.kind || next.value != cur.value)
+      {
         cur = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderWidth)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderWidth))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedBorderWidth) {
+      if (next != v.computed.resolvedBorderWidth)
+      {
         v.computed.resolvedBorderWidth = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<Color()>>(&v.style.borderColor)) {
+    if (auto *fn = std::get_if<std::function<Color()>>(&v.style.borderColor))
+    {
       Color next = (*fn)();
       Color &cur = v.computed.resolvedBorderColor;
       if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
-          next.a != cur.a) {
+          next.a != cur.a)
+      {
         cur = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderRadius)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.borderRadius))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedBorderRadius) {
+      if (next != v.computed.resolvedBorderRadius)
+      {
         v.computed.resolvedBorderRadius = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.left)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.left))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedLeft) {
+      if (next != v.computed.resolvedLeft)
+      {
         v.computed.resolvedLeft = next;
         v.computed.dirty = true;
         changed = true; // affects layout — relayout() picked up by caller
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.top)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.top))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedTop) {
+      if (next != v.computed.resolvedTop)
+      {
         v.computed.resolvedTop = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.right)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.right))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedRight) {
+      if (next != v.computed.resolvedRight)
+      {
         v.computed.resolvedRight = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<float()>>(&v.style.bottom)) {
+    if (auto *fn = std::get_if<std::function<float()>>(&v.style.bottom))
+    {
       float next = (*fn)();
-      if (next != v.computed.resolvedBottom) {
+      if (next != v.computed.resolvedBottom)
+      {
         v.computed.resolvedBottom = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
     if (auto *fn =
-            std::get_if<std::function<Color()>>(&v.style.backgroundColor)) {
+            std::get_if<std::function<Color()>>(&v.style.backgroundColor))
+    {
       Color next = (*fn)();
       Color &cur = v.computed.resolvedBackgroundColor;
       if (next.r != cur.r || next.g != cur.g || next.b != cur.b ||
-          next.a != cur.a) {
+          next.a != cur.a)
+      {
         cur = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
     if (auto *fn = std::get_if<std::function<std::optional<Color>()>>(
-            &v.style.scrollTrackColor)) {
+            &v.style.scrollTrackColor))
+    {
       std::optional<Color> next = (*fn)();
-      if (next != v.computed.resolvedScrollTrackColor) {
+      if (next != v.computed.resolvedScrollTrackColor)
+      {
         v.computed.resolvedScrollTrackColor = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
     if (auto *fn = std::get_if<std::function<std::optional<Color>()>>(
-            &v.style.scrollThumbColor)) {
+            &v.style.scrollThumbColor))
+    {
       std::optional<Color> next = (*fn)();
-      if (next != v.computed.resolvedScrollThumbColor) {
+      if (next != v.computed.resolvedScrollThumbColor)
+      {
         v.computed.resolvedScrollThumbColor = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<Display()>>(&v.style.display)) {
+    if (auto *fn = std::get_if<std::function<Display()>>(&v.style.display))
+    {
       Display next = (*fn)();
-      if (next != v.computed.resolvedDisplay) {
+      if (next != v.computed.resolvedDisplay)
+      {
         v.computed.resolvedDisplay = next;
         v.computed.dirty = true;
         changed = true; // affects layout — relayout() picked up by caller
       }
     }
     if (auto *fn =
-            std::get_if<std::function<Visibility()>>(&v.style.visibility)) {
+            std::get_if<std::function<Visibility()>>(&v.style.visibility))
+    {
       Visibility next = (*fn)();
-      if (next != v.computed.resolvedVisibility) {
+      if (next != v.computed.resolvedVisibility)
+      {
         v.computed.resolvedVisibility = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (auto *fn = std::get_if<std::function<int()>>(&v.style.zIndex)) {
+    if (auto *fn = std::get_if<std::function<int()>>(&v.style.zIndex))
+    {
       int next = (*fn)();
-      if (next != v.computed.resolvedZIndex) {
+      if (next != v.computed.resolvedZIndex)
+      {
         v.computed.resolvedZIndex = next;
         v.computed.dirty = true;
         changed = true; // affects stacking order — repaint picks it up
       }
     }
-    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.margin)) {
+    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.margin))
+    {
       EdgeInsets next = (*fn)();
-      if (next != v.computed.resolvedMargin) {
+      if (next != v.computed.resolvedMargin)
+      {
         v.computed.resolvedMargin = next;
         v.computed.dirty = true;
         changed = true; // affects layout — relayout() picked up by caller
       }
     }
-    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.padding)) {
+    if (auto *fn = std::get_if<std::function<EdgeInsets()>>(&v.style.padding))
+    {
       EdgeInsets next = (*fn)();
-      if (next != v.computed.resolvedPadding) {
+      if (next != v.computed.resolvedPadding)
+      {
         v.computed.resolvedPadding = next;
         v.computed.dirty = true;
         changed = true;
       }
     }
-    if (v.canvasDirtySource && v.canvasDirtySource()) {
+    if (v.canvasDirtySource && v.canvasDirtySource())
+    {
       v.computed.canvasNeedsRedraw = true;
       v.computed.dirty = true;
       changed = true;
     }
-    if (v.wantsFocus && v.wantsFocus()) {
+    if (v.wantsFocus && v.wantsFocus())
+    {
       pendingFocusRequest_ = &v;
       changed = true;
     }
@@ -7355,7 +8407,8 @@ private:
   //
   // Matching is O(new * old). Fine for the list sizes a scroll container
   // realistically holds; swap in a key->index map if that stops being true.
-  static bool reconcileChildren(View &v, const std::vector<std::string> &keys) {
+  static bool reconcileChildren(View &v, const std::vector<std::string> &keys)
+  {
     if (!v.itemBuilder)
       return false;
     std::vector<View> old = std::move(v.children);
@@ -7364,19 +8417,24 @@ private:
     std::vector<bool> reused(old.size(), false);
     bool changed = old.size() != keys.size();
 
-    for (size_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
       size_t match = old.size();
       for (size_t j = 0; j < old.size(); ++j)
-        if (!reused[j] && old[j].key == keys[i]) {
+        if (!reused[j] && old[j].key == keys[i])
+        {
           match = j;
           break;
         }
-      if (match < old.size()) {
+      if (match < old.size())
+      {
         reused[match] = true;
         if (match != i)
           changed = true; // same node, new position — still needs relayout
         v.children.push_back(std::move(old[match]));
-      } else {
+      }
+      else
+      {
         View built = v.itemBuilder(keys[i]);
         built.key = keys[i];
         v.children.push_back(std::move(built));
@@ -7384,7 +8442,8 @@ private:
       }
     }
     for (size_t j = 0; j < old.size(); ++j)
-      if (!reused[j]) {
+      if (!reused[j])
+      {
         old[j].freeTextResources();
         changed = true;
       }
@@ -7399,8 +8458,10 @@ private:
   // its onBlur would be a use-after-free. dragView_ is nulled directly
   // for the same reason, bypassing endDrag() — firing onDragEnd here
   // could dereference a freed view.
-  void invalidateViewPointers() {
-    for (int i = 0; i < 3; ++i) {
+  void invalidateViewPointers()
+  {
+    for (int i = 0; i < 3; ++i)
+    {
       pressedView_[i] = nullptr;
       dragView_[i] = nullptr;
     }
@@ -7410,7 +8471,8 @@ private:
   }
 
   // The one place that polls dynamic sources and applies the result.
-  bool pollAndRelayout() {
+  bool pollAndRelayout()
+  {
     if (!hasRoot_)
       return false;
     structureChanged_ = false;
@@ -7430,9 +8492,11 @@ private:
   // view is never marked hovered. Returns whether any flag actually
   // flipped, so callers only repaint when hover state visibly changes.
   static bool updateHover(View &v, float x, float y, ClipRect clip,
-                          bool *needPoll = nullptr) {
+                          bool *needPoll = nullptr)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
-        Visibility::Hidden) {
+        Visibility::Hidden)
+    {
       bool changed = v.computed.isHovered;
       if (changed && v.onHoverEnd && v.onHoverEnd() && needPoll)
         *needPoll = true;
@@ -7442,7 +8506,8 @@ private:
     }
     bool inside = clip.contains(x, y) && containsPoint(v, x, y);
     bool changed = false;
-    if (inside != v.computed.isHovered) {
+    if (inside != v.computed.isHovered)
+    {
       v.computed.isHovered = inside;
       if (v.style.hoverColor)
         v.computed.dirty = true;
@@ -7464,10 +8529,12 @@ private:
 
   // Invokes v's click handler for `btn` if it has one; no-op for
   // nullptr, a disabled view, or an unset handler.
-  static void dispatchClick(View *v, MouseButton btn) {
+  static void dispatchClick(View *v, MouseButton btn)
+  {
     if (!v || resolveDynamic(v->disabled, v->computed.resolvedDisabled))
       return;
-    switch (btn) {
+    switch (btn)
+    {
     case MouseButton::Left:
       if (v->onClick)
         v->onClick();
@@ -7489,17 +8556,21 @@ private:
   // still react to the wheel. `notches` > 0 means wheel-up. Returns
   // whether a handler fired (caller should repaint) — poll/relayout for
   // any state the handler mutated, same idiom as endPress/updateDrag.
-  bool dispatchScroll(float x, float y, float notches) {
+  bool dispatchScroll(float x, float y, float notches)
+  {
     if (notches == 0.0f || !hasRoot_)
       return false;
     bool up = notches > 0;
     View *v = hitTestScroll(root_, x, y, ClipRect{}, up);
     if (!v)
       return false;
-    if (up) {
+    if (up)
+    {
       if (v->onScrollUp)
         v->onScrollUp();
-    } else {
+    }
+    else
+    {
       if (v->onScrollDown)
         v->onScrollDown();
     }
@@ -7546,7 +8617,8 @@ private:
   Color scrollTrack_{0xE0, 0xE0, 0xE0, 255};
   Color scrollThumb_{0x90, 0x90, 0x90, 255};
 
-  void requestTooltipRepaint() {
+  void requestTooltipRepaint()
+  {
 #if defined(_WIN32)
     if (hwnd_)
       InvalidateRect(hwnd_, nullptr, FALSE);
@@ -7556,13 +8628,16 @@ private:
 #endif
   }
 
-  void showTooltip() {
+  void showTooltip()
+  {
     tooltipVisible_ = true;
     requestTooltipRepaint();
   }
 
-  void hideTooltip() {
-    if (tooltipTimerHandle_ >= 0) {
+  void hideTooltip()
+  {
+    if (tooltipTimerHandle_ >= 0)
+    {
       removeInterval(tooltipTimerHandle_);
       tooltipTimerHandle_ = -1;
     }
@@ -7574,14 +8649,16 @@ private:
   }
 
   // Call on every pointer-motion event.
-  void updateTooltipHover(float x, float y) {
+  void updateTooltipHover(float x, float y)
+  {
     View *hit = hitTestTooltip(x, y);
     tooltipPointerX_ = x;
     tooltipPointerY_ = y;
     if (hit == tooltipTarget_)
       return; // same target (or same "nothing") — leave timer/visibility alone
 
-    if (tooltipTimerHandle_ >= 0) {
+    if (tooltipTimerHandle_ >= 0)
+    {
       removeInterval(tooltipTimerHandle_);
       tooltipTimerHandle_ = -1;
     }
@@ -7591,16 +8668,17 @@ private:
     if (wasVisible)
       requestTooltipRepaint();
 
-    if (hit) {
-      tooltipTimerHandle_ = addInterval(tooltipStyle_.delayMs, [this] {
+    if (hit)
+    {
+      tooltipTimerHandle_ = addInterval(tooltipStyle_.delayMs, [this]
+                                        {
         showTooltip();
         // addInterval's timers repeat — cancel the underlying OS timer
         // now that it's done its one job, or it'd keep firing.
         int h = tooltipTimerHandle_;
         tooltipTimerHandle_ = -1;
         if (h >= 0)
-          removeInterval(h);
-      });
+          removeInterval(h); });
     }
   }
 
@@ -7609,7 +8687,8 @@ private:
   // or Wayland's xkb_state on every "modifiers" event).
   KeyModifiers modState_;
 
-  void setFocus(View *v) {
+  void setFocus(View *v)
+  {
     if (v == focusedView_)
       return;
     if (focusedView_ && focusedView_->onBlur)
@@ -7623,7 +8702,8 @@ private:
   // anything does), checked before the focused view's own onKeyDown. Use
   // this for things like Ctrl+S that should work even while a button (not
   // a text field) has focus.
-  struct Shortcut {
+  struct Shortcut
+  {
     KeyModifiers mods;
     Key key;
     std::function<void()> fn;
@@ -7638,7 +8718,8 @@ public:
   int addInterval(int ms, std::function<void()> fn);
   void removeInterval(int handle);
   void setTooltipStyle(TooltipStyle s) { tooltipStyle_ = std::move(s); }
-  void setWindowBackground(Color c) {
+  void setWindowBackground(Color c)
+  {
     windowBg_ = c;
     requestRepaint();
   }
@@ -7646,16 +8727,18 @@ public:
   // Style::scrollTrackColor/scrollThumbColor set overrides these defaults
   // for itself only (see paintScrollbars/renderScrollbars) — there is no
   // separate "global" color to opt back into once a view overrides one.
-  void setScrollbarColors(Color track, Color thumb) {
+  void setScrollbarColors(Color track, Color thumb)
+  {
     scrollTrack_ = track;
     scrollThumb_ = thumb;
     requestRepaint();
   }
-  void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
+  void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn)
+  {
     shortcuts_.push_back({mods, key, std::move(fn)});
   }
   void requestRepaint();
-  static LiteUI *current() { return activeInstance_; }
+  static LiteUIImpl *current() { return activeInstance_; }
 
   // Wakes the event loop from ANY thread — the one LiteUI call that is safe
   // off the UI thread. The loop normally sleeps until the OS hands it an
@@ -7685,16 +8768,20 @@ private:
   // focusedView_->onKeyDown if nothing claimed it. Polls dynamic sources
   // afterward, same idiom as dispatchClick/dispatchScroll, since a
   // handler may have mutated app state a Dynamic<> field reads from.
-  bool dispatchKeyDown(KeyEvent e) {
-    for (auto &sc : shortcuts_) {
-      if (sc.key == e.key && sc.mods == e.mods) {
+  bool dispatchKeyDown(KeyEvent e)
+  {
+    for (auto &sc : shortcuts_)
+    {
+      if (sc.key == e.key && sc.mods == e.mods)
+      {
         if (sc.fn)
           sc.fn();
         pollAndRelayout();
         return true;
       }
     }
-    if (focusedView_ && focusedView_->onKeyDown) {
+    if (focusedView_ && focusedView_->onKeyDown)
+    {
       focusedView_->onKeyDown(e);
       pollAndRelayout();
       return true;
@@ -7702,8 +8789,10 @@ private:
     return false;
   }
 
-  bool dispatchKeyUp(KeyEvent e) {
-    if (focusedView_ && focusedView_->onKeyUp) {
+  bool dispatchKeyUp(KeyEvent e)
+  {
+    if (focusedView_ && focusedView_->onKeyUp)
+    {
       focusedView_->onKeyUp(e);
       pollAndRelayout();
       return true;
@@ -7711,8 +8800,10 @@ private:
     return false;
   }
 
-  bool dispatchTextInput(uint32_t codepoint) {
-    if (focusedView_ && focusedView_->onTextInput) {
+  bool dispatchTextInput(uint32_t codepoint)
+  {
+    if (focusedView_ && focusedView_->onTextInput)
+    {
       focusedView_->onTextInput(codepoint);
       pollAndRelayout();
       return true;
@@ -7722,7 +8813,8 @@ private:
 
   // Records the view under (x, y) as the pending click's press target,
   // for whichever button was pressed.
-  void beginPress(float x, float y, MouseButton btn = MouseButton::Left) {
+  void beginPress(float x, float y, MouseButton btn = MouseButton::Left)
+  {
     int i = btnIdx(btn);
     View *hit = hitTest(x, y, btn);
 
@@ -7742,9 +8834,11 @@ private:
 
     if (btn == MouseButton::Left)
       setFocus((hit && hit->focusable) ? hit : nullptr);
-    if (hit) {
+    if (hit)
+    {
 
-      switch (btn) {
+      switch (btn)
+      {
       case MouseButton::Left:
         if (hit->onPressAt)
           hit->onPressAt(lx, ly);
@@ -7772,12 +8866,14 @@ private:
   // state the handler changed — same checkForUpdates+relayout idiom used
   // everywhere else dynamic sources are re-read. A no-op, and cheap,
   // when no drag is active.
-  bool updateDrag(float x, float y, MouseButton btn = MouseButton::Left) {
+  bool updateDrag(float x, float y, MouseButton btn = MouseButton::Left)
+  {
     View *v = dragView_[btnIdx(btn)];
     if (!v)
       return false;
     float lx = x - v->computed.x, ly = y - v->computed.y;
-    switch (btn) {
+    switch (btn)
+    {
     case MouseButton::Left:
       v->onDragTo(lx, ly);
       break;
@@ -7794,7 +8890,8 @@ private:
   // Advances any of the three buttons' drags at once — motion events
   // don't carry "which button", so this just tries all three; each is a
   // no-op unless that button's drag is actually in progress.
-  bool updateAllDrags(float x, float y) {
+  bool updateAllDrags(float x, float y)
+  {
     bool changed = false;
     changed |= updateDrag(x, y, MouseButton::Left);
     changed |= updateDrag(x, y, MouseButton::Middle);
@@ -7809,8 +8906,10 @@ private:
   // destruction (invalidateViewPointers, setRoot), where the pointer may
   // already be dangling and firing a callback on it would be a
   // use-after-free.
-  void endDrag(int i) {
-    if (View *v = dragView_[i]) {
+  void endDrag(int i)
+  {
+    if (View *v = dragView_[i])
+    {
       dragView_[i] = nullptr;
       if (v->onDragEnd)
         v->onDragEnd();
@@ -7821,7 +8920,8 @@ private:
   // release also landed on that same view, then clears the pending state
   // unconditionally (a press that never resolves shouldn't linger and
   // affect some later, unrelated release).
-  bool endPress(float x, float y, MouseButton btn = MouseButton::Left) {
+  bool endPress(float x, float y, MouseButton btn = MouseButton::Left)
+  {
     int i = btnIdx(btn);
     View *released = hitTest(x, y, btn);
     if (released && released == pressedView_[i])
@@ -7857,7 +8957,8 @@ private:
   // ~LiteUI() instead.
   IWICImagingFactory *wicFactory_ = nullptr;
   bool wicComInitialized_ = false;
-  IWICImagingFactory *ensureWicFactory() {
+  IWICImagingFactory *ensureWicFactory()
+  {
     if (wicFactory_)
       return wicFactory_;
     HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -7879,7 +8980,8 @@ private:
   // A no-op once a valid target already exists; WM_SIZE calls Resize()
   // directly instead of tearing this down, so this only actually runs
   // once per (factory, hwnd) pair unless EndDraw() invalidates the target.
-  void ensureRenderTarget() {
+  void ensureRenderTarget()
+  {
     if (renderTarget_)
       return;
     RECT rc;
@@ -7895,17 +8997,20 @@ private:
   }
 
   // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
-  static D2D1::ColorF toD2DColor(Color c) {
+  static D2D1::ColorF toD2DColor(Color c)
+  {
     return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
   }
 
   // Draws a filled rectangle in one shot: create brush, fill, release.
   // Mirrors the old gdiFillRect's create-use-delete pattern 1:1.
   static void d2dFillRect(ID2D1RenderTarget *rt, float x, float y, float w,
-                          float h, Color c) {
+                          float h, Color c)
+  {
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(c), &brush);
-    if (brush) {
+    if (brush)
+    {
       rt->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brush);
       brush->Release();
     }
@@ -7913,13 +9018,15 @@ private:
 
   // The Win32 window procedure: Windows calls this for every message sent to
   // hwnd.
-  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+  {
     // Will hold the LiteUI instance associated with this hwnd, if any.
-    LiteUI *self = nullptr;
+    LiteUIImpl *self = nullptr;
 
     // WM_NCCREATE arrives before any other message and carries the creation
     // parameters.
-    if (msg == WM_NCCREATE) {
+    if (msg == WM_NCCREATE)
+    {
       // WM_NCCREATE is the very first message a window receives, sent
       // during CreateWindowExW itself, before the window is usable.
       // Reinterpret the message's lParam as the CREATESTRUCTW Windows built for
@@ -7927,28 +9034,32 @@ private:
       auto cs = reinterpret_cast<CREATESTRUCTW *>(lp);
       // Recover the `this` pointer we passed as the lpParam argument to
       // CreateWindowExW.
-      self = static_cast<LiteUI *>(cs->lpCreateParams);
+      self = static_cast<LiteUIImpl *>(cs->lpCreateParams);
       // Stash that pointer in the window's user-data slot so future messages
       // can retrieve it.
       SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     // For every other message, the pointer was already stored by the
     // WM_NCCREATE branch above.
-    else {
+    else
+    {
       // Fetch the previously stored `this` pointer back out of the window's
       // user-data slot.
-      self = reinterpret_cast<LiteUI *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+      self = reinterpret_cast<LiteUIImpl *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
 
     // Dispatch on the specific message type.
-    switch (msg) {
+    switch (msg)
+    {
     // Repaint request: paint everything into the off-screen back buffer,
     // then blit it to the screen in a single BitBlt — see memDC_'s comment
     // for why (this is the actual flicker fix).
-    case WM_PAINT: {
+    case WM_PAINT:
+    {
       PAINTSTRUCT ps;
       BeginPaint(hwnd, &ps);
-      if (self) {
+      if (self)
+      {
         self->ensureRenderTarget();
         LITEUI_PROF_START(profBuild);
         self->renderTarget_->BeginDraw();
@@ -7963,7 +9074,8 @@ private:
         // D2DERR_RECREATE_TARGET means the underlying device is gone
         // (driver reset, GPU removal, etc.) — drop the target so the next
         // WM_PAINT's ensureRenderTarget() rebuilds it from scratch.
-        if (hr == D2DERR_RECREATE_TARGET) {
+        if (hr == D2DERR_RECREATE_TARGET)
+        {
           self->renderTarget_->Release();
           self->renderTarget_ = nullptr;
         }
@@ -7987,8 +9099,10 @@ private:
       // click (see updateScrollDrag/endScrollPress). Capture the mouse so we
       // still get the matching WM_MOUSEMOVE/WM_LBUTTONUP even if the cursor
       // leaves the window before the button is released.
-    case WM_LBUTTONDOWN: {
-      if (self) {
+    case WM_LBUTTONDOWN:
+    {
+      if (self)
+      {
         self->hideTooltip();
         self->moveRequested_ =
             false; // only honor a request made during THIS press
@@ -7997,7 +9111,8 @@ private:
         if (!self->beginScrollPress(x, y))
           self->beginPress(x, y);
 
-        if (self->moveRequested_) {
+        if (self->moveRequested_)
+        {
           self->moveRequested_ = false;
           // Hand the mouse to
           // Windows' own move loop, WITHOUT calling SetCapture first. The
@@ -8026,8 +9141,10 @@ private:
     // Pointer moved with a button held: advances an in-progress scrollbar
     // drag or content pan. No-op (returns false) if neither is active, so
     // this costs nothing on ordinary hover.
-    case WM_MOUSEMOVE: {
-      if (self) {
+    case WM_MOUSEMOVE:
+    {
+      if (self)
+      {
         LITEUI_PROF_START(profMove);
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
@@ -8036,7 +9153,7 @@ private:
           changed = true;
         bool needPoll = false;
         if (self->hasRoot_ &&
-            LiteUI::updateHover(self->root_, x, y, ClipRect{}, &needPoll))
+            LiteUIImpl::updateHover(self->root_, x, y, ClipRect{}, &needPoll))
           changed = true;
         self->updateTooltipHover(x, y);
         if (needPoll)
@@ -8056,8 +9173,10 @@ private:
     // the original press target (endScrollPress handles the scroll-drag
     // side of this and defers to endPress() when a pan never actually
     // moved, i.e. it was really just a click).
-    case WM_LBUTTONUP: {
-      if (self) {
+    case WM_LBUTTONUP:
+    {
+      if (self)
+      {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (self->endScrollPress(x, y) && self->hwnd_)
@@ -8070,8 +9189,10 @@ private:
     // Middle/right buttons don't interact with scrollbars — that's a
     // left-drag convention — so these go straight through the ordinary
     // press/click path.
-    case WM_MBUTTONDOWN: {
-      if (self) {
+    case WM_MBUTTONDOWN:
+    {
+      if (self)
+      {
         self->hideTooltip();
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
@@ -8083,8 +9204,10 @@ private:
       return 0;
     }
 
-    case WM_MBUTTONUP: {
-      if (self) {
+    case WM_MBUTTONUP:
+    {
+      if (self)
+      {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (self->endPress(x, y, MouseButton::Middle) && self->hwnd_)
@@ -8094,8 +9217,10 @@ private:
       return 0;
     }
 
-    case WM_RBUTTONDOWN: {
-      if (self) {
+    case WM_RBUTTONDOWN:
+    {
+      if (self)
+      {
         self->hideTooltip();
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
@@ -8107,8 +9232,10 @@ private:
       return 0;
     }
 
-    case WM_RBUTTONUP: {
-      if (self) {
+    case WM_RBUTTONUP:
+    {
+      if (self)
+      {
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         if (self->endPress(x, y, MouseButton::Right) && self->hwnd_)
@@ -8123,8 +9250,10 @@ private:
     // client-space) — ScreenToClient converts before hit-testing. One
     // notch (WHEEL_DELTA = 120) scrolls a fixed 40px step; larger/precision
     // wheels report multiples/fractions of that.
-    case WM_MOUSEWHEEL: {
-      if (self) {
+    case WM_MOUSEWHEEL:
+    {
+      if (self)
+      {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         float notches =
@@ -8146,8 +9275,10 @@ private:
     // Horizontal mouse-wheel rotation (tilt-wheel or shift+wheel on most
     // drivers). Same coordinate/notch handling as WM_MOUSEWHEEL, but
     // positive notches scroll right, so no negation here.
-    case WM_MOUSEHWHEEL: {
-      if (self) {
+    case WM_MOUSEHWHEEL:
+    {
+      if (self)
+      {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         float notches =
@@ -8166,8 +9297,10 @@ private:
     // both the pending click and any in-progress scroll drag rather than
     // let a later, unrelated event resolve them.
     case WM_CAPTURECHANGED:
-      if (self) {
-        for (int i = 0; i < 3; ++i) {
+      if (self)
+      {
+        for (int i = 0; i < 3; ++i)
+        {
           self->pressedView_[i] = nullptr;
           self->endDrag(i);
         }
@@ -8176,8 +9309,10 @@ private:
       return 0;
 
     case WM_KEYDOWN:
-    case WM_SYSKEYDOWN: {
-      if (self) {
+    case WM_SYSKEYDOWN:
+    {
+      if (self)
+      {
         KeyEvent e{vkToKey(wp), currentModifiers()};
         if (self->dispatchKeyDown(e) && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -8188,8 +9323,10 @@ private:
     }
 
     case WM_KEYUP:
-    case WM_SYSKEYUP: {
-      if (self) {
+    case WM_SYSKEYUP:
+    {
+      if (self)
+      {
         KeyEvent e{vkToKey(wp), currentModifiers()};
         if (self->dispatchKeyUp(e) && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -8200,19 +9337,26 @@ private:
     // WM_CHAR gives already-composed text as UTF-16 code units — handle
     // surrogate pairs since anything outside the BMP (emoji, etc.) arrives
     // as a high/low surrogate pair across two messages.
-    case WM_CHAR: {
-      if (self) {
+    case WM_CHAR:
+    {
+      if (self)
+      {
         uint32_t cu = static_cast<uint32_t>(wp);
         static uint32_t pendingHighSurrogate = 0;
-        if (cu >= 0xD800 && cu <= 0xDBFF) {
+        if (cu >= 0xD800 && cu <= 0xDBFF)
+        {
           pendingHighSurrogate = cu;
-        } else if (cu >= 0xDC00 && cu <= 0xDFFF && pendingHighSurrogate) {
+        }
+        else if (cu >= 0xDC00 && cu <= 0xDFFF && pendingHighSurrogate)
+        {
           uint32_t cp =
               0x10000 + ((pendingHighSurrogate - 0xD800) << 10) + (cu - 0xDC00);
           pendingHighSurrogate = 0;
           if (self->dispatchTextInput(cp) && self->hwnd_)
             InvalidateRect(self->hwnd_, nullptr, FALSE);
-        } else if (cu >= 0x20 || cu == '\t') { // skip raw control chars
+        }
+        else if (cu >= 0x20 || cu == '\t')
+        { // skip raw control chars
           pendingHighSurrogate = 0;
           if (self->dispatchTextInput(cu) && self->hwnd_)
             InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -8225,19 +9369,23 @@ private:
     // — blur our own focused view so a background window doesn't keep
     // silently eating keystrokes meant for something else.
     case WM_KILLFOCUS:
-      if (self) {
+      if (self)
+      {
         self->setFocus(nullptr);
         self->hideTooltip();
       }
       return 0;
 
       // Keeps a frameless window from covering the taskbar when maximized.
-    case WM_GETMINMAXINFO: {
-      if (self && self->hideTitlebar_) {
+    case WM_GETMINMAXINFO:
+    {
+      if (self && self->hideTitlebar_)
+      {
         HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(mon, &mi)) {
+        if (GetMonitorInfoW(mon, &mi))
+        {
           auto *mmi = reinterpret_cast<MINMAXINFO *>(lp);
           mmi->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
           mmi->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
@@ -8253,10 +9401,12 @@ private:
       // stored dimensions and re-run layout against the new size. GDI needs
       // no buffer reallocation (it paints straight into the window's DC), so
       // this is just relayout + repaint.
-    case WM_SIZE: {
+    case WM_SIZE:
+    {
       if (wp == SIZE_MINIMIZED)
         return 0;
-      if (self) {
+      if (self)
+      {
         self->width_ = LOWORD(lp);
         self->height_ = HIWORD(lp);
         if (self->renderTarget_)
@@ -8270,8 +9420,10 @@ private:
       }
       return 0;
     }
-    case kWakeMsg: {
-      if (self) {
+    case kWakeMsg:
+    {
+      if (self)
+      {
         // Clear the flag BEFORE running the handler: a wake() issued while
         // the handler runs must post a fresh message, not be swallowed.
         self->wakePending_.store(false);
@@ -8281,10 +9433,13 @@ private:
       }
       return 0;
     }
-    case WM_TIMER: {
-      if (self) {
+    case WM_TIMER:
+    {
+      if (self)
+      {
         auto it = self->timers_.find(wp);
-        if (it != self->timers_.end()) {
+        if (it != self->timers_.end())
+        {
           it->second();
           self->requestRepaint();
         }
@@ -8309,7 +9464,8 @@ private:
   }
 
   // Draws every queued box into the render target.
-  void paintBoxes(ID2D1RenderTarget *rt) {
+  void paintBoxes(ID2D1RenderTarget *rt)
+  {
     for (const auto &b : boxes_)
       d2dFillRect(rt, static_cast<float>(b.pos_x), static_cast<float>(b.pos_y),
                   static_cast<float>(b.width), static_cast<float>(b.height),
@@ -8319,8 +9475,10 @@ private:
   // Draws the layout tree (if any). Border-radius is handled natively by
   // D2D1_ROUNDED_RECT — no manual pixel math needed on this platform,
   // same as the old RoundRect approach, just anti-aliased for free.
-  void paintRoot(ID2D1RenderTarget *rt) {
-    if (hasRoot_) {
+  void paintRoot(ID2D1RenderTarget *rt)
+  {
+    if (hasRoot_)
+    {
       paintView(rt, root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
@@ -8330,7 +9488,8 @@ private:
     }
   }
 
-  void paintTooltip(ID2D1RenderTarget *rt) {
+  void paintTooltip(ID2D1RenderTarget *rt)
+  {
     if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
       return;
     TextStyle ts;
@@ -8354,7 +9513,8 @@ private:
         m.width + 4, m.height + 4);
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(tooltipStyle_.textColor), &brush);
-    if (brush) {
+    if (brush)
+    {
       rt->SetTransform(D2D1::Matrix3x2F::Identity());
       rt->DrawTextLayout(D2D1::Point2F(bx + pad, by + pad), layout, brush);
       brush->Release();
@@ -8368,7 +9528,8 @@ private:
   // restricts (a scrollbar always sits fully within its own view's box,
   // which is itself already visible or this function wouldn't have been
   // reached).
-  void paintScrollbars(ID2D1RenderTarget *rt, const View &v) {
+  void paintScrollbars(ID2D1RenderTarget *rt, const View &v)
+  {
     // Auto-hide: painted only while hovered, or while this exact view's
     // thumb is mid-drag (so a fast drag that briefly outruns the pointer
     // doesn't make the bar vanish out from under it).
@@ -8380,19 +9541,22 @@ private:
     // Per-view override falls back to the window-wide default independently
     // for track and thumb (see Style::scrollTrackColor/scrollThumbColor).
     Color track = resolveDynamic(v.style.scrollTrackColor,
-                                  v.computed.resolvedScrollTrackColor)
+                                 v.computed.resolvedScrollTrackColor)
                       .value_or(scrollTrack_);
     Color thumb = resolveDynamic(v.style.scrollThumbColor,
-                                  v.computed.resolvedScrollThumbColor)
+                                 v.computed.resolvedScrollThumbColor)
                       .value_or(scrollThumb_);
-    auto box = [&](const PixRect &r, Color c) {
+    auto box = [&](const PixRect &r, Color c)
+    {
       d2dFillRect(rt, r.x, r.y, r.w, r.h, c);
     };
-    if (wantVBar(v)) {
+    if (wantVBar(v))
+    {
       box(vTrackRect(v), track);
       box(vThumbRect(v), thumb);
     }
-    if (wantHBar(v)) {
+    if (wantHBar(v))
+    {
       box(hTrackRect(v), track);
       box(hThumbRect(v), thumb);
     }
@@ -8406,7 +9570,8 @@ private:
   // different final width — a resize/relayout can change how the text
   // wraps even with no string/style change. `v` is const here (called
   // from paintView), which is exactly why the cache fields are mutable.
-  static void ensureTextLayout(const View &v) {
+  static void ensureTextLayout(const View &v)
+  {
     const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
     float fontSize =
         resolveDynamic(v.textStyle.fontSize, v.computed.resolvedFontSize);
@@ -8421,7 +9586,8 @@ private:
         v.computed.textLayoutBuiltForFontWeight == fontWeight &&
         v.computed.textLayoutBuiltForFontStyle == fontStyleVal)
       return;
-    if (v.computed.textLayout) {
+    if (v.computed.textLayout)
+    {
       v.computed.textLayout->Release();
       v.computed.textLayout = nullptr;
     }
@@ -8438,14 +9604,16 @@ private:
     v.computed.textLayoutBuiltForFontStyle = fontStyleVal;
   }
 
-  void paintText(ID2D1RenderTarget *rt, const View &v) {
+  void paintText(ID2D1RenderTarget *rt, const View &v)
+  {
     ensureTextLayout(v);
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(
         toD2DColor(
             resolveDynamic(v.textStyle.color, v.computed.resolvedTextColor)),
         &brush);
-    if (brush) {
+    if (brush)
+    {
       const EdgeInsets &pad =
           resolveDynamic(v.style.padding, v.computed.resolvedPadding);
       float x = v.computed.x + pad.left;
@@ -8467,7 +9635,8 @@ private:
   // true, so this always happens at least once). A plain repaint with
   // neither condition true is a no-op: the previous frame's bitmap is
   // simply reused.
-  void ensureCanvasTarget(const View &v) {
+  void ensureCanvasTarget(const View &v)
+  {
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
@@ -8475,12 +9644,15 @@ private:
     bool resized = !v.computed.canvasTarget ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
-    if (resized) {
-      if (v.computed.canvasTarget) {
+    if (resized)
+    {
+      if (v.computed.canvasTarget)
+      {
         v.computed.canvasTarget->Release();
         v.computed.canvasTarget = nullptr;
       }
-      if (v.computed.canvasWicBitmap) {
+      if (v.computed.canvasWicBitmap)
+      {
         v.computed.canvasWicBitmap->Release();
         v.computed.canvasWicBitmap = nullptr;
       }
@@ -8488,7 +9660,8 @@ private:
       // the new one (see CanvasContext::drawImage's comment) — drop it so
       // the next drawImage call rebuilds fresh instead of leaking it or,
       // worse, drawing a stale bitmap belonging to a released target.
-      if (v.computed.cachedImageBitmap) {
+      if (v.computed.cachedImageBitmap)
+      {
         v.computed.cachedImageBitmap->Release();
         v.computed.cachedImageBitmap = nullptr;
       }
@@ -8504,7 +9677,8 @@ private:
       if (wic && SUCCEEDED(wic->CreateBitmap(
                      static_cast<UINT>(innerW), static_cast<UINT>(innerH),
                      GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
-                     &v.computed.canvasWicBitmap))) {
+                     &v.computed.canvasWicBitmap)))
+      {
         D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -8518,12 +9692,13 @@ private:
     }
     if (!v.computed.canvasTarget)
       return;
-    if (v.computed.canvasNeedsRedraw && v.onPaint) {
+    if (v.computed.canvasNeedsRedraw && v.onPaint)
+    {
       LITEUI_PROF_START(profCanvas);
       v.computed.canvasTarget->BeginDraw();
       v.computed.canvasTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
-      CanvasContext ctx(v.computed.canvasTarget, innerW, innerH,
-                        v.computed.canvasWicBitmap, &v.computed);
+      CanvasContextImpl ctx(v.computed.canvasTarget, innerW, innerH,
+                            v.computed.canvasWicBitmap, &v.computed);
       v.onPaint(ctx);
       v.computed.canvasTarget->EndDraw();
       v.computed.canvasNeedsRedraw = false;
@@ -8542,7 +9717,8 @@ private:
   // simplicity (it also sidesteps needing to invalidate any cached bitmap
   // on device loss/D2DERR_RECREATE_TARGET); revisit with a cache keyed on
   // canvasNeedsRedraw if this ever shows up as a bottleneck.
-  void paintCanvas(ID2D1RenderTarget *rt, const View &v) {
+  void paintCanvas(ID2D1RenderTarget *rt, const View &v)
+  {
     ensureCanvasTarget(v);
     if (!v.computed.canvasTarget || !v.computed.canvasWicBitmap)
       return;
@@ -8573,7 +9749,8 @@ private:
   // per View), pushing on entry and popping on exit naturally nests
   // correctly with the call tree — no need to save/restore a previous
   // clip handle the way SelectClipRgn did.
-  void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip) {
+  void paintView(ID2D1RenderTarget *rt, const View &v, ClipRect clip)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return; // space already reserved by layout; just don't draw it
@@ -8595,7 +9772,8 @@ private:
     // would otherwise paint an opaque box under the glyphs on every text
     // node, since Style::backgroundColor defaults to opaque white rather
     // than "none" (Color has no alpha channel to express transparent).
-    if (v.isText) {
+    if (v.isText)
+    {
       paintText(rt, v);
       if (clipped)
         rt->PopAxisAlignedClip();
@@ -8612,19 +9790,22 @@ private:
                                     v.computed.resolvedBackgroundColor);
     ID2D1SolidColorBrush *bgBrush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(bg), &bgBrush);
-    if (bgBrush) {
+    if (bgBrush)
+    {
       rt->FillRoundedRectangle(rr, bgBrush);
       bgBrush->Release();
     }
     float borderWidth =
         resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
-    if (borderWidth > 0) {
+    if (borderWidth > 0)
+    {
       ID2D1SolidColorBrush *borderBrush = nullptr;
       rt->CreateSolidColorBrush(
           toD2DColor(
               resolveDynamic(s.borderColor, v.computed.resolvedBorderColor)),
           &borderBrush);
-      if (borderBrush) {
+      if (borderBrush)
+      {
         rt->DrawRoundedRectangle(rr, borderBrush, borderWidth);
         borderBrush->Release();
       }
@@ -8668,7 +9849,7 @@ private:
       nullptr; // Connection handle to the Wayland compositor; null until
                // wl_display_connect succeeds.
   wl_compositor *compositor_ =
-      nullptr; // The compositor global, used to create surfaces.
+      nullptr;                      // The compositor global, used to create surfaces.
   xdg_wm_base *wm_base_ = nullptr;  // The xdg-shell global, used to turn a raw
                                     // surface into a desktop window.
   wl_surface *surface_ = nullptr;   // The raw drawable surface for this window.
@@ -8687,7 +9868,8 @@ private:
   xkb_keymap *xkbKeymap_ = nullptr;
   xkb_state *xkbState_ = nullptr;
 
-  struct IntervalTimer {
+  struct IntervalTimer
+  {
     int fd;
     std::function<void()> fn;
   };
@@ -8792,8 +9974,8 @@ private:
   GLuint texProgram_ = 0;
   GLuint canvasProgram_ = 0; // samples RGBA directly, no alpha-tint (unlike
                              // texProgram_'s glyph-coverage tinting)
-  GLuint quadVbo_ = 0; // static unit quad, reused by every rectProgram_ draw
-  GLuint flatVbo_ = 0; // rewritten per-call for flatProgram_ (line quads)
+  GLuint quadVbo_ = 0;       // static unit quad, reused by every rectProgram_ draw
+  GLuint flatVbo_ = 0;       // rewritten per-call for flatProgram_ (line quads)
   GLint rectAPos_ = -1, rectUPos_ = -1, rectUSize_ = -1, rectUScreen_ = -1,
         rectURadius_ = -1, rectUColor_ = -1;
   GLint flatAPos_ = -1, flatUScreen_ = -1, flatUColor_ = -1;
@@ -8804,8 +9986,8 @@ private:
         canvasUScreen_ = -1, canvasUTex_ = -1;
 
   bool configured_ =
-      false; // Set true once the compositor has sent its first
-             // configure event, meaning we're allowed to attach a buffer.
+      false;              // Set true once the compositor has sent its first
+                          // configure event, meaning we're allowed to attach a buffer.
   int pendingWidth_ = 0;  // Size most recently suggested by
   int pendingHeight_ = 0; // toplevelConfigure; 0 means "no suggestion yet"
                           // (the compositor may send 0x0 to mean "you decide").
@@ -8908,13 +10090,15 @@ private:
     }
   )";
 
-  static GLuint compileShader(GLenum type, const char *src) {
+  static GLuint compileShader(GLenum type, const char *src)
+  {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
     glCompileShader(s);
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
+    if (!ok)
+    {
       char log[512];
       glGetShaderInfoLog(s, sizeof(log), nullptr, log);
       fprintf(stderr, "shader compile error: %s\n", log);
@@ -8922,7 +10106,8 @@ private:
     }
     return s;
   }
-  static GLuint linkProgram(const char *vs, const char *fs) {
+  static GLuint linkProgram(const char *vs, const char *fs)
+  {
     GLuint v = compileShader(GL_VERTEX_SHADER, vs);
     GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
     GLuint p = glCreateProgram();
@@ -8933,7 +10118,8 @@ private:
     glDeleteShader(f);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    if (!ok) {
+    if (!ok)
+    {
       char log[512];
       glGetProgramInfoLog(p, sizeof(log), nullptr, log);
       fprintf(stderr, "program link error: %s\n", log);
@@ -8943,7 +10129,8 @@ private:
   }
 
   // xdg_wm_base ping handler: the compositor periodically checks we're alive.
-  static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial) {
+  static void wmBasePing(void *, xdg_wm_base *base, uint32_t serial)
+  {
     // Echo the serial straight back so the compositor knows we're responsive.
     xdg_wm_base_pong(base, serial);
   }
@@ -8952,9 +10139,10 @@ private:
   static constexpr xdg_wm_base_listener wmBaseListener = {wmBasePing};
 
   // Called when the compositor wants us to (re)configure our xdg_surface.
-  static void surfaceConfigure(void *data, xdg_surface *xs, uint32_t serial) {
+  static void surfaceConfigure(void *data, xdg_surface *xs, uint32_t serial)
+  {
     // Recover the LiteUI instance this callback belongs to.
-    auto *self = static_cast<LiteUI *>(data);
+    auto *self = static_cast<LiteUIImpl *>(data);
     // Acknowledge the configure event with its serial, as the protocol
     // requires.
     xdg_surface_ack_configure(xs, serial);
@@ -8965,9 +10153,11 @@ private:
     // first configure, no buffer exists yet, so create and attach one now.
     if (self->pendingWidth_ > 0 && self->pendingHeight_ > 0 &&
         (self->pendingWidth_ != self->width_ ||
-         self->pendingHeight_ != self->height_)) {
+         self->pendingHeight_ != self->height_))
+    {
       self->resize(self->pendingWidth_, self->pendingHeight_);
-    } else if (!self->eglReady_)
+    }
+    else if (!self->eglReady_)
       self->initEgl();
   }
   // Listener struct binding surfaceConfigure to xdg_surface's single event.
@@ -8975,9 +10165,11 @@ private:
 
   // Called when the compositor suggests a new size/state for the toplevel.
   static void toplevelConfigure(void *data, xdg_toplevel *, int32_t width,
-                                int32_t height, wl_array *states) {
-    auto *self = static_cast<LiteUI *>(data);
-    if (width > 0 && height > 0) {
+                                int32_t height, wl_array *states)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (width > 0 && height > 0)
+    {
       self->pendingWidth_ = width;
       self->pendingHeight_ = height;
     }
@@ -8990,9 +10182,10 @@ private:
   }
   // Called when the compositor/user requests the window be closed (e.g. via a
   // taskbar close action).
-  static void toplevelClose(void *data, xdg_toplevel *) {
+  static void toplevelClose(void *data, xdg_toplevel *)
+  {
     // Flip the running flag so run()'s dispatch loop exits on its next check.
-    static_cast<LiteUI *>(data)->running_ = false;
+    static_cast<LiteUIImpl *>(data)->running_ = false;
   }
   // Listener struct binding the two callbacks above to xdg_toplevel's
   // configure/close events.
@@ -9003,13 +10196,16 @@ private:
 
   // Called when the seat announces which input capabilities
   // (pointer/keyboard/touch) it has.
-  static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps) {
-    auto *self = static_cast<LiteUI *>(data);
-    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_) {
+  static void seatCapabilities(void *data, wl_seat *seat, uint32_t caps)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !self->pointer_)
+    {
       self->pointer_ = wl_seat_get_pointer(seat);
       wl_pointer_add_listener(self->pointer_, &pointerListener, self);
     }
-    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !self->keyboard_) {
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !self->keyboard_)
+    {
       self->keyboard_ = wl_seat_get_keyboard(seat);
       wl_keyboard_add_listener(self->keyboard_, &keyboardListener, self);
     }
@@ -9022,9 +10218,10 @@ private:
 
   // Called when the pointer enters this surface.
   static void pointerEnter(void *data, wl_pointer *, uint32_t serial,
-                           wl_surface *, wl_fixed_t sx, wl_fixed_t sy) {
+                           wl_surface *, wl_fixed_t sx, wl_fixed_t sy)
+  {
     // Recover the owning LiteUI.
-    auto *self = static_cast<LiteUI *>(data);
+    auto *self = static_cast<LiteUIImpl *>(data);
     // Convert Wayland's fixed-point x coordinate to a double and store it.
     self->pointer_x_ = wl_fixed_to_double(sx);
     // Same for the y coordinate.
@@ -9043,16 +10240,18 @@ private:
   // Called when the pointer leaves this surface. Reset the cached cursor
   // name so re-entering always re-applies one, rather than skipping the
   // very next setCursor() as a no-op change.
-  static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *) {
-    static_cast<LiteUI *>(data)->flushPendingMotion();
-    static_cast<LiteUI *>(data)->currentCursorName_.clear();
+  static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *)
+  {
+    static_cast<LiteUIImpl *>(data)->flushPendingMotion();
+    static_cast<LiteUIImpl *>(data)->currentCursorName_.clear();
   }
   // Called on every pointer movement while over this surface.
   // Called on every pointer movement while over this surface.
   static void pointerMotion(void *data, wl_pointer *, uint32_t, wl_fixed_t sx,
-                            wl_fixed_t sy) {
+                            wl_fixed_t sy)
+  {
     // Recover the owning LiteUI.
-    auto *self = static_cast<LiteUI *>(data);
+    auto *self = static_cast<LiteUIImpl *>(data);
     // Only remember where the pointer is now. A compositor can deliver
     // several motion events per frame (and a high-polling-rate mouse many
     // more); doing the drag/hover/redraw work for each one made a slow
@@ -9076,7 +10275,8 @@ private:
   // MUST NOT be called while a wl_display_prepare_read() is outstanding:
   // redraw() -> eglSwapBuffers can read the display itself, which would
   // wait forever on our own pending read intent.
-  void flushPendingMotion() {
+  void flushPendingMotion()
+  {
     if (!motionPending_)
       return;
     motionPending_ = false;
@@ -9091,7 +10291,7 @@ private:
     if (updateAllDrags(x, y))
       changed = true;
     bool needPoll = false;
-    if (hasRoot_ && LiteUI::updateHover(root_, x, y, ClipRect{}, &needPoll))
+    if (hasRoot_ && LiteUIImpl::updateHover(root_, x, y, ClipRect{}, &needPoll))
       changed = true;
 
     // arms/cancels/re-targets the tooltip timer. Handles its own
@@ -9118,8 +10318,9 @@ private:
   // wl_pointer protocol), so it's usable directly as a pixel delta with no
   // extra scaling, unlike Windows' notch-based WM_MOUSEWHEEL.
   static void pointerAxis(void *data, wl_pointer *, uint32_t, uint32_t axis,
-                          wl_fixed_t value) {
-    auto *self = static_cast<LiteUI *>(data);
+                          wl_fixed_t value)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
     self->flushPendingMotion(); // hit-test against the up-to-date position
     float delta = static_cast<float>(wl_fixed_to_double(value));
     float dx = 0, dy = 0;
@@ -9143,9 +10344,10 @@ private:
   }
   // Called on every pointer button press/release.
   static void pointerButton(void *data, wl_pointer *, uint32_t serial, uint32_t,
-                            uint32_t button, uint32_t state) {
+                            uint32_t button, uint32_t state)
+  {
     // Recover the owning LiteUI.
-    auto *self = static_cast<LiteUI *>(data);
+    auto *self = static_cast<LiteUIImpl *>(data);
     // Bring any drag up to the final pointer position first, so a release
     // that arrives in the same batch as the last few motion events ends the
     // drag where the user actually let go.
@@ -9172,9 +10374,11 @@ private:
       pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis};
 
   static void keyboardKeymap(void *data, wl_keyboard *, uint32_t format,
-                             int32_t fd, uint32_t size) {
-    auto *self = static_cast<LiteUI *>(data);
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+                             int32_t fd, uint32_t size)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
+    {
       close(fd);
       return;
     }
@@ -9202,16 +10406,18 @@ private:
 
   // Keyboard focus left our surface entirely (switched to another window)
   // — blur, and stop any in-flight repeat, same reasoning as WM_KILLFOCUS.
-  static void keyboardLeave(void *data, wl_keyboard *, uint32_t, wl_surface *) {
-    auto *self = static_cast<LiteUI *>(data);
+  static void keyboardLeave(void *data, wl_keyboard *, uint32_t, wl_surface *)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
     self->setFocus(nullptr);
     self->repeatKeycode_ = 0;
     self->hideTooltip();
   }
 
   static void keyboardKey(void *data, wl_keyboard *, uint32_t, uint32_t,
-                          uint32_t key, uint32_t state) {
-    auto *self = static_cast<LiteUI *>(data);
+                          uint32_t key, uint32_t state)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
     if (!self->xkbState_)
       return;
     // Wayland keycodes are evdev-based, offset by 8 from the X11/xkb
@@ -9220,7 +10426,8 @@ private:
     xkb_keysym_t sym = xkb_state_key_get_one_sym(self->xkbState_, xkbCode);
     KeyEvent e{xkbKeysymToKey(sym), self->modState_};
     bool changed = false;
-    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    {
       changed = self->dispatchKeyDown(e);
       uint32_t cp = xkb_state_key_get_utf32(self->xkbState_, xkbCode);
       if ((cp >= 0x20 || cp == '\t') && !self->modState_.alt)
@@ -9228,11 +10435,14 @@ private:
       // Arm repeat for this key if the compositor wants repeat and this
       // key actually produces repeatable input (xkb flags this).
       if (self->repeatRateHz_ > 0 &&
-          xkb_keymap_key_repeats(self->xkbKeymap_, xkbCode)) {
+          xkb_keymap_key_repeats(self->xkbKeymap_, xkbCode))
+      {
         self->repeatKeycode_ = key;
         self->armRepeatTimer(self->repeatDelayMs_);
       }
-    } else {
+    }
+    else
+    {
       changed = self->dispatchKeyUp(e);
       if (self->repeatKeycode_ == key)
         self->repeatKeycode_ = 0;
@@ -9243,8 +10453,9 @@ private:
 
   static void keyboardModifiers(void *data, wl_keyboard *, uint32_t,
                                 uint32_t modsDepressed, uint32_t modsLatched,
-                                uint32_t modsLocked, uint32_t group) {
-    auto *self = static_cast<LiteUI *>(data);
+                                uint32_t modsLocked, uint32_t group)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
     if (!self->xkbState_)
       return;
     xkb_state_update_mask(self->xkbState_, modsDepressed, modsLatched,
@@ -9262,17 +10473,19 @@ private:
   }
 
   static void keyboardRepeatInfo(void *data, wl_keyboard *, int32_t rate,
-                                 int32_t delay) {
-    auto *self = static_cast<LiteUI *>(data);
+                                 int32_t delay)
+  {
+    auto *self = static_cast<LiteUIImpl *>(data);
     self->repeatRateHz_ = rate;
     self->repeatDelayMs_ = delay;
   }
 
   static constexpr wl_keyboard_listener keyboardListener = {
-      keyboardKeymap, keyboardEnter,     keyboardLeave,
-      keyboardKey,    keyboardModifiers, keyboardRepeatInfo};
+      keyboardKeymap, keyboardEnter, keyboardLeave,
+      keyboardKey, keyboardModifiers, keyboardRepeatInfo};
 
-  void armRepeatTimer(int delayMs) {
+  void armRepeatTimer(int delayMs)
+  {
     if (repeatTimerFd_ < 0)
       repeatTimerFd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (repeatTimerFd_ < 0)
@@ -9280,14 +10493,16 @@ private:
     itimerspec spec{};
     spec.it_value.tv_sec = delayMs / 1000;
     spec.it_value.tv_nsec = (delayMs % 1000) * 1000000L;
-    if (repeatRateHz_ > 0) {
+    if (repeatRateHz_ > 0)
+    {
       spec.it_interval.tv_sec = 0;
       spec.it_interval.tv_nsec = 1000000000L / repeatRateHz_;
     }
     timerfd_settime(repeatTimerFd_, 0, &spec, nullptr);
   }
 
-  void fireRepeatIfDue() {
+  void fireRepeatIfDue()
+  {
     if (repeatTimerFd_ < 0 || repeatKeycode_ == 0 || !xkbState_)
       return;
     uint64_t expirations;
@@ -9306,17 +10521,20 @@ private:
 
   // Called once per global object the compositor advertises via the registry.
   static void registryGlobal(void *data, wl_registry *registry, uint32_t name,
-                             const char *interface, uint32_t) {
+                             const char *interface, uint32_t)
+  {
     // Recover the owning LiteUI.
-    auto *self = static_cast<LiteUI *>(data);
+    auto *self = static_cast<LiteUIImpl *>(data);
     // If this global is the compositor interface...
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    if (strcmp(interface, wl_compositor_interface.name) == 0)
+    {
       // ...bind to it at version 4 and store the resulting proxy.
       self->compositor_ = static_cast<wl_compositor *>(
           wl_registry_bind(registry, name, &wl_compositor_interface, 4));
     }
     // If instead this global is the xdg_wm_base (window-shell) interface...
-    else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+    else if (strcmp(interface, xdg_wm_base_interface.name) == 0)
+    {
       // ...bind to it at version 1...
       self->wm_base_ = static_cast<xdg_wm_base *>(
           wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
@@ -9324,13 +10542,15 @@ private:
       xdg_wm_base_add_listener(self->wm_base_, &wmBaseListener, self);
     }
     // If instead this global is the shared-memory interface...
-    else if (strcmp(interface, wl_shm_interface.name) == 0) {
+    else if (strcmp(interface, wl_shm_interface.name) == 0)
+    {
       // ...bind to it so we can later allocate pixel buffers.
       self->shm_ = static_cast<wl_shm *>(
           wl_registry_bind(registry, name, &wl_shm_interface, 1));
     }
     // If instead this global is the seat (input devices) interface...
-    else if (strcmp(interface, wl_seat_interface.name) == 0) {
+    else if (strcmp(interface, wl_seat_interface.name) == 0)
+    {
       // ...bind to it...
       self->seat_ = static_cast<wl_seat *>(
           wl_registry_bind(registry, name, &wl_seat_interface, 1));
@@ -9340,13 +10560,16 @@ private:
     }
     // If instead this global is the decoration-manager interface...
     else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) ==
-             0) {
+             0)
+    {
       // ...bind to it so we can later request client-side (or server-side)
       // decorations.
       self->decoration_manager_ =
           static_cast<zxdg_decoration_manager_v1 *>(wl_registry_bind(
               registry, name, &zxdg_decoration_manager_v1_interface, 1));
-    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+    }
+    else if (strcmp(interface, wl_seat_interface.name) == 0)
+    {
       self->seat_ = static_cast<wl_seat *>(
           wl_registry_bind(registry, name, &wl_seat_interface,
                            4)); // bump to 4 for keyboard repeat_info
@@ -9369,7 +10592,8 @@ private:
   // Maps a pointer position to which edge (if any) an interactive resize
   // should grab, mirroring how most CSD toolkits treat a thin strip along
   // each window edge as a resize handle rather than ordinary content.
-  uint32_t resizeEdgeAt(double px, double py) const {
+  uint32_t resizeEdgeAt(double px, double py) const
+  {
     bool left = px < kResizeMargin;
     bool right = px >= width_ - kResizeMargin;
     bool top = py < kResizeMargin;
@@ -9395,8 +10619,10 @@ private:
 
   // Standard XCursor names for each edge/corner; "left_ptr" is the ordinary
   // arrow shown everywhere else.
-  static const char *cursorNameForEdge(uint32_t edge) {
-    switch (edge) {
+  static const char *cursorNameForEdge(uint32_t edge)
+  {
+    switch (edge)
+    {
     case XDG_TOPLEVEL_RESIZE_EDGE_TOP:
       return "top_side";
     case XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM:
@@ -9421,7 +10647,8 @@ private:
   // Swaps the pointer's visible cursor to the named XCursor image, skipping
   // the work entirely if it's already showing (motion events fire far more
   // often than the cursor actually needs to change).
-  void setCursor(const char *name) {
+  void setCursor(const char *name)
+  {
     if (!cursorTheme_ || !pointer_ || currentCursorName_ == name)
       return;
     wl_cursor *cursor = wl_cursor_theme_get_cursor(cursorTheme_, name);
@@ -9446,7 +10673,8 @@ private:
   // allocates+attaches fresh buffers at the new dimensions. Buffers can't
   // be resized in place — wl_shm buffers are fixed-size — so this is a full
   // destroy/recreate rather than a realloc.
-  void resize(int newWidth, int newHeight) {
+  void resize(int newWidth, int newHeight)
+  {
     width_ = newWidth;
     height_ = newHeight;
     if (eglWindow_)
@@ -9463,7 +10691,8 @@ private:
   // compiles the two shader programs. Called once, from surfaceConfigure(),
   // the first time the compositor hands us a configure event — mirroring
   // when attachBuffer() used to run.
-  void initEgl() {
+  void initEgl()
+  {
     // eglGetDisplay() can't reliably tell "this pointer is a wl_display*"
     // apart from other native display types on multi-platform Mesa
     // builds — on some setups it silently falls back to the generic
@@ -9473,10 +10702,13 @@ private:
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
         reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
             eglGetProcAddress("eglGetPlatformDisplayEXT"));
-    if (eglGetPlatformDisplayEXT) {
+    if (eglGetPlatformDisplayEXT)
+    {
       eglDisplay_ =
           eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_EXT, display_, nullptr);
-    } else {
+    }
+    else
+    {
       eglDisplay_ =
           eglGetDisplay(reinterpret_cast<EGLNativeDisplayType>(display_));
     }
@@ -9582,7 +10814,8 @@ private:
   // Restricts subsequent draws to `clip`, intersected with the window
   // bounds. GL's scissor origin is bottom-left, so the y range is flipped
   // relative to ClipRect's top-left/y-down convention.
-  void applyScissor(const ClipRect &clip) {
+  void applyScissor(const ClipRect &clip)
+  {
     float x0 = std::max(clip.x0, 0.0f), y0 = std::max(clip.y0, 0.0f);
     float x1 = std::min(clip.x1, static_cast<float>(width_));
     float y1 = std::min(clip.y1, static_cast<float>(height_));
@@ -9597,7 +10830,8 @@ private:
   // Draws one filled, optionally rounded-corner rectangle. radius <= 0
   // renders a plain rect (same shader — the SDF collapses correctly).
   void drawRectGL(float x, float y, float w, float h, float radius, Color c,
-                  const ClipRect &clip) {
+                  const ClipRect &clip)
+  {
     if (w <= 0 || h <= 0)
       return;
     applyScissor(clip);
@@ -9619,7 +10853,8 @@ private:
   // Thick line as an oriented quad — needed (rather than a bbox rect) since
   // drawTitlebar uses this for the X icon's two diagonal strokes.
   void drawLineGL(float x0, float y0, float x1, float y1, Color c,
-                  float thickness = 2.0f) {
+                  float thickness = 2.0f)
+  {
     float dx = x1 - x0, dy = y1 - y0;
     float len = std::sqrt(dx * dx + dy * dy);
     float nx = len > 0.0001f ? -dy / len : 1.0f;
@@ -9642,11 +10877,13 @@ private:
 
   // Fills an axis-aligned rectangle with a solid color by calling setPixel for
   // every point inside it. Same unclipped/clipped overload split as setPixel.
-  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
+  void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b)
+  {
     fillRect(x0, y0, w, h, r, g, b, ClipRect{});
   }
   void fillRect(int x0, int y0, int w, int h, uint8_t r, uint8_t g, uint8_t b,
-                const ClipRect &clip) {
+                const ClipRect &clip)
+  {
     drawRectGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(w), static_cast<float>(h), 0.0f, {r, g, b},
                clip);
@@ -9657,11 +10894,13 @@ private:
   // check against each corner's circle center — fine at this scale, not
   // meant for huge boxes. Same unclipped/clipped overload split as setPixel.
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
-                       uint8_t g, uint8_t b) {
+                       uint8_t g, uint8_t b)
+  {
     fillRoundedRect(x0, y0, w, h, radius, r, g, b, ClipRect{});
   }
   void fillRoundedRect(int x0, int y0, int w, int h, int radius, uint8_t r,
-                       uint8_t g, uint8_t b, const ClipRect &clip) {
+                       uint8_t g, uint8_t b, const ClipRect &clip)
+  {
     radius = std::max(0, std::min({radius, w / 2, h / 2}));
     drawRectGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(w), static_cast<float>(h),
@@ -9672,10 +10911,12 @@ private:
   int tooltipTexW_ = 0, tooltipTexH_ = 0;
   std::string tooltipTextureBuiltFor_;
 
-  void ensureTooltipTexture(const std::string &text) {
+  void ensureTooltipTexture(const std::string &text)
+  {
     if (tooltipTextTexture_ && tooltipTextureBuiltFor_ == text)
       return;
-    if (tooltipTextTexture_) {
+    if (tooltipTextTexture_)
+    {
       glDeleteTextures(1, &tooltipTextTexture_);
       tooltipTextTexture_ = 0;
     }
@@ -9727,7 +10968,8 @@ private:
     tooltipTextureBuiltFor_ = text;
   }
 
-  void paintTooltip() {
+  void paintTooltip()
+  {
     if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
       return;
     ensureTooltipTexture(tooltipTarget_->tooltip);
@@ -9766,7 +11008,8 @@ private:
   // cairo's native ARGB32 buffer — GL_ALPHA is core GLES2, unlike the
   // BGRA extension and non-tightly-packed row uploads that ARGB32 would
   // otherwise require.
-  static void ensureTextTexture(const View &v) {
+  static void ensureTextTexture(const View &v)
+  {
     const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
     float fontSize =
         resolveDynamic(v.textStyle.fontSize, v.computed.resolvedFontSize);
@@ -9781,7 +11024,8 @@ private:
         v.computed.textTextureBuiltForFontWeight == fontWeight &&
         v.computed.textTextureBuiltForFontStyle == fontStyleVal)
       return;
-    if (v.computed.textTexture) {
+    if (v.computed.textTexture)
+    {
       glDeleteTextures(1, &v.computed.textTexture);
       v.computed.textTexture = 0;
     }
@@ -9824,7 +11068,8 @@ private:
     // 32-bit pixel, which on the little-endian platforms this file
     // targets is byte offset 3.
     std::vector<unsigned char> alpha(static_cast<size_t>(innerW) * innerH);
-    for (int row = 0; row < innerH; ++row) {
+    for (int row = 0; row < innerH; ++row)
+    {
       const unsigned char *src = data + row * stride;
       unsigned char *dst = alpha.data() + row * innerW;
       for (int col = 0; col < innerW; ++col)
@@ -9863,7 +11108,8 @@ private:
     v.computed.textTextureBuiltForFontStyle = fontStyleVal;
   }
 
-  void drawTextTexture(const View &v, const ClipRect &clip) {
+  void drawTextTexture(const View &v, const ClipRect &clip)
+  {
     ensureTextTexture(v);
     if (!v.computed.textTexture)
       return;
@@ -9900,7 +11146,8 @@ private:
   // pixels as a GL texture whenever either of those happened — a plain
   // repaint with neither condition true reuses the existing texture
   // untouched.
-  void ensureCanvasSurface(const View &v) {
+  void ensureCanvasSurface(const View &v)
+  {
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
@@ -9910,8 +11157,10 @@ private:
     bool resized = !v.computed.canvasSurface ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
-    if (resized) {
-      if (v.computed.canvasSurface) {
+    if (resized)
+    {
+      if (v.computed.canvasSurface)
+      {
         cairo_surface_destroy(v.computed.canvasSurface);
         v.computed.canvasSurface = nullptr;
       }
@@ -9925,14 +11174,15 @@ private:
       return;
 
     bool needUpload = resized;
-    if (v.computed.canvasNeedsRedraw && v.onPaint) {
+    if (v.computed.canvasNeedsRedraw && v.onPaint)
+    {
       cairo_t *cr = cairo_create(v.computed.canvasSurface);
       cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
       cairo_set_source_rgba(cr, 0, 0, 0, 0);
       cairo_paint(cr);
       cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-      CanvasContext ctx(cr, static_cast<float>(iw), static_cast<float>(ih),
-                        &v.computed);
+      CanvasContextImpl ctx(cr, static_cast<float>(iw), static_cast<float>(ih),
+                            &v.computed);
       v.onPaint(ctx);
       cairo_destroy(cr);
       v.computed.canvasNeedsRedraw = false;
@@ -9950,7 +11200,8 @@ private:
     // uploaded directly. Fall back to a repack only if that ever changes.
     std::vector<unsigned char> repacked;
     const unsigned char *upload = data;
-    if (stride != iw * 4) {
+    if (stride != iw * 4)
+    {
       repacked.resize(static_cast<size_t>(iw) * ih * 4);
       for (int row = 0; row < ih; ++row)
         std::memcpy(repacked.data() + static_cast<size_t>(row) * iw * 4,
@@ -9961,7 +11212,8 @@ private:
 
     glActiveTexture(GL_TEXTURE0);
     bool created = false;
-    if (!v.computed.canvasTexture) {
+    if (!v.computed.canvasTexture)
+    {
       GLuint tex = 0;
       glGenTextures(1, &tex);
       v.computed.canvasTexture = tex;
@@ -9971,24 +11223,30 @@ private:
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
       created = true;
-    } else {
+    }
+    else
+    {
       glBindTexture(GL_TEXTURE_2D, v.computed.canvasTexture);
     }
 
     glPixelStorei(GL_UNPACK_ALIGNMENT,
                   4); // rows are iw*4 bytes, always 4-aligned
-    if (created || resized) {
+    if (created || resized)
+    {
       // (Re)specify storage: new texture, or the canvas changed size.
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA,
                    GL_UNSIGNED_BYTE, upload);
-    } else {
+    }
+    else
+    {
       // Same size: overwrite in place, no reallocation on the driver side.
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_RGBA, GL_UNSIGNED_BYTE,
                       upload);
     }
   }
 
-  void drawCanvasTexture(const View &v, const ClipRect &clip) {
+  void drawCanvasTexture(const View &v, const ClipRect &clip)
+  {
     ensureCanvasSurface(v);
     if (!v.computed.canvasTexture)
       return;
@@ -10022,7 +11280,8 @@ private:
   // ancestor-level clip (not narrowed by v's own children), so a
   // scrollbar correctly disappears if v itself has scrolled out of some
   // outer ancestor's viewport, same reasoning as the GDI version.
-  void renderScrollbars(const View &v, const ClipRect &clip) {
+  void renderScrollbars(const View &v, const ClipRect &clip)
+  {
     // Auto-hide: painted only while hovered, or while this exact view's
     // thumb is mid-drag (so a fast drag that briefly outruns the pointer
     // doesn't make the bar vanish out from under it).
@@ -10034,19 +11293,22 @@ private:
     // Per-view override falls back to the window-wide default independently
     // for track and thumb (see Style::scrollTrackColor/scrollThumbColor).
     Color track = resolveDynamic(v.style.scrollTrackColor,
-                                  v.computed.resolvedScrollTrackColor)
+                                 v.computed.resolvedScrollTrackColor)
                       .value_or(scrollTrack_);
     Color thumb = resolveDynamic(v.style.scrollThumbColor,
-                                  v.computed.resolvedScrollThumbColor)
+                                 v.computed.resolvedScrollThumbColor)
                       .value_or(scrollThumb_);
-    auto box = [&](const PixRect &r, Color c) {
+    auto box = [&](const PixRect &r, Color c)
+    {
       drawRectGL(r.x, r.y, r.w, r.h, 0.0f, c, clip);
     };
-    if (wantVBar(v)) {
+    if (wantVBar(v))
+    {
       box(vTrackRect(v), track);
       box(vThumbRect(v), thumb);
     }
-    if (wantHBar(v)) {
+    if (wantHBar(v))
+    {
       box(hTrackRect(v), track);
       box(hThumbRect(v), thumb);
     }
@@ -10073,7 +11335,8 @@ private:
   // narrowed by v itself), while children are drawn under a further-
   // narrowed clip if v itself scrolls, which is what actually makes
   // scrolled-out content invisible instead of just mispositioned.
-  void renderView(const View &v, ClipRect clip) {
+  void renderView(const View &v, ClipRect clip)
+  {
     if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
         Visibility::Hidden)
       return; // space already reserved by layout; just don't draw it
@@ -10081,7 +11344,8 @@ private:
     // layout-only, so it must never paint its own opaque background —
     // otherwise white text (or any text) can end up invisible against
     // its own node's default-white box, as happened here.
-    if (v.isText) {
+    if (v.isText)
+    {
       drawTextTexture(v, clip);
       return;
     }
@@ -10097,13 +11361,16 @@ private:
     radius = std::max(0, std::min({radius, w / 2, h / 2}));
     float borderWidthVal =
         resolveDynamic(s.borderWidth, v.computed.resolvedBorderWidth);
-    if (borderWidthVal > 0) {
+    if (borderWidthVal > 0)
+    {
       Color bc = resolveDynamic(s.borderColor, v.computed.resolvedBorderColor);
       int bw = static_cast<int>(borderWidthVal);
       drawRectGL(x, y, w, h, radius, bc, clip);
       drawRectGL(x + bw, y + bw, std::max(0, w - 2 * bw),
                  std::max(0, h - 2 * bw), std::max(0, radius - bw), bg, clip);
-    } else if (bg.a > 0) {
+    }
+    else if (bg.a > 0)
+    {
       drawRectGL(x, y, w, h, radius, bg, clip);
     }
     // A canvas node paints its own Style background/border like any
@@ -10134,25 +11401,29 @@ private:
   // Draws a crude line between two points by linear interpolation, stepping
   // once per pixel along the longer axis.
   void drawLine(int x0, int y0, int x1, int y1, uint8_t r, uint8_t g,
-                uint8_t b) {
+                uint8_t b)
+  {
     drawLineGL(static_cast<float>(x0), static_cast<float>(y0),
                static_cast<float>(x1), static_cast<float>(y1), {r, g, b});
   }
 
   // ---- titlebar button layout ----
   // Plain axis-aligned rectangle used for button hit-testing.
-  struct Rect {
+  struct Rect
+  {
     int x, y, w, h;
   };
   // Returns whether point (px, py) falls within rectangle r (using half-open
   // bounds).
-  static bool inside(const Rect &r, double px, double py) {
+  static bool inside(const Rect &r, double px, double py)
+  {
     // Standard axis-aligned bounding box containment test.
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
   }
   // Computes the close button's rectangle: flush against the right edge of the
   // titlebar.
-  Rect closeRect() const {
+  Rect closeRect() const
+  {
     // x is inset from the right edge by the margin and the button's own width;
     // y centers it vertically in the titlebar.
     return {width_ - kButtonMargin - kButtonSize,
@@ -10160,7 +11431,8 @@ private:
   }
   // Computes the maximize button's rectangle, positioned one button-width left
   // of the close button.
-  Rect maximizeRect() const {
+  Rect maximizeRect() const
+  {
     // Start from the close button's rectangle as a reference point.
     Rect c = closeRect();
     // Shift left by one margin plus one button width, keeping the same y/size.
@@ -10168,7 +11440,8 @@ private:
   }
   // Computes the minimize button's rectangle, positioned one button-width left
   // of the maximize button.
-  Rect minimizeRect() const {
+  Rect minimizeRect() const
+  {
     // Start from the maximize button's rectangle as a reference point.
     Rect m = maximizeRect();
     // Shift left by one margin plus one button width, keeping the same y/size.
@@ -10176,7 +11449,8 @@ private:
   }
 
   // Paints the custom titlebar background and its three buttons/icons.
-  void drawTitlebar() {
+  void drawTitlebar()
+  {
     // Fill the whole titlebar strip with a dark gray background.
     fillRect(0, 0, width_, kTitlebarHeight, 0x2D, 0x2D, 0x2D);
 
@@ -10224,7 +11498,8 @@ private:
   // retries automatically the moment that buffer frees up — a call to
   // redraw() should therefore be thought of as "request a repaint soon",
   // not "repaint synchronously right now".
-  void redraw() {
+  void redraw()
+  {
     if (!eglReady_)
       return;
     glViewport(0, 0, width_, height_);
@@ -10237,12 +11512,14 @@ private:
     for (const auto &b : boxes_)
       fillRect(b.pos_x, b.pos_y, b.width, b.height, b.color.r, b.color.g,
                b.color.b);
-    if (hasRoot_) {
+    if (hasRoot_)
+    {
       renderView(root_, ClipRect{});
       std::vector<AbsoluteEntry> absolutes;
       collectAbsolutes(root_, absolutes);
       std::stable_sort(absolutes.begin(), absolutes.end(),
-                       [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
+                       [](const AbsoluteEntry &a, const AbsoluteEntry &b)
+                       {
                          int za =
                              resolveDynamic(a.view->style.zIndex,
                                             a.view->computed.resolvedZIndex);
@@ -10268,16 +11545,19 @@ private:
   // (close/maximize/minimize) still act immediately on press, same as
   // before — only content-area widget clicks wait for a matching release
   // (see beginPress/endPress).
-  void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
+  void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left)
+  {
     lastPressSerial_ = serial;
     hideTooltip();
     // Resize/move grabs and the chrome buttons are a left-button-only
     // convention (matching every desktop's own titlebar) — a middle/
     // right click on the resize strip just falls through to whatever's
     // below it instead of starting a grab.
-    if (btn == MouseButton::Left) {
+    if (btn == MouseButton::Left)
+    {
       uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
-      if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+      if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE)
+      {
         if (seat_)
           xdg_toplevel_resize(toplevel_, seat_, serial, edge);
         return;
@@ -10289,7 +11569,8 @@ private:
     // grab or track click consumes it entirely; anything else falls
     // through to the ordinary pending-click press, resolved later in
     // handleRelease().
-    if (pointer_y_ >= titlebarHeight()) {
+    if (pointer_y_ >= titlebarHeight())
+    {
       float x = static_cast<float>(pointer_x_),
             y = static_cast<float>(pointer_y_);
       // Only the left button interacts with scrollbars — a thumb grab
@@ -10304,17 +11585,20 @@ private:
       return; // titlebar chrome (close/max/min/move) is left-button only
 
     // If the click landed on the close button...
-    if (inside(closeRect(), pointer_x_, pointer_y_)) {
+    if (inside(closeRect(), pointer_x_, pointer_y_))
+    {
       // ...request the event loop to stop, ending run().
       running_ = false;
       return;
     }
-    if (inside(maximizeRect(), pointer_x_, pointer_y_)) {
+    if (inside(maximizeRect(), pointer_x_, pointer_y_))
+    {
       requestMaximize();
       redraw();
       return;
     }
-    if (inside(minimizeRect(), pointer_x_, pointer_y_)) {
+    if (inside(minimizeRect(), pointer_x_, pointer_y_))
+    {
       requestMinimize();
       return;
     }
@@ -10329,8 +11613,10 @@ private:
   // release. Chrome buttons and resize/move grabs don't need this — they
   // already acted on press — so this only matters for content-area
   // interactions below the titlebar.
-  void handleRelease(MouseButton btn = MouseButton::Left) {
-    if (pointer_y_ >= titlebarHeight()) {
+  void handleRelease(MouseButton btn = MouseButton::Left)
+  {
+    if (pointer_y_ >= titlebarHeight())
+    {
       bool changed = (btn == MouseButton::Left)
                          ? endScrollPress(static_cast<float>(pointer_x_),
                                           static_cast<float>(pointer_y_))
@@ -10338,7 +11624,9 @@ private:
                                     static_cast<float>(pointer_y_), btn);
       if (changed)
         redraw();
-    } else {
+    }
+    else
+    {
       // release moved back into the titlebar; cancel the pending press
       pressedView_[btnIdx(btn)] = nullptr;
     }
@@ -10353,8 +11641,9 @@ private:
 
 // Out-of-line constructor definition; inline because this is a single-header
 // library.
-inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
-    : width_(w > 0 ? w : 800), height_(h > 0 ? h : 600) {
+inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h, bool hideTitlebar)
+    : width_(w > 0 ? w : 800), height_(h > 0 ? h : 600)
+{
   startMaximized_ = (w <= 0 || h <= 0);
   hideTitlebar_ = hideTitlebar;
   activeInstance_ = this;
@@ -10385,7 +11674,8 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
 
   DWORD style = WS_OVERLAPPEDWINDOW;
   int posX = CW_USEDEFAULT, posY = CW_USEDEFAULT;
-  if (hideTitlebar_) {
+  if (hideTitlebar_)
+  {
     // WS_POPUP = no caption, no border. SYSMENU/MINIMIZEBOX keep the
     // taskbar button's right-click menu and click-to-minimize working.
     style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
@@ -10400,7 +11690,8 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
                           width_, height_, nullptr, nullptr, hInst, this);
   // If creation failed, surface it as an exception rather than continuing with
   // a null handle.
-  if (!hwnd_) {
+  if (!hwnd_)
+  {
     throw std::runtime_error("CreateWindowExW failed");
   }
 
@@ -10474,7 +11765,8 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
   // The compositor's first configure event reports the real work-area
   // size via toplevelConfigure -> pendingWidth_/pendingHeight_, which
   // surfaceConfigure() then applies via resize().
-  if (startMaximized_) {
+  if (startMaximized_)
+  {
     xdg_toplevel_set_maximized(toplevel_);
     maximized_ = true; // keep our own tracking flag in sync, so the
                        // titlebar's maximize button correctly offers
@@ -10489,7 +11781,8 @@ inline LiteUI::LiteUI(const std::string &title, int w, int h, bool hideTitlebar)
 }
 
 // Out-of-line destructor definition.
-inline LiteUI::~LiteUI() {
+inline LiteUIImpl::~LiteUIImpl()
+{
   if (activeInstance_ == this)
     activeInstance_ = nullptr;
   if (hasRoot_)
@@ -10516,7 +11809,8 @@ inline LiteUI::~LiteUI() {
     DestroyWindow(hwnd_);
 // Linux/Wayland-specific teardown path.
 #else
-  if (eglDisplay_ != EGL_NO_DISPLAY) {
+  if (eglDisplay_ != EGL_NO_DISPLAY)
+  {
     eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (rectProgram_)
       glDeleteProgram(rectProgram_);
@@ -10582,7 +11876,8 @@ inline LiteUI::~LiteUI() {
 #endif
 }
 
-inline View View::toView(TextInput ti) {
+View View::toView(TextInput ti)
+{
   auto state = ti.state;
   state->text = ti.text;
   state->cursor = state->text.size();
@@ -10609,17 +11904,20 @@ inline View View::toView(TextInput ti) {
 
   // Border color reflects focus automatically — overrides whatever the
   // caller set on style.borderColor.
-  v.style.borderColor = [state, borderColor, focusedBorderColor] {
+  v.style.borderColor = [state, borderColor, focusedBorderColor]
+  {
     return state->focused ? focusedBorderColor : borderColor;
   };
 
-  v.canvasDirtySource = [state] {
+  v.canvasDirtySource = [state]
+  {
     bool d = state->dirty;
     state->dirty = false;
     return d;
   };
 
-  v.wantsFocus = [state]() -> bool {
+  v.wantsFocus = [state]() -> bool
+  {
     if (!state->requestFocus)
       return false;
     state->requestFocus = false;
@@ -10627,7 +11925,8 @@ inline View View::toView(TextInput ti) {
   };
 
   v.onPaint = [state, ts, textColor, placeholderColor, caretColor, leftPad,
-               placeholder](CanvasContext &ctx) {
+               placeholder](CanvasContext &ctx)
+  {
     float availW = std::max(0.0f, ctx.width() - leftPad * 2.0f);
 
     // Keep the caret in view: scroll right if it's past the visible edge,
@@ -10656,20 +11955,24 @@ inline View View::toView(TextInput ti) {
     ctx.clip();
 
     ctx.setFont(ts.fontFamily, resolveStatic(ts.fontSize),
-               resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle));
+                resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle));
     ctx.setTextBaseline(TextBaseline::Middle);
     ctx.setTextAlign(TextAlign::Start);
 
     float textX = leftPad - state->scrollOffset;
-    if (state->text.empty() && !state->focused) {
+    if (state->text.empty() && !state->focused)
+    {
       ctx.setFillColor(placeholderColor);
       ctx.fillText(placeholder, leftPad, ctx.height() / 2.0f);
-    } else {
+    }
+    else
+    {
       ctx.setFillColor(textColor);
       ctx.fillText(state->text, textX, ctx.height() / 2.0f);
     }
 
-    if (state->focused && state->blinkOn) {
+    if (state->focused && state->blinkOn)
+    {
       float cx = textX + cursorX;
       ctx.setFillColor(caretColor);
       ctx.fillRect(cx, 5.0f, 1.5f, std::max(0.0f, ctx.height() - 10.0f));
@@ -10678,7 +11981,8 @@ inline View View::toView(TextInput ti) {
     ctx.restore();
   };
 
-  v.onPressAt = [state, ts, leftPad](float lx, float) {
+  v.onPressAt = [state, ts, leftPad](float lx, float)
+  {
     state->cursor = liteui_text::caretIndexForX(
         state->text, ts, resolveStatic(ts.fontSize),
         resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle),
@@ -10687,28 +11991,34 @@ inline View View::toView(TextInput ti) {
     state->dirty = true;
   };
 
-  v.onFocus = [state] {
+  v.onFocus = [state]
+  {
     state->focused = true;
     state->blinkOn = true;
     state->dirty = true;
-    if (state->blinkTimerHandle < 0 && LiteUI::current()) {
-      state->blinkTimerHandle = LiteUI::current()->addInterval(530, [state] {
+    if (state->blinkTimerHandle < 0 && LiteUIImpl::current())
+    {
+      state->blinkTimerHandle = LiteUIImpl::current()->addInterval(530, [state]
+                                                                   {
         state->blinkOn = !state->blinkOn;
-        state->dirty = true;
-      });
+        state->dirty = true; });
     }
   };
-  v.onBlur = [state] {
+  v.onBlur = [state]
+  {
     state->focused = false;
     state->dirty = true;
-    if (state->blinkTimerHandle >= 0 && LiteUI::current()) {
-      LiteUI::current()->removeInterval(state->blinkTimerHandle);
+    if (state->blinkTimerHandle >= 0 && LiteUIImpl::current())
+    {
+      LiteUIImpl::current()->removeInterval(state->blinkTimerHandle);
       state->blinkTimerHandle = -1;
     }
   };
 
-  v.onKeyDown = [state, onChange, onSubmit](KeyEvent e) {
-    switch (e.key) {
+  v.onKeyDown = [state, onChange, onSubmit](KeyEvent e)
+  {
+    switch (e.key)
+    {
     case Key::Left:
       if (state->cursor > 0)
         state->cursor--;
@@ -10724,7 +12034,8 @@ inline View View::toView(TextInput ti) {
       state->cursor = state->text.size();
       break;
     case Key::Backspace:
-      if (state->cursor > 0) {
+      if (state->cursor > 0)
+      {
         state->text.erase(state->cursor - 1, 1);
         state->cursor--;
         if (onChange)
@@ -10732,7 +12043,8 @@ inline View View::toView(TextInput ti) {
       }
       break;
     case Key::Delete:
-      if (state->cursor < state->text.size()) {
+      if (state->cursor < state->text.size())
+      {
         state->text.erase(state->cursor, 1);
         if (onChange)
           onChange(state->text);
@@ -10742,14 +12054,16 @@ inline View View::toView(TextInput ti) {
       if (onSubmit)
         onSubmit(state->text);
       return; // don't touch blink/dirty for a submit
-    case Key::V: {
+    case Key::V:
+    {
       if (!e.mods.ctrl)
         return;
       std::string clip = liteui_clipboard::getTextWithFallback();
       // single-line field: strip line breaks, and keep ASCII-only to match
       // this widget's byte-offset cursor (see note below)
       clip.erase(std::remove_if(clip.begin(), clip.end(),
-                                [](unsigned char c) {
+                                [](unsigned char c)
+                                {
                                   return c == '\n' || c == '\r' || c >= 0x80;
                                 }),
                  clip.end());
@@ -10768,8 +12082,10 @@ inline View View::toView(TextInput ti) {
     state->dirty = true;
   };
 
-  v.onTextInput = [state, onChange](uint32_t cp) {
-    if (cp >= 0x20 && cp < 128) {
+  v.onTextInput = [state, onChange](uint32_t cp)
+  {
+    if (cp >= 0x20 && cp < 128)
+    {
       state->text.insert(state->cursor, 1, static_cast<char>(cp));
       state->cursor++;
       state->blinkOn = true;
@@ -10782,7 +12098,8 @@ inline View View::toView(TextInput ti) {
   return v;
 }
 
-inline View View::toView(Image img) {
+View View::toView(Image img)
+{
   auto state = std::make_shared<ImageState>();
 
   // A dynamic source is polled every dispatch cycle (see
@@ -10792,17 +12109,24 @@ inline View View::toView(Image img) {
   std::function<std::shared_ptr<CanvasImage>()> sourceFn;
   std::string err;
   if (auto *fn = std::get_if<std::function<std::shared_ptr<CanvasImage>()>>(
-          &img.source)) {
+          &img.source))
+  {
     sourceFn = *fn;
     state->pixels = sourceFn ? sourceFn() : nullptr;
-  } else if (auto *fixed =
-                 std::get_if<std::shared_ptr<CanvasImage>>(&img.source);
-             fixed && *fixed) {
+  }
+  else if (auto *fixed =
+               std::get_if<std::shared_ptr<CanvasImage>>(&img.source);
+           fixed && *fixed)
+  {
     state->pixels = *fixed;
-  } else if (!img.path.empty()) {
+  }
+  else if (!img.path.empty())
+  {
     if (auto decoded = liteui_image::decodeFile(img.path, &err))
       state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
-  } else if (!img.memoryData.empty()) {
+  }
+  else if (!img.memoryData.empty())
+  {
     if (auto decoded = liteui_image::decodeMemory(img.memoryData.data(),
                                                   img.memoryData.size(), &err))
       state->pixels = std::make_shared<CanvasImage>(std::move(*decoded));
@@ -10829,20 +12153,21 @@ inline View View::toView(Image img) {
                     std::get<Size>(v.style.width).kind == Size::Kind::Fit;
   bool heightIsFit = std::get_if<Size>(&v.style.height) &&
                      std::get<Size>(v.style.height).kind == Size::Kind::Fit;
-  if (sourceFn) {
+  if (sourceFn)
+  {
     if (widthIsFit)
-      v.style.width = std::function<Size()>([state] {
-        return state->pixels
-                   ? Size::pixel(static_cast<float>(state->pixels->width))
-                   : Size::fit();
-      });
+      v.style.width = std::function<Size()>([state]
+                                            { return state->pixels
+                                                         ? Size::pixel(static_cast<float>(state->pixels->width))
+                                                         : Size::fit(); });
     if (heightIsFit)
-      v.style.height = std::function<Size()>([state] {
-        return state->pixels
-                   ? Size::pixel(static_cast<float>(state->pixels->height))
-                   : Size::fit();
-      });
-  } else if (state->pixels) {
+      v.style.height = std::function<Size()>([state]
+                                             { return state->pixels
+                                                          ? Size::pixel(static_cast<float>(state->pixels->height))
+                                                          : Size::fit(); });
+  }
+  else if (state->pixels)
+  {
     if (widthIsFit)
       v.style.width = Size::pixel(static_cast<float>(state->pixels->width));
     if (heightIsFit)
@@ -10857,10 +12182,13 @@ inline View View::toView(Image img) {
   // a different shared_ptr than last time, swaps it in, re-fires
   // onLoad/onError, and marks this canvas dirty. A no-op (one call, one
   // pointer compare) for a static source, since sourceFn is empty there.
-  v.canvasDirtySource = [state, sourceFn, onLoad, onError] {
-    if (sourceFn) {
+  v.canvasDirtySource = [state, sourceFn, onLoad, onError]
+  {
+    if (sourceFn)
+    {
       std::shared_ptr<CanvasImage> next = sourceFn();
-      if (next != state->pixels) {
+      if (next != state->pixels)
+      {
         state->pixels = next;
         state->dirty = true;
         if (state->pixels && onLoad)
@@ -10874,8 +12202,10 @@ inline View View::toView(Image img) {
     return d;
   };
 
-  v.onPaint = [state, fit, bg](CanvasContext &ctx) {
-    if (bg.a > 0) {
+  v.onPaint = [state, fit, bg](CanvasContext &ctx)
+  {
+    if (bg.a > 0)
+    {
       ctx.setFillColor(bg);
       ctx.fillRect(0, 0, ctx.width(), ctx.height());
     }
@@ -10887,7 +12217,8 @@ inline View View::toView(Image img) {
     float cw = ctx.width(), ch = ctx.height();
     float iw = static_cast<float>(im.width), ih = static_cast<float>(im.height);
     float dw = cw, dh = ch, dx = 0, dy = 0;
-    switch (fit) {
+    switch (fit)
+    {
     case ObjectFit::Fill:
       break;
     case ObjectFit::None:
@@ -10897,7 +12228,8 @@ inline View View::toView(Image img) {
       dy = (ch - dh) / 2.0f;
       break;
     case ObjectFit::Contain:
-    case ObjectFit::ScaleDown: {
+    case ObjectFit::ScaleDown:
+    {
       float scale = std::min(cw / iw, ch / ih);
       if (fit == ObjectFit::ScaleDown)
         scale = std::min(scale, 1.0f);
@@ -10907,7 +12239,8 @@ inline View View::toView(Image img) {
       dy = (ch - dh) / 2.0f;
       break;
     }
-    case ObjectFit::Cover: {
+    case ObjectFit::Cover:
+    {
       float scale = std::max(cw / iw, ch / ih);
       dw = iw * scale;
       dh = ih * scale;
@@ -10922,7 +12255,8 @@ inline View View::toView(Image img) {
   return v;
 }
 
-inline View View::toView(Svg s) {
+View View::toView(Svg s)
+{
   std::string err;
   auto doc = std::make_shared<std::optional<liteui_svg::Document>>();
   *doc = s.path.empty() ? liteui_svg::parseString(s.source)
@@ -10938,7 +12272,8 @@ inline View View::toView(Svg s) {
   v.style = std::move(s.style);
   v.isCanvas = true;
 
-  if (doc->has_value()) {
+  if (doc->has_value())
+  {
     if (std::get_if<Size>(&v.style.width) &&
         std::get<Size>(v.style.width).kind == Size::Kind::Fit)
       v.style.width = Size::pixel((*doc)->width);
@@ -10950,8 +12285,10 @@ inline View View::toView(Svg s) {
   ObjectFit fit = s.fit;
   Color bg = s.backgroundColor;
 
-  v.onPaint = [doc, fit, bg](CanvasContext &ctx) {
-    if (bg.a > 0) {
+  v.onPaint = [doc, fit, bg](CanvasContext &ctx)
+  {
+    if (bg.a > 0)
+    {
       ctx.setFillColor(bg);
       ctx.fillRect(0, 0, ctx.width(), ctx.height());
     }
@@ -10962,7 +12299,8 @@ inline View View::toView(Svg s) {
       return;
     float cw = ctx.width(), ch = ctx.height();
     float sx = cw / d.width, sy = ch / d.height, dx = 0, dy = 0;
-    switch (fit) {
+    switch (fit)
+    {
     case ObjectFit::Fill:
       break;
     case ObjectFit::None:
@@ -10971,7 +12309,8 @@ inline View View::toView(Svg s) {
       dy = (ch - d.height) / 2.0f;
       break;
     case ObjectFit::Contain:
-    case ObjectFit::ScaleDown: {
+    case ObjectFit::ScaleDown:
+    {
       float scale = std::min(sx, sy);
       if (fit == ObjectFit::ScaleDown)
         scale = std::min(scale, 1.0f);
@@ -10980,7 +12319,8 @@ inline View View::toView(Svg s) {
       dy = (ch - d.height * scale) / 2.0f;
       break;
     }
-    case ObjectFit::Cover: {
+    case ObjectFit::Cover:
+    {
       float scale = std::max(sx, sy);
       sx = sy = scale;
       dx = (cw - d.width * scale) / 2.0f;
@@ -10991,13 +12331,16 @@ inline View View::toView(Svg s) {
     ctx.save();
     ctx.translate(dx, dy);
     ctx.scale(sx, sy);
-    for (const auto &shape : d.shapes) {
+    for (const auto &shape : d.shapes)
+    {
       ctx.save();
       ctx.transformBy(shape.transform.a, shape.transform.b, shape.transform.c,
                       shape.transform.d, shape.transform.e, shape.transform.f);
       ctx.beginPath();
-      for (const auto &op : shape.ops) {
-        switch (op.kind) {
+      for (const auto &op : shape.ops)
+      {
+        switch (op.kind)
+        {
         case liteui_svg::PathOp::Kind::Move:
           ctx.moveTo(op.x, op.y);
           break;
@@ -11015,11 +12358,13 @@ inline View View::toView(Svg s) {
           break;
         }
       }
-      if (shape.hasFill) {
+      if (shape.hasFill)
+      {
         ctx.setFillColor(shape.fill);
         ctx.fill(shape.evenOdd ? FillRule::EvenOdd : FillRule::NonZero);
       }
-      if (shape.hasStroke) {
+      if (shape.hasStroke)
+      {
         ctx.setStrokeColor(shape.stroke);
         ctx.setLineWidth(shape.strokeWidth);
         ctx.setLineCap(shape.lineCap == 1   ? LineCap::Round
@@ -11040,7 +12385,8 @@ inline View View::toView(Svg s) {
   return v;
 }
 
-inline void LiteUI::requestRepaint() {
+inline void LiteUIImpl::requestRepaint()
+{
   pollAndRelayout();
 #if defined(_WIN32)
   if (hwnd_)
@@ -11052,17 +12398,20 @@ inline void LiteUI::requestRepaint() {
 }
 
 #if defined(_WIN32)
-inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
+inline int LiteUIImpl::addInterval(int ms, std::function<void()> fn)
+{
   UINT_PTR id =
       SetTimer(hwnd_, timers_.size() + 1, static_cast<UINT>(ms), nullptr);
   timers_[id] = std::move(fn);
   return static_cast<int>(id);
 }
-inline void LiteUI::removeInterval(int handle) {
+inline void LiteUIImpl::removeInterval(int handle)
+{
   KillTimer(hwnd_, static_cast<UINT_PTR>(handle));
   timers_.erase(static_cast<UINT_PTR>(handle));
 }
-inline void LiteUI::wake() {
+inline void LiteUIImpl::wake()
+{
   if (!hwnd_)
     return;
   // PostMessage is documented as callable from any thread. Only post if none
@@ -11071,7 +12420,8 @@ inline void LiteUI::wake() {
     wakePending_.store(false); // queue full: let the next wake() retry
 }
 #else
-inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
+inline int LiteUIImpl::addInterval(int ms, std::function<void()> fn)
+{
   int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
   itimerspec spec{};
   spec.it_value.tv_sec = ms / 1000;
@@ -11083,30 +12433,35 @@ inline int LiteUI::addInterval(int ms, std::function<void()> fn) {
   intervalTimers_.push_back({fd, std::move(fn)});
   return handle;
 }
-inline void LiteUI::removeInterval(int handle) {
+inline void LiteUIImpl::removeInterval(int handle)
+{
   auto it = intervalHandleToFd_.find(handle);
   if (it == intervalHandleToFd_.end())
     return;
   int fd = it->second;
   intervalTimers_.erase(
       std::remove_if(intervalTimers_.begin(), intervalTimers_.end(),
-                     [fd](const IntervalTimer &t) { return t.fd == fd; }),
+                     [fd](const IntervalTimer &t)
+                     { return t.fd == fd; }),
       intervalTimers_.end());
   close(fd);
   intervalHandleToFd_.erase(it);
 }
-inline void LiteUI::wake() {
+inline void LiteUIImpl::wake()
+{
   if (wakeFd_ < 0)
     return;
   const uint64_t one = 1;
   // Nonblocking eventfd: this can only fail if the 64-bit counter is full,
   // in which case it is already readable and a wake is already pending.
-  if (write(wakeFd_, &one, sizeof one) < 0) {
+  if (write(wakeFd_, &one, sizeof one) < 0)
+  {
   }
 }
 #endif
 
-inline void LiteUI::setRoot(View view) {
+inline void LiteUIImpl::setRoot(View view)
+{
   // Every one of these is a raw View* into root_'s subtree. root_ is
   // about to be destroyed (freeTextResources() below, then replaced) —
   // leaving any of these pointing at it would dangle the moment the old
@@ -11114,7 +12469,8 @@ inline void LiteUI::setRoot(View view) {
   // via focusedView_, a scroll via scrollDrag_.target, a tooltip poll
   // via tooltipTarget_, ...) would then use-after-free.
   focusedView_ = nullptr;
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 3; ++i)
+  {
     pressedView_[i] = nullptr;
     dragView_[i] = nullptr;
   }
@@ -11147,7 +12503,8 @@ inline void LiteUI::setRoot(View view) {
 #endif
 }
 
-inline void LiteUI::addBox(const Box &box) {
+inline void LiteUIImpl::addBox(const Box &box)
+{
   boxes_.push_back(box);
 #if defined(_WIN32)
   // Ask Windows to repaint; the actual drawing happens in WM_PAINT.
@@ -11162,14 +12519,16 @@ inline void LiteUI::addBox(const Box &box) {
 }
 
 // Out-of-line definition of the blocking event loop.
-inline void LiteUI::run() {
+inline void LiteUIImpl::run()
+{
 // Windows-specific message loop.
 #if defined(_WIN32)
   // Storage for each retrieved message.
   MSG msg;
   // GetMessage blocks until a message arrives and returns 0 on WM_QUIT, ending
   // the loop.
-  while (GetMessage(&msg, nullptr, 0, 0)) {
+  while (GetMessage(&msg, nullptr, 0, 0))
+  {
     // Translate virtual-key messages into character messages (needed for text
     // input).
     TranslateMessage(&msg);
@@ -11178,7 +12537,8 @@ inline void LiteUI::run() {
   }
 // Linux/Wayland-specific event loop.
 #else
-  while (running_) {
+  while (running_)
+  {
     // Apply the newest pointer position (one drag/hover update + at most one
     // redraw) before blocking. Must happen here, outside the
     // prepare_read/read_events window below — see flushPendingMotion.
@@ -11188,7 +12548,8 @@ inline void LiteUI::run() {
     // Events dispatched by the loop above may have recorded fresh motion.
     // Give up the read intent and go around again to flush it, rather than
     // sleeping in poll() with an unapplied pointer position.
-    if (motionPending_) {
+    if (motionPending_)
+    {
       wl_display_cancel_read(display_);
       continue;
     }
@@ -11207,7 +12568,8 @@ inline void LiteUI::run() {
       fds.push_back({t.fd, POLLIN, 0});
 
     int n = poll(fds.data(), static_cast<nfds_t>(fds.size()), -1);
-    if (n < 0) {
+    if (n < 0)
+    {
       wl_display_cancel_read(display_);
       break;
     }
@@ -11220,8 +12582,10 @@ inline void LiteUI::run() {
     if (repeatTimerFd_ >= 0 && fds[repeatIdx].revents & POLLIN)
       fireRepeatIfDue();
 
-    for (size_t i = 0; i < intervalTimers_.size(); ++i) {
-      if (fds[intervalStart + i].revents & POLLIN) {
+    for (size_t i = 0; i < intervalTimers_.size(); ++i)
+    {
+      if (fds[intervalStart + i].revents & POLLIN)
+      {
         uint64_t exp;
         read(intervalTimers_[i].fd, &exp, sizeof(exp));
         intervalTimers_[i].fn();
@@ -11232,9 +12596,11 @@ inline void LiteUI::run() {
     // wake() from another thread. Handled after the interval timers because
     // the handler is free to add/remove intervals, which would shift the
     // indices the loop above relies on.
-    if (wakeFd_ >= 0 && (fds[wakeIdx].revents & POLLIN)) {
+    if (wakeFd_ >= 0 && (fds[wakeIdx].revents & POLLIN))
+    {
       uint64_t n;
-      if (read(wakeFd_, &n, sizeof n) > 0) { // drain: N wakes -> one callback
+      if (read(wakeFd_, &n, sizeof n) > 0)
+      { // drain: N wakes -> one callback
         if (wakeHandler_)
           wakeHandler_();
         requestRepaint();
@@ -11243,3 +12609,91 @@ inline void LiteUI::run() {
   }
 #endif
 }
+
+float CanvasContext::width() const { return static_cast<const CanvasContextImpl *>(this)->width(); }
+float CanvasContext::height() const { return static_cast<const CanvasContextImpl *>(this)->height(); }
+void CanvasContext::save() { static_cast<CanvasContextImpl *>(this)->save(); }
+void CanvasContext::restore() { static_cast<CanvasContextImpl *>(this)->restore(); }
+void CanvasContext::translate(float x, float y) { static_cast<CanvasContextImpl *>(this)->translate(x, y); }
+void CanvasContext::rotate(float radians) { static_cast<CanvasContextImpl *>(this)->rotate(radians); }
+void CanvasContext::scale(float sx, float sy) { static_cast<CanvasContextImpl *>(this)->scale(sx, sy); }
+void CanvasContext::transformBy(float a, float b, float c, float d, float e, float f) { static_cast<CanvasContextImpl *>(this)->transformBy(a, b, c, d, e, f); }
+void CanvasContext::setTransform(float a, float b, float c, float d, float e, float f) { static_cast<CanvasContextImpl *>(this)->setTransform(a, b, c, d, e, f); }
+void CanvasContext::resetTransform() { static_cast<CanvasContextImpl *>(this)->resetTransform(); }
+void CanvasContext::setFillColor(Color c) { static_cast<CanvasContextImpl *>(this)->setFillColor(c); }
+void CanvasContext::setFillGradient(const CanvasGradient &g) { static_cast<CanvasContextImpl *>(this)->setFillGradient(g); }
+void CanvasContext::setStrokeColor(Color c) { static_cast<CanvasContextImpl *>(this)->setStrokeColor(c); }
+void CanvasContext::setStrokeGradient(const CanvasGradient &g) { static_cast<CanvasContextImpl *>(this)->setStrokeGradient(g); }
+void CanvasContext::setLineWidth(float w) { static_cast<CanvasContextImpl *>(this)->setLineWidth(w); }
+void CanvasContext::setLineCap(LineCap c) { static_cast<CanvasContextImpl *>(this)->setLineCap(c); }
+void CanvasContext::setLineJoin(LineJoin j) { static_cast<CanvasContextImpl *>(this)->setLineJoin(j); }
+void CanvasContext::setMiterLimit(float m) { static_cast<CanvasContextImpl *>(this)->setMiterLimit(m); }
+void CanvasContext::setLineDash(const std::vector<float> &dashes) { static_cast<CanvasContextImpl *>(this)->setLineDash(dashes); }
+void CanvasContext::setLineDashOffset(float offset) { static_cast<CanvasContextImpl *>(this)->setLineDashOffset(offset); }
+void CanvasContext::setGlobalAlpha(float a) { static_cast<CanvasContextImpl *>(this)->setGlobalAlpha(a); }
+void CanvasContext::setGlobalCompositeOperation(CompositeOp op) { static_cast<CanvasContextImpl *>(this)->setGlobalCompositeOperation(op); }
+void CanvasContext::setShadow(Color color, float blurPx, float offsetX, float offsetY) { static_cast<CanvasContextImpl *>(this)->setShadow(color, blurPx, offsetX, offsetY); }
+void CanvasContext::setFont(const std::string &family, float sizePx, FontWeight weight, FontStyle style) { static_cast<CanvasContextImpl *>(this)->setFont(family, sizePx, weight, style); }
+void CanvasContext::setTextAlign(TextAlign a) { static_cast<CanvasContextImpl *>(this)->setTextAlign(a); }
+void CanvasContext::setTextBaseline(TextBaseline b) { static_cast<CanvasContextImpl *>(this)->setTextBaseline(b); }
+void CanvasContext::beginPath() { static_cast<CanvasContextImpl *>(this)->beginPath(); }
+void CanvasContext::closePath() { static_cast<CanvasContextImpl *>(this)->closePath(); }
+void CanvasContext::moveTo(float x, float y) { static_cast<CanvasContextImpl *>(this)->moveTo(x, y); }
+void CanvasContext::lineTo(float x, float y) { static_cast<CanvasContextImpl *>(this)->lineTo(x, y); }
+void CanvasContext::quadraticCurveTo(float cpx, float cpy, float x, float y) { static_cast<CanvasContextImpl *>(this)->quadraticCurveTo(cpx, cpy, x, y); }
+void CanvasContext::bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x, float y) { static_cast<CanvasContextImpl *>(this)->bezierCurveTo(c1x, c1y, c2x, c2y, x, y); }
+void CanvasContext::arc(float cx, float cy, float r, float startAngle, float endAngle, bool ccw) { static_cast<CanvasContextImpl *>(this)->arc(cx, cy, r, startAngle, endAngle, ccw); }
+void CanvasContext::arcTo(float x1, float y1, float x2, float y2, float radius) { static_cast<CanvasContextImpl *>(this)->arcTo(x1, y1, x2, y2, radius); }
+void CanvasContext::ellipse(float cx, float cy, float rx, float ry, float rotation, float startAngle, float endAngle, bool ccw) { static_cast<CanvasContextImpl *>(this)->ellipse(cx, cy, rx, ry, rotation, startAngle, endAngle, ccw); }
+void CanvasContext::rect(float x, float y, float w, float h) { static_cast<CanvasContextImpl *>(this)->rect(x, y, w, h); }
+void CanvasContext::roundRect(float x, float y, float w, float h, float radius) { static_cast<CanvasContextImpl *>(this)->roundRect(x, y, w, h, radius); }
+void CanvasContext::fill(FillRule rule) { static_cast<CanvasContextImpl *>(this)->fill(rule); }
+void CanvasContext::stroke() { static_cast<CanvasContextImpl *>(this)->stroke(); }
+void CanvasContext::clip(FillRule rule) { static_cast<CanvasContextImpl *>(this)->clip(rule); }
+void CanvasContext::fillRect(float x, float y, float w, float h) { static_cast<CanvasContextImpl *>(this)->fillRect(x, y, w, h); }
+void CanvasContext::strokeRect(float x, float y, float w, float h) { static_cast<CanvasContextImpl *>(this)->strokeRect(x, y, w, h); }
+void CanvasContext::clearRect(float x, float y, float w, float h) { static_cast<CanvasContextImpl *>(this)->clearRect(x, y, w, h); }
+CanvasContext::TextMetricsResult CanvasContext::measureText(const std::string &text) { return static_cast<CanvasContextImpl *>(this)->measureText(text); }
+void CanvasContext::fillText(const std::string &text, float x, float y, float maxWidth) { static_cast<CanvasContextImpl *>(this)->fillText(text, x, y, maxWidth); }
+void CanvasContext::strokeText(const std::string &text, float x, float y, float maxWidth) { static_cast<CanvasContextImpl *>(this)->strokeText(text, x, y, maxWidth); }
+void CanvasContext::drawImage(const CanvasImage &img, float dx, float dy) { static_cast<CanvasContextImpl *>(this)->drawImage(img, dx, dy); }
+void CanvasContext::drawImage(const CanvasImage &img, float dx, float dy, float dw, float dh) { static_cast<CanvasContextImpl *>(this)->drawImage(img, dx, dy, dw, dh); }
+void CanvasContext::drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh) { static_cast<CanvasContextImpl *>(this)->drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh); }
+std::optional<CanvasImage> CanvasContext::getImageData(float x, float y, float w, float h) { return static_cast<CanvasContextImpl *>(this)->getImageData(x, y, w, h); }
+void CanvasContext::putImageData(const CanvasImage &img, float dx, float dy) { static_cast<CanvasContextImpl *>(this)->putImageData(img, dx, dy); }
+
+// ---- public LiteUI handle -> platform implementation ----
+static LiteUI *liteui_currentFacade_ = nullptr;
+LiteUI::LiteUI(const std::string &title, int width, int height, bool hideTitlebar)
+    : p_(new LiteUIImpl(title, width, height, hideTitlebar))
+{
+  liteui_currentFacade_ = this;
+}
+LiteUI::~LiteUI()
+{
+  if (liteui_currentFacade_ == this)
+    liteui_currentFacade_ = nullptr;
+  delete p_;
+}
+void LiteUI::run() { p_->run(); }
+void LiteUI::addBox(const Box &box) { p_->addBox(box); }
+void LiteUI::setRoot(View view) { p_->setRoot(std::move(view)); }
+void LiteUI::requestClose() { p_->requestClose(); }
+void LiteUI::requestMinimize() { p_->requestMinimize(); }
+void LiteUI::requestMaximize() { p_->requestMaximize(); }
+void LiteUI::requestMove() { p_->requestMove(); }
+void LiteUI::setOnCloseRequest(std::function<void()> fn) { p_->setOnCloseRequest(std::move(fn)); }
+void LiteUI::forceClose() { p_->forceClose(); }
+KeyModifiers LiteUI::modifiers() const { return p_->modifiers(); }
+int LiteUI::addInterval(int ms, std::function<void()> fn) { return p_->addInterval(ms, std::move(fn)); }
+void LiteUI::removeInterval(int handle) { p_->removeInterval(handle); }
+void LiteUI::setTooltipStyle(TooltipStyle s) { p_->setTooltipStyle(std::move(s)); }
+void LiteUI::setWindowBackground(Color c) { p_->setWindowBackground(c); }
+void LiteUI::setScrollbarColors(Color track, Color thumb) { p_->setScrollbarColors(track, thumb); }
+void LiteUI::addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) { p_->addShortcut(mods, key, std::move(fn)); }
+void LiteUI::requestRepaint() { p_->requestRepaint(); }
+LiteUI *LiteUI::current() { return liteui_currentFacade_; }
+void LiteUI::wake() { p_->wake(); }
+void LiteUI::setWakeHandler(std::function<void()> fn) { p_->setWakeHandler(std::move(fn)); }
+
+#endif // LITEUI_IMPLEMENTATION

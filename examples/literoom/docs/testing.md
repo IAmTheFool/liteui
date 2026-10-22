@@ -2,17 +2,26 @@
 
 Literoom's engine headers have no UI, so almost all of them can be tested without opening a window. This page explains the three kinds of tests, how to run them, what each one covers, and how the **golden render test** protects you when you refactor.
 
-## Turning tests on
+## Running the tests
 
-Tests are off by default, so a normal build stays fast. Switch them on when you configure:
+Literoom is an example inside the liteui tree (`examples/literoom`), and its `CMakeLists.txt` stops with an error if it is configured on its own. Always configure, build and run `ctest` from the **liteui root**.
+
+The tests are **on by default**: `LITEROOM_TESTS` follows the root switch `LITEUI_BUILD_TESTS`, which is ON for a top-level build, so a normal build already compiles them. Pass `-DLITEROOM_TESTS=OFF` to skip only the literoom tests, or `-DLITEUI_BUILD_TESTS=OFF` to skip every test in the tree.
 
 ```powershell
-cmake -S . -B build -DLITEROOM_TESTS=ON
-cmake --build build --config Release
-ctest --test-dir build -C Release
+# from the liteui root (CMakePresets.json has msvc-release, gcc-release, ...)
+cmake --preset msvc-release
+cmake --build build/release
+ctest --test-dir build/release -C Release --output-on-failure
 ```
 
-`-C Release` (the configuration) is needed with Visual Studio's multi-configuration generator. To run just one test, filter by name: `ctest --test-dir build -C Release -R mask_brush`. `ctest --test-dir build -N` lists them all: there are **31** (21 plain unit tests, 4 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`), 5 LiteUI tests and `golden_render`).
+`-C Release` (the configuration) is needed with Visual Studio's multi-configuration generator and is harmless with Ninja. To run just one test, filter by name: `ctest --test-dir build/release -C Release -R mask_brush`.
+
+Each test is a target named `literoom_<name>_test` and a CTest entry named `literoom_<name>`, so `-R mask_brush` still matches. There are **31** literoom tests (21 plain unit tests, 4 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`), 5 LiteUI tests and `golden_render`). A plain `ctest -N` from the liteui root lists more (177 at the time of writing), because it also includes liteui's own Catch2 cases and the `counter` example. To list only literoom's:
+
+```powershell
+ctest --test-dir build/release -N -R literoom_
+```
 
 The golden render test needs a recorded reference file before it can pass; see [The golden render test](#3-the-golden-render-test).
 
@@ -59,15 +68,25 @@ Some headers take LiteUI's `CanvasImage` or decoders, or run a real thread, so t
 | `latest_worker` | The platform thread library | It runs a `std::jthread`. No LiteUI; it is tested with plain integers and move-only types. |
 | `thumb_worker` | LiteUI **and** threads | It decodes real files on a thread. The test writes those files with the app's own encoders (`image_codec.hpp`). |
 
+**A test that uses LiteUI must define `LITEUI_IMPLEMENTATION`.** LiteUI is one header, and its implementation (the Win32 / WIC includes, `toWide`, the decoders, ...) is only compiled when the macro is defined. Each test executable must define it in **exactly one** `.cpp`, before the first include that reaches `liteui.hpp`:
+
+```cpp
+#define LITEUI_IMPLEMENTATION
+#include "liteui.hpp"
+// ...then the literoom headers
+```
+
+Linking `liteui::liteui` (the `LITEUI` option of `literoom_add_test`) only supplies include paths and libraries; it does not define the macro. Forgetting it gives a flood of undeclared-identifier errors from `io/image_codec.hpp` (`HRESULT`, `CoInitializeEx`, `IWICImagingFactory`, `toWide`, ...) on Windows.
+
 **Thread tests can be flaky in a way that only shows up occasionally.** Run them in a loop to shake out timing problems:
 
 ```powershell
-ctest --test-dir build -C Release -R latest_worker --repeat until-fail:50
-ctest --test-dir build -C Release -R "detail_layer|neighbor_fx" --repeat until-fail:50
-ctest --test-dir build -C Release -R thumb_worker --repeat until-fail:50
+ctest --test-dir build/release -C Release -R latest_worker --repeat until-fail:50
+ctest --test-dir build/release -C Release -R "detail_layer|neighbor_fx" --repeat until-fail:50 --timeout 60
+ctest --test-dir build/release -C Release -R thumb_worker --repeat until-fail:50
 ```
 
-This repeats the test up to 50 times and stops at the first failure.
+This repeats the test up to 50 times and stops at the first failure. `--timeout 60` makes a hung run fail instead of stalling ctest; use it for `detail_layer` and `neighbor_fx`, which have no timeouts of their own.
 
 How `latest_worker` and `thumb_worker` are written so they stay reliable:
 
@@ -86,19 +105,21 @@ It compiles `src/main.cpp` itself (with `main()` renamed so the test can have it
 
 The idea: if you restructure code and the pixels come out bit-for-bit the same, the fingerprints match and the test passes. If a refactoring changes even one pixel, you find out immediately, at the step that caused it.
 
-Floating-point results can differ between compilers and between compiler flags, so there is **one golden file per configuration**, named `tests/golden/render_<CONFIG>.txt` (for example `render_Release.txt`). Only compare a run against a file recorded by the same build.
+Floating-point results can differ between compilers and between compiler flags, so there is **one golden file per compiler and configuration**, named `tests/golden/render_<COMPILER>_<CONFIG>.txt` (for example `render_MSVC_Release.txt`, `render_GNU_Debug.txt`). Only compare a run against a file recorded by the same build. **Commit the golden files**: without them a fresh checkout cannot run the test.
 
 The workflow:
 
 ```powershell
 # 1. Once, BEFORE refactoring: record the current behavior as the reference
-cmake --build build --config Release --target golden_record
+cmake --build build/release --target literoom_golden_record
 
 # 2. After every refactoring step: check nothing changed
-ctest --test-dir build -C Release -R golden_render
+ctest --test-dir build/release -C Release -R literoom_golden_render
 ```
 
-**On a fresh checkout the golden test fails until you have recorded it.** If the golden file does not exist the test prints `cannot open ... (record it first with --record)` and exits with code 2. Record once per configuration you test (`Debug`, `Release`, ...). With a single-configuration generator (Makefiles, Ninja), pass `-DCMAKE_BUILD_TYPE=Release` when you configure; without a build type the file name has an empty configuration (`render_.txt`).
+**On a fresh checkout the golden test is skipped until you have recorded it.** If the golden file does not exist the test prints `cannot open ... (record it first with --record); skipping` and exits with code 77, which CTest reports as **Skipped** (`CMakeLists.txt` sets `SKIP_RETURN_CODE 77` on the test). A skipped golden test means the safety net is **not running**, so record the file before you start refactoring. Record once per compiler and configuration you test (`Debug`, `Release`, ...). With a single-configuration generator (Makefiles, Ninja), pass `-DCMAKE_BUILD_TYPE=Release` when you configure; without a build type the configuration part of the file name is empty (`render_MSVC_.txt`).
+
+Recording prints the same summary as a normal run, for example `228 scenarios, 0 mismatches, 0 invariant failures, 1 notes`. Record only while you trust the current output, because the file becomes the reference for later refactoring. Do not re-record just to make a failing run pass.
 
 #### What it renders
 
@@ -128,7 +149,7 @@ Each line is a scenario name followed by a hash. A run ends with `N scenarios, M
 | `INVARIANT FAILED <name>` | A built-in check broke (below). Independent of the golden file. |
 | `note: ...` | Information only; does **not** fail the run (below). |
 
-Exit code: **0** every scenario matches and every invariant holds, **1** a mismatch or invariant failure, **2** bad usage or missing golden file.
+Exit code: **0** every scenario matches and every invariant holds, **1** a mismatch or invariant failure, **2** bad usage, **77** no golden file recorded yet (CTest shows it as skipped).
 
 Built-in invariants (these fail the run even when recording):
 
@@ -137,7 +158,7 @@ Built-in invariants (these fail the run even when recording):
 - The background render path (`renderWith` with a generation counter) gives the same bytes as the synchronous one, and a superseded render returns null.
 - The sidecar text parses and loads back, and scenario names are unique.
 
-Notes that do **not** fail the run, so read them: a scenario with no visible effect on the test picture, an untouched edit set that does not reproduce the input exactly, and the sidecar round trip (a second dump differing from the first, or a render after save and load differing from the original). A refactoring that breaks save and load rendering would only show up as a note.
+Notes that do **not** fail the run, so read them: a scenario with no visible effect on the test picture (for example `adj/18_Noise_Reduction/low` at the time of writing: the scenario is still recorded, but it guards only the pixels the test picture actually has), an untouched edit set that does not reproduce the input exactly, and the sidecar round trip (a second dump differing from the first, or a render after save and load differing from the original). A refactoring that breaks save and load rendering would only show up as a note.
 
 #### Finding where pixels changed
 
@@ -219,7 +240,7 @@ g++ -std=c++20 -I../src -g -O1 -fsanitize=address,undefined sidecar_test.cpp -o 
 g++ -std=c++20 -I../src -g -O1 -pthread -fsanitize=thread latest_worker_test.cpp -o latest_worker_test && ./latest_worker_test
 ```
 
-Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libraries, which is easier through CMake. On MSVC, `/fsanitize=address` is available for the address checks.
+Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libraries, which is easier through CMake. On MSVC, `/fsanitize=address` is available for the address checks, but MSVC has **no ThreadSanitizer**: to check the thread tests for data races on Windows, build them with GCC or Clang under WSL or on Linux.
 
 ## Platform differences
 
@@ -229,11 +250,11 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 
 ## Where a new test belongs
 
-1. **A new engine header with no UI:** put the header in the `src/` folder for its layer (see [Where things live](headers.md#where-things-live)) and add it to `LITEROOM_HEADERS` in `CMakeLists.txt`. Then add `tests/<name>_test.cpp` and add the name to the first `foreach` list in `CMakeLists.txt` (the plain unit tests).
-2. **One that takes `CanvasImage`:** add it to the `foreach` that links `liteui::liteui`.
-3. **One that runs a thread:** link `Threads::Threads` (copy the `detail_layer`/`neighbor_fx` loop, or the `latest_worker` block), assert only on the main thread, give every wait a timeout, and loop it with `--repeat until-fail`.
+1. **A new engine header with no UI:** put the header in the `src/` folder for its layer (see [Where things live](headers.md#where-things-live)) and add it to `LITEROOM_HEADERS` in `examples/literoom/CMakeLists.txt`. Then add `tests/<name>_test.cpp` and add the name to the first `foreach` list there (the plain unit tests, which call `literoom_add_test(<name>)`).
+2. **One that takes `CanvasImage`:** add it to the `foreach` that links `liteui::liteui` (the `LITEUI` option of `literoom_add_test`), and put `#define LITEUI_IMPLEMENTATION` before the `liteui.hpp` include in the test's `.cpp` (see [kind 2](#2-tests-that-need-liteui-or-threads)).
+3. **One that runs a thread:** use the `THREADS` option of `literoom_add_test` (copy the `detail_layer`/`neighbor_fx` loop, or the `latest_worker` block), assert only on the main thread, give every wait a timeout, and loop it with `--repeat until-fail` and `--timeout`.
 4. Start the test file with `#include "check.hpp"`, end it with `return finish();`, and put the build command in a comment on the first line, like the others.
-5. **A new slider, mask type or effect that changes pixels:** add a scenario to `golden_render_test.cpp` as well (sliders are picked up automatically through the table; see "Adding a slider" above) and re-record the golden files.
+5. **A new slider, mask type or effect that changes pixels:** add a scenario to `golden_render_test.cpp` as well (sliders are picked up automatically through the table; see "Adding a slider" above) and re-record the golden file for each compiler and configuration you use.
 
 ## Known gaps and things to check
 

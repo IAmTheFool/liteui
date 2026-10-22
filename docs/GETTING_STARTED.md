@@ -10,6 +10,7 @@ once you know your way around, see [`API.md`](API.md).
 Every program follows the same three steps:
 
 ```cpp
+#define LITEUI_IMPLEMENTATION   // in exactly one .cpp of your project
 #include "liteui.hpp"
 
 int main() {
@@ -25,6 +26,13 @@ int main() {
 1. Build a `View` tree describing what's on screen.
 2. Hand it to a `LiteUI` window with `setRoot`.
 3. Call `run()`, which blocks until the window closes.
+
+The `#define LITEUI_IMPLEMENTATION` line compiles the library itself into
+that file, so it goes in exactly one `.cpp` (here, the only one). Every
+other file that uses liteui just writes `#include "liteui.hpp"` without
+it. If you link the `liteui::liteui` CMake target instead, leave the
+`#define` out — the target already contains the implementation. See the
+[README](../README.md#how-the-single-header-works) for details.
 
 There's no separate "render loop" to write. Layout, painting, input
 dispatch, and re-rendering after state changes are all handled

@@ -5,6 +5,8 @@
 // decoded by the real decoder. Every wait has a timeout so a broken worker fails
 // instead of hanging; CHECK is not thread-safe (check.hpp), so assertions only
 // run on the main thread.
+#define LITEUI_IMPLEMENTATION
+#include "liteui.hpp"
 #include "workers/thumb_worker.hpp"
 #include "io/exif.hpp"
 #include "io/image_codec.hpp"

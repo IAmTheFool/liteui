@@ -1,10 +1,12 @@
 # liteui
 
-A single-header, retained-mode GUI library for C++23. One compiled definition per build via `#ifdef` — native
-rendering on both platforms (Direct2D/DirectWrite on Windows,
+A single-header, retained-mode GUI library for C++23. Copy in one file,
+define `LITEUI_IMPLEMENTATION` in exactly one `.cpp`, and start building —
+native rendering on both platforms (Direct2D/DirectWrite on Windows,
 Wayland/EGL/Cairo/Pango on Linux).
 
 ```cpp
+#define LITEUI_IMPLEMENTATION   // in exactly one .cpp of your project
 #include "liteui.hpp"
 
 int main() {
@@ -43,6 +45,13 @@ int main() {
   ui.run();
 }
 ```
+
+The `#define LITEUI_IMPLEMENTATION` line is what compiles the library
+itself into this file, so it goes in exactly one `.cpp` (here, the only
+one). Every other file that uses liteui just writes
+`#include "liteui.hpp"` without it. If you link the `liteui::liteui`
+CMake target instead, drop the `#define` — the target already contains
+the implementation (see [Getting started](#getting-started)).
 
 ## Screenshots
 
@@ -86,12 +95,49 @@ SVG feature coverage, etc.) before relying on any of the above.
 
 There is no X11 backend and no macOS backend at this time.
 
+## How the single header works
+
+`liteui.hpp` has two halves, in the style of `stb_*.h`:
+
+- **Declarations** (always visible): the types, `View`, `Canvas`,
+  `LiteUI`, and the clipboard / file-picker / image-decoding functions.
+  This part includes only a handful of standard headers and none of the
+  platform headers, so including it from many files is cheap.
+- **Implementation** (compiled only where you ask for it): the Win32 or
+  Wayland backend, the layout engine, text rendering, the SVG/XML
+  parsers and image decoders. It is compiled in the one translation unit
+  that defines `LITEUI_IMPLEMENTATION` before including the header.
+
+```cpp
+// liteui_impl.cpp  (any one .cpp file in your project)
+#define LITEUI_IMPLEMENTATION
+#include "liteui.hpp"
+```
+
+Every other file just writes `#include "liteui.hpp"`. A project with a
+single `.cpp` does both in that file. Defining `LITEUI_IMPLEMENTATION`
+in more than one file is an error (duplicate symbols).
+
+Why split it this way: the implementation is roughly ten thousand lines
+of non-template code. In a plain header-only library every `.cpp` that
+includes it compiles all of that again and the linker throws the copies
+away, so build time grows with the number of files that use liteui.
+Compiling it once keeps your own files fast to build.
+
+For a tour of how the library itself is organized (the public/implementation
+boundary, the frame pipeline, and the Windows and Wayland backends), see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## This is not a zero-dependency header
 
-Unlike `stb_*.h`, `liteui.hpp` talks directly to each platform's native
+Unlike `stb_*.h`, liteui talks directly to each platform's native
 GUI/graphics stack, so linking against system libraries is required —
-`#include`-ing the header alone is not enough to build. This is closer
-to how GLFW or Dear ImGui's platform backends work than to stb.
+including the header alone is not enough to produce a working program.
+This is closer to how GLFW or Dear ImGui's platform backends work than
+to stb.
+
+Only the translation unit that defines `LITEUI_IMPLEMENTATION` needs the
+platform headers on its include path; your other files never see them.
 
 | Platform | Required libraries |
 |---|---|
@@ -107,9 +153,13 @@ add_subdirectory(path/to/liteui)   # or FetchContent_Declare + FetchContent_Make
 target_link_libraries(your_app PRIVATE liteui::liteui)
 ```
 
-The `liteui::liteui` target already carries the include directory, the
-C++23 requirement, and every platform link library above — you don't
-need to write your own `find_package`/`pkg_check_modules` calls.
+`liteui::liteui` is a small static library that compiles the
+implementation once (`liteui_impl.cpp`). Linking it gives you the include
+directory, the C++23 requirement, and every platform link library above —
+you don't need to write your own `find_package`/`pkg_check_modules`
+calls, and your own targets don't inherit the platform include paths.
+Your sources only `#include "liteui.hpp"`; do **not** define
+`LITEUI_IMPLEMENTATION` yourself when you link this target.
 
 On Linux, the Wayland protocol bindings (`xdg-shell`,
 `xdg-decoration`) are pre-generated and checked into
@@ -139,11 +189,20 @@ installed at all.
 
 ### Without CMake
 
-Add `liteui.hpp` to your include path and link the libraries from the
-table above manually. On Linux you'll also need to compile
-`platform/wayland-protocols/xdg-shell-protocol.c` and
-`platform/wayland-protocols/xdg-decoration-protocol.c` into your build
-— they're plain C files, no code generation needed at your end.
+1. Copy `liteui.hpp` into your project.
+2. In exactly one `.cpp` file, define `LITEUI_IMPLEMENTATION` before
+   including it (see [How the single header works](#how-the-single-header-works)).
+3. Build that file with the platform headers available and link the
+   libraries from the table above.
+
+On Linux, that one file additionally needs
+`-Iplatform/wayland-protocols` (the header includes
+`xdg-shell-client-protocol.h` and `xdg-decoration-client-protocol.h` from
+there), the compile flags from
+`pkg-config --cflags wayland-client wayland-cursor wayland-egl cairo pangocairo egl glesv2 xkbcommon libpng libjpeg`,
+and you must compile `platform/wayland-protocols/xdg-shell-protocol.c`
+and `platform/wayland-protocols/xdg-decoration-protocol.c` into your
+build — they're plain C files, no code generation needed at your end.
 
 ## Examples
 

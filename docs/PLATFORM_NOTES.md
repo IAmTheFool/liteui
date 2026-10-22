@@ -6,6 +6,12 @@ simplification rather than a bug. Pulled together from the comments
 already sitting next to the relevant code — if you're debugging
 something that looks wrong, check here before assuming it's a bug.
 
+Internal names mentioned below (`liteui_svg`, `liteui_xml`,
+`resolveScrollTarget`, `kTitlebarHeight`, and so on) live in the
+implementation section of `liteui.hpp` — the part compiled under
+`LITEUI_IMPLEMENTATION`. They're referenced to help you find the relevant
+code, not because they're public API.
+
 ## Canvas 2D (`CanvasContext`)
 
 The Windows backend (Direct2D, v1 `ID2D1RenderTarget`) and the Linux
@@ -14,9 +20,9 @@ resolve differently or aren't fully implemented on one side:
 
 | Feature | Linux (Cairo) | Windows (Direct2D) |
 |---|---|---|
-| `getImageData` | Fully supported — reads back the canvas's own backing surface | **Unsupported** — always returns `std::nullopt`. A plain `ID2D1RenderTarget` isn't CPU-readable without WIC/DXGI plumbing this header doesn't pull in |
+| `getImageData` | Fully supported — reads back the canvas's own backing surface | Fully supported — reads the WIC bitmap that backs each canvas node's render target. Like Linux, it ignores the current transform and returns raw device pixels |
 | `putImageData` / `drawImage` | Supported | Supported |
-| `clearRect` | True sub-rectangle clear (`CAIRO_OPERATOR_CLEAR`) | Clears the **entire** canvas — Direct2D v1's `Clear()` ignores the requested rect, clip, and transform entirely |
+| `clearRect` | True, transform-aware sub-rectangle clear (`CAIRO_OPERATOR_CLEAR`), antialiased at rotated/skewed edges | True, transform-aware sub-rectangle clear, written straight into the WIC bitmap (Direct2D's own `Clear()` would wipe the whole target). The edges of a rotated/skewed rect are a hard pixel-center test, **not** antialiased |
 | `globalCompositeOperation` | Full range, maps 1:1 onto Cairo operators | Only ever draws normal source-over alpha blending — a plain `ID2D1RenderTarget` has no Porter-Duff blend control. The value is stored but has no visible effect |
 | Radial gradients | Exact — Cairo's native two-circle model | Approximated. Direct2D only models a single circle plus a focal point, so the inner-radius stop is approximated by rescaling stop offsets rather than drawn exactly |
 

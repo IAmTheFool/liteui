@@ -2,11 +2,21 @@ cmake_minimum_required(VERSION 3.21)
 project(liteui LANGUAGES C CXX)
 
 # ------------------------------------------------------------------------
-# liteui::liteui — INTERFACE target for the single-header library.
+# liteui::liteui — header-only INTERFACE library (liteui.hpp).
+#
+# The implementation lives in the same header, guarded by
+# LITEUI_IMPLEMENTATION. Each executable must define it in EXACTLY ONE .cpp:
+#
+#     #define LITEUI_IMPLEMENTATION
+#     #include "liteui.hpp"
 #
 # Consumers do:
 #     add_subdirectory(path/to/liteui)          # or FetchContent
 #     target_link_libraries(app PRIVATE liteui::liteui)
+#
+# Because the implementation is compiled inside the consumer, the platform
+# libraries (Win32/D2D, or Wayland/Cairo/EGL/...) and the LITEUI_PROFILE
+# define are all INTERFACE: they propagate to whatever links liteui.
 #
 # This variant VENDORS the generated xdg-shell / xdg-decoration protocol
 # bindings under platform/wayland-protocols/ (checked into git). A
@@ -14,8 +24,8 @@ project(liteui LANGUAGES C CXX)
 # below (wayland-client, cairo, egl, etc.) — NOT wayland-scanner or the
 # wayland-protocols package. The trade-off: the vendored files are
 # frozen at whatever wayland-protocols version generated them, and a
-# maintainer has to re-run the `regen-protocols` target (see below) and
-# commit the result to pick up upstream protocol changes.
+# maintainer has to re-run the `regen-protocols` target and commit the
+# result to pick up upstream protocol changes.
 #
 # Expected layout:
 #   platform/wayland-protocols/xdg-shell-protocol.c
@@ -23,21 +33,18 @@ project(liteui LANGUAGES C CXX)
 #   platform/wayland-protocols/xdg-decoration-protocol.c
 #   platform/wayland-protocols/xdg-decoration-client-protocol.h
 #
-# On a FRESH CHECKOUT (or the first time you build liteui itself rather
-# than just consuming it) those files don't exist yet. This file
-# registers the `regen-protocols` target BEFORE checking for the
-# vendored files, and downgrades the missing-files case to a WARNING
-# (instead of a hard FATAL_ERROR) whenever wayland-scanner and
-# wayland-protocols are available to generate them — so a plain
-# `cmake -B build` still configures successfully and you can run:
+# On a FRESH CHECKOUT those files don't exist yet. This file registers the
+# `regen-protocols` target BEFORE checking for the vendored files, and
+# downgrades the missing-files case to a WARNING whenever wayland-scanner
+# and wayland-protocols are available, so a plain `cmake -B build` still
+# configures and you can run:
 #
 #   cmake --build build --target regen-protocols
 #   git add platform/wayland-protocols && git commit
 #
 # ...then re-run cmake's configure step. If wayland-scanner/
-# wayland-protocols aren't installed AND the vendored files are
-# missing, configure still fails with a FATAL_ERROR, since there's no
-# way to produce a working build either way.
+# wayland-protocols aren't installed AND the vendored files are missing,
+# configure fails with a FATAL_ERROR.
 # ------------------------------------------------------------------------
 
 add_library(liteui INTERFACE)
@@ -46,10 +53,10 @@ add_library(liteui::liteui ALIAS liteui)
 target_include_directories(liteui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(liteui INTERFACE cxx_std_23)
 
-# Optional frame profiler (see LITEUI_PROFILE in liteui.hpp). When ON, every
-# target that links liteui::liteui is compiled with -DLITEUI_PROFILE and
-# prints per-second timing of mouse handling / painting / etc. to stderr.
-# OFF by default: compiles to nothing.
+# Optional frame profiler (see LITEUI_PROFILE in liteui.hpp). When ON,
+# consumers are compiled with -DLITEUI_PROFILE and print per-second timing
+# of mouse handling / painting / etc. to stderr. OFF by default: compiles
+# to nothing.
 option(LITEUI_PROFILE "Print per-second frame timing to stderr" OFF)
 if(LITEUI_PROFILE)
     target_compile_definitions(liteui INTERFACE LITEUI_PROFILE)
@@ -80,14 +87,8 @@ else()
     pkg_check_modules(JPEG           REQUIRED IMPORTED_TARGET libjpeg)
 
     # ------------------------------------------------------------------
-    # Register `regen-protocols` FIRST, before the existence check below.
-    # A FATAL_ERROR anywhere in this file halts configure immediately,
-    # so if the check came first (as it used to), this target would
-    # never get registered on a fresh checkout — the exact chicken-and-
-    # egg problem that produced the original build failure. Registering
-    # it up front, gated only on finding wayland-scanner +
-    # wayland-protocols (not on the vendored files existing), lets a
-    # fresh checkout configure far enough to actually run it.
+    # Register `regen-protocols` FIRST, before the existence check below,
+    # so a fresh checkout can configure far enough to run it.
     # ------------------------------------------------------------------
     find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
     pkg_get_variable(_liteui_wp_dir wayland-protocols pkgdatadir)
@@ -106,12 +107,8 @@ else()
         )
     endif()
 
-    # Deliberately no requirement on wayland-scanner/wayland-protocols
-    # being installed for a NORMAL build — the whole point of vendoring
-    # is that a consumer with the committed platform/wayland-protocols/
-    # files doesn't need either of those. This check only fires when
-    # those files are missing (first build, or a fresh checkout before
-    # regen-protocols has been run and committed).
+    # Only fires when the vendored files are missing (first build, or a
+    # fresh checkout before regen-protocols has been run and committed).
     if(NOT EXISTS "${LITEUI_PROTO_DIR}/xdg-shell-protocol.c")
         if(TARGET regen-protocols)
             message(WARNING
@@ -133,12 +130,7 @@ else()
         endif()
     endif()
 
-    # Only build (and link) the protocol bindings once the sources
-    # actually exist — lets configure succeed even on a fresh checkout
-    # so `regen-protocols` itself can be built; a normal `liteui` build
-    # target will still fail obviously (missing sources) until you've
-    # run regen-protocols and re-configured, rather than failing here
-    # with an opaque error.
+    # Only build (and link) the protocol bindings once the sources exist.
     if(EXISTS "${LITEUI_PROTO_DIR}/xdg-shell-protocol.c")
         add_library(liteui_wayland_protocols STATIC
             ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
@@ -166,14 +158,17 @@ else()
 endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    # Tests are configured BEFORE examples so that Catch2 and enable_testing()
+    # exist when an example registers its own tests. Examples are optional
+    # about this: one without a tests/ folder simply registers none.
+    option(LITEUI_BUILD_TESTS "Build the liteui unit tests (Catch2)" ON)
+    if(LITEUI_BUILD_TESTS)
+        include(CTest)   # also generates DartConfiguration.tcl for IDE/`ctest -T` runs
+        add_subdirectory(tests)
+    endif()
+
     option(LITEUI_BUILD_EXAMPLES "Build the liteui example programs" ON)
     if(LITEUI_BUILD_EXAMPLES)
         add_subdirectory(examples)
-    endif()
-
-    option(LITEUI_BUILD_TESTS "Build the liteui unit tests (Catch2)" ON)
-    if(LITEUI_BUILD_TESTS)
-        enable_testing()
-        add_subdirectory(tests)
     endif()
 endif()
