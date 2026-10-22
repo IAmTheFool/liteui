@@ -7873,8 +7873,15 @@ private:
   // their own top-level slot in the global list. Each entry also carries
   // the clip of its scrollable ancestors, so absolutes scrolled out of
   // view are neither painted nor hit-tested.
+  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out)
+  {
+    // Overload instead of `ClipRect clip = ClipRect{}`: GCC/Clang reject a
+    // default argument that needs a nested class's default member
+    // initializers before the enclosing class is complete.
+    collectAbsolutes(v, out, ClipRect{});
+  }
   void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out,
-                        ClipRect clip = ClipRect{})
+                        ClipRect clip)
   {
     ClipRect childClip = (v.scrollsX() || v.scrollsY())
                              ? clip.intersect(v.computed.x, v.computed.y,
@@ -12539,7 +12546,10 @@ inline void LiteUIImpl::run()
       if (fds[intervalStart + i].revents & POLLIN)
       {
         uint64_t exp;
-        read(intervalTimers_[i].fd, &exp, sizeof(exp));
+        {
+          ssize_t n = read(intervalTimers_[i].fd, &exp, sizeof(exp));
+          (void)n; // timerfd drain; value unused
+        }
         intervalTimers_[i].fn();
         requestRepaint();
       }
