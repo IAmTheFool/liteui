@@ -1821,6 +1821,25 @@ static void filmQueueThumbs()
   thumbWorker.setQueue(std::move(todo));
 }
 
+// A strip holding only `imagePath` (no folder scan, no thumbnails for others).
+static void filmAdoptSingle(const std::string &imagePath)
+{
+  const std::filesystem::path p = fsPath(imagePath);
+  std::string folder = u8ToString(p.parent_path());
+  if (folder.empty())
+    folder = ".";
+  FilmStrip next;
+  next.folder = folder;
+  next.visible = state.film.visible;
+  FilmEntry e;
+  e.path = imagePath;
+  e.name = u8ToString(p.filename());
+  next.byName[filmLower(e.name)] = 0;
+  next.files.push_back(std::move(e));
+  state.film = std::move(next);
+  state.film.dirty = true;
+}
+
 // Makes the folder `folder` the filmstrip's. False (nothing changed) if it
 // holds no JPEG / PNG pictures.
 static bool filmAdoptFolder(const std::string &folder)
@@ -1844,15 +1863,7 @@ static void filmSync(const std::string &imagePath)
   std::string folder = u8ToString(p.parent_path());
   if (folder.empty())
     folder = ".";
-  bool same = false;
-  if (!f.folder.empty())
-  {
-    std::error_code ec;
-    same = std::filesystem::equivalent(fsPath(f.folder), fsPath(folder), ec) &&
-           !ec;
-  }
-  if (!same)
-    filmAdoptFolder(folder);
+  filmAdoptSingle(imagePath);
   FilmStrip &g = state.film;
   const auto it = g.byName.find(filmLower(u8ToString(p.filename())));
   g.current = g.target = it == g.byName.end() ? -1 : static_cast<int>(it->second);
