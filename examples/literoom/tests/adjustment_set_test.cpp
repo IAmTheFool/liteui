@@ -57,6 +57,8 @@ static void testSliderStepsAndCoalescing()
   CHECK(lastLabel(s) == "Highlights +3.1"); // 0.1 off a whole number is still shown
   s.set(AdjId::Shadows, 3.04f);
   CHECK(lastLabel(s) == "Shadows +3");      // 0.04 is not
+  s.set(AdjId::Sepia, 60.0f);
+  CHECK(lastLabel(s) == "Sepia +60");        // the Filters get History labels from the table too
   CHECK(kMaxUndoSteps == 200);
 }
 
@@ -364,6 +366,7 @@ static void testJson()
   fresh(a);
   a.set(AdjId::Exposure, 25.0f);
   a.set(AdjId::Texture, -30.0f);
+  a.set(AdjId::Vintage, 45.0f);
   a.setGeometry(Orient{1, false}, 4.5f, CropRect{});
   a.setCurve(CurveChannel::Blue, CurvePoints{{0, 0}, {120, 100}, {255, 255}}, false);
   a.setMix(MixChan::Saturation, 2, -15.0f);
@@ -373,6 +376,8 @@ static void testJson()
   a.setGrade(g, -1);
   a.setMasks(MaskSet{radialMask()}, -1);
   const std::string text = a.toJson().dump();
+  // A Filter is saved under its label, and one at 0 is left out like every other slider.
+  CHECK(text.find("\"Vintage\"") != std::string::npos && text.find("\"Sepia\"") == std::string::npos);
 
   AdjustmentSet b;
   fresh(b);
@@ -381,6 +386,7 @@ static void testJson()
   std::string err;
   CHECK(mj::Json::parse(text, &j, &err) && b.loadJson(j));
   CHECK(b.get(AdjId::Exposure) == 25.0f && b.get(AdjId::Texture) == -30.0f && b.get(AdjId::Hue) == 0.0f);
+  CHECK(b.get(AdjId::Vintage) == 45.0f && b.get(AdjId::Sepia) == 0.0f);
   CHECK(b.orient() == (Orient{1, false}) && b.angle() == 4.5f && b.curve(CurveChannel::Blue) == a.curve(CurveChannel::Blue));
   CHECK(b.mix(MixChan::Saturation, 2) == -15.0f && b.grade() == a.grade() && b.masks().size() == 1);
   CHECK(b.toJson().dump() == text);
@@ -449,6 +455,42 @@ static void testBuildTables()
   CHECK(u.buildRenderParams().masks.size() == 1);
 }
 
+static void testFilterSlidersReachTheColorPass()
+{
+  // A Filter alone makes the global color pass active, and touches no other stage.
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Greyscale, 100.0f);
+  const ColorPass cp = s.buildColorPass();
+  CHECK(cp.active && cp.filters.any && cp.filters.grey == 1.0f);
+  CHECK(!cp.mix && !cp.grade && !cp.hue && !cp.colorize);
+  const RenderParams rp = s.buildRenderParams();
+  CHECK(rp.color.active && rp.color.filters.any && !rp.fx.any() && rp.masks.empty());
+  for (int i = 0; i < 256; ++i)
+    CHECK(rp.luts[0][static_cast<size_t>(i)] == i); // the tone tables are untouched
+  s.set(AdjId::Greyscale, 0.0f);
+  CHECK(!s.buildColorPass().active); // back to neutral: the fast path again
+
+  // The global edit and a mask must read the Filters the same way (two call sites of makeColorPass).
+  AdjustmentSet t;
+  fresh(t);
+  Mask m = radialMask();
+  m.adj = AdjValues{};
+  float v = 15.0f;
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize})
+  {
+    t.set(id, v);
+    m.adj[static_cast<size_t>(id)] = v;
+    v += 12.0f;
+  }
+  t.setMasks(MaskSet{m}, -1);
+  const RenderParams r2 = t.buildRenderParams();
+  CHECK(r2.masks.size() == 1 && r2.masks[0].color.active);
+  const FilterPass &g = r2.color.filters, &l = r2.masks[0].color.filters;
+  CHECK(g.any && l.any && g.grey == l.grey && g.sepia == l.sepia && g.vintage == l.vintage && g.fade == l.fade);
+  CHECK(g.negative == l.negative && g.solarize == l.solarize && g.posterLevels == l.posterLevels);
+}
+
 static void testMasksFollowTheGeometry()
 {
   AdjustmentSet s;
@@ -505,6 +547,7 @@ int main()
   testVersionAndLabelCache();
   testJson();
   testBuildTables();
+  testFilterSlidersReachTheColorPass();
   testMasksFollowTheGeometry();
   testMaskTablesMatchTheGlobalOnes();
   return finish();

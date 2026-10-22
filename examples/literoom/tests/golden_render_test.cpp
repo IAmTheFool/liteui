@@ -331,12 +331,24 @@ namespace golden
 
   static size_t idx(AdjId id) { return static_cast<size_t>(id); }
 
-  static std::string two(size_t i)
+  // The Filters (Greyscale ... Solarize) are one contiguous block of the table.
+  static bool isFilter(AdjId id) { return id >= AdjId::Greyscale && id <= AdjId::Solarize; }
+  // Position of slider i among the sliders that are NOT filters. The "every
+  // other slider goes negative" pattern of the kitchen-sink scenarios (all_*,
+  // fullEffect, buildSink) uses it, so inserting the Filters into the table
+  // does not flip any other slider's sign (and so does not change those
+  // fingerprints for any reason except the Filters themselves).
+  static size_t sinkPos(size_t i)
   {
-    char b[8];
-    std::snprintf(b, sizeof b, "%02zu", i);
-    return b;
+    const size_t first = idx(AdjId::Greyscale), count = idx(AdjId::Solarize) - first + 1;
+    return i < first ? i : i - count; // only meaningful for non-filter i
   }
+  // Strength the kitchen-sink scenarios give every Filter. Modest on purpose:
+  // at 50 %, Negative and Solarize map every bright pixel to the same mid-gray,
+  // which would hide regressions in everything upstream of them (tone, color,
+  // mixer, grade) in those fingerprints. 0 reproduces the pre-Filters
+  // fingerprints exactly (used once to prove nothing else changed).
+  static constexpr float kSinkFilterStrength = 20.0f;
 
   // Renders twice (cold, then with whatever the first render cached) and
   // fingerprints the first. Returns the cold result.
@@ -454,7 +466,12 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-      m.adj[i] = (i % 2 && sp.min < 0) ? sp.min * 0.4f : sp.max * 0.4f;
+      if (isFilter(sp.id))
+      {
+        m.adj[i] = kSinkFilterStrength;
+        continue;
+      }
+      m.adj[i] = (sinkPos(i) % 2 && sp.min < 0) ? sp.min * 0.4f : sp.max * 0.4f;
     }
     m.mix[mixIndex(MixChan::Hue, 2)] = 30;
     m.mix[mixIndex(MixChan::Saturation, 3)] = -40;
@@ -522,7 +539,9 @@ namespace golden
         s.set(sp.id, st.v);
         if (sp.id == AdjId::ColorizeHue) // Hue alone tints nothing
           s.set(AdjId::ColorizeAmount, 60.0f);
-        renderScenario("adj/" + two(i) + "_" + label + st.suffix, s, img);
+        // Named by label, not table index: inserting a slider must not rename
+        // (and so re-record) every scenario after it.
+        renderScenario("adj/" + label + st.suffix, s, img);
       }
     }
     for (int pol = 0; pol < 2; ++pol)
@@ -532,9 +551,51 @@ namespace golden
       for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
       {
         const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-        s.set(sp.id, (pol == 1 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f);
+        s.set(sp.id, isFilter(sp.id) ? kSinkFilterStrength
+                                     : ((pol == 1 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
       }
       renderScenario(pol == 0 ? "adj/all_pos" : "adj/all_neg", s, img);
+    }
+
+    // ---- Filters together and next to the other stages ----
+    {
+      // Several at once: the fixed order is Vintage, Fade, Greyscale, Sepia,
+      // Solarize, Posterize, Negative.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Vintage, 50);
+      s.set(AdjId::Fade, 30);
+      s.set(AdjId::Greyscale, 40);
+      s.set(AdjId::Sepia, 60);
+      s.set(AdjId::Solarize, 20);
+      s.set(AdjId::Posterize, 25);
+      s.set(AdjId::Negative, 20);
+      renderScenario("adj/filters_stack", s, img);
+    }
+    {
+      // Filters run after every other color stage: Negative over a picture the
+      // Saturation / Temperature / Color Grading stages have already changed.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Exposure, 25);
+      s.set(AdjId::Saturation, 40);
+      s.set(AdjId::Temperature, 25);
+      ColorGrade g;
+      g.wheel[1].hue = 200;
+      g.wheel[1].sat = 40;
+      g.wheel[0].lum = -15;
+      s.setGrade(g, -1);
+      s.set(AdjId::Negative, 100);
+      renderScenario("adj/filter_after_color", s, img);
+    }
+    {
+      // A Filter plus the neighbor effects (which run after the color pass).
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Sepia, 70);
+      s.set(AdjId::Clarity, 40);
+      s.set(AdjId::Sharpness, 50);
+      renderScenario("adj/filter_with_detail", s, img);
     }
   }
 
@@ -754,6 +815,19 @@ namespace golden
       one("mask/composite_inverted_amount70", {m});
     }
     {
+      // A mask whose only effect is a Filter must be kept and must render.
+      Mask m = makeMask(radial());
+      m.adj = AdjValues{};
+      m.adj[idx(AdjId::Greyscale)] = 100;
+      one("mask/filter_only", {m});
+      // Two filter masks overlapping, in list order.
+      Mask b = makeMask(linear());
+      b.adj = AdjValues{};
+      b.adj[idx(AdjId::Sepia)] = 80;
+      b.adj[idx(AdjId::Fade)] = 40;
+      one("mask/filters_overlapping", {m, b});
+    }
+    {
       Mask m = makeMask(radial());
       m.adj = AdjValues{};
       m.adj[idx(AdjId::Dehaze)] = 60;
@@ -864,7 +938,8 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-      s.set(sp.id, (i % 2 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f);
+      s.set(sp.id, isFilter(sp.id) ? kSinkFilterStrength
+                                   : ((sinkPos(i) % 2 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
     }
     for (size_t c = 0; c < kMixChanCount; ++c)
       for (size_t b = 0; b < kMixBandCount; ++b)

@@ -15,6 +15,21 @@
 #include "detail/neighbor_fx.hpp"
 #include "mask/mask.hpp"
 
+// The Filters sliders of one AdjValues, in the form makeColorPass takes. Use it
+// at BOTH makeColorPass call sites: here (masks) and AdjustmentSet::buildColorPass().
+inline FilterValues filterValuesFromAdj(const AdjValues &a)
+{
+  FilterValues f;
+  f.greyscale = a[adjIndex(AdjId::Greyscale)];
+  f.sepia = a[adjIndex(AdjId::Sepia)];
+  f.vintage = a[adjIndex(AdjId::Vintage)];
+  f.fade = a[adjIndex(AdjId::Fade)];
+  f.negative = a[adjIndex(AdjId::Negative)];
+  f.posterize = a[adjIndex(AdjId::Posterize)];
+  f.solarize = a[adjIndex(AdjId::Solarize)];
+  return f;
+}
+
 // A mask frozen for the render thread: its shape and everything its sliders
 // boil down to. Built on the UI thread (O(256)), copied into RenderParams.
 struct MaskPass
@@ -73,7 +88,8 @@ inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
                              m.mix, m.grade,
                              m.adj[static_cast<size_t>(AdjId::Hue)],
                              m.adj[static_cast<size_t>(AdjId::ColorizeHue)],
-                             m.adj[static_cast<size_t>(AdjId::ColorizeAmount)]);
+                             m.adj[static_cast<size_t>(AdjId::ColorizeAmount)],
+                             filterValuesFromAdj(m.adj));
     mp.fx = neighbor_fx::gainsFromValues(
         m.adj[static_cast<size_t>(AdjId::Texture)],
         m.adj[static_cast<size_t>(AdjId::Clarity)],

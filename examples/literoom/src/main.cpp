@@ -6518,7 +6518,7 @@ int main()
     h.color = kColorTextMuted;
     return h;
   };
-  bool colorHeaderAdded = false, detailHeaderAdded = false;
+  bool colorHeaderAdded = false, filtersHeaderAdded = false, detailHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
@@ -6526,6 +6526,12 @@ int main()
     {
       adjustPane.addChild(sectionLabel("Color"));
       colorHeaderAdded = true;
+    }
+    // Filters are Color-stage entries; AdjId::Greyscale starts their block.
+    if (!filtersHeaderAdded && spec.id == AdjId::Greyscale)
+    {
+      adjustPane.addChild(sectionLabel("Filters"));
+      filtersHeaderAdded = true;
     }
     if (!detailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
     {
@@ -7384,7 +7390,7 @@ int main()
 
   // Basic: Amount plus the same table as the Adjust pane.
   fxBasic.addChild(buildMaskAmountSlider());
-  bool maskColorHeaderAdded = false, maskDetailHeaderAdded = false;
+  bool maskColorHeaderAdded = false, maskFiltersHeaderAdded = false, maskDetailHeaderAdded = false;
   fxBasic.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
@@ -7393,6 +7399,11 @@ int main()
     {
       fxBasic.addChild(sectionLabel("Color"));
       maskColorHeaderAdded = true;
+    }
+    if (!maskFiltersHeaderAdded && spec.id == AdjId::Greyscale)
+    {
+      fxBasic.addChild(sectionLabel("Filters"));
+      maskFiltersHeaderAdded = true;
     }
     if (!maskDetailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
     {

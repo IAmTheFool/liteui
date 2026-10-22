@@ -13,6 +13,134 @@
 constexpr float kHueShiftDegrees = 90.0f; // Hue slider +/-100 = +/- this many degrees
 constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction of the tint's chroma
 
+// ---------------- Filters (the "look" block, last in the color pass) ----------------
+// Every filter is a strength 0..100 (0 = untouched). At strength s the result
+// is lerp(pixel, filtered(pixel), s / 100), so 0 is exactly the identity and
+// existing renders (and the golden fingerprints) cannot change. Fixed order:
+// Vintage -> Fade -> Greyscale -> Sepia -> (clamp) -> Solarize -> Posterize -> Negative.
+struct FilterValues
+{
+  float greyscale = 0, sepia = 0, vintage = 0, fade = 0, negative = 0,
+        posterize = 0, solarize = 0;
+};
+
+struct FilterPass
+{
+  bool any = false; // false = skip the filter block entirely
+  float grey = 0, sepia = 0, vintage = 0, fade = 0, negative = 0, solarize = 0; // 0..1
+  int posterLevels = 0;                                                         // 0 = off, else 2..255
+  float posterScale = 0, posterInv = 0;                                         // (L-1)/255 and 255/(L-1)
+};
+
+inline FilterPass makeFilterPass(const FilterValues &v)
+{
+  // NaN/inf -> 0, everything else clamped to 0..100, then scaled to 0..1.
+  auto amt = [](float x)
+  { return std::isfinite(x) ? std::clamp(x, 0.0f, 100.0f) / 100.0f : 0.0f; };
+  FilterPass f;
+  f.grey = amt(v.greyscale);
+  f.sepia = amt(v.sepia);
+  f.vintage = amt(v.vintage);
+  f.fade = amt(v.fade);
+  f.negative = amt(v.negative);
+  f.solarize = amt(v.solarize);
+  const float p = amt(v.posterize);
+  if (p > 0.0f)
+  {
+    // Level count falls smoothly from 256 (p = 0) to 2 (p = 1), so the slider
+    // has no dead zone and no sudden jump. 256 levels or more = no visible effect.
+    int levels = static_cast<int>(
+        std::lround(256.0 * std::pow(2.0 / 256.0, static_cast<double>(p))));
+    if (levels < 2)
+      levels = 2;
+    if (levels < 256)
+    {
+      f.posterLevels = levels;
+      f.posterScale = static_cast<float>(levels - 1) / 255.0f;
+      f.posterInv = 255.0f / static_cast<float>(levels - 1);
+    }
+  }
+  f.any = f.grey > 0.0f || f.sepia > 0.0f || f.vintage > 0.0f || f.fade > 0.0f ||
+          f.negative > 0.0f || f.solarize > 0.0f || f.posterLevels != 0;
+  return f;
+}
+
+inline float filterLerp(float a, float b, float t) { return a + (b - a) * t; }
+inline float filterClamp255(float x) { return x < 0.0f ? 0.0f : (x > 255.0f ? 255.0f : x); }
+
+// One pixel, float in and out (0..255, may leave the range; the caller rounds
+// and clamps once). Plain code, no std:: helpers, for the Debug-build reason
+// stated at applyColorPass.
+inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
+{
+  r = filterClamp255(r);
+  g = filterClamp255(g);
+  b = filterClamp255(b);
+  if (f.vintage > 0.0f)
+  {
+    // Partial desaturation, warm cast, lifted blacks, slightly flatter contrast.
+    const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
+    float vr = filterLerp(r, l, 0.35f) * 1.06f + 8.0f;
+    float vg = filterLerp(g, l, 0.35f) * 1.00f + 4.0f;
+    float vb = filterLerp(b, l, 0.35f) * 0.88f + 0.0f;
+    vr = 128.0f + (vr - 128.0f) * 0.92f;
+    vg = 128.0f + (vg - 128.0f) * 0.92f;
+    vb = 128.0f + (vb - 128.0f) * 0.92f;
+    r = filterLerp(r, vr, f.vintage);
+    g = filterLerp(g, vg, f.vintage);
+    b = filterLerp(b, vb, f.vintage);
+  }
+  if (f.fade > 0.0f)
+  {
+    // Lift the blacks to 40 and compress the range (white stays at 255).
+    const float k = 215.0f / 255.0f;
+    r = filterLerp(r, 40.0f + r * k, f.fade);
+    g = filterLerp(g, 40.0f + g * k, f.fade);
+    b = filterLerp(b, 40.0f + b * k, f.fade);
+  }
+  if (f.grey > 0.0f)
+  {
+    const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
+    r = filterLerp(r, l, f.grey);
+    g = filterLerp(g, l, f.grey);
+    b = filterLerp(b, l, f.grey);
+  }
+  if (f.sepia > 0.0f)
+  {
+    const float sr = 0.393f * r + 0.769f * g + 0.189f * b;
+    const float sg = 0.349f * r + 0.686f * g + 0.168f * b;
+    const float sb = 0.272f * r + 0.534f * g + 0.131f * b;
+    r = filterLerp(r, sr, f.sepia);
+    g = filterLerp(g, sg, f.sepia);
+    b = filterLerp(b, sb, f.sepia);
+  }
+  // Everything below needs 0..255 input (earlier steps can overshoot).
+  r = filterClamp255(r);
+  g = filterClamp255(g);
+  b = filterClamp255(b);
+  if (f.solarize > 0.0f)
+  {
+    // Invert only the channel values above mid-gray.
+    r = filterLerp(r, r > 128.0f ? 255.0f - r : r, f.solarize);
+    g = filterLerp(g, g > 128.0f ? 255.0f - g : g, f.solarize);
+    b = filterLerp(b, b > 128.0f ? 255.0f - b : b, f.solarize);
+  }
+  if (f.posterLevels != 0)
+  {
+    // Hard quantize (the slider moves the level count, not a blend). Inputs are
+    // >= 0 here, so truncating (x + 0.5) is a correct round.
+    r = static_cast<float>(static_cast<int>(r * f.posterScale + 0.5f)) * f.posterInv;
+    g = static_cast<float>(static_cast<int>(g * f.posterScale + 0.5f)) * f.posterInv;
+    b = static_cast<float>(static_cast<int>(b * f.posterScale + 0.5f)) * f.posterInv;
+  }
+  if (f.negative > 0.0f)
+  {
+    r = filterLerp(r, 255.0f - r, f.negative);
+    g = filterLerp(g, 255.0f - g, f.negative);
+    b = filterLerp(b, 255.0f - b, f.negative);
+  }
+}
+
 // ---------------- Color pass (float, per pixel) ----------------
 // Runs on the LUT's 8-bit output. Everything here is computed in float and
 // rounded/clamped once at the end, so stacking Temperature + Vibrance +
@@ -38,6 +166,7 @@ struct ColorPass
   MixLut mixLut;                               // only filled when `mix` is true
   bool grade = false;                          // Color Grading stage enabled (gradeLut is valid)
   GradeLut gradeLut{};                         // only filled when `grade` is true
+  FilterPass filters;                          // Filters block (filters.any = enabled), runs last
 };
 
 // UI values are the -100..+100 slider values (Colorize Hue is 0..360 degrees,
@@ -46,7 +175,8 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
                                float saturation, const MixValues &mix,
                                const ColorGrade &grade,
                                float hueShift = 0.0f, float colorizeHue = 0.0f,
-                               float colorizeAmount = 0.0f)
+                               float colorizeAmount = 0.0f,
+                               const FilterValues &filters = FilterValues{})
 {
   // Sanitize first: NaN/inf -> 0, everything else clamped to its range. A NaN
   // here would otherwise reach static_cast<int> and then a table index.
@@ -69,7 +199,8 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   cp.grade = grade.anyActive();
   cp.hue = hueShift != 0.0f;
   cp.colorize = colorizeAmount > 0.0f;
-  cp.active = cp.mix || cp.grade || cp.hue || cp.colorize ||
+  cp.filters = makeFilterPass(filters); // sanitizes its own values
+  cp.active = cp.mix || cp.grade || cp.hue || cp.colorize || cp.filters.any ||
               temperature != 0.0f || tint != 0.0f || vibrance != 0.0f ||
               saturation != 0.0f;
   if (!cp.active)
@@ -137,6 +268,8 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
   const float tvR = cp.tintVec[0], tvG = cp.tintVec[1], tvB = cp.tintVec[2];
   const bool doMix = cp.mix;
   const bool doGrade = cp.grade;
+  const bool doFilt = cp.filters.any;
+  const FilterPass &fp = cp.filters;
   const float *gdR = cp.gradeLut[0].data();
   const float *gdG = cp.gradeLut[1].data();
   const float *gdB = cp.gradeLut[2].data();
@@ -303,6 +436,8 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
       g += gdG[yi];
       b += gdB[yi];
     }
+    if (doFilt)
+      applyFilterPixel(fp, r, g, b); // the "look" block, still float
     p[i] = toU8Clamped(r);
     p[i + 1] = toU8Clamped(g);
     p[i + 2] = toU8Clamped(b);

@@ -427,7 +427,8 @@ public:
     return makeColorPass(get(AdjId::Temperature), get(AdjId::Tint),
                          get(AdjId::Vibrance), get(AdjId::Saturation), mix_,
                          grade_, get(AdjId::Hue), get(AdjId::ColorizeHue),
-                         get(AdjId::ColorizeAmount));
+                         get(AdjId::ColorizeAmount),
+                         filterValuesFromAdj(values_));
   }
 
 private:

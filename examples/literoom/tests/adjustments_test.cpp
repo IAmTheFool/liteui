@@ -32,6 +32,8 @@ static void testTable()
   CHECK(spec(AdjId::Blacks).stage == AdjustmentSpec::Stage::Tone);
   CHECK(spec(AdjId::Temperature).stage == AdjustmentSpec::Stage::Color);
   CHECK(spec(AdjId::ColorizeAmount).stage == AdjustmentSpec::Stage::Color);
+  CHECK(spec(AdjId::Greyscale).stage == AdjustmentSpec::Stage::Color);
+  CHECK(spec(AdjId::Solarize).stage == AdjustmentSpec::Stage::Color);
   CHECK(spec(AdjId::Texture).stage == AdjustmentSpec::Stage::Detail);
   CHECK(spec(AdjId::Blur).stage == AdjustmentSpec::Stage::Detail);
 }
@@ -45,6 +47,9 @@ static void testRanges()
   CHECK(spec(AdjId::ColorizeAmount).min == 0.0f && spec(AdjId::ColorizeAmount).max == 100.0f);
   // One-sided sliders: they only add an effect.
   for (AdjId id : {AdjId::Sharpness, AdjId::NoiseLuma, AdjId::NoiseColor, AdjId::Blur})
+    CHECK(spec(id).min == 0.0f && spec(id).max == 100.0f);
+  // The Filters are strengths too: 0 (off) to 100.
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize})
     CHECK(spec(id).min == 0.0f && spec(id).max == 100.0f);
   // Two-sided ones are symmetric.
   for (AdjId id : {AdjId::Contrast, AdjId::Highlights, AdjId::Shadows, AdjId::Whites, AdjId::Blacks,
@@ -111,6 +116,35 @@ static void testToneDirections()
   CHECK_NEAR(spec(AdjId::Blacks).apply(0.0f, 100.0f), 40.0f, 1e-3);
 }
 
+
+// The Filters block: seven Color-stage strengths, kept together between
+// Colorize Amount and the first Detail entry (main.cpp starts its "Filters"
+// header at Greyscale, so the block must stay contiguous and in this order).
+static void testFilterBlock()
+{
+  const AdjId filters[] = {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize};
+  const char *labels[] = {"Greyscale", "Sepia", "Vintage", "Fade", "Negative", "Posterize", "Solarize"};
+  for (size_t i = 0; i < 7; ++i)
+  {
+    const AdjustmentSpec &s = spec(filters[i]);
+    CHECK(s.stage == AdjustmentSpec::Stage::Color && s.apply == nullptr);
+    CHECK(s.label == labels[i]); // the labels are sidecar keys: renaming one orphans saved values
+    CHECK(adjIndex(filters[i]) == adjIndex(AdjId::Greyscale) + i); // contiguous, in order
+  }
+  CHECK(adjIndex(AdjId::Greyscale) == adjIndex(AdjId::ColorizeAmount) + 1);
+  CHECK(adjIndex(AdjId::Texture) == adjIndex(AdjId::Solarize) + 1);
+  // Values are sanitized into 0..100 like every other slider.
+  CHECK(sanitizedValue(spec(AdjId::Greyscale), 250.0f) == 100.0f);
+  CHECK(sanitizedValue(spec(AdjId::Greyscale), -5.0f) == 0.0f);
+  CHECK(sanitizedValue(spec(AdjId::Greyscale), std::nanf("")) == 0.0f);
+  // They are not part of the tone table, at any strength.
+  AdjValues f{};
+  for (AdjId id : filters)
+    f[static_cast<size_t>(id)] = 100.0f;
+  const auto lut = toneLutFromValues(f, nullptr);
+  for (int i = 0; i < 256; ++i)
+    CHECK(lut[static_cast<size_t>(i)] == i);
+}
 
 // ---------------------------------------------------------- toneLutFromValues
 static AdjValues only(AdjId id, float v)
@@ -199,6 +233,7 @@ int main()
   testToneLut();
   testTable();
   testRanges();
+  testFilterBlock();
   testToneFunctions();
   testToneDirections();
   return finish();

@@ -54,6 +54,15 @@ enum class AdjId : int
   Hue,
   ColorizeHue,
   ColorizeAmount,
+  // Filters: strength 0..100 each (0 = off). Still Stage::Color; the "look"
+  // block at the end of the color pass. Keep them inside the Color block.
+  Greyscale,
+  Sepia,
+  Vintage,
+  Fade,
+  Negative,
+  Posterize,
+  Solarize,
   Texture,
   Clarity,
   Sharpness,
@@ -184,6 +193,23 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
         {AdjId::ColorizeHue, "Colorize Hue", 0.0f, 360.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         {AdjId::ColorizeAmount, "Colorize Amount", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        // Filters (see FilterPass in color_pass.hpp). Strength 0..100: the
+        // result is lerp(pixel, filtered pixel, value / 100). NOTE: these
+        // labels are sidecar keys; never rename them once released.
+        {AdjId::Greyscale, "Greyscale", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Sepia, "Sepia", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Vintage, "Vintage", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Fade, "Fade", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Negative, "Negative", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Posterize, "Posterize", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Solarize, "Solarize", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         // Detail stage (see detail_layer.hpp). Texture and Clarity soften when
         // negative; Sharpness only sharpens.

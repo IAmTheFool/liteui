@@ -49,13 +49,14 @@ When you drag a slider, the edit state (`AdjustmentSet`) is **frozen** into a sm
 That value is then handed to `renderWith()` in `render.hpp`, which processes the picture in blocks of 128 rows. Per pixel, the order is always:
 
 1. **Tone tables.** Exposure, Brightness, Contrast, Highlights, Shadows, Whites and Blacks are composed into one lookup table, followed by the master curve, then each channel's own curve. A pixel costs one table read per channel.
-2. **Color pass.** One float calculation per pixel, in this order: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading. It rounds to 8 bits only **once, at the end**, so stacking several color sliders does not pile up rounding errors.
+2. **Color pass.** One float calculation per pixel, in this order: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. It rounds to 8 bits only **once, at the end**, so stacking several color sliders does not pile up rounding errors.
 3. **Neighbor effects.** Dehaze, then Texture / Clarity / Sharpness, then noise reduction, then Blur (last, so it wins).
 4. **Masks**, in list order. Each mask repeats steps 1 to 3 on its own copy of the pixels and blends the result back.
 
 Some details that explain choices you will see in the code:
 
 - **Why lookup tables?** The tone sliders are pointwise (a pixel's result depends only on that pixel's own channel value), so all of them can be baked into 256 numbers. The table is rounded and clamped after *each* slider, so the result is bit-identical to running the sliders one after another.
+- **Why the Filters come last.** Greyscale, Sepia, Vintage, Fade, Negative, Posterize and Solarize are a "look" laid over your edits, so they run at the end of the color pass and see the finished color. Each is a blend, `lerp(pixel, filtered, strength)`, so a strength of 0 is exactly the identity. They stay in float, so they add no extra rounding. They are plain Color-stage sliders, so masks get them for free (a local black-and-white, for example).
 - **Why a float color pass?** Cross-channel math (saturation, hue, the mixer) cannot be a per-channel table. Doing it in float and rounding once is both cheaper and more accurate than chaining 8-bit stages.
 - **Why the color pass shares its luma weights.** Several pieces of the color pass (Color Grading's tint, the white-balance normalization, vibrance, saturation) use the same Rec. 601 luma weights (`kGradeLumaR/G/B`). If the weights ever disagreed, a tint would shift brightness or read the wrong table row. Other parts of the program use their own luma, each consistent within itself: `detail_layer.hpp`, `neighbor_fx.hpp` and the Luminosity mask use integer 54/183/19 (about Rec. 709), Color Range uses float Rec. 709, and the histogram uses integer Rec. 601 (77/150/29).
 - **Why 128-row blocks?** So a background render can check "have I been superseded?" between blocks and stop within a few milliseconds.

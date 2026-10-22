@@ -13,7 +13,7 @@ Every slider in the Adjust pane is one entry in the `kAdjustmentSpecs` table in 
 
 A compile-time check (`static_assert`) fails the build if the table and the enum do not line up, if a range is empty, or if a Tone entry has no `apply`. You cannot forget a half silently.
 
-**Keep the table grouped by stage: all Tone entries, then all Color entries, then all Detail entries.** The Adjust pane (and each mask's Basic list) adds its "Color" and "Detail" headers when it reaches the first entry of that stage, so a Color slider placed after a Detail entry would show up under the Detail header.
+**Keep the table grouped by stage: all Tone entries, then all Color entries, then all Detail entries.** The Adjust pane (and each mask's Basic list) adds its "Color" and "Detail" headers when it reaches the first entry of that stage, so a Color slider placed after a Detail entry would show up under the Detail header. The one exception is **Filters**: they are Color-stage entries, and `main.cpp` adds a "Filters" header (in both the Adjust pane and each mask's Basic list) when its loop reaches `AdjId::Greyscale`. Keep new filters in that block, after `Solarize` and before the first Detail entry.
 
 ### Step 2: pick the stage
 
@@ -35,8 +35,17 @@ The stage decides where the slider acts and what else you need to write.
 **Color sliders** also need:
 
 1. A field in `ColorPass` and the math in `makeColorPass` / `applyColorPass` (`color/color_pass.hpp`). `makeColorPass` takes the slider values as parameters, so add a parameter.
-2. The new value passed in at **both** call sites: `AdjustmentSet::buildColorPass()` for the global edit, and `buildMaskPasses()` in `edit/render_params.hpp` for masks.
+2. The new value passed in at **both** call sites: `AdjustmentSet::buildColorPass()` for the global edit, and `buildMaskPasses()` in `edit/render_params.hpp` for masks. Forgetting the global one is easy to miss: the slider shows up and saves to the sidecar, and masks work, but the global edit does nothing.
 3. The new slider included in `cp.active`, so the fast path is skipped when it is non-zero.
+
+**Filters** (Greyscale, Sepia, ...) are Color sliders with a shortcut. To add another one:
+
+1. Add an `AdjId` and a table entry in the Filters block of `core/adjustments.hpp`, range 0..100, stage `Color`, `apply = nullptr`.
+2. Add a field to `FilterValues` and `FilterPass`, set it in `makeFilterPass` (and in `FilterPass::any`), and add its step to `applyFilterPixel` in `color/color_pass.hpp`. Make it `lerp(pixel, filtered, strength)` so 0 changes nothing, and keep it before the final clamp.
+3. Read it in `filterValuesFromAdj` (`edit/render_params.hpp`). Both call sites already use that helper, so they need no change.
+4. Nothing else in the app: `cp.active`, masks, undo, History, the sidecar and the Adjust pane follow from the table.
+5. Not automatic, the tests: add the filter to `kFilterFields` and give it a case in `color_pass_test`, to the label list in `testFilterBlock` (`adjustments_test`), to `filterValuesFromAdj`'s check in `render_params_test`, and to the filter lists in `adjustment_set_test`. If it goes after `Solarize`, move the upper bound of `isFilter` in `golden_render_test.cpp` and the `Texture`-follows-`Solarize` check in `testFilterBlock`.
+6. Re-record the golden file and check it as described in [testing.md](testing.md#checking-a-re-record). Give the new filter a strength in the kitchen-sink scenarios that keeps the picture's information (see `kSinkFilterStrength`).
 
 **Detail sliders** also need:
 

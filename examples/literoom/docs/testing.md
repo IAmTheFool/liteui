@@ -101,7 +101,7 @@ How `latest_worker` and `thumb_worker` are written so they stay reliable:
 
 This is the safety net for refactoring `src/main.cpp`, and it works differently from the others.
 
-It compiles `src/main.cpp` itself (with `main()` renamed so the test can have its own), renders roughly **230** picture/edit combinations (the test prints the exact count at the end of every run), and **fingerprints** each result. It then compares the fingerprints with a saved "golden" file.
+It compiles `src/main.cpp` itself (with `main()` renamed so the test can have its own), renders roughly **250** picture/edit combinations (the test prints the exact count at the end of every run), and **fingerprints** each result. It then compares the fingerprints with a saved "golden" file.
 
 The idea: if you restructure code and the pixels come out bit-for-bit the same, the fingerprints match and the test passes. If a refactoring changes even one pixel, you find out immediately, at the step that caused it.
 
@@ -119,18 +119,18 @@ ctest --test-dir build/release -C Release -R literoom_golden_render
 
 **On a fresh checkout the golden test is skipped until you have recorded it.** If the golden file does not exist the test prints `cannot open ... (record it first with --record); skipping` and exits with code 77, which CTest reports as **Skipped** (`CMakeLists.txt` sets `SKIP_RETURN_CODE 77` on the test). A skipped golden test means the safety net is **not running**, so record the file before you start refactoring. Record once per compiler and configuration you test (`Debug`, `Release`, ...). With a single-configuration generator (Makefiles, Ninja), pass `-DCMAKE_BUILD_TYPE=Release` when you configure; without a build type the configuration part of the file name is empty (`render_MSVC_.txt`).
 
-Recording prints the same summary as a normal run, for example `228 scenarios, 0 mismatches, 0 invariant failures, 1 notes`. Record only while you trust the current output, because the file becomes the reference for later refactoring. Do not re-record just to make a failing run pass.
+Recording prints the same summary as a normal run, for example `254 scenarios, 0 mismatches, 0 invariant failures, 1 notes`. Record only while you trust the current output, because the file becomes the reference for later refactoring. Do not re-record just to make a failing run pass.
 
 #### What it renders
 
 | Group (name prefix) | What is rendered |
 |---|---|
-| `adj/` | Every slider on its own (up, down, barely moved, full range both ends), with nothing set, and with all sliders set together |
+| `adj/` | Every slider on its own (up, down, barely moved, full range both ends; named by label, for example `adj/Texture/pos`), with nothing set, with all sliders set together, and the Filters stacked (`filters_stack`), over other color stages (`filter_after_color`) and next to the neighbor effects (`filter_with_detail`) |
 | `curve/`, `mix/`, `grade/` | Master and per-channel curves, every Color Mixer channel, each grading wheel, blending and balance, a hidden wheel |
-| `mask/` | Every mask type and its inverse, parameter extremes (hard and fully soft edges, smallest and largest radii, a one-dab brush, an unset Color Range), Amount, a disabled mask, overlapping masks, composites of Add / Subtract / Intersect, neighbor effects only, and every effect at once |
+| `mask/` | Every mask type and its inverse, parameter extremes (hard and fully soft edges, smallest and largest radii, a one-dab brush, an unset Color Range), Amount, a disabled mask, overlapping masks, composites of Add / Subtract / Intersect, neighbor effects only, masks whose only effect is a Filter (`filter_only`, `filters_overlapping`), and every effect at once |
 | `seg/` | The stand-in segmenter's own coverage map, which is then used as an Object mask |
 | `geo/`, `geo_masks/` | All 8 orientations, straightening in both corner modes, a crop, and the same mask set rendered through three different geometries |
-| `sink/` | The "kitchen sink": every slider, Mix, Grade, curves and three masks at once, on a 200 × 150 and an odd 97 × 71 picture |
+| `sink/` | The "kitchen sink": every slider (the Filters at a modest 20 %, see below), Mix, Grade, curves and three masks at once, on a 200 × 150 and an odd 97 × 71 picture |
 | `history/`, `sidecar/` | The undo labels and indices after a scripted sequence of edits, and the sidecar JSON text |
 | `util/`, `thumb/`, `preview/` | Natural sort order, path helpers, thumbnails and the preview downsample |
 | `histogram/` | The four histograms, clip flags and clipping overlay, driven through the editor's global `state` (every overlay option, strided sampling, block reduction, no image, mid-drag preview) |
@@ -158,7 +158,7 @@ Built-in invariants (these fail the run even when recording):
 - The background render path (`renderWith` with a generation counter) gives the same bytes as the synchronous one, and a superseded render returns null.
 - The sidecar text parses and loads back, and scenario names are unique.
 
-Notes that do **not** fail the run, so read them: a scenario with no visible effect on the test picture (for example `adj/18_Noise_Reduction/low` at the time of writing: the scenario is still recorded, but it guards only the pixels the test picture actually has), an untouched edit set that does not reproduce the input exactly, and the sidecar round trip (a second dump differing from the first, or a render after save and load differing from the original). A refactoring that breaks save and load rendering would only show up as a note.
+Notes that do **not** fail the run, so read them: a scenario with no visible effect on the test picture (for example `adj/Noise_Reduction/low` at the time of writing: the scenario is still recorded, but it guards only the pixels the test picture actually has), an untouched edit set that does not reproduce the input exactly, and the sidecar round trip (a second dump differing from the first, or a render after save and load differing from the original). A refactoring that breaks save and load rendering would only show up as a note.
 
 #### Finding where pixels changed
 
@@ -176,17 +176,31 @@ A few habits that make this pay off:
 - **Refactor in small steps** and run the check after each, so a failure points at one small change.
 - **A failure is not always a bug.** If you *meant* to change the output (a new effect, a fixed formula), re-record the golden file and review what changed in version control.
 - **Adding a slider should not change the existing fingerprints** while the new slider is at 0, but the test **does** loop over the slider table, so expect this when you add one:
-  - It gains new `adj/<NN>_<label>/...` scenarios for the new slider (`NN` is the slider's position in the table).
-  - Scenarios that set **every** slider change: `adj/all_pos`, `adj/all_neg`, the `sink/` scenarios, `mask/every_effect`, `mask/composite_every_effect` and `sidecar/sink_json`. Which sign a slider gets in those depends on whether its index is odd or even.
-  - **Adding in the middle of the table renumbers every later slider's scenario names**, so each shows up as `NEW` plus `MISSING`. Append at the end to keep the diff small, then re-record.
-  - Any existing single-slider scenario (other than renumbering) that changes means the new code is affecting untouched pictures: a real bug.
+  - It gains new `adj/<label>/...` scenarios for the new slider. Scenarios are named by **label**, not by table position, so inserting a slider renames nothing.
+  - Scenarios that set **every** slider change: `adj/all_pos`, `adj/all_neg`, the `sink/` scenarios, `mask/every_effect`, `mask/composite_every_effect` and `sidecar/sink_json`. In `fullEffect` and `buildSink` the sign a slider gets depends on its position among the sliders that are **not** Filters (`sinkPos`), so inserting a Filter flips no other slider. Inserting any other slider in the middle shifts that position for every later slider, so append it, or extend `sinkPos`.
+  - The Filters get `kSinkFilterStrength` (20) in those scenarios, not half their range. At 50 %, Negative and Solarize turn every bright pixel into the same mid-gray, and the fingerprint would stop noticing changes in the tone, color, mixer and grade stages upstream of them.
+  - The golden test finds the Filters with `isFilter` (the block from `AdjId::Greyscale` to `AdjId::Solarize`). A new Filter added after `Solarize` needs that upper bound moved.
+  - Any existing single-slider scenario that changes means the new code is affecting untouched pictures: a real bug.
+
+#### Checking a re-record
+
+When a change legitimately alters the kitchen-sink scenarios (a new slider, say), you can still prove that nothing *else* changed. Keep a copy of the old golden file, re-record, then run:
+
+```bash
+python tests/golden_compare.py render_<COMPILER>_<CONFIG>.old.txt tests/golden/render_<COMPILER>_<CONFIG>.txt
+```
+
+It compares every scenario by name and exits 0 only if every pre-existing scenario has its old fingerprint, apart from the ones that set every slider (`adj/all_*`, `sink/*`, `mask/every_effect`, `mask/composite_every_effect`, `sidecar/sink_json`). It also strips the index from the old index-based names (`adj/14_Texture/pos` becomes `adj/Texture/pos`), so a golden file recorded before the label-based names can still be compared. Anything else that changed, or vanished, is listed as `UNEXPECTED` or `VANISHED`.
+
+To prove that the only change in the kitchen-sink scenarios is the new slider, give it the value 0 in those scenarios first (for the Filters: set `kSinkFilterStrength` to `0.0f`) and run the normal test against the **old** golden file. There should be no `MISMATCH` lines, only `NEW` and `MISSING` for scenarios that were added or renamed. Then restore the value and re-record.
 
 ## What each test covers
 
 | Test | What it pins down |
 |---|---|
 | `pixel_math` | `smoothStep01` (monotone, symmetric, flat at both ends), `toU8Clamped` (exact on whole levels, halves round up, clamps), `kDegToRad`. |
-| `adjustments` | The slider table (ids match positions, ranges, stage order Tone → Color → Detail, only Tone has `apply`). Direction and reach of each tone function. `toneLutFromValues`: byte rounding after **each** slider, table order matters, curve applied last, clamping not wrapping. |
+| `adjustments` | The slider table (ids match positions, ranges, stage order Tone → Color → Detail, only Tone has `apply`). Direction and reach of each tone function. `toneLutFromValues`: byte rounding after **each** slider, table order matters, curve applied last, clamping not wrapping. The Filters block: seven Color-stage 0..100 sliders, contiguous between Colorize Amount and Texture, with their exact labels pinned (they are sidecar keys), sanitized into range, and never part of the tone table. |
+| `color_pass` | The stage flags (`active`, `mix`, `grade`, `hue`, `colorize`, and each Filter making the pass active), a neutral pass changes nothing, white-balance gains keep luma, grays stay gray under the color-only stages, saturation and vibrance, hue and colorize, the mixer and grading stages, alpha and trailing bytes untouched. Filters: sanitizing, the poster level count (2 at 100, falling smoothly), exact results for Greyscale, Negative, Posterize, Solarize, Sepia, Fade and Vintage, the fixed order (Greyscale before Sepia), and that Filters run after Color Grading. |
 | `color_mix` | Band layout and names, identity table when neutral, a band's center gets exactly its own value, sign symmetry, no seams (including the Magenta-to-Red wrap) on random settings. |
 | `color_grade` | Hue to RGB, neutral gives all zeros, the three ranges always add up to 1, tints are luma-neutral, hidden wheels, how Balance and Blending move the crossovers. |
 | `color_pass` | Which flags turn on, a neutral pass is a byte-exact no-op, white balance keeps brightness, grays stay gray, saturation +100 doubles chroma, vibrance spares vivid colors, hue direction, colorize, byte-count handling and untouched alpha. |
@@ -201,8 +215,8 @@ A few habits that make this pay off:
 | `mask_object` | Grow, shrink and feather against naive references, the bilinear warp (quarter turns, straighten corners, size cap) and its caches, shape equality by map id, prompts follow the frame. |
 | `mask` | The type order matches the variants, Add / Subtract / Intersect as a fold, composite row spans, `Mask` defaults and equality, mask names, `clearMaskCaches`. |
 | `sidecar` | Round trip of a rich edit set, the file layout, clamping and defaults for every field, crop validation against the turned picture, object bitmaps, a 2,500-case fuzz test where every loadable result must satisfy the editor's invariants. |
-| `render_params` | Which masks are kept, what each frozen pass holds, shapes mapped through the frame, defaults. |
-| `adjustment_set` | Undo coalescing and labels, undo / redo / jumps, the 200-step cap, geometry, curve, mixer, grading and mask steps, `version()` rules, JSON round trip, the tables built from the state (also matching mask tables). |
+| `render_params` | Which masks are kept (a mask whose only effect is a Filter is kept; a Filter that rounds to no effect is not), what each frozen pass holds, `filterValuesFromAdj`, shapes mapped through the frame, defaults. |
+| `adjustment_set` | Undo coalescing and labels, undo / redo / jumps, the 200-step cap, geometry, curve, mixer, grading and mask steps, `version()` rules, JSON round trip, the tables built from the state (also matching mask tables), and the Filters: a History label, a sidecar round trip, a lone Filter making the global color pass active, and the global edit and a mask reading the Filters identically. |
 | `minijson` | Round trips (floats exactly), escapes and surrogate pairs, malformed input rejected, depth limit, base64 and run-length coding. |
 | `exif` | Orientation table, re-embedding into a plain JPEG (orientation reset, thumbnail unlinked, size tags patched, ICC kept), a 100,000-case fuzz test of damaged headers. |
 | `file_utils` | Paths and UTF-8, extensions, natural order (and its deterministic tie-break), `readFilePrefix`, atomic writes (failure cases, no leftover temp file), `listImageFiles`. |
@@ -254,7 +268,7 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 2. **One that takes `CanvasImage`:** add it to the `foreach` that links `liteui::liteui` (the `LITEUI` option of `literoom_add_test`), and put `#define LITEUI_IMPLEMENTATION` before the `liteui.hpp` include in the test's `.cpp` (see [kind 2](#2-tests-that-need-liteui-or-threads)).
 3. **One that runs a thread:** use the `THREADS` option of `literoom_add_test` (copy the `detail_layer`/`neighbor_fx` loop, or the `latest_worker` block), assert only on the main thread, give every wait a timeout, and loop it with `--repeat until-fail` and `--timeout`.
 4. Start the test file with `#include "check.hpp"`, end it with `return finish();`, and put the build command in a comment on the first line, like the others.
-5. **A new slider, mask type or effect that changes pixels:** add a scenario to `golden_render_test.cpp` as well (sliders are picked up automatically through the table; see "Adding a slider" above) and re-record the golden file for each compiler and configuration you use.
+5. **A new slider, mask type or effect that changes pixels:** add a scenario to `golden_render_test.cpp` as well (sliders are picked up automatically through the table; see "Adding a slider" above) and re-record the golden file for each compiler and configuration you use (and see "Checking a re-record" above).
 
 ## Known gaps and things to check
 

@@ -86,7 +86,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 
 **Three stages**
 - **Tone**: pointwise per channel (0..255 in, float out). Composed into one lookup table by `toneLutFromValues`. Runs first.
-- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`).
+- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize): 0..100 strengths that run as the last block of the color pass.
 - **Detail**: needs neighbor pixels. `apply` is `nullptr`; read by `detail_layer.hpp` and `neighbor_fx.hpp`.
 
 **Constants**
@@ -99,7 +99,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | `kToneMin` / `kToneMax` | `int` | = `kBipolar*` | Older names for the same range, kept so old code compiles |
 
 **Types**
-- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
 - `struct AdjustmentSpec`
 
   | Field | Type | Meaning |
@@ -109,9 +109,9 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
   | `min`, `max` | `float` | Slider range; `min < max` is enforced at compile time |
   | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color and Detail |
   | `stage` | `Stage` (`Tone`, `Color`, `Detail`) | Which pass consumes it. Defaults to `Tone` |
-- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 21 floats, indexed by `adjIndex(id)`.
+- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 28 floats, indexed by `adjIndex(id)`.
 
-**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 21>`). Declaration order is the sidebar order and, within Tone, the processing order.
+**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 28>`). Declaration order is the sidebar order and, within Tone, the processing order.
 
 | Slider | Range | Stage | Per-channel function (x = channel 0..255, v = value) |
 |---|---|---|---|
@@ -125,6 +125,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | Temperature, Tint, Vibrance, Saturation, Hue | -100..100 | Color | none (see `color_pass.hpp`) |
 | ColorizeHue | 0..360 (degrees) | Color | none |
 | ColorizeAmount | 0..100 | Color | none |
+| Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize | 0..100 | Color | none (the Filters block of `color_pass.hpp`; 0 = off). Their labels are sidecar keys, so never rename them |
 | Texture, Clarity, Dehaze | -100..100 | Detail | none |
 | Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
 
@@ -255,7 +256,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 **`std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const`**
 - Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what `renderWith`'s fast path checks).
 
-**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer and the grade.
+**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade and the seven Filters (via `filterValuesFromAdj(values_)`).
 
 **`RenderParams buildRenderParams() const`**
 - Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), and `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks).
@@ -283,6 +284,8 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 
 **Functions**
 
+**`inline FilterValues filterValuesFromAdj(const AdjValues &a)`**: picks the seven Filter sliders (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize) out of an `AdjValues` in the form `makeColorPass` takes. It must be passed at **both** `makeColorPass` call sites (`AdjustmentSet::buildColorPass()` and `buildMaskPasses()`); a site that forgets it silently ignores the Filters.
+
 **`inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks, const GeoFrame &frame)`**
 - Inputs: the user's masks (stored against the original picture) and the `GeoFrame` of the picture being rendered.
 - Returns: one `MaskPass` per mask that is **on** and would **change something**, in list order. Shapes are mapped into the current picture here, once, on the UI thread.
@@ -290,7 +293,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - How each part is built:
   - `tone` is set if any Tone slider is non-zero or any of the four curves is not the identity (checked with `curveIsIdentity`).
   - Tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
-  - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount).
+  - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount, and the Filters through `filterValuesFromAdj`). A mask with only a Filter slider set counts as having an active color pass, so it is kept.
   - `fx` comes from `neighbor_fx::gainsFromValues` with the seven detail sliders.
 
 ---
@@ -298,7 +301,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 ## Color
 
 ### `color_pass.hpp`
-The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization).
+The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization).
 
 **Depends on:** `color_grade.hpp`, `color_mix.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test`.
 
@@ -327,16 +330,29 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 | `mixLut` | `MixLut` | zeros | Only filled when `mix` |
 | `grade` | `bool` | false | Color Grading on; `gradeLut` is valid |
 | `gradeLut` | `GradeLut` | zeros | Only filled when `grade` |
+| `filters` | `FilterPass` | all off | The Filters block; `filters.any` = on. Counts toward `active` |
+
+`struct FilterValues`: the seven Filter slider values as given by the UI (0..100 each, default 0): `greyscale`, `sepia`, `vintage`, `fade`, `negative`, `posterize`, `solarize`.
+
+`struct FilterPass`: the Filters frozen for the loop, built by `makeFilterPass`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `any` | `bool` | false | False = skip the whole block |
+| `grey`, `sepia`, `vintage`, `fade`, `negative`, `solarize` | `float` | 0 | Strength 0..1 (slider / 100) |
+| `posterLevels` | `int` | 0 | 0 = off, otherwise 2..255 levels per channel |
+| `posterScale`, `posterInv` | `float` | 0 | `(levels − 1) / 255` and its inverse, so the loop has no division |
 
 **Functions**
 
-**`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f)`**
+**`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f, const FilterValues &filters = FilterValues{})`**
 - Inputs (all UI slider values):
   - `temperature`, `tint`, `vibrance`, `saturation`, `hueShift`: -100..100, 0 = untouched.
   - `mix`: the 8 × 3 Color Mixer sliders (`MixValues`).
   - `grade`: the four-wheel `ColorGrade`.
   - `colorizeHue`: degrees; only checked for finiteness (it wraps, so any value works).
   - `colorizeAmount`: 0..100.
+  - `filters`: the seven Filter strengths, 0..100 (default: all off). Sanitized by `makeFilterPass` (NaN/infinity → 0, clamped).
 - Returns: a `ColorPass`. If nothing is non-neutral, `active` is false and the rest is left at defaults.
 - Sanitizing: each slider is clamped to its range and NaN/infinity become 0, so the loop only ever sees finite values and its table indexes are in range. `grade` is sanitized inside `buildGradeLut`.
 - Details:
@@ -345,6 +361,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   - Hue matrix is the SVG `hueRotate` matrix with angle = `hueShift/100 × 90°`.
   - `tintVec` = (hue color − its own luma) × `colorizeAmount/100 × 0.6 × 255`.
   - The Mixer and Grade tables are built here (`buildMixLut`, `buildGradeLut`) only when those stages are on.
+  - `cp.filters = makeFilterPass(filters)` is built before `active` is computed, and `filters.any` is part of `active`; without that the fast path would skip a lone Filter.
 
 **`inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)`**
 - Inputs:
@@ -360,7 +377,8 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   5. **Mixer**: clamp to 0..255, RGB → HSL, apply `hueShift`/`satMul`/`lumAdj` from `mixLut`, HSL → RGB. Pure grays (max = min) are skipped. The effect fades in with chroma (smoothstep up to `kMixChromaFull`), so near-gray noise does not become colored speckle. Luminance moves toward white (positive) or black (negative) by `lumAdj × w × kMixLumAmount`.
   6. **Colorize**: adds `tintVec × 4·l·(1 − l)` where `l` is luma 0..1 (strongest in midtones, zero at black and white).
   7. **Grading**: clamp to 0..255, `yi = int(luma + 0.5)`, add `gradeLut[c][yi]`.
-  8. Write back with `toU8Clamped`, once.
+  8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
+  9. Write back with `toU8Clamped`, once.
 - Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
 
 ### `color_mix.hpp`

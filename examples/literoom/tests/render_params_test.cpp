@@ -71,6 +71,48 @@ static void testWhatEachPassHolds()
   CHECK(cp.tone && cp.luts[0] == cp.luts[2] && !(cp.luts[0] == cp.luts[1]));
 }
 
+static void testFilters()
+{
+  // filterValuesFromAdj picks each Filter slider out of an AdjValues, and nothing else.
+  CHECK(filterValuesFromAdj(AdjValues{}).greyscale == 0.0f && !makeFilterPass(filterValuesFromAdj(AdjValues{})).any);
+  AdjValues a{};
+  a[static_cast<size_t>(AdjId::Greyscale)] = 10.0f;
+  a[static_cast<size_t>(AdjId::Sepia)] = 20.0f;
+  a[static_cast<size_t>(AdjId::Vintage)] = 30.0f;
+  a[static_cast<size_t>(AdjId::Fade)] = 40.0f;
+  a[static_cast<size_t>(AdjId::Negative)] = 50.0f;
+  a[static_cast<size_t>(AdjId::Posterize)] = 60.0f;
+  a[static_cast<size_t>(AdjId::Solarize)] = 70.0f;
+  a[static_cast<size_t>(AdjId::Saturation)] = 99.0f; // not a filter
+  const FilterValues f = filterValuesFromAdj(a);
+  CHECK(f.greyscale == 10.0f && f.sepia == 20.0f && f.vintage == 30.0f && f.fade == 40.0f);
+  CHECK(f.negative == 50.0f && f.posterize == 60.0f && f.solarize == 70.0f);
+
+  // A mask with only a Filter slider set is kept (the filter makes its color pass active), and it
+  // holds exactly what makeFilterPass makes of the values.
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize})
+  {
+    const auto p = buildMaskPasses({maskWith(id, 40.0f)}, kId);
+    CHECK(p.size() == 1 && !p[0].tone && !p[0].fx.any() && p[0].color.active && p[0].color.filters.any);
+  }
+  Mask mk = maskWith(AdjId::Greyscale, 40.0f);
+  mk.adj[static_cast<size_t>(AdjId::Posterize)] = 60.0f;
+  const auto mp = buildMaskPasses({mk}, kId);
+  AdjValues mv{};
+  mv[static_cast<size_t>(AdjId::Greyscale)] = 40.0f;
+  mv[static_cast<size_t>(AdjId::Posterize)] = 60.0f;
+  const FilterPass want = makeFilterPass(filterValuesFromAdj(mv));
+  CHECK(mp.size() == 1 && mp[0].color.filters.grey == want.grey && mp[0].color.filters.posterLevels == want.posterLevels);
+  CHECK(want.grey == 0.4f && want.posterLevels >= 2 && want.posterLevels < 256);
+  // Out-of-range values are clamped on the way in.
+  CHECK(buildMaskPasses({maskWith(AdjId::Sepia, 250.0f)}, kId)[0].color.filters.sepia == 1.0f);
+  // A filter that rounds to no visible effect (Posterize this low is still 256 levels) leaves the mask empty.
+  CHECK(buildMaskPasses({maskWith(AdjId::Posterize, 0.01f)}, kId).empty());
+  // Filters do not leak into the tone table or the neighbor effects.
+  const auto both = buildMaskPasses({maskWith(AdjId::Exposure, 30.0f), maskWith(AdjId::Negative, 100.0f)}, kId);
+  CHECK(both.size() == 2 && both[0].tone && !both[0].color.filters.any && !both[1].tone && both[1].color.filters.any);
+}
+
 static void testShapesAreMappedThroughTheFrame()
 {
   // A mask stored in the top-left of the original ends up in the top-right of a
@@ -102,6 +144,7 @@ int main()
 {
   testWhichMasksAreKept();
   testWhatEachPassHolds();
+  testFilters();
   testShapesAreMappedThroughTheFrame();
   testRenderParamsDefaults();
   return finish();
