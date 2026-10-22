@@ -49,9 +49,11 @@ int main() {
 The `#define LITEUI_IMPLEMENTATION` line is what compiles the library
 itself into this file, so it goes in exactly one `.cpp` (here, the only
 one). Every other file that uses liteui just writes
-`#include "liteui.hpp"` without it. If you link the `liteui::liteui`
-CMake target instead, drop the `#define` — the target already contains
-the implementation (see [Getting started](#getting-started)).
+`#include "liteui.hpp"` without it. This is true with CMake too: the
+`liteui::liteui` target supplies the include path, the C++23 requirement
+and the platform libraries, but not the implementation, so each
+executable still defines the macro in exactly one `.cpp` (see
+[Getting started](#getting-started)).
 
 ## Screenshots
 
@@ -109,7 +111,7 @@ There is no X11 backend and no macOS backend at this time.
   that defines `LITEUI_IMPLEMENTATION` before including the header.
 
 ```cpp
-// liteui_impl.cpp  (any one .cpp file in your project)
+// main.cpp  (any one .cpp file in your project)
 #define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
 ```
@@ -137,7 +139,9 @@ This is closer to how GLFW or Dear ImGui's platform backends work than
 to stb.
 
 Only the translation unit that defines `LITEUI_IMPLEMENTATION` needs the
-platform headers on its include path; your other files never see them.
+platform headers; your other files never include them. (The CMake target
+passes the platform include paths and libraries to every target that
+links it, which is harmless.)
 
 | Platform | Required libraries |
 |---|---|
@@ -153,13 +157,22 @@ add_subdirectory(path/to/liteui)   # or FetchContent_Declare + FetchContent_Make
 target_link_libraries(your_app PRIVATE liteui::liteui)
 ```
 
-`liteui::liteui` is a small static library that compiles the
-implementation once (`liteui_impl.cpp`). Linking it gives you the include
-directory, the C++23 requirement, and every platform link library above —
-you don't need to write your own `find_package`/`pkg_check_modules`
-calls, and your own targets don't inherit the platform include paths.
-Your sources only `#include "liteui.hpp"`; do **not** define
-`LITEUI_IMPLEMENTATION` yourself when you link this target.
+`liteui::liteui` is a header-only `INTERFACE` target. Linking it gives
+you the include directory, the C++23 requirement, the optional
+`LITEUI_PROFILE` define, and every platform link library above — you
+don't need to write your own `find_package`/`pkg_check_modules` calls.
+The implementation is **not** prebuilt: in exactly one `.cpp` of each
+executable, define `LITEUI_IMPLEMENTATION` before including the header.
+
+```cpp
+// main.cpp
+#define LITEUI_IMPLEMENTATION
+#include "liteui.hpp"
+```
+
+If a program is split across several targets (say an app plus a library
+that both use liteui), put the `#define` in only one of them; defining
+it twice in one program is a duplicate-symbol link error.
 
 On Linux, the Wayland protocol bindings (`xdg-shell`,
 `xdg-decoration`) are pre-generated and checked into
@@ -206,18 +219,37 @@ build — they're plain C files, no code generation needed at your end.
 
 ## Examples
 
-Every file under [`examples/`](examples/) is a small, focused, single
-file program demonstrating one feature (text input, image loading,
+Every directory under [`examples/`](examples/) is a small, focused,
+single-file program demonstrating one feature (text input, image loading,
 menus, split panes, a paint canvas, a file explorer, etc.).
 
 ```bash
 cmake -B build -S .
 cmake --build build --target counter
-./build/examples/counter          # build/examples/Debug/counter.exe on multi-config generators
+./build/examples/counter/counter  # build/examples/counter/Debug/counter.exe on multi-config generators
 ```
 
-Swap `counter` for the name of any file under `examples/` (its target
-name matches the filename without `.cpp`).
+Swap `counter` for any example. Each example is a subdirectory,
+`examples/<name>/{CMakeLists.txt,main.cpp}`, and is picked up
+automatically on the next configure. Its CMakeLists is just:
+
+```cmake
+add_executable(hello main.cpp)
+target_link_libraries(hello PRIVATE liteui::liteui)
+```
+
+`CMakePresets.json` provides ready-made configurations too: `msvc-debug`,
+`msvc-release` (plus `-profile` variants with `LITEUI_PROFILE=ON`) on
+Windows, and `gcc-debug`, `gcc-release` on Linux. Build output then goes
+to `build/<preset-dir>/` instead of `build/`:
+
+```bash
+cmake --preset gcc-debug
+cmake --build --preset gcc-debug-build
+```
+
+The MSVC presets use Ninja with `cl.exe`, so run them from a Visual
+Studio Developer Prompt.
 
 ## License
 

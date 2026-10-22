@@ -51,9 +51,10 @@ liteui.hpp
 ```
 
 The implementation half is compiled in exactly one translation unit: the
-file that defines `LITEUI_IMPLEMENTATION`, which is `liteui_impl.cpp` when
-you link the `liteui::liteui` CMake target. A second definition of the macro
-in the same program is a duplicate-symbol link error by design.
+file that defines `LITEUI_IMPLEMENTATION`; the library has no separate
+implementation `.cpp`, each executable provides that file (for example its
+`main.cpp`). A second definition of the macro in the same program is a
+duplicate-symbol link error by design.
 
 ## The public/implementation boundary
 
@@ -241,7 +242,7 @@ a live tree is retired.
 
 | Subsystem | Namespace | Notes |
 |---|---|---|
-| File and folder pickers | (free functions) | `IFileOpenDialog`/`IFileSaveDialog` on Windows; shells out to `zenity`/`kdialog` on Linux |
+| File and folder pickers | `liteui_filepicker` (the free functions are the public API) | `IFileOpenDialog`/`IFileSaveDialog` on Windows; shells out to `zenity`/`kdialog` on Linux. All five pickers build a `Request` and go through one platform-specific `pick()`; to add a mode, extend `Mode` and both `pick()` implementations |
 | Clipboard | `liteui_clipboard` | Win32 clipboard; `wl-copy`/`wl-paste`/`xclip`/`xsel` on Linux; silent in-process fallback |
 | Image decoding | `liteui_image` | WIC on Windows; libpng + libjpeg on Linux |
 | XML | `liteui_xml` | Intentionally partial parser, used by SVG |
@@ -251,11 +252,17 @@ a live tree is retired.
 
 ## Build integration
 
-- **CMake:** `liteui::liteui` is a static library whose only source,
-  `liteui_impl.cpp`, defines `LITEUI_IMPLEMENTATION` and includes the
-  header. Platform libraries and the vendored protocol sources are `PRIVATE`
-  to it, so consumers include only the declarations and do not inherit
-  platform include paths. `LITEUI_PROFILE` is also `PRIVATE`.
+- **CMake:** `liteui::liteui` is a header-only `INTERFACE` library with no
+  sources of its own. It carries the include directory, `cxx_std_23`, the
+  optional `LITEUI_PROFILE` define, the platform libraries, and (on Linux)
+  the vendored `liteui_wayland_protocols` static library, all as
+  `INTERFACE` properties, so they propagate to every target that links it.
+  The consumer defines `LITEUI_IMPLEMENTATION` in one `.cpp`, so the
+  implementation is compiled inside the consumer. Examples are
+  `examples/<name>/{CMakeLists.txt,main.cpp}`, globbed at configure time.
+- **Protocol bindings:** `platform/wayland-protocols/` holds the generated
+  xdg-shell and xdg-decoration sources; the `regen-protocols` target
+  rebuilds them and the result must be committed.
 - **Without CMake:** copy the header and define the macro in one `.cpp`; see
   the [README](../README.md#how-the-single-header-works).
 

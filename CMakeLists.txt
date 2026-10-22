@@ -153,7 +153,7 @@ else()
         PkgConfig::XKBCOMMON
         PkgConfig::PNG
         PkgConfig::JPEG
-        util
+        util  #TODO :: used in codeeditor for terminal needs to move there
     )
 endif()
 

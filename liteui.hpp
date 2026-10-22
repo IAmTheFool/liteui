@@ -14,7 +14,9 @@
 //       #include "liteui.hpp"
 //
 //   A program with a single .cpp file just does both in that file.
-//   With CMake, linking liteui::liteui does this for you.
+//   With CMake, linking liteui::liteui supplies the include path, C++23 and
+//   the platform libraries, but you still define LITEUI_IMPLEMENTATION in
+//   one .cpp of each executable.
 //
 // Platform members/methods are selected at compile time via #ifdef.
 
@@ -1606,148 +1608,200 @@ namespace liteui_prof
 #define LITEUI_PROF_ADD(stat, var) ((void)0)
 #endif
 
+// ======================= File / folder pickers =======================
+//
+// All five public pickers (openFilePicker, openFilesPicker, saveFilePicker,
+// openFolderPicker, saveFolderPicker) funnel through a single
+// platform-specific `liteui_filepicker::pick(Request)`. The platform code
+// below only knows how to show "a dialog of kind X" and hand back a list of
+// paths; the public wrappers at the bottom are platform-independent.
+namespace liteui_filepicker
+{
+
+  enum class Mode
+  {
+    OpenFile,
+    OpenFiles,
+    SaveFile,
+    Folder,     // pick an existing folder
+    SaveFolder  // same, but "Save"/"Select" framing where the platform has it
+  };
+
+  struct Request
+  {
+    Mode mode;
+    std::string title;
+    std::vector<FileFilter> filters;
+    std::string defaultName; // SaveFile only
+    std::string defaultExt;  // SaveFile only
+  };
+
+  inline std::optional<std::string> first(std::vector<std::string> &&v)
+  {
+    if (v.empty())
+      return std::nullopt;
+    return std::move(v.front());
+  }
+
 #if defined(_WIN32)
 
-std::optional<std::string>
-openFilePicker(const std::string &title,
-               const std::vector<FileFilter> &filters)
-{
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileOpenDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr))
+  // RAII CoInitializeEx/CoUninitialize. Only balances the call when WE were
+  // the ones to initialize COM (S_OK); S_FALSE / RPC_E_CHANGED_MODE mean the
+  // host app already did, and must not be uninitialized by us.
+  struct ComScope
   {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-
-  // COMDLG_FILTERSPEC just points at wide strings we own, so keep the
-  // backing wstrings alive until after SetFileTypes/Show.
-  std::vector<std::wstring> names, patterns;
-  std::vector<COMDLG_FILTERSPEC> specs;
-  names.reserve(filters.size());
-  patterns.reserve(filters.size());
-  for (auto &f : filters)
-  {
-    names.push_back(toWide(f.name));
-    patterns.push_back(toWide(f.pattern));
-  }
-  for (size_t i = 0; i < filters.size(); ++i)
-    specs.push_back({names[i].c_str(), patterns[i].c_str()});
-  if (!specs.empty())
-    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr); // blocks until closed
-  if (SUCCEEDED(hr))
-  {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item)))
+    bool owns;
+    ComScope()
+        : owns(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                           COINIT_DISABLE_OLE1DDE) == S_OK) {}
+    ~ComScope()
     {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
-      {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? len - 1 : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
+      if (owns)
+        CoUninitialize();
     }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
+    ComScope(const ComScope &) = delete;
+    ComScope &operator=(const ComScope &) = delete;
+  };
 
-std::vector<std::string>
-openFilesPicker(const std::string &title,
-                const std::vector<FileFilter> &filters)
-{
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileOpenDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr))
+  // COMDLG_FILTERSPEC just points at wide strings we own, so the backing
+  // wstrings must outlive SetFileTypes/Show — hence a struct held by caller.
+  struct FilterSpecs
   {
-    if (weInitialized)
-      CoUninitialize();
+    std::vector<std::wstring> names, patterns;
+    std::vector<COMDLG_FILTERSPEC> specs;
+
+    explicit FilterSpecs(const std::vector<FileFilter> &filters)
+    {
+      names.reserve(filters.size());
+      patterns.reserve(filters.size());
+      for (auto &f : filters)
+      {
+        names.push_back(toWide(f.name));
+        patterns.push_back(toWide(f.pattern));
+      }
+      for (size_t i = 0; i < filters.size(); ++i)
+        specs.push_back({names[i].c_str(), patterns[i].c_str()});
+    }
+    void applyTo(IFileDialog *dlg)
+    {
+      if (!specs.empty())
+        dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
+    }
+  };
+
+  // Appends the item's filesystem path (UTF-8) to `out`. Releases `item`.
+  inline void appendItemPath(IShellItem *item, std::vector<std::string> &out)
+  {
+    PWSTR path = nullptr;
+    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+    {
+      int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
+                                    nullptr);
+      std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
+      if (len > 0)
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
+                            nullptr);
+      out.push_back(std::move(s));
+      CoTaskMemFree(path);
+    }
+    item->Release();
+  }
+
+  template <class Dlg>
+  struct DialogClsid;
+  template <>
+  struct DialogClsid<IFileOpenDialog>
+  {
+    static const CLSID &get() { return CLSID_FileOpenDialog; }
+  };
+  template <>
+  struct DialogClsid<IFileSaveDialog>
+  {
+    static const CLSID &get() { return CLSID_FileSaveDialog; }
+  };
+
+  // The one place that creates, configures, shows and harvests an
+  // IFileOpenDialog / IFileSaveDialog. `extraOpts` are OR'd into FOS_*.
+  template <class Dlg>
+  std::vector<std::string> showDialog(const Request &r, DWORD extraOpts)
+  {
+    ComScope com;
+
+    Dlg *dlg = nullptr;
+    if (FAILED(CoCreateInstance(DialogClsid<Dlg>::get(), nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))))
+      return {};
+
+    dlg->SetTitle(toWide(r.title).c_str());
+    if (extraOpts)
+    {
+      DWORD opts = 0;
+      dlg->GetOptions(&opts);
+      dlg->SetOptions(opts | extraOpts);
+    }
+    if (!r.defaultName.empty())
+      dlg->SetFileName(toWide(r.defaultName).c_str());
+    // Prompt-on-overwrite is IFileSaveDialog's default, so nothing to request.
+    if (!r.defaultExt.empty())
+      dlg->SetDefaultExtension(toWide(r.defaultExt).c_str());
+
+    FilterSpecs filters(r.filters);
+    filters.applyTo(dlg);
+
+    std::vector<std::string> out;
+    if (SUCCEEDED(dlg->Show(nullptr))) // blocks until closed
+    {
+      bool collected = false;
+      if constexpr (std::is_same_v<Dlg, IFileOpenDialog>)
+      {
+        if (r.mode == Mode::OpenFiles)
+        {
+          collected = true;
+          IShellItemArray *items = nullptr;
+          if (SUCCEEDED(dlg->GetResults(&items)))
+          {
+            DWORD count = 0;
+            items->GetCount(&count);
+            for (DWORD i = 0; i < count; ++i)
+            {
+              IShellItem *item = nullptr;
+              if (SUCCEEDED(items->GetItemAt(i, &item)))
+                appendItemPath(item, out);
+            }
+            items->Release();
+          }
+        }
+      }
+      if (!collected)
+      {
+        IShellItem *item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item)))
+          appendItemPath(item, out);
+      }
+    }
+    dlg->Release();
+    return out;
+  }
+
+  inline std::vector<std::string> pick(const Request &r)
+  {
+    switch (r.mode)
+    {
+    case Mode::OpenFile:
+      return showDialog<IFileOpenDialog>(r, 0);
+    case Mode::OpenFiles:
+      return showDialog<IFileOpenDialog>(r, FOS_ALLOWMULTISELECT);
+    case Mode::SaveFile:
+      return showDialog<IFileSaveDialog>(r, 0);
+    case Mode::Folder:
+      return showDialog<IFileOpenDialog>(r, FOS_PICKFOLDERS);
+    case Mode::SaveFolder:
+      return showDialog<IFileSaveDialog>(r, FOS_PICKFOLDERS);
+    }
     return {};
   }
 
-  dlg->SetTitle(toWide(title).c_str());
-  DWORD opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_ALLOWMULTISELECT);
-
-  std::vector<std::wstring> names, patterns;
-  std::vector<COMDLG_FILTERSPEC> specs;
-  for (auto &f : filters)
-  {
-    names.push_back(toWide(f.name));
-    patterns.push_back(toWide(f.pattern));
-  }
-  for (size_t i = 0; i < filters.size(); ++i)
-    specs.push_back({names[i].c_str(), patterns[i].c_str()});
-  if (!specs.empty())
-    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-
-  std::vector<std::string> result;
-  hr = dlg->Show(nullptr); // blocks until closed
-  if (SUCCEEDED(hr))
-  {
-    IShellItemArray *items = nullptr;
-    if (SUCCEEDED(dlg->GetResults(&items)))
-    {
-      DWORD count = 0;
-      items->GetCount(&count);
-      for (DWORD i = 0; i < count; ++i)
-      {
-        IShellItem *item = nullptr;
-        if (FAILED(items->GetItemAt(i, &item)))
-          continue;
-        PWSTR path = nullptr;
-        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
-        {
-          int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0,
-                                        nullptr, nullptr);
-          std::string s(len > 0 ? len - 1 : 0, '\0');
-          if (len > 0)
-            WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                                nullptr);
-          result.push_back(std::move(s));
-          CoTaskMemFree(path);
-        }
-        item->Release();
-      }
-      items->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-#else // Linux
-
-namespace liteui_filepicker
-{
+#else // Linux — shells out to zenity, falling back to kdialog
 
   inline bool commandExists(const char *name)
   {
@@ -1767,216 +1821,93 @@ namespace liteui_filepicker
     return out;
   }
 
-} // namespace liteui_filepicker
-
-std::optional<std::string>
-openFilePicker(const std::string &title,
-               const std::vector<FileFilter> &filters)
-{
-  using namespace liteui_filepicker;
-
-  std::string cmd;
-  if (commandExists("zenity"))
+  // Our patterns are ';'-separated; zenity/kdialog want space-separated.
+  inline std::string spaceSeparated(const std::string &pattern)
   {
-    cmd = "zenity --file-selection --title=" + shellQuote(title);
+    std::string g = pattern;
+    std::replace(g.begin(), g.end(), ';', ' ');
+    return g;
+  }
+
+  // " --file-filter='Images | *.png *.jpg'" per filter (leading space each).
+  inline std::string zenityFilterArgs(const std::vector<FileFilter> &filters)
+  {
+    std::string args;
     for (auto &f : filters)
+      args += " --file-filter=" +
+              shellQuote(f.name + " | " + spaceSeparated(f.pattern));
+    return args;
+  }
+
+  // kdialog wants one trailing arg: "*.png *.jpg|Images\n*.mp3|Audio".
+  // Returns " '<spec>'" (leading space), or "" when there are no filters.
+  inline std::string kdialogFilterArg(const std::vector<FileFilter> &filters)
+  {
+    if (filters.empty())
+      return {};
+    std::string spec;
+    for (size_t i = 0; i < filters.size(); ++i)
     {
-      // zenity wants space-separated globs; our pattern is ';'-separated.
-      std::string globs = f.pattern;
-      std::replace(globs.begin(), globs.end(), ';', ' ');
-      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
+      if (i)
+        spec += "\n";
+      spec += spaceSeparated(filters[i].pattern) + "|" + filters[i].name;
     }
+    return " " + shellQuote(spec);
   }
-  else if (commandExists("kdialog"))
+
+  // Runs whichever of the two commands matches an installed picker binary
+  // (zenity preferred). Returns the raw stdout, or nullopt if neither exists,
+  // the pipe failed, the user cancelled (non-zero exit), or output is empty.
+  inline std::optional<std::string> runPicker(const std::string &zenityCmd,
+                                              const std::string &kdialogCmd)
   {
-    // kdialog's filter syntax is "*.png *.jpg|Images\n*.mp3|Audio" — build
-    // it from all filters at once, appended as a single trailing arg.
-    cmd = "kdialog --getopenfilename . --title " + shellQuote(title);
-    if (!filters.empty())
+    std::string cmd;
+    if (commandExists("zenity"))
+      cmd = zenityCmd;
+    else if (commandExists("kdialog"))
+      cmd = kdialogCmd;
+    else
+      return std::nullopt; // no picker binary available
+    cmd += " 2>/dev/null";
+
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe)
+      return std::nullopt;
+    std::string out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe))
+      out += buf;
+    int rc = pclose(pipe);
+    if (rc != 0 || out.empty())
+      return std::nullopt;
+    return out;
+  }
+
+  inline void trimTrailingNewlines(std::string &s)
+  {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+      s.pop_back();
+  }
+
+  inline std::vector<std::string> splitLines(const std::string &out)
+  {
+    std::vector<std::string> result;
+    size_t start = 0;
+    while (start <= out.size())
     {
-      std::string spec;
-      for (size_t i = 0; i < filters.size(); ++i)
-      {
-        std::string globs = filters[i].pattern;
-        std::replace(globs.begin(), globs.end(), ';', ' ');
-        if (i)
-          spec += "\n";
-        spec += globs + "|" + filters[i].name;
-      }
-      cmd += " " + shellQuote(spec);
+      size_t nl = out.find('\n', start);
+      std::string line = out.substr(
+          start, nl == std::string::npos ? std::string::npos : nl - start);
+      while (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      if (!line.empty())
+        result.push_back(std::move(line));
+      if (nl == std::string::npos)
+        break;
+      start = nl + 1;
     }
+    return result;
   }
-  else
-  {
-    return std::nullopt; // no picker binary available
-  }
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-std::vector<std::string>
-openFilesPicker(const std::string &title,
-                const std::vector<FileFilter> &filters)
-{
-  using namespace liteui_filepicker;
-
-  std::string cmd;
-  if (commandExists("zenity"))
-  {
-    cmd = "zenity --file-selection --multiple --separator=" +
-          shellQuote("\n") + " --title=" + shellQuote(title);
-    for (auto &f : filters)
-    {
-      std::string globs = f.pattern;
-      std::replace(globs.begin(), globs.end(), ';', ' ');
-      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
-    }
-  }
-  else if (commandExists("kdialog"))
-  {
-    cmd = "kdialog --getopenfilename . --multiple --separate-output --title " +
-          shellQuote(title);
-    if (!filters.empty())
-    {
-      std::string spec;
-      for (size_t i = 0; i < filters.size(); ++i)
-      {
-        std::string globs = filters[i].pattern;
-        std::replace(globs.begin(), globs.end(), ';', ' ');
-        if (i)
-          spec += "\n";
-        spec += globs + "|" + filters[i].name;
-      }
-      cmd += " " + shellQuote(spec);
-    }
-  }
-  else
-  {
-    return {};
-  }
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return {};
-  std::string out;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    out += buf;
-  if (pclose(pipe) != 0)
-    return {};
-
-  std::vector<std::string> result;
-  size_t start = 0;
-  while (start <= out.size())
-  {
-    size_t nl = out.find('\n', start);
-    std::string line = out.substr(start, nl == std::string::npos
-                                             ? std::string::npos
-                                             : nl - start);
-    while (!line.empty() && line.back() == '\r')
-      line.pop_back();
-    if (!line.empty())
-      result.push_back(std::move(line));
-    if (nl == std::string::npos)
-      break;
-    start = nl + 1;
-  }
-  return result;
-}
-
-#endif
-
-#if defined(_WIN32)
-
-std::optional<std::string>
-saveFilePicker(const std::string &title, const std::string &defaultName,
-               const std::vector<FileFilter> &filters,
-               const std::string &defaultExt)
-{
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileSaveDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr))
-  {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  if (!defaultName.empty())
-    dlg->SetFileName(toWide(defaultName).c_str());
-  if (!defaultExt.empty())
-    dlg->SetDefaultExtension(toWide(defaultExt).c_str());
-
-  // Prompt-on-overwrite is IFileSaveDialog's default behavior already
-  // (unlike zenity below, which needs it requested explicitly), so
-  // nothing extra is needed here.
-
-  std::vector<std::wstring> names, patterns;
-  std::vector<COMDLG_FILTERSPEC> specs;
-  names.reserve(filters.size());
-  patterns.reserve(filters.size());
-  for (auto &f : filters)
-  {
-    names.push_back(toWide(f.name));
-    patterns.push_back(toWide(f.pattern));
-  }
-  for (size_t i = 0; i < filters.size(); ++i)
-    specs.push_back({names[i].c_str(), patterns[i].c_str()});
-  if (!specs.empty())
-    dlg->SetFileTypes(static_cast<UINT>(specs.size()), specs.data());
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr); // blocks until closed
-  if (SUCCEEDED(hr))
-  {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item)))
-    {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
-      {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? len - 1 : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
-}
-
-#else // Linux
-
-namespace liteui_filepicker
-{
 
   // Appends defaultExt to path if it doesn't already end in one of the
   // extensions listed in `filters`' patterns. Keeps zenity/kdialog (which
@@ -1988,6 +1919,8 @@ namespace liteui_filepicker
   {
     if (defaultExt.empty() || path.empty())
       return path;
+    auto iequal = [](char a, char b)
+    { return std::tolower(a) == std::tolower(b); };
     auto endsWithAny = [&](const std::string &p)
     {
       for (auto &f : filters)
@@ -2003,11 +1936,7 @@ namespace liteui_filepicker
           {
             std::string suffix = glob.substr(star + 1);
             if (suffix.size() <= p.size() &&
-                std::equal(suffix.rbegin(), suffix.rend(), p.rbegin(),
-                           [](char a, char b)
-                           {
-                             return std::tolower(a) == std::tolower(b);
-                           }))
+                std::equal(suffix.rbegin(), suffix.rend(), p.rbegin(), iequal))
               return true;
           }
           if (sep == std::string::npos)
@@ -2021,243 +1950,107 @@ namespace liteui_filepicker
       return path;
     if (path.size() >= defaultExt.size() + 1 &&
         path[path.size() - defaultExt.size() - 1] == '.' &&
-        std::equal(
-            defaultExt.rbegin(), defaultExt.rend(), path.rbegin(),
-            [](char a, char b)
-            { return std::tolower(a) == std::tolower(b); }))
+        std::equal(defaultExt.rbegin(), defaultExt.rend(), path.rbegin(),
+                   iequal))
       return path;
     return path + "." + defaultExt;
   }
 
+  inline std::vector<std::string> pick(const Request &r)
+  {
+    const std::string t = shellQuote(r.title);
+    const std::string zf = zenityFilterArgs(r.filters);
+    const std::string kf = kdialogFilterArg(r.filters);
+    std::string zen, kde;
+
+    switch (r.mode)
+    {
+    case Mode::OpenFile:
+      zen = "zenity --file-selection --title=" + t + zf;
+      kde = "kdialog --getopenfilename . --title " + t + kf;
+      break;
+    case Mode::OpenFiles:
+      zen = "zenity --file-selection --multiple --separator=" +
+            shellQuote("\n") + " --title=" + t + zf;
+      kde = "kdialog --getopenfilename . --multiple --separate-output "
+            "--title " +
+            t + kf;
+      break;
+    case Mode::SaveFile:
+      zen = "zenity --file-selection --save --confirm-overwrite --title=" + t;
+      if (!r.defaultName.empty())
+        zen += " --filename=" + shellQuote(r.defaultName);
+      zen += zf;
+      // kdialog itself prompts on overwrite by default.
+      kde = "kdialog --getsavefilename " +
+            shellQuote(r.defaultName.empty() ? "." : r.defaultName) + kf +
+            " --title " + t;
+      break;
+    case Mode::Folder:
+    case Mode::SaveFolder:
+      // zenity/kdialog have no separate "save" mode for directories; the
+      // two modes differ only in the title the caller passes.
+      zen = "zenity --file-selection --directory --title=" + t;
+      kde = "kdialog --getexistingdirectory . --title " + t;
+      break;
+    }
+
+    auto raw = runPicker(zen, kde);
+    if (!raw)
+      return {};
+
+    if (r.mode == Mode::OpenFiles)
+      return splitLines(*raw);
+
+    trimTrailingNewlines(*raw);
+    if (r.mode == Mode::SaveFile)
+      *raw = ensureExtension(std::move(*raw), r.defaultExt, r.filters);
+    return {std::move(*raw)};
+  }
+
+#endif // _WIN32
+
 } // namespace liteui_filepicker
+
+// ---- Public API: platform-independent wrappers over pick() ----
+
+std::optional<std::string>
+openFilePicker(const std::string &title,
+               const std::vector<FileFilter> &filters)
+{
+  return liteui_filepicker::first(liteui_filepicker::pick(
+      {liteui_filepicker::Mode::OpenFile, title, filters, {}, {}}));
+}
+
+std::vector<std::string>
+openFilesPicker(const std::string &title,
+                const std::vector<FileFilter> &filters)
+{
+  return liteui_filepicker::pick(
+      {liteui_filepicker::Mode::OpenFiles, title, filters, {}, {}});
+}
 
 std::optional<std::string>
 saveFilePicker(const std::string &title, const std::string &defaultName,
                const std::vector<FileFilter> &filters,
                const std::string &defaultExt)
 {
-  using namespace liteui_filepicker;
-
-  std::string cmd;
-  if (commandExists("zenity"))
-  {
-    cmd = "zenity --file-selection --save --confirm-overwrite --title=" +
-          shellQuote(title);
-    if (!defaultName.empty())
-      cmd += " --filename=" + shellQuote(defaultName);
-    for (auto &f : filters)
-    {
-      std::string globs = f.pattern;
-      std::replace(globs.begin(), globs.end(), ';', ' ');
-      cmd += " --file-filter=" + shellQuote(f.name + " | " + globs);
-    }
-  }
-  else if (commandExists("kdialog"))
-  {
-    cmd = "kdialog --getsavefilename";
-    cmd += " " + shellQuote(defaultName.empty() ? "." : defaultName);
-    if (!filters.empty())
-    {
-      std::string spec;
-      for (size_t i = 0; i < filters.size(); ++i)
-      {
-        std::string globs = filters[i].pattern;
-        std::replace(globs.begin(), globs.end(), ';', ' ');
-        if (i)
-          spec += "\n";
-        spec += globs + "|" + filters[i].name;
-      }
-      cmd += " " + shellQuote(spec);
-    }
-    cmd += " --title " + shellQuote(title);
-    // kdialog itself prompts on overwrite by default.
-  }
-  else
-  {
-    return std::nullopt;
-  }
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return ensureExtension(result, defaultExt, filters);
+  return liteui_filepicker::first(liteui_filepicker::pick(
+      {liteui_filepicker::Mode::SaveFile, title, filters, defaultName,
+       defaultExt}));
 }
-
-#endif
-
-#if defined(_WIN32)
 
 std::optional<std::string> openFolderPicker(const std::string &title)
 {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileOpenDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr))
-  {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  DWORD opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_PICKFOLDERS);
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr);
-  if (SUCCEEDED(hr))
-  {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item)))
-    {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
-      {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
+  return liteui_filepicker::first(
+      liteui_filepicker::pick({liteui_filepicker::Mode::Folder, title, {}, {}, {}}));
 }
 
-// Same as openFolderPicker but via IFileSaveDialog, so the dialog's
-// action button reads "Save"/"Select" rather than "Open" — the only
-// difference; folders have no other save-specific behavior.
 std::optional<std::string> saveFolderPicker(const std::string &title)
 {
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
-                                             COINIT_DISABLE_OLE1DDE);
-  bool weInitialized = coHr == S_OK;
-
-  IFileSaveDialog *dlg = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
-  if (FAILED(hr))
-  {
-    if (weInitialized)
-      CoUninitialize();
-    return std::nullopt;
-  }
-
-  dlg->SetTitle(toWide(title).c_str());
-  DWORD opts = 0;
-  dlg->GetOptions(&opts);
-  dlg->SetOptions(opts | FOS_PICKFOLDERS);
-
-  std::optional<std::string> result;
-  hr = dlg->Show(nullptr);
-  if (SUCCEEDED(hr))
-  {
-    IShellItem *item = nullptr;
-    if (SUCCEEDED(dlg->GetResult(&item)))
-    {
-      PWSTR path = nullptr;
-      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
-      {
-        int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr,
-                                      nullptr);
-        std::string s(len > 0 ? static_cast<size_t>(len - 1) : 0, '\0');
-        if (len > 0)
-          WideCharToMultiByte(CP_UTF8, 0, path, -1, s.data(), len, nullptr,
-                              nullptr);
-        result = std::move(s);
-        CoTaskMemFree(path);
-      }
-      item->Release();
-    }
-  }
-  dlg->Release();
-  if (weInitialized)
-    CoUninitialize();
-  return result;
+  return liteui_filepicker::first(liteui_filepicker::pick(
+      {liteui_filepicker::Mode::SaveFolder, title, {}, {}, {}}));
 }
-
-#else // Linux
-
-std::optional<std::string> openFolderPicker(const std::string &title)
-{
-  using namespace liteui_filepicker;
-  std::string cmd;
-  if (commandExists("zenity"))
-    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
-  else if (commandExists("kdialog"))
-    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
-  else
-    return std::nullopt;
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-// zenity/kdialog have no separate "save" mode for directories, so this
-// is identical to openFolderPicker aside from the default title string
-// the caller passes.
-std::optional<std::string> saveFolderPicker(const std::string &title)
-{
-  using namespace liteui_filepicker;
-  std::string cmd;
-  if (commandExists("zenity"))
-    cmd = "zenity --file-selection --directory --title=" + shellQuote(title);
-  else if (commandExists("kdialog"))
-    cmd = "kdialog --getexistingdirectory . --title " + shellQuote(title);
-  else
-    return std::nullopt;
-  cmd += " 2>/dev/null";
-
-  FILE *pipe = popen(cmd.c_str(), "r");
-  if (!pipe)
-    return std::nullopt;
-  std::string result;
-  char buf[1024];
-  while (fgets(buf, sizeof(buf), pipe))
-    result += buf;
-  int rc = pclose(pipe);
-  if (rc != 0 || result.empty())
-    return std::nullopt;
-  while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-    result.pop_back();
-  return result;
-}
-
-#endif
 
 // ==================== Clipboard ====================
 namespace liteui_clipboard

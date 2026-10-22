@@ -9,8 +9,9 @@ deliberate v1 limitation.
 
 Everything below is declared in the part of `liteui.hpp` you get from a
 plain `#include`. The implementation is compiled in the one `.cpp` that
-defines `LITEUI_IMPLEMENTATION` (or by linking the `liteui::liteui` CMake
-target) — see the [README](../README.md#how-the-single-header-works).
+defines `LITEUI_IMPLEMENTATION` (the `liteui::liteui` CMake target
+supplies the include path and platform libraries, but you still define
+the macro yourself) — see the [README](../README.md#how-the-single-header-works).
 
 ## Contents
 
@@ -648,6 +649,11 @@ std::optional<std::string>
 openFilePicker(const std::string &title = "Open File",
                const std::vector<FileFilter> &filters = {});
 
+// Multi-select (Ctrl / Shift). Empty vector on cancel/failure.
+std::vector<std::string>
+openFilesPicker(const std::string &title = "Open Files",
+                const std::vector<FileFilter> &filters = {});
+
 std::optional<std::string>
 saveFilePicker(const std::string &title = "Save File",
                const std::string &defaultName = "",
@@ -660,8 +666,9 @@ std::optional<std::string> saveFolderPicker(const std::string &title = "Select F
 
 `saveFilePicker`'s `defaultExt` (no leading dot) is appended if the
 user's typed name doesn't already end in an extension covered by
-`filters`. All four return the chosen absolute path, or `std::nullopt`
-on cancel/failure.
+`filters`. The single-path pickers return the chosen absolute path, or
+`std::nullopt` on cancel/failure; `openFilesPicker` returns an empty
+vector in those cases.
 
 ## Clipboard (`liteui_clipboard`)
 
