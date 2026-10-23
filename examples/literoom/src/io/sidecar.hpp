@@ -615,3 +615,75 @@ inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH,
   *out = std::move(e);
   return true;
 }
+
+// Sync Settings: puts a look (sliders, curves, Color Mixer, Color Grading) into
+// the sidecar text of ANOTHER picture without touching its geometry or masks.
+//   oldText   the picture's current sidecar file ("" if it has none)
+//   imgW/H    the picture's size. Needed only when oldText is empty (a new file
+//             must record it); otherwise the size recorded in the file is used,
+//             and if imgW/H are given too they must match it.
+// Returns false, with a reason in *err and *outText untouched, when the old
+// file can't be trusted (unreadable, from a newer version, other size): the
+// caller skips that picture rather than overwrite edits it can't read.
+// Everything else in the old file goes through sidecarEditsFromJson, so it is
+// validated and clamped exactly as when the picture is opened.
+inline bool sidecarSyncLook(const std::string &oldText,
+                            const std::string &imageName, int imgW, int imgH,
+                            const AdjValues &values, const CurveSet &curves,
+                            const MixValues &mix, const ColorGrade &grade,
+                            std::string *outText, std::string *err)
+{
+  using mj::Json;
+  auto fail = [&](const char *why)
+  {
+    if (err)
+      *err = why;
+    return false;
+  };
+  SidecarEdits e;
+  int W = imgW, H = imgH;
+  if (!oldText.empty())
+  {
+    Json root;
+    std::string perr;
+    if (!Json::parse(oldText, &root, &perr) || !root.isObject())
+      return fail("its saved edits are unreadable");
+    const Json *ver = root.find("version");
+    if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion)
+      return fail("its saved edits are from a newer Literoom");
+    const Json *img = root.find("image");
+    const Json *jw = img && img->isObject() ? img->find("width") : nullptr;
+    const Json *jh = img && img->isObject() ? img->find("height") : nullptr;
+    if (!jw || !jh)
+      return fail("its saved edits have no picture size");
+    const int fw = static_cast<int>(jw->asNum(-1));
+    const int fh = static_cast<int>(jh->asNum(-1));
+    if (imgW > 0 && imgH > 0 && (fw != imgW || fh != imgH))
+      return fail("the picture's size has changed");
+    const Json *edits = root.find("edits");
+    if (!edits || !sidecarEditsFromJson(*edits, fw, fh, &e))
+      return fail("its saved edits are unreadable");
+    W = fw;
+    H = fh;
+  }
+  else if (W <= 0 || H <= 0)
+    return fail("the picture's size is unknown");
+
+  e.values = values;
+  e.curves = curves;
+  e.mix = mix;
+  e.grade = grade;
+
+  Json img = Json::object();
+  img.set("name", Json::str(imageName));
+  img.set("width", Json::num(W));
+  img.set("height", Json::num(H));
+  Json root = Json::object();
+  root.set("app", Json::str("literoom"));
+  root.set("version", Json::num(kSidecarVersion));
+  root.set("image", std::move(img));
+  root.set("edits", sidecarEditsToJson(e));
+  if (outText)
+    *outText = root.dump();
+  return true;
+}

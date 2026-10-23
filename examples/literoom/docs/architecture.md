@@ -14,7 +14,7 @@ Literoom is split into three layers:
 
 Why split it this way? Because everything in the engine is a *plain function of plain values*. A slider value goes in, a number or a table comes out. That makes the engine easy to test without opening a window (nearly every engine header has its own unit test; the exceptions are `sam_segmenter.hpp`, which needs ONNX Runtime, and `check.hpp`, the test harness itself), and it makes it safe to run on a background thread.
 
-`main.cpp` is long (about 8,500 lines) because it holds all the UI. It reads roughly top to bottom as: layout constants and colors, the render worker, crop and filmstrip state, `EditorState`, handing worker results back to the UI thread, crop, the geometry worker, rotate/flip and straighten, opening a file (the decode worker), object segmentation, saving and loading edits, the filmstrip, small reusable widgets, one section per pane (plus the History panel, the Presets list and Before / After), and finally `main()` which wires up shortcuts, menus, the workers' wake-ups and the event loop.
+`main.cpp` is long (about 8,800 lines) because it holds all the UI. It reads roughly top to bottom as: layout constants and colors, the render worker, crop and filmstrip state, `EditorState`, handing worker results back to the UI thread, crop, the geometry worker, rotate/flip and straighten, opening a file (the decode worker), object segmentation, saving and loading edits, Sync Settings (its worker), the filmstrip, small reusable widgets, one section per pane (plus the History panel, the Presets list, which also holds the Copy / Paste Settings clipboard, and Before / After), and finally `main()` which wires up shortcuts, menus, the workers' wake-ups and the event loop.
 
 ## The picture pipeline
 
@@ -120,10 +120,19 @@ Presets follow the same rules as the rest of the engine:
 
 The Presets pane in `main.cpp` is a thin layer over this: a list of the files in the presets folder, a name field and a Save button. The list is a cache, re-read when the pane is opened and after a save or delete, never per frame. For the per-function details see `preset.hpp` in [headers.md](headers.md#presethpp).
 
+## Copy, paste and sync settings
+
+These reuse the preset machinery instead of adding a new kind of data. The thing being moved around is a `Preset` (the look: sliders, curves, Color Mixer, Color Grading), never crop, rotation or masks, for the same reason presets leave them out.
+
+- **Copy / Paste Settings** (Ctrl+Shift+C / V) work on the open picture. Copy keeps `currentPreset()` in a small in-memory clipboard in `main.cpp`; Paste calls `applyPreset`, so it is one undo step labelled `Preset: Pasted`. See [undo-and-history.md](undo-and-history.md#copy-and-paste-settings).
+- **Sync Settings** (Ctrl+Shift+S) copies the open picture's look onto the pictures selected in the filmstrip (Ctrl+click toggles one, Shift+click selects a range, Ctrl+A selects all, a plain click clears the selection and opens a picture). The other pictures are not open, so there is no `AdjustmentSet` to change. Instead `sidecarSyncLook` (a pure function in `io/sidecar.hpp`) takes a picture's sidecar text, replaces only the four look groups, and returns the new text, so each picture keeps its own crop, rotation and masks. A background worker does the file work, because a picture with no sidecar must be decoded once to learn its size. See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures) and [threading.md](threading.md#the-sync-worker-is-a-batch-that-is-never-superseded).
+
+The engine stays UI-free: `sidecarSyncLook` has no file, window or editor dependency and is tested with plain strings. The selection flags and the clipboard are UI-side state in `main.cpp`.
+
 ## Where state lives
 
-All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). The one other piece of UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder). Presets themselves live in files, not in `state`; applying one copies its values into `state.adjust`.
+All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
 
 ## The rule about threads
 
-Workers never read `state` and never call LiteUI. They receive an immutable picture and a copy of the parameters, and they return a value. This is what makes the threading simple enough to reason about. Details in [threading.md](threading.md). Presets need no worker: saving, loading and listing read or write a few hundred bytes, so they run on the UI thread like the sidecar's small writes.
+Workers never read `state` and never call LiteUI. They receive an immutable picture and a copy of the parameters, and they return a value. This is what makes the threading simple enough to reason about. Details in [threading.md](threading.md). Presets need no worker: saving, loading and listing read or write a few hundred bytes, so they run on the UI thread like the sidecar's small writes. Sync Settings does need one (it can decode pictures and write many files) and gets its look as a copied value when the job is built.

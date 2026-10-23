@@ -102,6 +102,12 @@ How it fits the history:
 
 Applying a preset is a normal edit, so it also bumps `version()` and the edited picture is saved to its sidecar like any other change. The sidecar stores the resulting sliders and curves, not the preset's name: reopening the picture shows the look but not that it came from a preset, and the history (with its preset label) is not saved.
 
+### Copy and Paste Settings
+
+Copy Settings (Ctrl+Shift+C) stores `currentPreset("")` in a small in-memory clipboard in `main.cpp` (a `Preset`, plus the name of the picture it came from). It is not a file and it is gone when the app closes. Paste Settings (Ctrl+Shift+V) calls `applyPreset` on the open picture with the name `Pasted`, so everything above holds: one undo step labelled `Preset: Pasted`, crop, orientation and masks untouched, a paste that changes nothing adds no step ("Already has these settings"), and undo restores every control.
+
+**Sync Settings** is different: it writes the look into the *sidecars* of other pictures, which are not open and have no history, so it creates no step anywhere. See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
+
 ## The version counter
 
 `version()` increases on every change to the edit state (an edit, undo, redo, reset). The app compares it with its value at the last save or load to decide whether the saved-edits file is stale, and uses it to invalidate the label cache. It is not part of the undo history.
@@ -114,4 +120,5 @@ After an undo, redo or a jump in the History panel, `lastEdited_` is cleared. Ot
 
 - Saving and loading: [sidecar-format.md](sidecar-format.md).
 - Preset files and helpers: [headers.md](headers.md#presethpp).
+- Putting a look into other pictures' sidecars: [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
 - How an edit becomes pixels: [architecture.md](architecture.md).

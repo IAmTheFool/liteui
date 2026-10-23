@@ -1,6 +1,6 @@
 # Threading
 
-Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the five workers, and the rules that keep it safe.
+Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails, syncing settings onto other pictures) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the six workers, and the rules that keep it safe.
 
 ## The problem "latest wins" solves
 
@@ -39,7 +39,7 @@ One qualification: the segmentation job keeps per-image state (the loaded model,
 
 This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs.
 
-## The five workers
+## The six workers
 
 | Worker | Job | Can it be cancelled? | Notes |
 |---|---|---|---|
@@ -48,8 +48,9 @@ This is also why the editor never edits images in place: a render job holds a po
 | **Decode** | Decode a PNG/JPEG file and apply its EXIF rotation. | **No.** The image libraries have no cancel hook. | A second "open" queues behind a running decode; the first result is simply dropped. |
 | **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Keeps per-image state in worker-only statics (see the rule above). |
 | **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
+| **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
 
-The first four are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
+The first four and Sync are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
 
 ### The geometry worker rebuilds everything
 
@@ -69,9 +70,21 @@ Thumbnails are a different kind of work: you want *all* of them, not just the ne
 - Like `LatestWorker`, `setNotify()` must be called before the first `setQueue()`.
 - For each file it also checks whether a saved-edits sidecar exists, which is what puts the dot on a thumbnail.
 
+### The sync worker is a batch that is never superseded
+
+Sync Settings copies the open picture's look onto the other pictures selected in the filmstrip. Those pictures are not open, so there is no `AdjustmentSet` to edit. The job rewrites each one's sidecar file directly (see [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures)). A picture with no sidecar yet is decoded once to learn its size, which is why this is background work.
+
+It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not for "newest wins", because dropping a half-finished batch would leave some pictures synced and others not:
+
+- **The job ignores cancellation** and always returns a result: one `SyncOutcome` (path, ok, reason) per picture. A failure on one picture (an unreadable sidecar, a different size, a read-only folder) is recorded and the batch carries on.
+- **A second sync is refused while one is outstanding**, and `syncBusy()` also makes opening a picture (File > Open, a filmstrip click, the arrow keys) or a folder wait ("Wait for the sync to finish"). Nothing reads a sidecar that is about to be replaced.
+- **The open picture is never in the batch.** Its edits live in memory and autosave writes its sidecar; syncing onto it would race with that. It is the *source* of the look, copied on the UI thread by `currentPreset()` when the job is built, so the job holds a plain value and never touches `state`.
+- **Writes are temp-file-then-rename**, as in `saveSidecar`, so a crash or a full disk cannot leave half a sidecar.
+- `collectSyncJob()` runs once per frame from `flushPendingAdjust`. It sets the "has edits" dot on each synced picture and shows "Synced N" or "Synced N, skipped M (file: reason)" in the status bar.
+
 ## How the UI picks results up
 
-The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()` and `collectSegmentJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
+The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()`, `collectSegmentJob()` and `collectSyncJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
 
 Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 
@@ -81,7 +94,7 @@ Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 - **A drag cancels the full render.** `enterDrag()` invalidates the render worker, because the render in flight would be for values the drag is about to change.
 - **A result for something that no longer exists is dropped.** For example, a finished object segmentation for a mask you deleted in the meantime, or a thumbnail for a folder you have left.
 - **A new picture invalidates everything in flight.** When a decode lands, `adoptDecoded` invalidates the render, geometry and segmentation workers and bumps `imageSerial`, so nothing made for the old picture can be adopted over the new one.
-- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled.
+- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled, and the sync worker's finishes the batch it is writing.
 - **Small photos skip all of this.** For small images the pass is faster than the hand-off, so the render is synchronous.
 
 ## When you add a worker

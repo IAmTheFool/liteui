@@ -63,11 +63,14 @@ Once the table entry exists, these need no changes:
 - The saved-edits file.
 - **Presets.** A preset stores sliders by label through the same table, so a new slider is saved in presets and applied by them with no preset code. A preset saved before the slider existed simply has no entry for it, which reads as 0.
 - The drag-preview path.
+- **Copy, Paste and Sync Settings.** They move a `Preset`, which stores sliders by label through the same table, so a new slider is copied, pasted and written into other pictures' sidecars with no extra code. A picture's sidecar that predates the slider has no entry for it, which reads as 0.
 
 ### Two things to watch
 
 - **The label is the saved-edits key.** Sliders are written to the sidecar, and to every saved preset, under their `label`, and zero-valued sliders are left out. Renaming a label silently orphans that slider's value in existing sidecars and presets.
 - **Applying a preset replaces the whole look.** An older preset has no entry for a slider you add later, so applying it sets that slider back to 0. That is the intended "replace" behavior (see [undo-and-history.md](undo-and-history.md#presets)), not a bug in the new slider.
+- **Sync Settings replaces the whole look too.** Like applying a preset, it sets every look slider of the target picture to the source's value, including back to 0. That is the intended "replace" behavior.
+- **A new kind of look data needs three updates.** If you add a new group to the look (not a slider: a new list or table like the curves), add it to `Preset`, to `presetToJson` / `presetFromJson`, and to the parameters of `sidecarSyncLook`, or Copy, Paste and Sync would silently skip it.
 - **A new slider at 0 must change nothing.** Default values are 0, and the golden render test (see [testing.md](testing.md)) fingerprints the output. If adding a slider changes an *existing* fingerprint while the new slider is untouched, something is wrong.
 
 ## Adding a mask type

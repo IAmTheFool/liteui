@@ -214,7 +214,7 @@ To prove that the only change in the kitchen-sink scenarios is the new slider, g
 | `mask_range` | Luminosity and Color Range written out as formulas, `setLo` / `setHi`, integer luma used for the weight, unset Color Range selects nothing, these shapes are not spatial. |
 | `mask_object` | Grow, shrink and feather against naive references, the bilinear warp (quarter turns, straighten corners, size cap) and its caches, shape equality by map id, prompts follow the frame. |
 | `mask` | The type order matches the variants, Add / Subtract / Intersect as a fold, composite row spans, `Mask` defaults and equality, mask names, `clearMaskCaches`. |
-| `sidecar` | Round trip of a rich edit set, the file layout, clamping and defaults for every field, crop validation against the turned picture, object bitmaps, a 2,500-case fuzz test where every loadable result must satisfy the editor's invariants. |
+| `sidecar` | Round trip of a rich edit set, the file layout, clamping and defaults for every field, crop validation against the turned picture, object bitmaps, a 2,500-case fuzz test where every loadable result must satisfy the editor's invariants. Sync Settings (`testSyncLook`, `sidecarSyncLook`): a picture with no sidecar needs a size and gets a fresh file; a picture with edits gets the new sliders, curves, Mixer and grading while its crop, orientation, angle, canvas mode and masks are kept; the size comes from the file when none is given and a different size is refused; unreadable JSON, a non-object, a newer version and a file with no picture size are refused with `*outText` untouched; syncing twice gives the same text. |
 | `render_params` | Which masks are kept (a mask whose only effect is a Filter is kept; a Filter that rounds to no effect is not), what each frozen pass holds, `filterValuesFromAdj`, shapes mapped through the frame, defaults. |
 | `adjustment_set` | Undo coalescing and labels, undo / redo / jumps, the 200-step cap, geometry, curve, mixer, grading and mask steps, `version()` rules, JSON round trip, the tables built from the state (also matching mask tables), and the Filters: a History label, a sidecar round trip, a lone Filter making the global color pass active, and the global edit and a mask reading the Filters identically. Presets (`testPresets`): `applyPreset` replaces the whole look (a slider the preset leaves at 0 is reset) but keeps crop, orientation and masks; it is one step labelled `Preset: <name>` (`Preset` for a blank name); an identical look adds no step and does not bump `version()`; the next slider touch is its own step, not folded into the preset step; the label survives undo, redo and History jumps; a hand-built preset with an out-of-range or NaN slider is sanitized; `currentPreset` returns the live look; and the result survives a JSON round trip. |
 | `minijson` | Round trips (floats exactly), escapes and surrogate pairs, malformed input rejected, depth limit, base64 and run-length coding. |
@@ -242,6 +242,26 @@ If you write a new test, these patterns will look familiar:
 - **Written-out numbers.** Several tests (`adjustments`, `mask_geom`, `mask_range`, `mask_object`, `mask_brush`) repeat a formula and its constants from the design, so a changed constant or a refactored formula fails loudly.
 - **Cross-module ties.** `raster_ops` is checked against `GeoFrame` and the EXIF table, and mask tables against the global table builders, so two copies of the same recipe cannot drift apart.
 - **Fuzzing damaged input** (`exif`, `sidecar`, `minijson`): the loader must reject or clamp, never crash or hand back something the UI could not produce. Run these under a sanitizer (below).
+
+## Manual checks: copy, paste and sync settings
+
+The UI parts have no automated test (see "Known gaps"). With a folder of at least five photos, one of them a portrait phone photo (it has an EXIF rotation), and no sidecars, check:
+
+**Copy and Paste (open picture)**
+1. Edit `a`, press Ctrl+Shift+C ("Copied settings from a"), open `b`, press Ctrl+Shift+V. `b` takes the look, and History has one step, `Preset: Pasted`. Ctrl+Z and Ctrl+Y move it back and forth.
+2. Paste again straight away: "Already has these settings" and no new step.
+3. Crop and rotate `c`, then paste. The crop and rotation stay.
+4. Paste before ever copying: "Copy settings from a photo first".
+
+**Sync (filmstrip selection)**
+1. Ctrl+click two photos (outlined), Ctrl+click one again (deselected), Shift+click for a range, Ctrl+A for all. A plain click clears the selection and opens that picture.
+2. With the look set on `a`, press Ctrl+Shift+S. Expect "Syncing..." then "Synced settings to N photo(s)", a `.literoom.json` for each, no `.tmp` left over, and the "has edits" dot. Opening a synced photo shows the look, with History starting at "Original".
+3. A photo that already has a crop, rotation and mask keeps all three; only the look changes.
+4. The portrait phone photo (no sidecar before the sync) opens afterwards with no "size has changed" message. If it appears, the width and height swap in `runSyncJob` is wrong.
+5. Nothing else selected: "Select other photos in the filmstrip first". Ctrl+A then sync: the open photo is skipped.
+6. During a large sync, try to open another picture or folder: "Wait for the sync to finish", and the sync still completes.
+7. A sidecar broken by hand, one with `"version": 99`, and one for a replaced picture of another size are each skipped with a reason, and their files are left untouched.
+8. Close the app during a sync: it exits cleanly after finishing the batch.
 
 ## Sanitizers
 
@@ -275,6 +295,7 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 
 - **The real model path is not tested.** `Segmenter::load`, the encoder and decoder runs and the mask pick need ONNX Runtime and a model, and the test target is built without `LITEROOM_ONNX`. `sam_segmenter_test` covers the stand-in and `sam::preprocess`; `seg_basic` tests the stand-in object selection with the same contract, and the golden test uses it too, so nothing runs the real model automatically.
 - **Presets are covered only below the UI.** `preset_test` and `testPresets` pin the file format, the helpers and the undo behavior. Not covered: the Presets pane (list, click-to-apply, save and delete buttons, the focus guard for shortcuts), `presetDir()` beyond "not empty" (the per-platform folder choice and the non-UTF-8 `%APPDATA%` case), and two names that map to the same file stem overwriting each other. The golden test has no preset scenario, so a refactor that changed what a preset does to the rendered picture would not show up there; the Presets code in `src/main.cpp` is compiled into the golden test but never run.
+- **Copy, Paste and Sync Settings are covered below the UI only.** `testSyncLook` pins the sidecar merge, and Paste is `applyPreset`, covered by `testPresets`. Not covered: the clipboard, the filmstrip selection (Ctrl/Shift-click, Ctrl+A, the selection tint), the sync worker and its status messages, the `syncBusy()` guards, decoding a picture with no sidecar to learn its size (including the EXIF quarter-turn swap, the case most likely to break), and the read-only-folder failure. Like the Presets code, it is compiled into the golden test (which includes `src/main.cpp`) but never run there. Use the manual checks below after touching any of it.
 - **The `src/main.cpp` UI itself is not under test.** The golden test reaches the render and geometry pipeline, undo history, sidecar, histogram state and a few helpers, but not widgets, shortcuts, menus or the event loop.
 - **`render_test`'s second mask check** compares a gray channel value against 0.4 where it means luma. This is fine for the gray ramp it uses, but would be wrong for a colored picture.
 - **Timing.** The `latest_worker` and `thumb_worker` tests are timeout-guarded, but run them in a loop after touching `latest_worker.hpp` or `thumb_worker.hpp`. The `detail_layer` and `neighbor_fx` thread tests have no timeouts (see above).

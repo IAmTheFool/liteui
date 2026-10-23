@@ -389,6 +389,7 @@ struct FilmEntry
   std::shared_ptr<const CanvasImage> thumb; // null until made
   bool failed = false;                      // couldn't be decoded: plain box
   bool edited = false;                      // has saved edits (a sidecar file)
+  bool selected = false;                    // in the multi-selection (Sync Settings)
 };
 
 // The pictures of the folder the open picture lives in (JPEG / PNG, natural
@@ -400,6 +401,7 @@ struct FilmStrip
   std::string folder;
   int current = -1;          // index of the picture that is open
   int target = -1;           // the one last asked for (== current when idle)
+  int anchor = -1;           // where a Shift-click range starts
   float scrollX = 0.0f;      // pixels scrolled
   float viewW = 0.0f;        // strip width at the last paint
   bool visible = true;       // View > Toggle Filmstrip
@@ -1741,6 +1743,179 @@ static void loadSidecar()
   setStatus("Restored saved edits", false);
 }
 
+// ---------------- Sync Settings: one look onto other pictures ----------------
+// Image > Sync Settings to Selected copies the open picture's look (sliders,
+// curves, Color Mixer, Color Grading) onto the pictures picked in the filmstrip
+// (Ctrl+click, Shift+click). The other pictures are not open, so there is no
+// AdjustmentSet to edit: their sidecar files are rewritten directly by
+// sidecarSyncLook, which keeps each picture's own crop, rotation and masks.
+// A picture with no sidecar has to be decoded once to learn its size. All of
+// that runs on a background worker. It is a LatestWorker but never cancelled:
+// a second sync is refused while one runs, and opening pictures waits too, so
+// no one reads a sidecar that is about to be replaced. The open picture is
+// never in the batch (its edits live in memory and autosave).
+struct SyncJob
+{
+  std::vector<std::string> paths;
+  Preset look; // only its values, curves, mix and grade are used
+};
+struct SyncOutcome
+{
+  std::string path;
+  bool ok = false;
+  std::string error; // why it was skipped
+};
+struct SyncResult
+{
+  std::vector<SyncOutcome> items;
+};
+
+// 1 = text read, 0 = no sidecar, -1 = unreadable or too big. Any thread.
+static int readSidecarText(const std::string &imagePath, std::string *text)
+{
+  std::ifstream f(sidecarPath(imagePath), std::ios::binary | std::ios::ate);
+  if (!f)
+    return 0;
+  const std::streamoff n = f.tellg();
+  if (n <= 0 || n > (64 << 20))
+    return -1;
+  text->assign(static_cast<size_t>(n), '\0');
+  f.seekg(0);
+  f.read(text->data(), n);
+  return f ? 1 : -1;
+}
+
+// Temp file, then rename, like saveSidecar. Any thread.
+static bool writeTextAtomic(const std::filesystem::path &path,
+                            const std::string &text, std::string *err)
+{
+  std::filesystem::path tmp = path;
+  tmp += ".tmp";
+  std::error_code ec;
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    f.flush();
+    if (!f)
+    {
+      f.close();
+      std::filesystem::remove(tmp, ec);
+      *err = "couldn't write its saved edits";
+      return false;
+    }
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec)
+  {
+    std::error_code ignore;
+    std::filesystem::remove(tmp, ignore);
+    *err = ec.message();
+    return false;
+  }
+  return true;
+}
+
+// Worker thread only. Always returns a value (it can't be cancelled).
+static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
+{
+  SyncResult res;
+  for (const std::string &path : job.paths)
+  {
+    SyncOutcome o;
+    o.path = path;
+    std::string old;
+    int w = 0, h = 0;
+    const int have = readSidecarText(path, &old);
+    if (have < 0)
+      o.error = "couldn't read its saved edits";
+    else
+    {
+      if (have == 0)
+      { // no sidecar yet: record the picture's (upright) size
+        std::string derr;
+        if (auto img = liteui_image::decodeFile(path, &derr))
+        {
+          w = img->width;
+          h = img->height;
+          if (exifOrientationOf(path).rot & 1) // a quarter turn swaps the sides
+            std::swap(w, h);
+        }
+        else
+          o.error = "couldn't open it: " + derr;
+      }
+      if (o.error.empty())
+      {
+        std::string text;
+        if (sidecarSyncLook(old, baseName(path), w, h, job.look.values,
+                            job.look.curves, job.look.mix, job.look.grade,
+                            &text, &o.error))
+          o.ok = writeTextAtomic(sidecarPath(path), text, &o.error);
+      }
+    }
+    res.items.push_back(std::move(o));
+  }
+  return res;
+}
+
+static LatestWorker<SyncJob, SyncResult> syncWorker(runSyncJob);
+
+// True (with a status message) while a sync is running.
+static bool syncBusy()
+{
+  if (!syncWorker.outstanding())
+    return false;
+  setStatus("Wait for the sync to finish", true);
+  return true;
+}
+
+// Polled once per frame from flushPendingAdjust.
+static void collectSyncJob()
+{
+  auto r = syncWorker.collect();
+  if (!r)
+    return;
+  size_t ok = 0, bad = 0;
+  std::string firstErr;
+  for (const SyncOutcome &o : r->items)
+  {
+    if (o.ok)
+    {
+      ++ok;
+      filmMarkEdited(o.path); // the strip's "has edits" dot
+    }
+    else if (++bad == 1)
+      firstErr = baseName(o.path) + ": " + o.error;
+  }
+  if (bad == 0)
+    setStatus("Synced settings to " + std::to_string(ok) + " photo(s)", false);
+  else
+    setStatus("Synced " + std::to_string(ok) + ", skipped " +
+                  std::to_string(bad) + " (" + firstErr + ")",
+              true);
+}
+
+// Image > Sync Settings to Selected.
+static void syncSettings()
+{
+  if (state.dragging || !state.original || syncBusy())
+    return;
+  const FilmStrip &f = state.film;
+  SyncJob job;
+  for (size_t i = 0; i < f.files.size(); ++i)
+    if (f.files[i].selected && static_cast<int>(i) != f.current)
+      job.paths.push_back(f.files[i].path);
+  if (job.paths.empty())
+  {
+    setStatus("Select other photos in the filmstrip first (Ctrl+click, Shift+click)",
+              true);
+    return;
+  }
+  job.look = state.adjust.currentPreset(std::string());
+  const size_t n = job.paths.size();
+  syncWorker.submit(std::move(job));
+  setStatus("Syncing settings to " + std::to_string(n) + " photo(s)...", false);
+}
+
 // BEGIN filmstrip
 // ---------------- Filmstrip: the folder's pictures ----------------
 // A strip under the canvas with a thumbnail of every JPEG / PNG in the open
@@ -1947,7 +2122,7 @@ static void filmOpenIndex(int i)
 {
   FilmStrip &f = state.film;
   if (i < 0 || static_cast<size_t>(i) >= f.files.size() || i == f.target ||
-      state.dragging)
+      state.dragging || syncBusy())
     return;
   f.target = i;
   f.dirty = true;
@@ -1975,10 +2150,58 @@ static void filmScrollBy(float dx)
   state.film.dirty = true;
 }
 
-static void filmClick(float localX)
+static void filmClearSelection()
 {
-  const FilmStrip &f = state.film;
+  for (FilmEntry &e : state.film.files)
+    e.selected = false;
+  state.film.dirty = true;
+}
+
+static void filmSelectAll()
+{
+  for (FilmEntry &e : state.film.files)
+    e.selected = true;
+  state.film.dirty = true;
+}
+
+// Plain click opens a picture (and clears the selection). Ctrl+click toggles
+// one picture in the selection, Shift+click selects the range from the last
+// one clicked. The open picture joins the selection the first time, so it is
+// part of the range.
+static void filmClick(float localX, const KeyModifiers &mods)
+{
+  FilmStrip &f = state.film;
+  const int n = static_cast<int>(f.files.size());
   const int i = static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
+  if (i < 0 || i >= n)
+    return;
+  if (mods.ctrl || mods.shift)
+  {
+    const int base = f.current >= 0 ? f.current : i;
+    const bool any = std::any_of(f.files.begin(), f.files.end(),
+                                 [](const FilmEntry &e)
+                                 { return e.selected; });
+    if (!any)
+      f.files[static_cast<size_t>(base)].selected = true;
+    if (mods.shift)
+    {
+      const int a = f.anchor >= 0 && f.anchor < n ? f.anchor : base;
+      for (FilmEntry &e : f.files)
+        e.selected = false;
+      for (int k = std::min(a, i); k <= std::max(a, i); ++k)
+        f.files[static_cast<size_t>(k)].selected = true;
+    }
+    else
+    {
+      FilmEntry &e = f.files[static_cast<size_t>(i)];
+      e.selected = !e.selected;
+      f.anchor = i;
+    }
+    f.dirty = true;
+    return;
+  }
+  filmClearSelection();
+  f.anchor = i;
   filmOpenIndex(i);
 }
 
@@ -1996,6 +2219,8 @@ static bool filmstripShown()
 // File > Open Folder: lists the folder and opens its first picture.
 static void openFolder()
 {
+  if (syncBusy())
+    return;
   auto dir = openFolderPicker("Open Folder");
   if (!dir)
     return; // user cancelled
@@ -2035,6 +2260,14 @@ static void paintFilmstrip(CanvasContext &ctx)
     {
       ctx.setFillColor(kColorActivityActive);
       ctx.fillRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+    }
+    else if (e.selected)
+    { // picked for Sync Settings
+      ctx.setFillColor(kColorTrack);
+      ctx.fillRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+      ctx.setStrokeColor(kColorAccent);
+      ctx.setLineWidth(1.0f);
+      ctx.strokeRect(cx + 2, 2, kFilmCellW - 4, H - 4);
     }
     const float bx = cx + (kFilmCellW - kFilmThumbW) / 2.0f, by = 6.0f;
     if (e.thumb)
@@ -2127,6 +2360,8 @@ static void collectDecodeJob()
 
 static void openImage()
 {
+  if (syncBusy())
+    return;
   auto paths = openFilesPicker(
       "Open Images",
       {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
@@ -3349,6 +3584,41 @@ static void filterPresetNameField(const std::string &typed)
     gPresetNameState->cursor = std::min(gPresetNameState->cursor, s.size());
     gPresetNameState->dirty = true;
   }
+}
+
+// ---------------- Copy / Paste Settings ----------------
+// Same payload as a preset (the look only), kept in memory instead of a file.
+static std::optional<Preset> gSettingsClip;
+static std::string gSettingsClipFrom;
+
+static void copySettings()
+{
+  if (!state.original)
+    return;
+  gSettingsClip = state.adjust.currentPreset(std::string());
+  gSettingsClipFrom = baseName(state.imagePath);
+  setStatus("Copied settings from " + gSettingsClipFrom, false);
+}
+
+static void pasteSettings()
+{
+  if (state.dragging || !state.original)
+    return;
+  if (!gSettingsClip)
+  {
+    setStatus("Copy settings from a photo first", true);
+    return;
+  }
+  Preset p = *gSettingsClip;
+  p.name = "Pasted"; // History shows "Preset: Pasted"
+  if (!state.adjust.applyPreset(p))
+  {
+    setStatus("Already has these settings", false);
+    return;
+  }
+  state.markAdjustDirty();
+  state.markDirty();
+  setStatus("Pasted settings from " + gSettingsClipFrom, false);
 }
 
 static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
@@ -5397,6 +5667,7 @@ static void flushPendingAdjust()
   collectGeometryJob(); // a finished background geometry rebuild, if any
   collectDecodeJob();   // a finished background file decode, if any
   collectSegmentJob();
+  collectSyncJob();  // a finished Sync Settings batch, if any
   autosaveSidecar(); // a finished change, once the mouse is released
   if (!state.adjustDirty)
     return;
@@ -6258,6 +6529,8 @@ int main()
                          { ui.wake(); });
   segmentWorker.setNotify([&ui]
                           { ui.wake(); });
+  syncWorker.setNotify([&ui]
+                       { ui.wake(); });
 
   // ---- Keyboard shortcuts ----
   // LiteUI's addShortcut is global: it fires whatever has focus, so these work
@@ -6300,10 +6573,15 @@ int main()
     auto zoomOut = []
     { setZoom(state.zoom / kZoomStep); };
 
+    ui.addShortcut(ctrlShift, Key::C, notTyping(copySettings));
+    ui.addShortcut(ctrlShift, Key::V, notTyping(idle(pasteSettings)));
+
     ui.addShortcut(ctrl, Key::Z, idle(undo));
     ui.addShortcut(ctrl, Key::Y, idle(redo));
     ui.addShortcut(ctrlShift, Key::Z, idle(redo));
     ui.addShortcut(ctrl, Key::O, idle(openImage));
+    ui.addShortcut(ctrlShift, Key::S, notTyping(idle(syncSettings)));
+    ui.addShortcut(ctrl, Key::A, notTyping(filmSelectAll));
     ui.addShortcut(ctrl, Key::E, idle(exportImage));
     ui.addShortcut(ctrl, Key::Q, [&ui]
                    { ui.requestClose(); });
@@ -6432,6 +6710,10 @@ int main()
                       { applyGeoOp(GeoOp::FlipH); }},
                      {"Flip Vertical", []
                       { applyGeoOp(GeoOp::FlipV); }},
+                     {"Copy Settings", copySettings, "Ctrl+Shift+C"},
+                     {"Paste Settings", pasteSettings, "Ctrl+Shift+V"},
+                     {"Select All Photos", filmSelectAll, "Ctrl+A"},
+                     {"Sync Settings to Selected", syncSettings, "Ctrl+Shift+S"},
                  }));
 
   View undoRedoGap;
@@ -8313,8 +8595,8 @@ int main()
     state.film.dirty = false;
     return d;
   };
-  filmstrip.onPressAt = [](float lx, float)
-  { filmClick(lx); };
+  filmstrip.onPressAt = [&ui](float lx, float)
+  { filmClick(lx, ui.modifiers()); };
   filmstrip.onScrollUp = []
   { filmScrollBy(-2.0f * kFilmCellW); };
   filmstrip.onScrollDown = []
@@ -8534,5 +8816,6 @@ int main()
   decodeWorker.shutdown();   // ditto (waits out a decode still running)
   thumbWorker.shutdown();    // ditto
   segmentWorker.shutdown();
+  syncWorker.shutdown(); // ditto (finishes the batch it is writing)
   return 0;
 }

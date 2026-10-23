@@ -13,6 +13,7 @@ This page describes what is in that file, when it is written and read, and how l
 | File handling and the top-level wrapper (`app`, `version`, `image`): when to save, the temp-file-and-rename write, the version, size and picture-size checks on load | `main.cpp`, next to `openImage` (`saveSidecar`, `loadSidecar`, `autosaveSidecar`, `flushSidecar`) |
 | `AdjustmentSet::toJson()` / `loadJson()` | `adjustment_set.hpp` (thin wrappers around `sidecar.hpp`) |
 | The separate **preset** file (a saved look, see [Presets](#presets-a-related-file) below) | `preset.hpp`, which reuses the readers and writers in `sidecar.hpp` |
+| Putting a look into **another picture's** sidecar without opening it (Sync Settings, see [below](#syncing-a-look-onto-other-pictures)) | `sidecarSyncLook` in `sidecar.hpp`; the file reading, atomic write and worker are in `main.cpp` (`readSidecarText`, `writeTextAtomic`, `runSyncJob`) |
 
 ## What the file contains
 
@@ -69,6 +70,7 @@ Brush strokes and object-selection bitmaps are saved too. A photo with many stro
 - **Written** after any change (once no mouse drag is in progress; applying a preset counts as a change), when another picture replaces this one, and when the app closes.
 - **Written safely:** to a temporary file first, then renamed over the real one, so a crash can never leave half a file.
 - **If saving fails** (a read-only folder, for example) the status bar says "Couldn't save edits...". The change still counts as seen, so a failing disk is not retried every frame, only on the next edit. After a successful save the picture's thumbnail in the filmstrip gets its "has edits" dot.
+- **Written for other pictures** by Sync Settings: the sidecars of the pictures selected in the filmstrip are rewritten in the background (see [below](#syncing-a-look-onto-other-pictures)). The open picture is never one of them.
 - **Not written** if you opened a picture and changed nothing.
 - **Read** when the picture is opened. A missing file is normal.
 - **The undo history is not saved.** It starts fresh each time the picture is opened.
@@ -128,10 +130,26 @@ Things that differ from a sidecar:
 - The `name` is cleaned on load (printable ASCII only, trimmed, at most 32 characters). If it is missing, the file name is used.
 - Applying a preset copies its values into the picture's edits. The picture's sidecar then stores those **values**, not the preset: reopening the picture shows the same look, but nothing records that it came from a preset, and later changes to the preset file never affect pictures it was applied to.
 
+## Syncing a look onto other pictures
+
+**Image > Sync Settings to Selected** (Ctrl+Shift+S) copies the open picture's look (sliders, curves, Color Mixer, Color Grading: the same four groups a preset holds) onto the pictures selected in the filmstrip. Those pictures are not open, so nothing goes through `AdjustmentSet`: their sidecar files are rewritten directly by `sidecarSyncLook`, a pure function in `sidecar.hpp`. It takes the picture's current sidecar text and returns the new text. How it decides:
+
+- **No sidecar yet:** a new file is made. It must record the picture's size, so the background job decodes the picture once and uses its upright size (a camera's quarter turn swaps width and height).
+- **A sidecar exists:** its recorded `image.width` and `image.height` are used, so no decode is needed. The file is read through `sidecarEditsFromJson`, **only the four look groups are replaced**, and the whole thing is written back through `sidecarEditsToJson`. The picture's own crop, rotation, straighten angle and masks are kept, so a crop that suits one photo is never pushed onto another.
+- **A file that can't be trusted is never overwritten.** The picture is *skipped*, and the status bar says why, when the file is not valid JSON or not an object, is from a newer version (or has none), has no picture size, was written for a different size than the one given, or has an `edits` part that can't be loaded. The edits in such a file might still be recoverable by hand, so syncing leaves it alone.
+- The rewritten file is validated and clamped by the same loader as an opened one. That is what keeps a hand-edited sidecar from carrying bad values across a sync.
+
+The result is the same file the app would write if you had opened the picture, applied the look and closed it, except that there is no undo step: the picture's history is not saved, and it starts fresh when the picture is next opened. Syncing the same look twice produces an identical file. Thumbnails of synced pictures get the "has edits" dot at once, but, as for any picture that is not open, they show the look only after the picture has been opened and left.
+
+The batch runs on a worker that is never cancelled, and opening pictures waits until it is done; see [threading.md](threading.md#the-sync-worker-is-a-batch-that-is-never-superseded).
+
+**Copy and Paste Settings** (Ctrl+Shift+C / V) work on the open picture only, hold the look in memory (not a file, and not kept after the app closes), and apply it as a preset step. See [undo-and-history.md](undo-and-history.md#copy-and-paste-settings).
+
 ## Changing the format
 
 - `kSidecarVersion` (currently 1) is written to every file by `saveSidecar` and checked by `loadSidecar`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
 - The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values in sidecars **and in saved presets** (see [extending.md](extending.md)).
 - Adding a field is safe if the loader gives it a default and clamps it.
+- **Every field must be written by `sidecarEditsToJson` and read by `sidecarEditsFromJson`.** Sync Settings reloads a picture's sidecar and writes it back, so a field that only the app's own code kept (and the loader dropped) would be lost from every picture it syncs onto.
 - A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`. Presets do not store masks, so they need no change.
 - A change to the slider, curve, Mixer or grading forms reaches presets too, because they share the same functions. Presets have their own `kPresetVersion`; bump it only for a change an older reader could not handle safely.

@@ -552,6 +552,95 @@ static void testFuzz()
   CHECK(loaded > 1000); // most of the damaged files still parse and load, so the checks above ran on them
 }
 
+// ------------------------------------------------------------ sync a look
+static std::string fileText(const SidecarEdits &e, int w, int h, int version = kSidecarVersion)
+{
+  Json img = Json::object();
+  img.set("name", Json::str("a.jpg"));
+  img.set("width", Json::num(w));
+  img.set("height", Json::num(h));
+  Json root = Json::object();
+  root.set("app", Json::str("literoom"));
+  root.set("version", Json::num(version));
+  root.set("image", std::move(img));
+  root.set("edits", sidecarEditsToJson(e));
+  return root.dump();
+}
+
+// Reads a whole sidecar file (wrapper + edits) back.
+static bool loadFile(const std::string &text, SidecarEdits *e, int w, int h)
+{
+  Json root;
+  std::string err;
+  if (!Json::parse(text, &root, &err) || !root.isObject())
+    return false;
+  const Json *edits = root.find("edits");
+  return edits && sidecarEditsFromJson(*edits, w, h, e);
+}
+
+static void testSyncLook()
+{
+  AdjValues v{};
+  v[static_cast<size_t>(AdjId::Exposure)] = 25.0f;
+  CurveSet cs = identityCurves();
+  cs[0] = CurvePoints{{0, 0}, {100, 140}, {255, 255}};
+  MixValues mix{};
+  mix[0] = 12.0f;
+  ColorGrade grade;
+  grade.blending = 71.0f;
+
+  std::string out, err;
+
+  // A picture with no sidecar yet: the size must be given.
+  CHECK(!sidecarSyncLook("", "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+  CHECK(!err.empty());
+  CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  SidecarEdits fresh;
+  CHECK(loadFile(out, &fresh, 400, 300));
+  CHECK(fresh.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
+  CHECK(fresh.curves[0] == cs[0]);
+  CHECK(fresh.mix[0] == 12.0f);
+  CHECK(fresh.grade.blending == 71.0f);
+  CHECK(fresh.crop.empty());
+  CHECK(fresh.masks.empty());
+
+  // A picture with edits: the look is replaced, geometry and masks stay.
+  const SidecarEdits old = rich();
+  const std::string oldText = fileText(old, 400, 300);
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err)); // size from the file
+  SidecarEdits e;
+  CHECK(loadFile(out, &e, 400, 300));
+  CHECK(e.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
+  CHECK(e.values[static_cast<size_t>(AdjId::Exposure)] != old.values[static_cast<size_t>(AdjId::Exposure)]);
+  CHECK(e.curves[0] == cs[0]);
+  CHECK(e.curves[2] == identityCurve()); // replaced, not merged
+  CHECK(e.mix[0] == 12.0f);
+  CHECK(e.grade.blending == 71.0f);
+  CHECK(e.crop == old.crop && e.orient == old.orient && e.angle == old.angle && e.expand == old.expand);
+  CHECK(e.masks.size() == old.masks.size());
+  CHECK(!e.masks.empty());
+
+  // Same size given and recorded: fine. A different size: refused.
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  out = "untouched";
+  CHECK(!sidecarSyncLook(oldText, "a.jpg", 500, 300, v, cs, mix, grade, &out, &err));
+  CHECK(out == "untouched");
+  CHECK(!err.empty());
+
+  // Files that can't be trusted are refused, never overwritten.
+  CHECK(!sidecarSyncLook("not json", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  CHECK(!sidecarSyncLook("[1,2]", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  CHECK(!sidecarSyncLook(fileText(old, 400, 300, kSidecarVersion + 1), "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  CHECK(!sidecarSyncLook("{\"version\":1,\"edits\":{}}", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err)); // no image size
+  CHECK(out == "untouched");
+
+  // Syncing twice with the same look gives the same file.
+  std::string again;
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+  CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, &again, &err));
+  CHECK(again == out);
+}
+
 int main()
 {
   testRoundTrip();
@@ -563,5 +652,6 @@ int main()
   testBrushAndRanges();
   testObjectMaps();
   testFuzz();
+  testSyncLook();
   return finish();
 }
