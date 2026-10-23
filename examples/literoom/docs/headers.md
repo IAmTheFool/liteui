@@ -40,7 +40,7 @@ Every header sits under `src/`, which is the include root, so a header is always
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram` |
-| `io/` | `sidecar`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
+| `io/` | `sidecar`, `preset`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
 | `workers/` | `latest_worker`, `thumb_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
@@ -163,7 +163,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 ### `adjustment_set.hpp`
 `AdjustmentSet`: the live value of every edit, the undo/redo history, the History labels, the sidecar JSON and the `RenderParams`. No UI, no pixels. See [undo-and-history.md](undo-and-history.md).
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `preset.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
 
 **Constants:** `kMaxUndoSteps` (`size_t`, 200): the history holds the baseline plus at most this many steps (so `historySize()` is at most 201); older steps are dropped as new edits come in.
 
@@ -173,7 +173,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
 - Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
 
-**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list.
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
 
 **Read access**
 
@@ -222,6 +222,17 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 **`void setMasks(const MaskSet &m, int key)`**
 - Commits a new mask list (add, delete, move, edit a slider...). `key` works as in `setGrade`; callers pack the mask index into it so two masks never share a step. No-op if equal (mask equality is cheap: object bitmaps compare by id). **`void endMaskEdit()`** closes the drag.
 
+**Presets** (see [`preset.hpp`](#presethpp); a preset is the *look* only, so crop, orientation, straighten angle and masks are never part of it)
+
+**`Preset currentPreset(const std::string &name) const`**
+- Returns the current slider values, the four curves, the 24 Mixer values and the grade as a `Preset`. `name` goes through `sanitizePresetName`, so it may come back shorter, trimmed or empty. Does not touch the history or `version()`.
+
+**`bool applyPreset(const Preset &p)`**
+- **Replaces the whole look** with `p` as **one undo step**. A slider the preset does not set (its value is 0) is reset to 0, not left alone; this is "replace", not "merge". Crop, orientation, angle, corner mode and masks are not touched.
+- Each slider value is run through `sanitizedValue` (clamped to its range, NaN/infinity become 0), so a hand-built `Preset` cannot put an out-of-range slider in. The curves, Mixer values and grade are taken **as given**: a `Preset` that came from `presetFromJson` already satisfies the editor's rules (see `sidecarCurveFromJson`), but a hand-built one must keep them itself.
+- Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders, the curves, the Mixer values and the grade all equal the current ones. Otherwise returns true.
+- The step is always its own: it goes through `pushStep()`, which ends any slider/curve/Mixer/grade/mask drag, so the next slider touch starts a fresh step rather than overwriting the preset step. Its label is `"Preset: <name>"` (the name sanitized again), or just `"Preset"` if the name is blank. The label is stored in the new snapshot, so it survives undo, redo and History jumps, and it stays even if the preset *file* is later deleted: history holds a full copy of the look, never a link to the file.
+
 **Loading, saving and resetting**
 
 **`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
@@ -239,7 +250,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
 - **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
 
-**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). The **first** difference found wins, checked in this order:
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset` sets one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
 1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
 2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
 3. `Tone Curve: RGB / Red / Green / Blue`.
@@ -1247,7 +1258,7 @@ Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the 
 ## Saving and files
 
 ### `sidecar.hpp`
-The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`.
+The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`. `preset.hpp` reuses the per-group functions (`sidecarAdjToJson` / `FromJson`, the curve, Mixer and grade ones), so a preset is validated and clamped exactly like a saved edit.
 
 **Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`. No UI. **Test:** `sidecar_test`.
 
@@ -1313,6 +1324,66 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 - Inputs: the parsed JSON, the picture's original size (needed to check the crop), and the output.
 - Returns: false (and leaves `*out` untouched) only if `o` isn't an object or `origW`/`origH` aren't positive. Anything wrong inside is dropped or clamped instead.
 - Details: `rotate` is rounded into 0..3; `angle` clamped to ±`kAngleMax`. The crop is kept only if it has four numbers, positive `w`/`h`, and fits inside the oriented, straightened size (a quarter turn swaps width and height first, then `rotatedDims` with the angle and `keepFullCanvas`). At most `kMaxMasks` masks are loaded.
+
+### `preset.hpp`
+Presets: a saved **look** (slider values, the four tone curves, the Color Mixer and Color Grading) that can be applied to any picture. Crop, orientation, straighten angle and masks are **not** part of a preset, because they belong to one picture. Pure functions on plain values plus small file helpers; no UI, no editor state. Loading goes through the sidecar readers, so a hand-edited or damaged preset can never put the editor in a state its own UI couldn't reach. `AdjustmentSet::currentPreset` / `applyPreset` are the bridge to the edit state; the Presets pane in `main.cpp` is the UI. See [undo-and-history.md](undo-and-history.md) for how applying one appears in History.
+
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `file_utils.hpp`, `minijson.hpp`, `sidecar.hpp` (all at or below `io/`). No UI. **Test:** `preset_test`; the undo behavior is covered in `adjustment_set_test` (`testPresets`). **Thread model:** no shared state, so every function is safe from any thread; the app calls them from the UI thread only.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kPresetVersion` | `int` | 1 | Written to every file; a file with a missing, lower-than-1 or higher version is refused |
+| `kPresetExt` | `const char *` | `".literoom-preset.json"` | Appended to the file-name stem |
+| `kPresetNameMax` | `size_t` | 32 | Longest preset name kept |
+| `kPresetMaxFileBytes` | `size_t` | 2^20 (1 MiB) | Larger files are refused (a real preset is a few hundred bytes) |
+| `kPresetMaxFiles` | `size_t` | 500 | Most files `listPresetFiles` returns |
+
+**Types:** `struct Preset { std::string name; AdjValues values{}; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; }` with a defaulted `operator==` (all five fields). A default `Preset` is the neutral look with no name.
+
+**File layout** (written by `presetToJson`): `{ "app": "literoom", "kind": "preset", "version": 1, "name": "...", "adjust": {...}, "curves": {...}, "colorMix": {...}, "colorGrading": {...} }`. The last four use exactly the sidecar's forms (see `sidecar.hpp`): sliders keyed by **label** with zero sliders left out, identity curves left out, and so on. A neutral look therefore has four empty groups. Because `adjust` is keyed by slider label, **renaming a slider label orphans it in saved presets** just as it does in sidecars.
+
+**Functions**
+
+**`inline std::string sanitizePresetName(const std::string &s)`**
+- Returns: `s` reduced to printable ASCII (bytes `0x20..0x7E` only, so control characters, DEL and every non-ASCII byte are dropped), trimmed of leading and trailing spaces, and cut to `kPresetNameMax` characters (re-trimmed after the cut). May return an empty string. The app's `TextInput` is ASCII-only, which is why non-ASCII is not kept.
+
+**`inline bool presetNameBlank(const std::string &s)`**: true if `sanitizePresetName(s)` is empty.
+
+**`inline std::string presetFileStem(const std::string &name)`**
+- Returns: a safe file-name stem for `name`: the sanitized name with each of `< > : " / \ | ? *` replaced by `_`, trailing dots and spaces removed, and the Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, any case) prefixed with `_`. Blank input gives `"preset"`.
+- Gotcha: the mapping is not one-to-one. `"a/b"` and `"a_b"` share a stem, so saving one overwrites the other's file (the name stored *inside* the file stays as given), and on a case-insensitive file system so do `"Warm"` and `"warm"`.
+
+**`inline mj::Json presetToJson(const Preset &p)`**: the file layout above. The name is sanitized on the way out.
+
+**`inline bool presetFromJson(const mj::Json &o, Preset *out)`**
+- Inputs: a parsed JSON value and the output.
+- Returns: false (and leaves `*out` untouched) if `o` isn't an object, `kind` is missing or not the string `"preset"`, or `version` is not a number from 1 to `kPresetVersion` (a string `"1"` is refused). The `app` key is not checked. Otherwise true.
+- Details: nothing inside is trusted. Sliders are clamped to their ranges, a non-number becomes 0, a curve that breaks the editor's rules becomes the identity curve, Mixer and grade values are clamped (all by the `sidecar*FromJson` functions). A missing or invalid `name` gives an empty name; `loadPresetFile` fills it from the file name.
+
+**`inline std::string presetDir()`**
+- Returns: where presets are kept: `%APPDATA%\Literoom\presets` on Windows; `$XDG_CONFIG_HOME/literoom/presets` or `~/.config/literoom/presets` elsewhere; the relative folder `presets` if no home can be found. Does not create the folder.
+- Gotcha: on Windows `%APPDATA%` comes from the environment in the system code page, not UTF-8, so a profile path with non-ASCII characters may not round-trip through `fsPath`.
+
+**`inline std::string presetPath(const std::string &dir, const std::string &name)`**: `dir + "/" + presetFileStem(name) + kPresetExt`.
+
+**`inline bool savePresetFile(const std::string &dir, const Preset &p, std::string *err, std::string *pathOut = nullptr)`**
+- Inputs: the folder, the preset, an optional error string (may be null), and an optional output for the path written.
+- Returns: true on success. Refuses (false, `*err` = `"give the preset a name"`) if the name is blank after sanitizing.
+- Details: creates the folder (and parents) if needed, then writes with `writeFileAtomic` (temp file and rename), so an interrupted save never leaves half a file. A preset whose stem matches an existing file **overwrites it** without asking. Other failures set `*err` to the file system's message or `"couldn't write <name>"`.
+
+**`inline bool loadPresetFile(const std::string &path, Preset *out, std::string *err)`**
+- Returns: true and fills `*out`; on any failure returns false with `*out` untouched and `*err` set to one of: `"couldn't read <file>"` (unreadable or empty), `"<file> is too large for a preset"` (over `kPresetMaxFileBytes`), `"<file>: <parse message>"` (not valid JSON), or `"<file> is not a Literoom preset"` (`presetFromJson` refused it).
+- Details: if the file has no usable name, the name becomes the file name without `kPresetExt`, sanitized.
+
+**`inline std::vector<std::string> listPresetFiles(const std::string &dir)`**
+- Returns: file names (UTF-8, no directory part) of regular files directly in `dir` whose lower-cased name is longer than, and ends with, `kPresetExt`, in natural order (ties broken by plain comparison, like `listImageFiles`). Sub-folders and other files are skipped. A missing or unreadable folder gives `{}`.
+- Cap behavior: at most `kPresetMaxFiles` names are collected **before** sorting, so a folder with more yields an arbitrary subset, sorted (the same rule as `listImageFiles`). The app shows at most 24 anyway (`kPresetRows` in `main.cpp`).
+
+**`inline bool deletePresetFile(const std::string &path)`**: true if the file was removed; false if it did not exist or couldn't be removed.
+
+**In the app** (`main.cpp`, not this header): the Presets activity keeps a cache of the folder's presets, re-read when the pane is opened and after each save or delete (never per frame). Clicking a row calls `AdjustmentSet::applyPreset`; "Save current look" calls `savePresetFile` with `currentPreset(name)`; unreadable files are skipped silently. While the name field has focus, `typingInTextField()` is true so plain-key shortcuts stand down.
 
 ### `minijson.hpp`
 A tiny JSON value, writer and parser (UTF-8, no dependencies), plus base64 and byte run-length helpers. Everything is in `namespace mj`. Used for the edit sidecar.

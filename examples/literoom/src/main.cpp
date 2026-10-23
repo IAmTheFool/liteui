@@ -52,6 +52,7 @@
 
 // saving and files
 #include "io/file_utils.hpp"
+#include "io/preset.hpp"
 #include "io/minijson.hpp"
 #include "io/exif.hpp"
 #include "io/image_meta.hpp"
@@ -122,6 +123,10 @@ constexpr float kPlaceholderH = 600.0f;
 
 // Activity id of the History panel (see the activities list in main).
 constexpr int kHistoryActivity = 9;
+// Activity id of the Presets panel, and how many preset rows it can show (the
+// view tree is built once, like the mask and history lists).
+constexpr int kPresetsActivity = 10;
+constexpr size_t kPresetRows = 24;
 
 // Masks, UI side: tint-bitmap sizes and overlay handle sizes. The engine
 // constants live next to their algorithms: mask_geom.hpp (radii), mask_brush.hpp,
@@ -3191,13 +3196,16 @@ static void maskEditDiscrete(const std::function<void(Mask &)> &fn)
 // The TextInput keeps its text in a shared state; we hold a pointer to it so
 // the field can follow the selected mask (selection change, undo / redo).
 static std::shared_ptr<TextInputState> gMaskNameState;
+// The Presets pane's name field (see "Presets" below).
+static std::shared_ptr<TextInputState> gPresetNameState;
 
-// True while the name field has keyboard focus: the global shortcuts that
+// True while a name field has keyboard focus: the global shortcuts that
 // would also fire on plain keys (Y, J, Left, Right, Delete...) must stand
 // down, or typing a name would toggle views and Delete would delete the mask.
 static bool typingInTextField()
 {
-  return gMaskNameState && gMaskNameState->focused;
+  return (gMaskNameState && gMaskNameState->focused) ||
+         (gPresetNameState && gPresetNameState->focused);
 }
 
 // Makes the field show the selected mask's name. Cheap; polled from the
@@ -3230,6 +3238,117 @@ static void renameSelectedMask(const std::string &typed)
   maskEdit(selMask(), [&](Mask &m)
            { m.name = s; }, kMaskCtlName);
   state.markDirty();
+}
+
+// ---------------- Presets ----------------
+// A preset is a saved look (sliders, curves, Color Mixer, Color Grading; see
+// io/preset.hpp). They live as small files in presetDir(); the list below is a
+// cache of what is there, re-read when the pane is opened and after every save
+// or delete (never per frame).
+struct PresetEntry
+{
+  std::string name;
+  std::string path;
+  Preset preset;
+};
+static std::vector<PresetEntry> gPresets;
+static int gPresetSel = -1; // the last preset clicked, or -1
+
+static void refreshPresets(const std::string &select = std::string())
+{
+  gPresets.clear();
+  gPresetSel = -1;
+  const std::string dir = presetDir();
+  for (const std::string &fn : listPresetFiles(dir))
+  {
+    if (gPresets.size() >= kPresetRows)
+      break;
+    Preset p;
+    std::string err;
+    if (!loadPresetFile(dir + "/" + fn, &p, &err))
+      continue; // a damaged file is skipped, not fatal
+    gPresets.push_back({p.name, dir + "/" + fn, std::move(p)});
+    if (!select.empty() && gPresets.back().name == select)
+      gPresetSel = static_cast<int>(gPresets.size()) - 1;
+  }
+}
+
+// Replaces the look with preset i: one undo step, "Preset: <name>" in History.
+// Crop, rotation and masks are not touched.
+static void applyPresetEntry(size_t i)
+{
+  if (state.dragging || !state.original || i >= gPresets.size())
+    return;
+  gPresetSel = static_cast<int>(i);
+  const PresetEntry &e = gPresets[i];
+  if (!state.adjust.applyPreset(e.preset))
+  {
+    setStatus("Already looks like \"" + e.name + "\"", false);
+    return;
+  }
+  state.markAdjustDirty(); // re-render through the normal (drag-safe) path
+  state.markDirty();
+  setStatus("Applied preset: " + e.name, false);
+}
+
+// Saves the current look under the name typed in the field.
+static void saveCurrentPreset()
+{
+  if (!state.original)
+    return;
+  const std::string name =
+      sanitizePresetName(gPresetNameState ? gPresetNameState->text : std::string());
+  if (name.empty())
+  {
+    setStatus("Type a name for the preset first", true);
+    return;
+  }
+  std::string err;
+  if (!savePresetFile(presetDir(), state.adjust.currentPreset(name), &err))
+  {
+    setStatus("Couldn't save preset: " + err, true);
+    return;
+  }
+  refreshPresets(name);
+  if (gPresetNameState)
+  {
+    gPresetNameState->text.clear();
+    gPresetNameState->cursor = 0;
+    gPresetNameState->scrollOffset = 0.0f;
+    gPresetNameState->dirty = true;
+  }
+  setStatus("Saved preset: " + name, false);
+}
+
+static void deleteSelectedPreset()
+{
+  if (gPresetSel < 0 || static_cast<size_t>(gPresetSel) >= gPresets.size())
+    return;
+  const PresetEntry e = gPresets[static_cast<size_t>(gPresetSel)];
+  if (!deletePresetFile(e.path))
+  {
+    setStatus("Couldn't delete " + baseName(e.path), true);
+    return;
+  }
+  refreshPresets();
+  setStatus("Deleted preset: " + e.name, false);
+}
+
+// Keeps the name field to printable ASCII (the TextInput is ASCII-only) and
+// the preset name cap. Trimming happens on save, so typing spaces between
+// words still works.
+static void filterPresetNameField(const std::string &typed)
+{
+  std::string s;
+  for (char c : typed)
+    if (c >= 0x20 && c <= 0x7E && s.size() < kPresetNameMax)
+      s.push_back(c);
+  if (gPresetNameState && gPresetNameState->text != s)
+  {
+    gPresetNameState->text = s;
+    gPresetNameState->cursor = std::min(gPresetNameState->cursor, s.size());
+    gPresetNameState->dirty = true;
+  }
 }
 
 static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
@@ -4766,6 +4885,44 @@ static View buildMaskRow(size_t i)
   return b;
 }
 
+// One row of the Presets list. Click applies the preset (undoable).
+static View buildPresetRow(size_t i)
+{
+  View b;
+  b.style.width = Size::full();
+  b.style.height = Size::pixel(28);
+  b.style.flexShrink = 0;
+  b.style.borderRadius = 4.0f;
+  b.style.alignItems = Align::Center;
+  b.style.padding = EdgeInsets{0, 10, 0, 10};
+  b.style.overflowX = Overflow::Hidden;
+  b.style.hoverColor = kColorActivityHover;
+  b.style.display = std::function<Display()>([i]
+                                             { return state.activeActivity == kPresetsActivity &&
+                                                              i < gPresets.size()
+                                                          ? Display::Flex
+                                                          : Display::None; });
+  const auto isSel = [i]
+  { return gPresetSel == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
+                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.borderWidth =
+      std::function<float()>([isSel]
+                             { return isSel() ? 1.0f : 0.0f; });
+  b.style.borderColor = kColorDividerHover;
+  b.onClick = [i]
+  { applyPresetEntry(i); };
+
+  Text t;
+  t.label = std::function<std::string()>([i]() -> std::string
+                                         { return i < gPresets.size() ? gPresets[i].name : std::string(); });
+  t.fontSize = 13.0f;
+  t.wrap = TextWrap::NoWrap;
+  t.color = kColorTextDark;
+  b.addChild(std::move(t));
+  return b;
+}
+
 // ---------------- History panel ----------------
 // Row r shows step (n - 1 - r): newest at the top, the untouched picture at
 // the bottom. There are kMaxUndoSteps + 1 rows, shown only for steps that
@@ -6190,6 +6347,7 @@ int main()
       {0, "Info", "I"},
       {kHistoryActivity, "History", "H"},
       {1, "Adjust", "A"},
+      {kPresetsActivity, "Presets", "P"},
       {4, "Curve", "~"},
       {5, "Color Mix", "M"},
       {6, "Color Grading", "G"},
@@ -6542,6 +6700,88 @@ int main()
   }
 
   sidebar.addChild(std::move(adjustPane));
+
+  // -- "Presets" pane: saved looks. Click one to apply it (one undo step);
+  // type a name and Save to store the current look. The list is re-read from
+  // disk each time the pane is opened.
+  View presetsPane;
+  presetsPane.style.width = Size::full();
+  presetsPane.style.direction = FlexDirection::Column;
+  presetsPane.style.gap = 6.0f;
+  presetsPane.style.display = std::function<Display()>(
+      []
+      {
+        static bool wasShown = false;
+        const bool shown = state.activeActivity == kPresetsActivity;
+        if (shown && !wasShown)
+          refreshPresets();
+        wasShown = shown;
+        return shown ? Display::Flex : Display::None;
+      });
+
+  Text presetsHint;
+  presetsHint.label = std::string(
+      "A preset is a look: sliders, curves, Color Mix and Color Grading. "
+      "Crop, rotation and masks are not included. Applying one replaces the "
+      "current look and can be undone.");
+  presetsHint.fontSize = 12.0f;
+  presetsHint.color = kColorTextMuted;
+  presetsHint.style.margin = EdgeInsets{0, 0, 6, 0};
+  presetsPane.addChild(std::move(presetsHint));
+
+  {
+    TextInput ti;
+    ti.placeholder = "Name this look";
+    ti.fontSize = 13.0f;
+    ti.textColor = kColorTextDark;
+    ti.placeholderColor = kColorTextMuted;
+    ti.caretColor = kColorTextDark;
+    ti.borderColor = kColorDividerHover;
+    ti.focusedBorderColor = Color{90, 150, 235, 255};
+    ti.style.width = Size::full();
+    ti.style.height = Size::pixel(28);
+    ti.style.flexShrink = 0;
+    ti.style.borderWidth = 1.0f;
+    ti.style.borderRadius = 4.0f;
+    ti.style.backgroundColor = kColorActivityBarBg;
+    ti.onChange = [](const std::string &s)
+    { filterPresetNameField(s); };
+    ti.onSubmit = [](const std::string &)
+    { saveCurrentPreset(); }; // Enter saves, like the button
+    gPresetNameState = ti.state;
+    presetsPane.addChild(std::move(ti));
+  }
+  presetsPane.addChild(sidebarButton(
+      "Save current look", saveCurrentPreset, {}, true,
+      []
+      { return state.original != nullptr; }));
+
+  Text presetsEmpty;
+  presetsEmpty.label = std::string("No presets yet. Name the current look and save it.");
+  presetsEmpty.fontSize = 12.0f;
+  presetsEmpty.color = kColorTextMuted;
+  presetsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
+  presetsEmpty.style.display = std::function<Display()>(
+      []
+      { return gPresets.empty() ? Display::Flex : Display::None; });
+  presetsPane.addChild(std::move(presetsEmpty));
+
+  for (size_t i = 0; i < kPresetRows; ++i)
+    presetsPane.addChild(buildPresetRow(i));
+
+  presetsPane.addChild(sidebarButton(
+      "Delete selected preset", deleteSelectedPreset, {}, false,
+      []
+      { return gPresetSel >= 0 && static_cast<size_t>(gPresetSel) < gPresets.size(); }));
+
+  Text presetsFolder;
+  presetsFolder.label = "Saved in " + presetDir();
+  presetsFolder.fontSize = 11.0f;
+  presetsFolder.color = kColorTextMuted;
+  presetsFolder.style.margin = EdgeInsets{8, 0, 0, 0};
+  presetsPane.addChild(std::move(presetsFolder));
+
+  sidebar.addChild(std::move(presetsPane));
 
   // -- "Curve" pane: tone curves — RGB (master) plus per-channel R, G, B, one
   // tab each. Click the plot to add a point, drag to move it, right-click a

@@ -14,7 +14,7 @@ Literoom is split into three layers:
 
 Why split it this way? Because everything in the engine is a *plain function of plain values*. A slider value goes in, a number or a table comes out. That makes the engine easy to test without opening a window (nearly every engine header has its own unit test; the exceptions are `sam_segmenter.hpp`, which needs ONNX Runtime, and `check.hpp`, the test harness itself), and it makes it safe to run on a background thread.
 
-`main.cpp` is long (about 8,200 lines) because it holds all the UI. It reads roughly top to bottom as: layout constants and colors, the render worker, crop and filmstrip state, `EditorState`, handing worker results back to the UI thread, crop, the geometry worker, rotate/flip and straighten, opening a file (the decode worker), object segmentation, saving and loading edits, the filmstrip, small reusable widgets, one section per pane (plus the History panel and Before / After), and finally `main()` which wires up shortcuts, menus, the workers' wake-ups and the event loop.
+`main.cpp` is long (about 8,500 lines) because it holds all the UI. It reads roughly top to bottom as: layout constants and colors, the render worker, crop and filmstrip state, `EditorState`, handing worker results back to the UI thread, crop, the geometry worker, rotate/flip and straighten, opening a file (the decode worker), object segmentation, saving and loading edits, the filmstrip, small reusable widgets, one section per pane (plus the History panel, the Presets list and Before / After), and finally `main()` which wires up shortcuts, menus, the workers' wake-ups and the event loop.
 
 ## The picture pipeline
 
@@ -107,10 +107,23 @@ Luminosity and Color Range are **not spatial**: they select by the picture's own
 
 To add a new mask type, see [extending.md](extending.md).
 
+## Presets
+
+A **preset** is a saved *look*: the slider values, the four tone curves, the Color Mixer and Color Grading. It deliberately leaves out crop, rotation, straighten and masks. Those belong to one picture: a crop that suits one photo is wrong for another, and masks are stored against one original picture's size. Slider values, curves, the mixer and grading are the same for every picture, so those are what a preset holds.
+
+Presets follow the same rules as the rest of the engine:
+
+- **A plain value, in a plain header.** `io/preset.hpp` holds the `Preset` struct and its file helpers. It has no window and no editor state, and a unit test needs no UI.
+- **Saved the same way as edits.** A preset file reuses the sidecar's writers and readers, so it is validated and clamped just like a saved-edits file: a damaged or hand-edited preset can never put the editor in a state its own UI could not reach. See [sidecar-format.md](sidecar-format.md#presets-a-related-file).
+- **Applied through `AdjustmentSet`.** `applyPreset` replaces the look and is one undo step, labelled `Preset: <name>` in History. A step stores a full copy of the look, so deleting the preset file later never changes a picture or its history. See [undo-and-history.md](undo-and-history.md#presets).
+- **Nothing geometric is touched.** Because a preset holds no crop, rotation or masks, applying one never goes through the `GeoFrame`, the geometry worker or the mask caches. It only changes values the normal render path already reads, so the picture is redrawn like any other adjustment-only change: synchronously for small photos, on the background render worker for large ones (it is not a slider drag, so the fast preview path is not used).
+
+The Presets pane in `main.cpp` is a thin layer over this: a list of the files in the presets folder, a name field and a Save button. The list is a cache, re-read when the pane is opened and after a save or delete, never per frame. For the per-function details see `preset.hpp` in [headers.md](headers.md#presethpp).
+
 ## Where state lives
 
-All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md).
+All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). The one other piece of UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder). Presets themselves live in files, not in `state`; applying one copies its values into `state.adjust`.
 
 ## The rule about threads
 
-Workers never read `state` and never call LiteUI. They receive an immutable picture and a copy of the parameters, and they return a value. This is what makes the threading simple enough to reason about. Details in [threading.md](threading.md).
+Workers never read `state` and never call LiteUI. They receive an immutable picture and a copy of the parameters, and they return a value. This is what makes the threading simple enough to reason about. Details in [threading.md](threading.md). Presets need no worker: saving, loading and listing read or write a few hundred bytes, so they run on the UI thread like the sidecar's small writes.

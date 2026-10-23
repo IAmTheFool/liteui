@@ -534,6 +534,57 @@ static void testMaskTablesMatchTheGlobalOnes()
   CHECK(rp.masks[0].luts == rp.luts);
 }
 
+static void testPresets()
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 5.0f);
+  s.setCrop(CropRect{10, 10, 100, 80});
+  s.setMasks({radialMask()}, -1);
+  const size_t before = s.historySize();
+
+  Preset p;
+  p.name = "Warm Film";
+  p.values[adjIndex(AdjId::Temperature)] = 30.0f;
+  p.values[adjIndex(AdjId::Sepia)] = 20.0f;
+  p.curves[0] = CurvePoints{{0, 10}, {255, 255}};
+  p.mix[mixIndex(MixChan::Hue, 0)] = 5.0f;
+  p.grade.blending = 70.0f;
+
+  CHECK(s.applyPreset(p));
+  CHECK(s.historySize() == before + 1 && lastLabel(s) == "Preset: Warm Film");
+  CHECK(s.get(AdjId::Temperature) == 30.0f && s.get(AdjId::Sepia) == 20.0f);
+  CHECK(s.get(AdjId::Exposure) == 0.0f); // a preset replaces the whole look
+  CHECK(s.curve() == p.curves[0] && s.mix(MixChan::Hue, 0) == 5.0f && s.grade().blending == 70.0f);
+  CHECK(s.crop() == CropRect{10, 10, 100, 80} && s.masks().size() == 1); // geometry + masks kept
+
+  CHECK(s.currentPreset("Again") == [&]{ Preset q = p; q.name = "Again"; return q; }());
+  const uint64_t v = s.version();
+  CHECK(!s.applyPreset(p) && s.version() == v && s.historySize() == before + 1); // no-op: no step
+
+  s.set(AdjId::Exposure, 8.0f); // the next slider touch is its own, normally labelled step
+  CHECK(s.historySize() == before + 2 && lastLabel(s) == "Exposure +8");
+  CHECK(label(s, before) == "Preset: Warm Film"); // the preset step keeps its label
+
+  s.undo();
+  s.undo();
+  CHECK(s.get(AdjId::Exposure) == 5.0f && s.get(AdjId::Temperature) == 0.0f && s.curve() == identityCurve());
+  s.redo();
+  CHECK(s.get(AdjId::Temperature) == 30.0f);
+
+  Preset hostile; // hand-built, out of range
+  hostile.name = "";
+  hostile.values[adjIndex(AdjId::Exposure)] = 1e9f;
+  hostile.values[adjIndex(AdjId::Tint)] = std::nanf("");
+  CHECK(s.applyPreset(hostile));
+  CHECK(s.get(AdjId::Exposure) == 100.0f && s.get(AdjId::Tint) == 0.0f && lastLabel(s) == "Preset");
+
+  // survives save + load of the edits (a preset leaves nothing special behind)
+  AdjustmentSet t;
+  fresh(t);
+  CHECK(t.loadJson(s.toJson()) && t.get(AdjId::Exposure) == 100.0f);
+}
+
 int main()
 {
   testFreshState();
@@ -550,5 +601,6 @@ int main()
   testFilterSlidersReachTheColorPass();
   testMasksFollowTheGeometry();
   testMaskTablesMatchTheGlobalOnes();
+  testPresets();
   return finish();
 }

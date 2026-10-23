@@ -20,6 +20,7 @@
 #include "detail/neighbor_fx.hpp"
 #include "edit/render_params.hpp"
 #include "io/minijson.hpp"
+#include "io/preset.hpp"
 #include "io/sidecar.hpp"
 #include "mask/mask.hpp"
 
@@ -309,6 +310,43 @@ public:
       lastEdited_ = AdjId::Count;
   }
 
+  // ---- Presets ----
+  // The current look (sliders, curves, Color Mixer, Color Grading) as a Preset.
+  // Crop, orientation, straighten and masks are not part of a preset.
+  Preset currentPreset(const std::string &name) const
+  {
+    Preset p;
+    p.name = sanitizePresetName(name);
+    p.values = values_;
+    p.curves = curves_;
+    p.mix = mix_;
+    p.grade = grade_;
+    return p;
+  }
+  // Replaces the whole look with `p` as ONE undo step labelled "Preset: <name>".
+  // Crop, orientation, straighten and masks are left alone. Returns false (and
+  // adds no step) if the look is already identical. Values are sanitized again
+  // here, so a Preset built by hand can't put an out-of-range slider in.
+  bool applyPreset(const Preset &p)
+  {
+    AdjValues v = p.values;
+    for (const auto &spec : kAdjustmentSpecs)
+    {
+      const size_t k = static_cast<size_t>(spec.id);
+      v[k] = sanitizedValue(spec, v[k]);
+    }
+    if (v == values_ && p.curves == curves_ && p.mix == mix_ && p.grade == grade_)
+      return false;
+    values_ = v;
+    curves_ = p.curves;
+    mix_ = p.mix;
+    grade_ = p.grade;
+    pushStep();
+    const std::string n = sanitizePresetName(p.name);
+    history_.back().label = n.empty() ? std::string("Preset") : "Preset: " + n;
+    return true;
+  }
+
   // Fresh baseline for a newly opened image: every slider back to 0, no
   // crop, no rotation/flip, no history to undo into.
   void reset()
@@ -445,6 +483,9 @@ private:
     MixValues mix{};
     ColorGrade grade;
     MaskSet masks;
+    // Non-empty only for steps that carry their own History label (a preset);
+    // every other step is labelled by diffing it against the one before.
+    std::string label;
   };
   Snapshot snapshot() const
   {
@@ -481,6 +522,8 @@ private:
   }
   static std::string describeStep(const Snapshot &a, const Snapshot &b)
   {
+    if (!b.label.empty())
+      return b.label;
     for (const auto &s : kAdjustmentSpecs)
     {
       const size_t k = static_cast<size_t>(s.id);

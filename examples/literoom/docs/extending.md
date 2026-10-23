@@ -61,11 +61,13 @@ Once the table entry exists, these need no changes:
 - Undo, redo, and coalescing of slider drags into one step.
 - The History label ("Name +20").
 - The saved-edits file.
+- **Presets.** A preset stores sliders by label through the same table, so a new slider is saved in presets and applied by them with no preset code. A preset saved before the slider existed simply has no entry for it, which reads as 0.
 - The drag-preview path.
 
 ### Two things to watch
 
-- **The label is the saved-edits key.** Sliders are written to the sidecar under their `label`, and zero-valued sliders are left out. Renaming a label silently orphans that slider's value in existing files.
+- **The label is the saved-edits key.** Sliders are written to the sidecar, and to every saved preset, under their `label`, and zero-valued sliders are left out. Renaming a label silently orphans that slider's value in existing sidecars and presets.
+- **Applying a preset replaces the whole look.** An older preset has no entry for a slider you add later, so applying it sets that slider back to 0. That is the intended "replace" behavior (see [undo-and-history.md](undo-and-history.md#presets)), not a bug in the new slider.
 - **A new slider at 0 must change nothing.** Default values are 0, and the golden render test (see [testing.md](testing.md)) fingerprints the output. If adding a slider changes an *existing* fingerprint while the new slider is untouched, something is wrong.
 
 ## Adding a mask type
@@ -92,7 +94,7 @@ You need four things:
 
 Put the shape and its Eval in their own header in `mask/`, the way `mask_range.hpp` does, and include it from `mask/mask.hpp`, where the variants are declared. Add the new header to `LITEROOM_HEADERS` in `CMakeLists.txt`. It may include headers from `core/`, `color/` and other `mask/` headers, but never from `edit/` or `render/`, which sit above `mask/`. Its unit test goes in the first `foreach` list of `CMakeLists.txt` (see [testing.md](testing.md)).
 
-Also teach the **sidecar** about it: `sidecarShapeToJson` and `sidecarShapeFromJson` in `io/sidecar.hpp`. The loader validates and clamps everything, so keep that property for your new fields.
+Also teach the **sidecar** about it: `sidecarShapeToJson` and `sidecarShapeFromJson` in `io/sidecar.hpp`. The loader validates and clamps everything, so keep that property for your new fields. Presets do not store masks, so they need no change.
 
 ### Rules for the Eval
 

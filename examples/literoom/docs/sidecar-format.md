@@ -12,6 +12,7 @@ This page describes what is in that file, when it is written and read, and how l
 | The JSON value, writer and parser | `minijson.hpp` |
 | File handling and the top-level wrapper (`app`, `version`, `image`): when to save, the temp-file-and-rename write, the version, size and picture-size checks on load | `main.cpp`, next to `openImage` (`saveSidecar`, `loadSidecar`, `autosaveSidecar`, `flushSidecar`) |
 | `AdjustmentSet::toJson()` / `loadJson()` | `adjustment_set.hpp` (thin wrappers around `sidecar.hpp`) |
+| The separate **preset** file (a saved look, see [Presets](#presets-a-related-file) below) | `preset.hpp`, which reuses the readers and writers in `sidecar.hpp` |
 
 ## What the file contains
 
@@ -65,7 +66,7 @@ Brush strokes and object-selection bitmaps are saved too. A photo with many stro
 
 ## When it is written and read
 
-- **Written** after any change (once no mouse drag is in progress), when another picture replaces this one, and when the app closes.
+- **Written** after any change (once no mouse drag is in progress; applying a preset counts as a change), when another picture replaces this one, and when the app closes.
 - **Written safely:** to a temporary file first, then renamed over the real one, so a crash can never leave half a file.
 - **If saving fails** (a read-only folder, for example) the status bar says "Couldn't save edits...". The change still counts as seen, so a failing disk is not retried every frame, only on the next edit. After a successful save the picture's thumbnail in the filmstrip gets its "has edits" dot.
 - **Not written** if you opened a picture and changed nothing.
@@ -90,9 +91,47 @@ A sidecar can be damaged, hand-edited, written by a newer version, or written fo
 - **Save in binary mode.** The writer uses `\n` for line breaks, so open files in binary mode to avoid `\r\n` rewriting.
 - `minijson.hpp` also provides base64 and byte run-length helpers for storing binary data in a text file.
 
+## Presets (a related file)
+
+A **preset** is a saved look that can be applied to any picture. It is a different file from the sidecar, but it is built from the same pieces, so it is described here. The code is `preset.hpp`; see [headers.md](headers.md#presethpp).
+
+|  | Sidecar | Preset |
+|---|---|---|
+| Belongs to | One picture | No picture: any picture |
+| Where | Next to the picture: `photo.jpg.literoom.json` | In the presets folder: `<name>.literoom-preset.json` |
+| Wrapper | `app`, `version`, `image`, `edits` | Flat: `app`, `kind`, `version`, `name`, then the groups |
+| Contains | Sliders, curves, Color Mixer, Color Grading, **geometry and masks** | Sliders, curves, Color Mixer, Color Grading only |
+| Written when | After every change, on switching pictures, on close | Only when you press "Save current look" |
+| Size limit on load | 64 MiB | 1 MiB |
+
+The presets folder is `%APPDATA%\Literoom\presets` on Windows, and `$XDG_CONFIG_HOME/literoom/presets` or `~/.config/literoom/presets` elsewhere. The file name is made from the preset's name: characters Windows does not allow become `_`, and a few reserved names get a leading `_`. Saving a preset under a name that maps to an existing file replaces it.
+
+```json
+{
+  "app": "literoom",
+  "kind": "preset",
+  "version": 1,
+  "name": "Warm Film",
+  "adjust": { "Exposure": 12.5, "Temperature": 30 },
+  "curves": { ... },
+  "colorMix": { ... },
+  "colorGrading": { ... }
+}
+```
+
+The `adjust`, `curves`, `colorMix` and `colorGrading` groups are **exactly** the sidecar's forms: sliders keyed by label with zero ones left out, curves as `[x, y]` lists with identity curves left out, and so on. A neutral look has four empty groups.
+
+**Loading is as strict as for a sidecar.** The preset is read with the same functions, so nothing in the file is trusted: slider values are clamped, non-numbers become 0, a tone curve that breaks the editor's rules becomes a straight line, and Mixer and grading values are clamped. A file is **refused** (the picture is not changed, and the pane simply leaves it out of the list) when it is empty, larger than 1 MiB, not valid JSON, not an object, has a `kind` other than `"preset"`, or has a missing, zero or higher-than-supported `version`. The preset's `version` is its own number (`kPresetVersion`) and is not tied to `kSidecarVersion`.
+
+Things that differ from a sidecar:
+- There is no picture size to check, because a preset has no geometry and no masks.
+- The `name` is cleaned on load (printable ASCII only, trimmed, at most 32 characters). If it is missing, the file name is used.
+- Applying a preset copies its values into the picture's edits. The picture's sidecar then stores those **values**, not the preset: reopening the picture shows the same look, but nothing records that it came from a preset, and later changes to the preset file never affect pictures it was applied to.
+
 ## Changing the format
 
 - `kSidecarVersion` (currently 1) is written to every file by `saveSidecar` and checked by `loadSidecar`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
-- The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values (see [extending.md](extending.md)).
+- The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values in sidecars **and in saved presets** (see [extending.md](extending.md)).
 - Adding a field is safe if the loader gives it a default and clamps it.
-- A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`.
+- A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`. Presets do not store masks, so they need no change.
+- A change to the slider, curve, Mixer or grading forms reaches presets too, because they share the same functions. Presets have their own `kPresetVersion`; bump it only for a change an older reader could not handle safely.
