@@ -436,6 +436,68 @@ static void testBufferHandling()
   CHECK(a == b);
 }
 
+// Runs the picker's answer through the real white-balance gains and returns the
+// largest gap between the three output channels (0 = perfectly gray).
+static int grayGapAfterPick(const WbPick &w, int r, int g, int b)
+{
+  const Px out = run(pass(w.temperature, w.tint), one(r, g, b));
+  const int hi = std::max({int(out[0]), int(out[1]), int(out[2])});
+  const int lo = std::min({int(out[0]), int(out[1]), int(out[2])});
+  return hi - lo;
+}
+
+static void testWhiteBalancePicker()
+{
+  // A warm gray (R > B) needs a cooler Temperature; a spot that is already neutral needs nothing.
+  const WbPick warm = solveWhiteBalance(180, 150, 120);
+  CHECK(warm.status == WbPickStatus::Ok && warm.usable());
+  CHECK(warm.temperature == -67 && warm.tint == 14);
+  CHECK(grayGapAfterPick(warm, 180, 150, 120) <= 2);
+
+  const WbPick neutral = solveWhiteBalance(128, 128, 128);
+  CHECK(neutral.status == WbPickStatus::Ok && neutral.temperature == 0 && neutral.tint == 0);
+
+  // Directions: a blue cast warms, a green cast adds magenta (positive Tint), a magenta cast adds green.
+  CHECK(solveWhiteBalance(100, 128, 160).temperature > 0);
+  CHECK(solveWhiteBalance(120, 150, 120).tint > 0);
+  CHECK(solveWhiteBalance(140, 110, 140).tint < 0);
+
+  // Round trip over a grid of mild casts: after the picked gains the spot is gray to within rounding.
+  int solved = 0;
+  for (int r = 60; r <= 220; r += 20)
+    for (int g = 60; g <= 220; g += 20)
+      for (int b = 60; b <= 220; b += 20)
+      {
+        const WbPick w = solveWhiteBalance(static_cast<float>(r), static_cast<float>(g), static_cast<float>(b));
+        CHECK(w.status != WbPickStatus::TooDark && w.status != WbPickStatus::Clipped);
+        CHECK(w.temperature >= -100 && w.temperature <= 100 && w.tint >= -100 && w.tint <= 100);
+        if (w.status == WbPickStatus::Ok)
+        {
+          ++solved;
+          CHECK(grayGapAfterPick(w, r, g, b) <= 3);
+        }
+      }
+  CHECK(solved > 100); // plenty of the grid is reachable, so the check above really ran
+
+  // Too colored to neutralize with +/-100: still usable, flagged, and clamped to the slider range.
+  const WbPick extreme = solveWhiteBalance(230, 60, 20);
+  CHECK(extreme.status == WbPickStatus::Limited && extreme.usable());
+  CHECK(std::fabs(extreme.temperature) == 100 || std::fabs(extreme.tint) == 100);
+  CHECK(grayGapAfterPick(extreme, 230, 60, 20) < 230 - 20); // closer to gray than before
+
+  // Unusable spots.
+  CHECK(solveWhiteBalance(3, 3, 3).status == WbPickStatus::TooDark);
+  CHECK(solveWhiteBalance(200, 200, 2).status == WbPickStatus::TooDark);
+  CHECK(solveWhiteBalance(255, 255, 255).status == WbPickStatus::Clipped);
+  CHECK(solveWhiteBalance(255, 200, 190).status == WbPickStatus::Clipped);
+  CHECK(!solveWhiteBalance(255, 255, 255).usable() && !solveWhiteBalance(3, 3, 3).usable());
+  CHECK(solveWhiteBalance(std::nanf(""), 100, 100).status == WbPickStatus::TooDark);
+  CHECK(solveWhiteBalance(100, INFINITY, 100).status == WbPickStatus::TooDark);
+  // The boundaries themselves: just inside the readable range is fine.
+  CHECK(solveWhiteBalance(kWbMinLevel, kWbMinLevel, kWbMinLevel).usable());
+  CHECK(solveWhiteBalance(kWbMaxLevel - 1, kWbMaxLevel - 1, kWbMaxLevel - 1).usable());
+}
+
 int main()
 {
   testActiveFlags();
@@ -457,5 +519,6 @@ int main()
   testFilterOrderAndPlacement();
   testFilterBufferHandling();
   testBufferHandling();
+  testWhiteBalancePicker();
   return finish();
 }

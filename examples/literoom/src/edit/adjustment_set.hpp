@@ -347,6 +347,24 @@ public:
     return true;
   }
 
+  // ---- White balance picker ----
+  // Sets Temperature and Tint together as ONE undo step labelled
+  // "White Balance +12 / -4" (two set() calls would be two steps). Values are
+  // sanitized like a preset's. Returns false, adding no step, if both already
+  // have these values. Ends any drag in progress, like applyPreset.
+  bool setWhiteBalance(float temperature, float tint)
+  {
+    const float t = sanitizedValue(kAdjustmentSpecs[adjIndex(AdjId::Temperature)], temperature);
+    const float n = sanitizedValue(kAdjustmentSpecs[adjIndex(AdjId::Tint)], tint);
+    if (t == get(AdjId::Temperature) && n == get(AdjId::Tint))
+      return false;
+    values_[adjIndex(AdjId::Temperature)] = t;
+    values_[adjIndex(AdjId::Tint)] = n;
+    pushStep();
+    history_.back().label = "White Balance " + signedNum(t) + " / " + signedNum(n);
+    return true;
+  }
+
   // Fresh baseline for a newly opened image: every slider back to 0, no
   // crop, no rotation/flip, no history to undo into.
   void reset()
@@ -483,7 +501,8 @@ private:
     MixValues mix{};
     ColorGrade grade;
     MaskSet masks;
-    // Non-empty only for steps that carry their own History label (a preset);
+    // Non-empty only for steps that carry their own History label (a preset,
+    // a white-balance pick);
     // every other step is labelled by diffing it against the one before.
     std::string label;
   };

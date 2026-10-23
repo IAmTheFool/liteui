@@ -173,7 +173,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
 - Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
 
-**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step and a white-balance pick**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
 
 **Read access**
 
@@ -233,6 +233,15 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders, the curves, the Mixer values and the grade all equal the current ones. Otherwise returns true.
 - The step is always its own: it goes through `pushStep()`, which ends any slider/curve/Mixer/grade/mask drag, so the next slider touch starts a fresh step rather than overwriting the preset step. Its label is `"Preset: <name>"` (the name sanitized again), or just `"Preset"` if the name is blank. The label is stored in the new snapshot, so it survives undo, redo and History jumps, and it stays even if the preset *file* is later deleted: history holds a full copy of the look, never a link to the file.
 
+**White balance picker** (the eyedropper's edit; the math is `solveWhiteBalance` in [`color_pass.hpp`](#color_passhpp))
+
+**`bool setWhiteBalance(float temperature, float tint)`**
+- Sets **Temperature and Tint together as one undo step**. Two `set()` calls would be two steps, and `applyPreset` would replace the whole look, so the picker needs its own call.
+- Both values go through `sanitizedValue` (clamped to the slider range, NaN/infinity become 0), like a preset's.
+- Returns false, and adds **no step** and does not bump `version()`, if both sanitized values already equal the current ones. Otherwise returns true.
+- Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress and the next slider touch (even Temperature) starts a fresh step instead of overwriting the pick. Its label is `"White Balance <temperature> / <tint>"` with signed numbers (for example `White Balance -67 / +14`; a zero prints as `+0`). The label is stored in the snapshot, so it survives undo, redo and History jumps.
+- Nothing else changes: the other sliders, curves, Mixer, grade, crop, orientation and masks are left alone. The values are ordinary slider values, so the sidecar, presets, Copy / Paste and Sync Settings carry them with no extra code. The label is History-only and is not saved.
+
 **Loading, saving and resetting**
 
 **`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
@@ -250,7 +259,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
 - **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
 
-**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset` sets one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset` and `setWhiteBalance` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
 1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
 2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
 3. `Tone Curve: RGB / Red / Green / Blue`.
@@ -312,7 +321,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 ## Color
 
 ### `color_pass.hpp`
-The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization).
+The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization). Also holds `solveWhiteBalance`, the inverse of the white-balance gains, used by the app's eyedropper.
 
 **Depends on:** `color_grade.hpp`, `color_mix.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test`.
 
@@ -322,6 +331,8 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 |---|---|---|---|
 | `kHueShiftDegrees` | `float` | 90 | The Hue slider at ±100 turns colors by ±90° |
 | `kColorizeStrength` | `float` | 0.6 | Colorize Amount 100 = this fraction of the tint's chroma |
+| `kWbMinLevel` | `float` | 6 | White-balance picker: every channel of the sampled spot must be at least this (0..255), or the spot is `TooDark` |
+| `kWbMaxLevel` | `float` | 254 | White-balance picker: a channel at or above this counts as clipped (`Clipped`) |
 
 **Types**
 
@@ -391,6 +402,22 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
   9. Write back with `toU8Clamped`, once.
 - Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
+
+
+**White-balance picker types**
+
+`enum class WbPickStatus`: `Ok` (solved exactly, to slider rounding), `Limited` (the spot needs more than ±100, so the answer is clamped and the spot ends up close to gray, not exactly gray), `TooDark` (a channel is below `kWbMinLevel`, or an input is NaN/infinity), `Clipped` (a channel is at or above `kWbMaxLevel`, so its real value is lost).
+
+`struct WbPick`: `temperature` and `tint` (`float`, whole slider values in -100..100, 0 unless the status is usable), `status` (starts as `TooDark`), and `bool usable() const` (true for `Ok` and `Limited`).
+
+**`inline WbPick solveWhiteBalance(float r, float g, float b)`**
+- Finds the Temperature and Tint whose gains (the ones `makeColorPass` builds) turn the color `(r, g, b)` gray. The three inputs are 0..255 and may be an average over a small patch.
+- **What to pass in:** the color as it *reaches the color pass*: the picture after the tone tables (tone sliders and curves) and **before** any white balance. That value does not depend on the current Temperature or Tint, so the answer is absolute: picking twice at the same spot gives the same result. The final picture (what the RGB readout shows) is the wrong input, because it has already been through white balance, saturation, the Mixer, grading and the Filters.
+- Math: gray means `R·gR = G·gG = B·gB`. The luma normalization in `makeColorPass` scales all three gains alike, so it does not change ratios, and the system solves in closed form with no iteration: `t = (B − R) / (0.3 (R + B))` from `R(1 + 0.3t) = B(1 − 0.3t)`, then `n = (G − m) / (0.2 G + 0.1 m)` from `G(1 − 0.2n) = m(1 + 0.1n)`, where `m` is the average of red and blue after the temperature gains (the two are equal unless `t` was clamped, and the average then splits the leftover error). Both are scaled by 100, **rounded to whole numbers** (the sliders show integers) and clamped to ±100.
+- Status: NaN/infinity → `TooDark`. Then any channel ≥ `kWbMaxLevel` → `Clipped`, then any channel < `kWbMinLevel` → `TooDark` (checked in that order, so a spot that is both reads as clipped). Needing more than ±100 on either slider → `Limited` (still usable). Otherwise `Ok`.
+- **Keep it in step with `makeColorPass`.** The constants 0.3, 0.1 and 0.2 are repeated from the gain formulas there. If the gains change, change this function too; the `color_pass` test runs the answer back through `makeColorPass` and fails if they drift apart.
+
+**In the app** (`main.cpp`, not this header): the Adjust pane's **Pick White Balance (W)** button arms a one-click picker. See [architecture.md](architecture.md#white-balance-picker). The edit goes through `AdjustmentSet::setWhiteBalance`.
 
 ### `color_mix.hpp`
 The Color Mixer (HSL): eight hue bands × (Hue, Saturation, Luminance), baked into three per-hue tables (`MixLut`) of 720 entries (half-degree resolution). Pure math; the sliders' display colors stay with the UI.

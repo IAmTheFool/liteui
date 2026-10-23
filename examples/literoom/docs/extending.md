@@ -67,6 +67,7 @@ Once the table entry exists, these need no changes:
 
 ### Two things to watch
 
+- **The white-balance picker repeats the Temperature and Tint gain formulas.** `solveWhiteBalance` in `color/color_pass.hpp` is the inverse of the gains in `makeColorPass` (the constants 0.3, 0.1 and 0.2). If you change how Temperature or Tint act, change the solver too. The `color_pass` test (`testWhiteBalancePicker`) runs the picked values back through `makeColorPass`, so it fails if the two drift apart. A new Color slider does not need anything here unless it acts *before* the white-balance gains: the picker samples the picture after the tone tables and before the color pass.
 - **The label is the saved-edits key.** Sliders are written to the sidecar, and to every saved preset, under their `label`, and zero-valued sliders are left out. Renaming a label silently orphans that slider's value in existing sidecars and presets.
 - **Applying a preset replaces the whole look.** An older preset has no entry for a slider you add later, so applying it sets that slider back to 0. That is the intended "replace" behavior (see [undo-and-history.md](undo-and-history.md#presets)), not a bug in the new slider.
 - **Sync Settings replaces the whole look too.** Like applying a preset, it sets every look slider of the target picture to the source's value, including back to 0. That is the intended "replace" behavior.

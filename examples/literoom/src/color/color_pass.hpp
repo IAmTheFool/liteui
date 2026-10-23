@@ -252,6 +252,83 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   return cp;
 }
 
+// ---------------- White-balance picker (the eyedropper's math) ----------------
+// Given the color of a spot that should be neutral gray, finds the Temperature
+// and Tint slider values whose gains (the ones makeColorPass builds above)
+// turn that spot gray. The input must be what REACHES the color pass: the
+// picture after the tone tables and BEFORE any white balance. That value does
+// not depend on the current Temperature / Tint, so the answer is absolute, not
+// a nudge on top of what is set now.
+//
+// With t = Temperature/100 and n = Tint/100 the gains are proportional to
+//   R: (1 + 0.3 t)(1 + 0.1 n)   G: (1 - 0.2 n)   B: (1 - 0.3 t)(1 + 0.1 n)
+// (the luma normalization in makeColorPass scales all three alike, so it does
+// not change ratios). Gray means R*gR = G*gG = B*gB, which solves in closed
+// form: R(1 + 0.3 t) = B(1 - 0.3 t) gives t, then G(1 - 0.2 n) = m(1 + 0.1 n)
+// gives n, where m is the red/blue level after the temperature gains.
+enum class WbPickStatus
+{
+  Ok,      // solved exactly (to slider rounding)
+  Limited, // needs more than +/-100: clamped, so the spot ends up close to gray, not exactly gray
+  TooDark, // too little signal to read a color from
+  Clipped  // a channel is at its maximum: its true value is lost
+};
+
+struct WbPick
+{
+  float temperature = 0.0f, tint = 0.0f; // whole slider values, -100..100
+  WbPickStatus status = WbPickStatus::TooDark;
+  bool usable() const { return status == WbPickStatus::Ok || status == WbPickStatus::Limited; }
+};
+
+constexpr float kWbMinLevel = 6.0f;   // every channel must be at least this (0..255)
+constexpr float kWbMaxLevel = 254.0f; // a channel at or above this counts as clipped
+
+// r, g, b: 0..255, after the tone tables (an average over a small patch is fine).
+inline WbPick solveWhiteBalance(float r, float g, float b)
+{
+  WbPick out; // status starts as TooDark: NaN/inf end up there
+  if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b))
+    return out;
+  if (r >= kWbMaxLevel || g >= kWbMaxLevel || b >= kWbMaxLevel)
+  {
+    out.status = WbPickStatus::Clipped;
+    return out;
+  }
+  if (r < kWbMinLevel || g < kWbMinLevel || b < kWbMinLevel)
+    return out;
+  bool limited = false;
+  float t = (b - r) / (0.3f * (r + b));
+  if (t > 1.0f)
+  {
+    t = 1.0f;
+    limited = true;
+  }
+  else if (t < -1.0f)
+  {
+    t = -1.0f;
+    limited = true;
+  }
+  // Red and blue after the temperature gains. Equal unless t was clamped; the
+  // average then splits the remaining error between them.
+  const float m = 0.5f * (r * (1.0f + 0.3f * t) + b * (1.0f - 0.3f * t));
+  float n = (g - m) / (0.2f * g + 0.1f * m); // the denominator is always > 0 here
+  if (n > 1.0f)
+  {
+    n = 1.0f;
+    limited = true;
+  }
+  else if (n < -1.0f)
+  {
+    n = -1.0f;
+    limited = true;
+  }
+  out.temperature = std::round(t * 100.0f);
+  out.tint = std::round(n * 100.0f);
+  out.status = limited ? WbPickStatus::Limited : WbPickStatus::Ok;
+  return out;
+}
+
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched). Raw pointers
 // and no std::clamp/min/max calls in the loop, for the same Debug-build
 // reason as AdjustmentSet::applyTo.

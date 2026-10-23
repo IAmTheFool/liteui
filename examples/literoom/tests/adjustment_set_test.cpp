@@ -585,6 +585,66 @@ static void testPresets()
   CHECK(t.loadJson(s.toJson()) && t.get(AdjId::Exposure) == 100.0f);
 }
 
+static void testWhiteBalancePick()
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 15.0f);
+  const size_t before = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One call, ONE step (two set() calls would be two), with its own label.
+  CHECK(s.setWhiteBalance(-67.0f, 14.0f));
+  CHECK(s.historySize() == before + 1);
+  CHECK(s.get(AdjId::Temperature) == -67.0f && s.get(AdjId::Tint) == 14.0f);
+  CHECK(s.get(AdjId::Exposure) == 15.0f); // nothing else moves
+  CHECK(lastLabel(s) == "White Balance -67 / +14");
+  CHECK(s.version() != v0);
+
+  // Same values again: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK(!s.setWhiteBalance(-67.0f, 14.0f));
+  CHECK(s.historySize() == before + 1 && s.version() == v1);
+
+  // Undo puts both sliders back together; redo restores them and the label.
+  s.undo();
+  CHECK(s.get(AdjId::Temperature) == 0.0f && s.get(AdjId::Tint) == 0.0f && s.get(AdjId::Exposure) == 15.0f);
+  s.redo();
+  CHECK(s.get(AdjId::Temperature) == -67.0f && s.get(AdjId::Tint) == 14.0f);
+  CHECK(lastLabel(s) == "White Balance -67 / +14");
+
+  // A later slider touch is a new step: it never overwrites the pick, even the same slider.
+  const size_t pickIdx = s.historySize() - 1;
+  s.set(AdjId::Temperature, -50.0f);
+  CHECK(s.historySize() == pickIdx + 2 && label(s, pickIdx) == "White Balance -67 / +14");
+  CHECK(lastLabel(s) == "Temperature -50");
+  // ...and a pick ends a drag in progress: the next touch of that slider is a new step again.
+  s.set(AdjId::Exposure, 30.0f);
+  s.set(AdjId::Exposure, 31.0f); // coalesced drag
+  const size_t n = s.historySize();
+  CHECK(s.setWhiteBalance(10.0f, 0.0f));
+  s.set(AdjId::Exposure, 32.0f);
+  CHECK(s.historySize() == n + 2);
+
+  // Only one of the two changing still counts as a pick.
+  AdjustmentSet u;
+  fresh(u);
+  CHECK(u.setWhiteBalance(0.0f, 20.0f) && u.historySize() == 2 && lastLabel(u) == "White Balance +0 / +20");
+
+  // Hand-built values are sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  CHECK(h.setWhiteBalance(1e9f, std::nanf("")));
+  CHECK(h.get(AdjId::Temperature) == 100.0f && h.get(AdjId::Tint) == 0.0f);
+  CHECK(!h.setWhiteBalance(500.0f, std::nanf(""))); // sanitizes to the same values: no step
+
+  // Saved with the edits like any slider values (the label is History-only and not saved).
+  AdjustmentSet r;
+  fresh(r);
+  CHECK(r.loadJson(s.toJson()) && r.get(AdjId::Temperature) == s.get(AdjId::Temperature));
+  CHECK(r.historySize() == 1);
+}
+
 int main()
 {
   testFreshState();
@@ -602,5 +662,6 @@ int main()
   testMasksFollowTheGeometry();
   testMaskTablesMatchTheGlobalOnes();
   testPresets();
+  testWhiteBalancePick();
   return finish();
 }

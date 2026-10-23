@@ -129,9 +129,27 @@ These reuse the preset machinery instead of adding a new kind of data. The thing
 
 The engine stays UI-free: `sidecarSyncLook` has no file, window or editor dependency and is tested with plain strings. The selection flags and the clipboard are UI-side state in `main.cpp`.
 
+## White-balance picker
+
+The Adjust pane has a **Pick White Balance (W)** button (above Temperature). Arm it, click something that should be gray, and Temperature and Tint are set so that spot becomes neutral. It adds no new kind of data: it sets two ordinary sliders.
+
+The engine does the work and stays UI-free:
+
+- **The math** is `solveWhiteBalance` in `color/color_pass.hpp`: the inverse of the white-balance gains `makeColorPass` builds, solved in closed form from a spot's R, G and B. It reports `Ok`, `Limited` (needs more than ±100), `TooDark` or `Clipped`. See [headers.md](headers.md#color_passhpp).
+- **The edit** is `AdjustmentSet::setWhiteBalance`: both sliders in one undo step, labelled `White Balance <t> / <n>`. See [undo-and-history.md](undo-and-history.md#white-balance-picker).
+
+The UI side lives in `main.cpp` and is small:
+
+- **Which pixels it reads.** Not the shown picture. White balance runs *after* the tone tables, so the spot's color has to be taken where the color pass would receive it: `state.source` (what the adjustments run on) through the current `buildChannelLuts()`, before any white balance. That makes the answer independent of the Temperature and Tint already set, and of Saturation, the Mixer, grading and the Filters, which all come later. The RGB readout under the cursor samples the finished picture, which is why it cannot be reused.
+- **A 5 × 5 patch** (`kWbPatchRadius = 2`) is averaged around the click, so one noisy pixel cannot decide the result. Fully transparent pixels (the empty corners of a straightened picture) are skipped.
+- **Armed state.** `state.wbPicking` is set by the button or the W key and read through `wbPickerActive()`, which also clears it the moment it stops making sense: another pane is open, no picture is shown, or Before / After is on. Esc cancels it, and a newly opened picture disarms it. A click while armed goes to `wbPress` before the crop and mask tools, which only act in their own panes anyway.
+- **One pick per arming.** A successful pick (or "already set") disarms the picker. A click that cannot be used (outside the picture, too dark, clipped) keeps it armed with a message, so you can try another spot.
+- **Not while the geometry worker is busy.** `state.source` still describes the previous geometry then, so `wbPress` waits (see [threading.md](threading.md#the-geometry-worker-rebuilds-everything)).
+- **Global edit only.** Masks keep their own Temperature and Tint; the picker never touches them.
+
 ## Where state lives
 
-All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
+All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). The white-balance picker's armed flag (`state.wbPicking`) is plain UI state and is never saved. Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
 
 ## The rule about threads
 
