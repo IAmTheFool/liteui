@@ -2,8 +2,9 @@
 //
 // makeThumb() box-averages a picture down to fit kFilmThumbW x kFilmThumbH;
 // ThumbWorker decodes a queue of files (EXIF rotation applied, like the
-// editor does), thumbnails them, and notes which ones have a saved-edits
-// sidecar. A different kind of worker from LatestWorker: it is a FIFO queue
+// editor does), thumbnails them, and reads each one's saved-edits sidecar for
+// two facts: whether it holds real edits (the filmstrip's dot) and the
+// picture's rating, flag and color label. A different kind of worker from LatestWorker: it is a FIFO queue
 // with no generations - setQueue() replaces what is still to do, the item in
 // flight finishes, and results accumulate until collect() drains them.
 #pragma once
@@ -11,7 +12,8 @@
 #include "core/geometry.hpp"      // Orient
 #include "core/raster_ops.hpp"    // orientImage
 #include "io/file_utils.hpp"      // fsPath
-#include "io/sidecar.hpp"         // sidecarFileOf
+#include "io/photo_meta.hpp"     // PhotoMeta
+#include "io/sidecar.hpp"         // sidecarFileOf, sidecarScan
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -28,6 +31,32 @@
 #include <vector>
 
 constexpr int kFilmThumbW = 96, kFilmThumbH = 72;
+
+// Largest sidecar the thumbnail worker will read: the same limit the editor
+// puts on a sidecar it opens. A bigger file counts as edited, with no meta.
+constexpr std::streamoff kThumbMaxSidecarBytes = std::streamoff{64} << 20;
+
+// The sidecar's text; false if there is no file, it is empty, too big or
+// unreadable. *exists says whether the file was there at all.
+inline bool readSidecarForThumb(const std::string &imagePath, std::string *text,
+                                bool *exists)
+{
+  const std::filesystem::path p = fsPath(sidecarFileOf(imagePath));
+  std::error_code ec;
+  *exists = std::filesystem::exists(p, ec) && !ec;
+  if (!*exists)
+    return false;
+  std::ifstream f(p, std::ios::binary | std::ios::ate);
+  if (!f)
+    return false;
+  const std::streamoff n = f.tellg();
+  if (n <= 0 || n > kThumbMaxSidecarBytes)
+    return false;
+  text->assign(static_cast<size_t>(n), '\0');
+  f.seekg(0);
+  f.read(text->data(), n);
+  return static_cast<bool>(f);
+}
 
 // `src` scaled down (box average) to fit kFilmThumbW x kFilmThumbH; never
 // enlarged. Null for an empty picture.
@@ -84,7 +113,9 @@ public:
   {
     std::string path;
     std::shared_ptr<const CanvasImage> thumb; // null: couldn't be decoded
-    bool edited = false;                      // a sidecar file exists
+    bool edited = false;                      // its sidecar holds real edits
+                                              // (an unreadable one counts)
+    PhotoMeta meta;                           // rating / flag / color label
   };
 
   // `orientOf` says how a file's camera rotation (EXIF) turns it upright. The
@@ -161,8 +192,18 @@ private:
           r.thumb = makeThumb(*turned);
         }
       }
-      std::error_code ec;
-      r.edited = std::filesystem::exists(fsPath(sidecarFileOf(path)), ec) && !ec;
+      {
+        std::string text;
+        bool exists = false;
+        if (readSidecarForThumb(path, &text, &exists))
+        {
+          const SidecarScan s = sidecarScan(text);
+          r.edited = s.edited;
+          r.meta = s.meta;
+        }
+        else
+          r.edited = exists; // present but unreadable / too big: as before
+      }
       {
         std::lock_guard lk(m_);
         results_.push_back(std::move(r));

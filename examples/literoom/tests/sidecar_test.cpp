@@ -641,6 +641,186 @@ static void testSyncLook()
   CHECK(again == out);
 }
 
+// ------------------------------------------------ rating / flag / color label
+static std::string metaFile(const SidecarEdits &e, const PhotoMeta &m, int w = 400, int h = 300)
+{
+  return sidecarFileText("a.jpg", w, h, sidecarEditsToJson(e), m);
+}
+
+static void testMeta()
+{
+  const PhotoMeta rated{4, PhotoFlag::Pick, 3};
+
+  { // the wrapper: "meta" only when it isn't the default, always before "edits"
+    const std::string plain = metaFile(SidecarEdits{}, PhotoMeta{});
+    CHECK(plain.find("\"meta\"") == std::string::npos);
+    const std::string with = metaFile(SidecarEdits{}, rated);
+    const size_t pm = with.find("\"meta\""), pe = with.find("\"edits\"");
+    CHECK(pm != std::string::npos && pe != std::string::npos && pm < pe);
+    // the new writer gives the old layout when there is no meta
+    CHECK(plain == fileText(SidecarEdits{}, 400, 300));
+    Json root;
+    std::string err;
+    CHECK(Json::parse(with, &root, &err));
+    CHECK(sidecarMetaFromRoot(root) == rated);
+    CHECK(root.get("image").get("width").asNum(0) == 400);
+    SidecarEdits back;
+    CHECK(loadFile(with, &back, 400, 300)); // a rated file still loads as edits
+  }
+
+  { // sidecarScan: edited is false only for a readable, neutral file
+    SidecarScan s = sidecarScan(metaFile(SidecarEdits{}, rated));
+    CHECK(!s.edited);
+    CHECK(s.meta == rated);
+    s = sidecarScan(metaFile(SidecarEdits{}, PhotoMeta{}));
+    CHECK(!s.edited && s.meta.isDefault());
+    SidecarEdits e;
+    e.values[static_cast<size_t>(AdjId::Exposure)] = 10.0f;
+    s = sidecarScan(metaFile(e, rated));
+    CHECK(s.edited && s.meta == rated);
+    e = SidecarEdits{};
+    e.crop = CropRect{1, 2, 30, 40};
+    CHECK(sidecarScan(metaFile(e, PhotoMeta{})).edited);
+    e = SidecarEdits{};
+    e.masks.push_back(rich().masks[0]);
+    CHECK(sidecarScan(metaFile(e, PhotoMeta{})).edited);
+    // anything else counts as edited (as a file always did), with no meta
+    for (const char *odd : {"", "not json", "[1,2]", "{}", "{\"edits\": 3}", "{\"meta\": {\"rating\": 2}}"})
+    {
+      s = sidecarScan(odd);
+      CHECK(s.edited);
+    }
+    CHECK(sidecarScan("{\"meta\": {\"rating\": 2}}").meta.rating == 2);
+    CHECK(sidecarScan("not json").meta.isDefault());
+    CHECK(sidecarNeutralEditsDump() == sidecarEditsToJson(SidecarEdits{}).dump());
+  }
+
+  { // a hostile meta object is clamped, never trusted
+    Json root;
+    std::string err;
+    CHECK(Json::parse(R"({"meta": {"rating": 500, "flag": "x", "label": 7}, "edits": {}})", &root, &err));
+    const PhotoMeta hostile = sidecarMetaFromRoot(root);
+    CHECK(hostile.rating == kMaxRating && hostile.flag == PhotoFlag::None && hostile.label == 0);
+    CHECK(Json::parse(R"({"meta": 7})", &root, &err));
+    CHECK(sidecarMetaFromRoot(root).isDefault());
+    CHECK(Json::parse(R"({"edits": {}})", &root, &err));
+    CHECK(sidecarMetaFromRoot(root).isDefault());
+  }
+
+  { // Sync Settings leaves the target's own rating, flag and label alone
+    AdjValues v{};
+    v[static_cast<size_t>(AdjId::Exposure)] = 25.0f;
+    CurveSet cs = identityCurves();
+    MixValues mix{};
+    ColorGrade grade;
+    std::string out, err;
+    SidecarEdits old = rich();
+    const std::string oldText = metaFile(old, rated);
+    CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+    Json root;
+    CHECK(Json::parse(out, &root, &err));
+    CHECK(sidecarMetaFromRoot(root) == rated);
+    SidecarEdits now;
+    CHECK(loadFile(out, &now, 400, 300));
+    CHECK(now.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
+    CHECK(now.crop == old.crop); // geometry kept, as before
+    // twice gives the same text, with the meta
+    std::string again;
+    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, &again, &err));
+    CHECK(again == out);
+    // a file without meta stays without
+    CHECK(sidecarSyncLook(fileText(old, 400, 300), "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+    CHECK(out.find("\"meta\"") == std::string::npos);
+    // a new file has none
+    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+    CHECK(out.find("\"meta\"") == std::string::npos);
+  }
+}
+
+static void testPatchMeta()
+{
+  const PhotoMeta rated{4, PhotoFlag::Pick, 3};
+  std::string out, err;
+  PhotoMeta got;
+
+  { // no sidecar yet: a file is started from the picture's size, with neutral edits
+    MetaPatch p;
+    p.rating = 3;
+    CHECK(sidecarPatchMeta("", "a.jpg", 400, 300, p, &out, &got, &err));
+    CHECK(got == PhotoMeta({3, PhotoFlag::None, 0}));
+    const SidecarScan s = sidecarScan(out);
+    CHECK(!s.edited && s.meta == got); // a rating alone isn't "edits"
+    SidecarEdits back;
+    CHECK(loadFile(out, &back, 400, 300));
+    CHECK(sidecarEditsToJson(back).dump() == sidecarNeutralEditsDump());
+    // no size, no file
+    out = "untouched";
+    CHECK(!sidecarPatchMeta("", "a.jpg", 0, 0, p, &out, &got, &err) && !err.empty());
+    CHECK(out == "untouched");
+  }
+
+  { // an existing file: only the named fields change, the edits are kept
+    const SidecarEdits e = rich();
+    const std::string old = metaFile(e, rated);
+    MetaPatch p;
+    p.flag = PhotoFlag::Reject;
+    CHECK(sidecarPatchMeta(old, "a.jpg", 0, 0, p, &out, &got, &err));
+    CHECK(got == PhotoMeta({4, PhotoFlag::Reject, 3}));
+    CHECK(sidecarScan(out).meta == got);
+    SidecarEdits back;
+    CHECK(loadFile(out, &back, 400, 300));
+    CHECK(sidecarEditsToJson(back).dump() == sidecarEditsToJson(e).dump());
+    CHECK(sidecarScan(out).edited);
+    // the size, when given, is checked against the file's
+    CHECK(sidecarPatchMeta(old, "a.jpg", 400, 300, p, &out, &got, &err));
+    CHECK(!sidecarPatchMeta(old, "a.jpg", 401, 300, p, &out, &got, &err));
+    // applying the same patch twice gives the same text
+    std::string again;
+    CHECK(sidecarPatchMeta(out, "a.jpg", 0, 0, p, &again, &got, &err));
+    CHECK(again == out);
+  }
+
+  { // clearing everything removes the "meta" key but keeps the file
+    MetaPatch p;
+    p.rating = 0;
+    p.flag = PhotoFlag::None;
+    p.label = 0;
+    CHECK(sidecarPatchMeta(metaFile(rich(), rated), "a.jpg", 0, 0, p, &out, &got, &err));
+    CHECK(got.isDefault());
+    CHECK(out.find("\"meta\"") == std::string::npos);
+    CHECK(out == fileText(rich(), 400, 300));
+  }
+
+  { // a file that can't be trusted is refused and never rewritten
+    MetaPatch p;
+    p.rating = 1;
+    const std::string bad[] = {"not json", "[1,2]", fileText(rich(), 400, 300, kSidecarVersion + 1),
+                               "{\"version\":1,\"image\":{\"width\":400,\"height\":300}}", // no edits
+                               "{\"version\":1,\"edits\":{}}"};                           // no size
+    for (const std::string &old : bad)
+    {
+      out = "untouched";
+      err.clear();
+      CHECK(!sidecarPatchMeta(old, "a.jpg", 0, 0, p, &out, &got, &err));
+      CHECK(!err.empty() && out == "untouched");
+    }
+  }
+
+  { // Sync Settings and a batch rating don't undo each other
+    AdjValues v{};
+    v[static_cast<size_t>(AdjId::Exposure)] = 25.0f;
+    MetaPatch p;
+    p.label = 2;
+    std::string synced;
+    CHECK(sidecarSyncLook(metaFile(rich(), rated), "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &synced, &err));
+    CHECK(sidecarPatchMeta(synced, "a.jpg", 0, 0, p, &out, &got, &err));
+    CHECK(got == PhotoMeta({4, PhotoFlag::Pick, 2}));
+    SidecarEdits back;
+    CHECK(loadFile(out, &back, 400, 300));
+    CHECK(back.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
+  }
+}
+
 int main()
 {
   testRoundTrip();
@@ -653,5 +833,7 @@ int main()
   testObjectMaps();
   testFuzz();
   testSyncLook();
+  testMeta();
+  testPatchMeta();
   return finish();
 }

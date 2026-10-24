@@ -40,7 +40,7 @@ Every header sits under `src/`, which is the include root, so a header is always
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram` |
-| `io/` | `sidecar`, `preset`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
+| `io/` | `sidecar`, `photo_meta`, `preset`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
 | `workers/` | `latest_worker`, `thumb_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
@@ -1410,7 +1410,42 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 **`inline bool sidecarSyncLook(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const AdjValues &values, const CurveSet &curves, const MixValues &mix, const ColorGrade &grade, std::string *outText, std::string *err)`**: puts a look into **another picture's** sidecar text without opening it (Image > Sync Settings to Selected). See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
 - Inputs: `oldText` is the picture's current sidecar file (`""` if it has none). `imageName` is written to `image.name` (informational). `imgW` / `imgH` are the picture's upright size: **required only when `oldText` is empty** (a new file must record it); otherwise the size recorded in the file is used, and if `imgW` and `imgH` are both positive they must match it. The look is the four groups a preset holds. `outText` receives the whole new file (wrapper plus edits); `err` receives a short reason.
 - Returns: true with `*outText` set. False, with a reason in `*err` and `*outText` untouched, when the old file can't be trusted: not valid JSON or not an object, a missing, non-numeric or higher `version`, no `image.width` / `image.height`, a different size than the one given, or an `edits` part that `sidecarEditsFromJson` refuses. Or when there is no old file and `imgW` / `imgH` aren't both positive. The caller skips that picture rather than overwrite edits it can't read.
-- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix` and `grade` are replaced, and the result is written by `sidecarEditsToJson`. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
+- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix` and `grade` are replaced, and the result is written by `sidecarEditsToJson`. The picture's own rating, flag and color label (`meta`) are read from the old file and written back as they were. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
+
+**Rating, flag and color label** (the wrapper's `meta` object; see [sidecar-format.md](sidecar-format.md)). `sidecar.hpp` includes `photo_meta.hpp`.
+
+**`inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH, SidecarEdits *e, PhotoMeta *meta, int *W, int *H, std::string *err)`**: the trust rules shared by every function that rewrites another picture's sidecar. With no text, the edits are neutral and the size must be given. With text, the file must be a JSON object, not from a newer version, with a picture size that matches `imgW x imgH` (when given) and loadable `edits`; otherwise it is refused with a reason in `*err`. On success it returns the file's edits, `meta` and size.
+
+**`inline bool sidecarPatchMeta(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const MetaPatch &patch, std::string *outText, PhotoMeta *outMeta, std::string *err)`**: the batch rating. Applies `patch` to the picture's rating / flag / color label in its sidecar text and keeps everything else; same trust rules as `sidecarSyncLook` (both are built on `sidecarReadForRewrite`). `*outMeta` is the meta after the patch. A caller can skip a picture with no sidecar when `patch.applyTo(PhotoMeta{})` is the default, since there is nothing to record. Pure.
+
+**`inline PhotoMeta sidecarMetaFromRoot(const mj::Json &root)`**: the `meta` object of a parsed sidecar, clamped; the default `PhotoMeta` if it is missing or malformed.
+
+**`inline std::string sidecarFileText(const std::string &imageName, int w, int h, mj::Json edits, const PhotoMeta &meta)`**: the whole sidecar file: `app`, `version`, `image`, `meta` (only if it is not the default) and `edits`. The app's own save and `sidecarSyncLook` both write through it, so no writer can drop `meta`. With a default `meta` the output is exactly the layout the app wrote before `meta` existed.
+
+**`inline const std::string &sidecarNeutralEditsDump()`**: the text `sidecarEditsToJson` gives for an untouched `SidecarEdits{}`.
+
+**`struct SidecarScan { bool edited = true; PhotoMeta meta; }`** and **`inline SidecarScan sidecarScan(const std::string &text)`**: what the filmstrip wants from a sidecar without opening the picture. `edited` is false only for a file that parses as an object whose `edits` dump equals the neutral dump (a file that exists because the picture was rated); an unreadable file, a non-object, or one with no `edits` counts as edited, as any existing file always did. `meta` is the file's rating, flag and label (the default if the file can't be read). Pure; the thumbnail worker calls it on its own thread.
+
+### `photo_meta.hpp`
+A picture's **rating, flag and color label**, their JSON form, and the filmstrip filter. Pure values: no UI, no files, no editor state. They are **not edits**: they never go through `AdjustmentSet`, so there is no undo step or History label. They live in the sidecar's top-level `meta` object (see [sidecar-format.md](sidecar-format.md)).
+
+**Depends on:** `minijson.hpp`. **Test:** `photo_meta_test` (and `testMeta` in `sidecar_test`). **Thread model:** no shared state; every function is safe from any thread.
+
+**Constants:** `kMaxRating` = 5; `kLabelCount` = 5; `kLabelNames` = `red`, `yellow`, `green`, `blue`, `purple` (label numbers are 1 to 5, 0 is none).
+
+**`enum class PhotoFlag : uint8_t { None, Pick, Reject }`**
+
+**`struct PhotoMeta { int rating = 0; PhotoFlag flag = PhotoFlag::None; int label = 0; }`**: `==` and `isDefault()`.
+
+**`inline PhotoMeta photoMetaSanitized(PhotoMeta m)`**: rating clamped to 0..5, an unknown flag becomes `None`, label clamped to 0..5.
+
+**`inline mj::Json photoMetaToJson(const PhotoMeta &m)`**: `{"rating": 3, "flag": "pick", "label": "red"}` with every default field left out, so the default gives an empty object. The value is sanitized first.
+
+**`inline PhotoMeta photoMetaFromJson(const mj::Json &o)`**: a non-object gives the default; a non-number rating is 0 and others are clamped into 0..5; a flag or label that isn't one of the exact names (case matters) is "none".
+
+**`struct MetaPatch { std::optional<int> rating; std::optional<PhotoFlag> flag; std::optional<int> label; }`**: "set these fields": what one rating / flag / label command changes. `empty()`; `applyTo(m)` changes only the fields that are set and sanitizes the result. A field set to 0 / `None` is a change (a clear), not an absent field.
+
+**`struct MetaFilter { int minRating; unsigned flags; unsigned labels; }`**: what the filmstrip shows. `minRating` is "at least this many stars" (0 = off); `flags` has a bit `1 << PhotoFlag value` per accepted flag and `labels` a bit `1 << label` per accepted color (0 = off for each). `active()` is true when anything is on. `matches(m)`: every switched-on criterion must hold (AND), and within `flags` or `labels` any chosen value matches (OR). A picture with no label doesn't match a color filter. `toggleRating(n)` (n is clamped; the value already set switches it off), `toggleFlag(f)`, `toggleLabel(c)` (1..5; anything else is ignored).
 
 ### `preset.hpp`
 Presets: a saved **look** (slider values, the four tone curves, the Color Mixer and Color Grading) that can be applied to any picture. Crop, orientation, straighten angle and masks are **not** part of a preset, because they belong to one picture. Pure functions on plain values plus small file helpers; no UI, no editor state. Loading goes through the sidecar readers, so a hand-edited or damaged preset can never put the editor in a state its own UI couldn't reach. `AdjustmentSet::currentPreset` / `applyPreset` are the bridge to the edit state; the Presets pane in `main.cpp` is the UI. See [undo-and-history.md](undo-and-history.md) for how applying one appears in History.
@@ -1723,9 +1758,9 @@ Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's cam
 - Blocking. Waits for the newest request to finish and returns its value. **Only call while `outstanding()`**: after `invalidate()` nothing would ever wake it.
 
 ### `thumb_worker.hpp`
-The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a picture to fit 96 × 72, and `ThumbWorker` decodes a queue of files, thumbnails them, and notes which have a sidecar. A first-in-first-out queue with **no generations**, so **not** a `LatestWorker`. (Needs LiteUI's decoder.)
+The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a picture to fit 96 × 72, and `ThumbWorker` decodes a queue of files, thumbnails them, and reads each one's sidecar for whether it holds real edits and for its rating, flag and color label. A first-in-first-out queue with **no generations**, so **not** a `LatestWorker`. (Needs LiteUI's decoder.)
 
-**Depends on:** `liteui.hpp` (decoder), `geometry.hpp`, `raster_ops.hpp` (`orientImage`), `file_utils.hpp` (`fsPath`), `sidecar.hpp` (`sidecarFileOf`). **Test:** `thumb_worker_test` (links LiteUI and the thread library).
+**Depends on:** `liteui.hpp` (decoder), `geometry.hpp`, `raster_ops.hpp` (`orientImage`), `file_utils.hpp` (`fsPath`), `sidecar.hpp` (`sidecarFileOf`, `sidecarScan`), `photo_meta.hpp`. **Test:** `thumb_worker_test` (links LiteUI and the thread library).
 
 **Constants:** `kFilmThumbW` = 96, `kFilmThumbH` = 72 (`int`).
 
@@ -1736,7 +1771,7 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 
 **`class ThumbWorker`** (non-copyable)
 
-- `struct Result { std::string path; std::shared_ptr<const CanvasImage> thumb; bool edited = false; }`: `thumb` is **null if the file couldn't be decoded** (the result is still delivered); `edited` is true if a sidecar file exists for the path.
+- `struct Result { std::string path; std::shared_ptr<const CanvasImage> thumb; bool edited = false; PhotoMeta meta; }`: `thumb` is **null if the file couldn't be decoded** (the result is still delivered, with its `meta`); `edited` is true if the picture's sidecar holds real edits (a sidecar that exists only because the picture was rated gives false; one that is unreadable, too big (over 64 MiB) or has no `edits` still gives true); `meta` is the rating, flag and color label from that sidecar (the default if there is none or it can't be read).
 - `using OrientFn = std::function<Orient(const std::string &)>`: says how a file's camera rotation turns it upright. The app passes its own EXIF reader (`exifOrientationOf`), so thumbnails are turned exactly like the editor turns the picture.
 - **`explicit ThumbWorker(OrientFn orientOf)`**: no thread yet.
 - **`~ThumbWorker()`**: calls `shutdown()`.
@@ -1744,7 +1779,7 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 - **`void setQueue(std::vector<std::string> paths)`**: replaces what is still to do (starting the thread on first use). The file being processed finishes; results already made stay until collected. Call it again whenever the open picture changes so the work starts next to it.
 - **`std::vector<Result> collect()`**: returns everything made since the last call and empties the list. Thread-safe, non-blocking.
 - **`void shutdown()`**: clears the queue, requests stop and joins the thread.
-- Per file, the worker: decodes it (`liteui_image::decodeFile`), applies the orientation from `orientOf`, makes the thumbnail, and checks for the sidecar with `std::filesystem::exists`.
+- Per file, the worker: decodes it (`liteui_image::decodeFile`), applies the orientation from `orientOf`, makes the thumbnail, then reads the sidecar (`readSidecarForThumb`, at most 64 MiB) and runs `sidecarScan` on it.
 
 ---
 

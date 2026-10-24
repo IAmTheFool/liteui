@@ -1,5 +1,6 @@
 // sidecar.hpp - The saved edits as JSON: sliders, curves, Color Mixer, Color Grading,
-// geometry and every mask. Pure functions on plain values; loading
+// geometry and every mask, plus the picture's rating / flag / color label (the
+// wrapper's "meta" object). Pure functions on plain values; loading
 // validates and clamps everything.
 #pragma once
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include "core/geometry.hpp"
 #include "mask/mask.hpp"
 #include "io/minijson.hpp"
+#include "io/photo_meta.hpp"
 
 // ---------------- Saved edits (the sidecar file's content) ----------------
 // Everything the user did to a picture, as JSON: slider values, curves, color
@@ -616,22 +618,96 @@ inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH,
   return true;
 }
 
+// ---- rating, flag, color label (the wrapper's "meta") ----
+// Not part of `edits`: they have no undo step and Sync Settings must leave a
+// picture's own rating alone. The "meta" key is written only when something
+// differs from the default, and every code path that rewrites a whole sidecar
+// (the app's own save, sidecarSyncLook) goes through sidecarFileText so none of
+// them can drop it.
+
+// The wrapper's "meta" object; the default PhotoMeta if it is missing or
+// malformed.
+inline PhotoMeta sidecarMetaFromRoot(const mj::Json &root)
+{
+  const mj::Json *m = root.find("meta");
+  return m ? photoMetaFromJson(*m) : PhotoMeta{};
+}
+
+// The whole sidecar file: the wrapper (app, version, image, and meta when it is
+// not the default) around `edits`. `w` / `h` are the picture's size.
+inline std::string sidecarFileText(const std::string &imageName, int w, int h,
+                                   mj::Json edits, const PhotoMeta &meta)
+{
+  using mj::Json;
+  Json img = Json::object();
+  img.set("name", Json::str(imageName));
+  img.set("width", Json::num(w));
+  img.set("height", Json::num(h));
+  Json root = Json::object();
+  root.set("app", Json::str("literoom"));
+  root.set("version", Json::num(kSidecarVersion));
+  root.set("image", std::move(img));
+  if (!meta.isDefault())
+    root.set("meta", photoMetaToJson(meta));
+  root.set("edits", std::move(edits));
+  return root.dump();
+}
+
+// What sidecarEditsToJson writes for a picture nobody has edited.
+inline const std::string &sidecarNeutralEditsDump()
+{
+  static const std::string s = sidecarEditsToJson(SidecarEdits{}).dump();
+  return s;
+}
+
+// What the filmstrip wants to know about a sidecar without opening the picture.
+//   edited  false only for a readable file whose `edits` are exactly the neutral
+//           ones (a file that exists only because the picture was rated); any
+//           other file, readable or not, counts as edited, as a file always did.
+//   meta    the rating / flag / label (default if there is none or the file
+//           can't be read).
+struct SidecarScan
+{
+  bool edited = true;
+  PhotoMeta meta;
+};
+inline SidecarScan sidecarScan(const std::string &text)
+{
+  SidecarScan s;
+  mj::Json root;
+  std::string err;
+  if (!mj::Json::parse(text, &root, &err) || !root.isObject())
+    return s;
+  s.meta = sidecarMetaFromRoot(root);
+  const mj::Json *edits = root.find("edits");
+  if (edits && edits->isObject() && edits->dump() == sidecarNeutralEditsDump())
+    s.edited = false;
+  return s;
+}
+
 // Sync Settings: puts a look (sliders, curves, Color Mixer, Color Grading) into
 // the sidecar text of ANOTHER picture without touching its geometry or masks.
 //   oldText   the picture's current sidecar file ("" if it has none)
 //   imgW/H    the picture's size. Needed only when oldText is empty (a new file
 //             must record it); otherwise the size recorded in the file is used,
 //             and if imgW/H are given too they must match it.
+// The picture's own rating / flag / color label is kept.
 // Returns false, with a reason in *err and *outText untouched, when the old
 // file can't be trusted (unreadable, from a newer version, other size): the
 // caller skips that picture rather than overwrite edits it can't read.
 // Everything else in the old file goes through sidecarEditsFromJson, so it is
 // validated and clamped exactly as when the picture is opened.
-inline bool sidecarSyncLook(const std::string &oldText,
-                            const std::string &imageName, int imgW, int imgH,
-                            const AdjValues &values, const CurveSet &curves,
-                            const MixValues &mix, const ColorGrade &grade,
-                            std::string *outText, std::string *err)
+// Reads a picture's existing sidecar text so it can be rewritten. With no text
+// (the picture has no sidecar) the edits are the neutral ones and the size must
+// be given (imgW x imgH). With text, the file must be one we can trust: valid
+// JSON object, not from a newer version, with a picture size that matches
+// imgW x imgH (when those are given). Anything else is refused, with a reason in
+// *err, so a file that might still be recoverable by hand is never overwritten.
+// On success *e holds the file's edits, *meta its rating / flag / label, and
+// *W x *H the picture's size.
+inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH,
+                                  SidecarEdits *e, PhotoMeta *meta, int *W, int *H,
+                                  std::string *err)
 {
   using mj::Json;
   auto fail = [&](const char *why)
@@ -640,50 +716,80 @@ inline bool sidecarSyncLook(const std::string &oldText,
       *err = why;
     return false;
   };
+  *e = SidecarEdits{};
+  *meta = PhotoMeta{};
+  *W = imgW;
+  *H = imgH;
+  if (oldText.empty())
+    return *W > 0 && *H > 0 ? true : fail("the picture's size is unknown");
+  Json root;
+  std::string perr;
+  if (!Json::parse(oldText, &root, &perr) || !root.isObject())
+    return fail("its saved edits are unreadable");
+  const Json *ver = root.find("version");
+  if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion)
+    return fail("its saved edits are from a newer Literoom");
+  const Json *img = root.find("image");
+  const Json *jw = img && img->isObject() ? img->find("width") : nullptr;
+  const Json *jh = img && img->isObject() ? img->find("height") : nullptr;
+  if (!jw || !jh)
+    return fail("its saved edits have no picture size");
+  const int fw = static_cast<int>(jw->asNum(-1));
+  const int fh = static_cast<int>(jh->asNum(-1));
+  if (imgW > 0 && imgH > 0 && (fw != imgW || fh != imgH))
+    return fail("the picture's size has changed");
+  const Json *edits = root.find("edits");
+  if (!edits || !sidecarEditsFromJson(*edits, fw, fh, e))
+    return fail("its saved edits are unreadable");
+  *meta = sidecarMetaFromRoot(root);
+  *W = fw;
+  *H = fh;
+  return true;
+}
+
+inline bool sidecarSyncLook(const std::string &oldText,
+                            const std::string &imageName, int imgW, int imgH,
+                            const AdjValues &values, const CurveSet &curves,
+                            const MixValues &mix, const ColorGrade &grade,
+                            std::string *outText, std::string *err)
+{
   SidecarEdits e;
-  int W = imgW, H = imgH;
-  if (!oldText.empty())
-  {
-    Json root;
-    std::string perr;
-    if (!Json::parse(oldText, &root, &perr) || !root.isObject())
-      return fail("its saved edits are unreadable");
-    const Json *ver = root.find("version");
-    if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion)
-      return fail("its saved edits are from a newer Literoom");
-    const Json *img = root.find("image");
-    const Json *jw = img && img->isObject() ? img->find("width") : nullptr;
-    const Json *jh = img && img->isObject() ? img->find("height") : nullptr;
-    if (!jw || !jh)
-      return fail("its saved edits have no picture size");
-    const int fw = static_cast<int>(jw->asNum(-1));
-    const int fh = static_cast<int>(jh->asNum(-1));
-    if (imgW > 0 && imgH > 0 && (fw != imgW || fh != imgH))
-      return fail("the picture's size has changed");
-    const Json *edits = root.find("edits");
-    if (!edits || !sidecarEditsFromJson(*edits, fw, fh, &e))
-      return fail("its saved edits are unreadable");
-    W = fw;
-    H = fh;
-  }
-  else if (W <= 0 || H <= 0)
-    return fail("the picture's size is unknown");
+  PhotoMeta meta; // the picture's own rating / flag / label: kept as it is
+  int W = 0, H = 0;
+  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &W, &H, err))
+    return false;
 
   e.values = values;
   e.curves = curves;
   e.mix = mix;
   e.grade = grade;
 
-  Json img = Json::object();
-  img.set("name", Json::str(imageName));
-  img.set("width", Json::num(W));
-  img.set("height", Json::num(H));
-  Json root = Json::object();
-  root.set("app", Json::str("literoom"));
-  root.set("version", Json::num(kSidecarVersion));
-  root.set("image", std::move(img));
-  root.set("edits", sidecarEditsToJson(e));
   if (outText)
-    *outText = root.dump();
+    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta);
+  return true;
+}
+
+// Batch rating: applies `patch` to a picture's rating / flag / color label in
+// its sidecar text and leaves everything else (edits, geometry, masks) as the
+// file has it. The same trust rules as sidecarSyncLook (see
+// sidecarReadForRewrite). *outMeta is the picture's meta after the patch. With
+// no old text the picture's size (imgW x imgH) is needed to start a file; the
+// caller can skip such a picture when patch.applyTo(PhotoMeta{}) is the default,
+// since there is nothing to record. Pure: no files, no threads.
+inline bool sidecarPatchMeta(const std::string &oldText,
+                             const std::string &imageName, int imgW, int imgH,
+                             const MetaPatch &patch, std::string *outText,
+                             PhotoMeta *outMeta, std::string *err)
+{
+  SidecarEdits e;
+  PhotoMeta meta;
+  int W = 0, H = 0;
+  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &W, &H, err))
+    return false;
+  meta = patch.applyTo(meta);
+  if (outMeta)
+    *outMeta = meta;
+  if (outText)
+    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta);
   return true;
 }

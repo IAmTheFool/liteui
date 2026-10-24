@@ -48,7 +48,7 @@ This is also why the editor never edits images in place: a render job holds a po
 | **Decode** | Decode a PNG/JPEG file and apply its EXIF rotation. | **No.** The image libraries have no cancel hook. | A second "open" queues behind a running decode; the first result is simply dropped. |
 | **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Keeps per-image state in worker-only statics (see the rule above). |
 | **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
-| **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
+| **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings), or apply one rating / flag / color label change to them (a batch rating). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
 
 The first four and Sync are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
 
@@ -68,7 +68,7 @@ Thumbnails are a different kind of work: you want *all* of them, not just the ne
 - The item already in flight finishes.
 - Results accumulate until `collect()` drains them.
 - Like `LatestWorker`, `setNotify()` must be called before the first `setQueue()`.
-- For each file it also checks whether a saved-edits sidecar exists, which is what puts the dot on a thumbnail.
+- For each file it also reads the saved-edits sidecar (up to 64 MiB, like the editor): whether it holds real edits is what puts the dot on a thumbnail, and the rating, flag and color label in it are what the filmstrip filter uses. A picture that can't be decoded still gets those.
 
 ### The sync worker is a batch that is never superseded
 
@@ -80,6 +80,7 @@ It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not
 - **A second sync is refused while one is outstanding**, and `syncBusy()` also makes opening a picture (File > Open, a filmstrip click, the arrow keys) or a folder wait ("Wait for the sync to finish"). Nothing reads a sidecar that is about to be replaced.
 - **The open picture is never in the batch.** Its edits live in memory and autosave writes its sidecar; syncing onto it would race with that. It is the *source* of the look, copied on the UI thread by `currentPreset()` when the job is built, so the job holds a plain value and never touches `state`.
 - **Writes are temp-file-then-rename**, as in `saveSidecar`, so a crash or a full disk cannot leave half a sidecar.
+- **The same worker does batch ratings.** When pictures are selected, a rating / flag / color label command changes the open picture on the UI thread and submits a `metaOnly` job for the other selected pictures: `sidecarPatchMeta` instead of `sidecarSyncLook`, with the same refusals and the same one-batch-at-a-time rule. Its outcomes carry each picture's new meta, so `collectSyncJob()` updates the strip's entries (and sets no "has edits" dot).
 - `collectSyncJob()` runs once per frame from `flushPendingAdjust`. It sets the "has edits" dot on each synced picture and shows "Synced N" or "Synced N, skipped M (file: reason)" in the status bar.
 
 ## How the UI picks results up

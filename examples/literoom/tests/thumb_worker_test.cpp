@@ -367,6 +367,76 @@ static void testEditedFlag()
   CHECK(sidecarFileOf("x/photo.jpg") == std::string("x/photo.jpg") + kSidecarExt);
 }
 
+// ----------------------------------------------------- rating, flag, color label
+static void writeSidecar(const std::string &image, const SidecarEdits &e, const PhotoMeta &m)
+{
+  const std::string text = sidecarFileText(baseName(image), 30, 20, sidecarEditsToJson(e), m);
+  std::ofstream f(fsPath(sidecarFileOf(image)), std::ios::binary);
+  f << text;
+}
+
+static void testMetaAndRealEdits()
+{
+  TempDir td;
+  const std::string rated = td.path("rated.png"),    // only a rating: no real edits
+      both = td.path("both.png"),                    // edits and a rating
+      plain = td.path("plain.png"),                  // no sidecar
+      broken = td.path("broken.png"),                // not JSON
+      oldFile = td.path("old.png");                  // edits, no "meta" (a file from before)
+  for (const std::string &p : {rated, both, plain, broken, oldFile})
+    CHECK(writePng(p, 30, 20));
+  const PhotoMeta m1{4, PhotoFlag::Pick, 3}, m2{1, PhotoFlag::Reject, 5};
+  SidecarEdits e;
+  e.values[static_cast<size_t>(AdjId::Exposure)] = 10.0f;
+  writeSidecar(rated, SidecarEdits{}, m1);
+  writeSidecar(both, e, m2);
+  writeSidecar(oldFile, e, PhotoMeta{});
+  {
+    std::ofstream f(fsPath(sidecarFileOf(broken)), std::ios::binary);
+    f << "this is not json";
+  }
+  Latch notified;
+  ThumbWorker w(orientFromExif);
+  w.setNotify([&] { notified.signal(); });
+  w.setQueue({rated, both, plain, broken, oldFile});
+  CHECK(notified.waitFor(5));
+  w.shutdown();
+  auto got = w.collect();
+  CHECK(got.size() == 5);
+  if (got.size() == 5)
+  {
+    CHECK(got[0].path == rated && !got[0].edited && got[0].meta == m1); // a rated file has no dot
+    CHECK(got[1].path == both && got[1].edited && got[1].meta == m2);
+    CHECK(got[2].path == plain && !got[2].edited && got[2].meta.isDefault());
+    CHECK(got[3].path == broken && got[3].edited && got[3].meta.isDefault()); // unreadable still counts
+    CHECK(got[4].path == oldFile && got[4].edited && got[4].meta.isDefault());
+    for (const auto &r : got)
+      CHECK(r.thumb != nullptr);
+  }
+}
+
+static void testMetaOfUndecodablePicture()
+{ // the rating comes from the sidecar, so it is delivered even if the picture can't be decoded
+  TempDir td;
+  const std::string bad = td.path("bad.png");
+  {
+    std::ofstream f(fsPath(bad), std::ios::binary);
+    f << "this is not a picture";
+  }
+  const PhotoMeta m{2, PhotoFlag::None, 1};
+  writeSidecar(bad, SidecarEdits{}, m);
+  Latch notified;
+  ThumbWorker w(orientFromExif);
+  w.setNotify([&] { notified.signal(); });
+  w.setQueue({bad});
+  CHECK(notified.waitFor(1));
+  w.shutdown();
+  auto got = w.collect();
+  CHECK(got.size() == 1);
+  if (got.size() == 1)
+    CHECK(got[0].thumb == nullptr && got[0].meta == m && !got[0].edited);
+}
+
 static void testExifOrientation()
 {
   TempDir td;
@@ -466,6 +536,8 @@ int main()
   testQueueReplacement();
   testFailedDecode();
   testEditedFlag();
+  testMetaAndRealEdits();
+  testMetaOfUndecodablePicture();
   testExifOrientation();
   testShutdown();
   return finish();

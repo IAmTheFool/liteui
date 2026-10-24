@@ -54,6 +54,7 @@
 // saving and files
 #include "io/file_utils.hpp"
 #include "io/preset.hpp"
+#include "io/photo_meta.hpp"
 #include "io/minijson.hpp"
 #include "io/exif.hpp"
 #include "io/image_meta.hpp"
@@ -391,6 +392,8 @@ struct FilmEntry
   bool failed = false;                      // couldn't be decoded: plain box
   bool edited = false;                      // has saved edits (a sidecar file)
   bool selected = false;                    // in the multi-selection (Sync Settings)
+  PhotoMeta meta;                           // rating / flag / color label
+  bool scanned = false;                     // `meta` has been read from the sidecar
 };
 
 // The pictures of the folder the open picture lives in (JPEG / PNG, natural
@@ -409,6 +412,9 @@ struct FilmStrip
   bool dirty = true;         // repaint wanted
   uint64_t thumbVersion = 0; // adjust.version() when the open picture's
                              // thumbnail was last (re)made
+  MetaFilter filter;         // the filter bar's state (rating / flag / label)
+  std::vector<int> view;     // indices into `files` the strip shows, ascending
+                             // (see filmRebuildView)
 };
 
 // What the canvas shows: the edited picture, the same picture with every
@@ -446,6 +452,9 @@ struct EditorState
   float zoom = 1.0f;
   AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
+  PhotoMeta meta;            // the open picture's rating / flag / color label
+                             // (not an edit: no undo step, see ratePhoto)
+  bool metaDirty = false;    // meta changed since the last sidecar save / load
 
   // Export pane settings.
   bool exportJpeg = true;   // the format the Export dialog offers first
@@ -1612,6 +1621,8 @@ static void collectSegmentJob()
 
 // Swaps a finished decode into the editor (UI thread only).
 static void filmMarkEdited(const std::string &path); // filmstrip (below)
+static int filmViewPos(int i);                       // filmstrip (below)
+static void filmApplyMeta(const std::string &path, const PhotoMeta &m); // ditto
 
 // ---------------- Saved edits: the sidecar file ----------------
 // photo.jpg's edits live in photo.jpg.literoom.json beside it. They are
@@ -1637,18 +1648,13 @@ static void saveSidecar()
 {
   if (!state.original || state.imagePath.empty())
     return;
+  const bool editsChanged = state.adjust.version() != state.sidecarSaved;
   state.sidecarSaved = state.adjust.version();
+  state.metaDirty = false;
 
-  mj::Json img = mj::Json::object();
-  img.set("name", mj::Json::str(baseName(state.imagePath)));
-  img.set("width", mj::Json::num(state.original->width));
-  img.set("height", mj::Json::num(state.original->height));
-  mj::Json root = mj::Json::object();
-  root.set("app", mj::Json::str("literoom"));
-  root.set("version", mj::Json::num(kSidecarVersion));
-  root.set("image", std::move(img));
-  root.set("edits", state.adjust.toJson());
-  const std::string text = root.dump();
+  const std::string text = sidecarFileText(
+      baseName(state.imagePath), state.original->width, state.original->height,
+      state.adjust.toJson(), state.meta);
 
   const std::filesystem::path path = sidecarPath(state.imagePath);
   std::filesystem::path tmp = path;
@@ -1674,14 +1680,15 @@ static void saveSidecar()
     std::filesystem::remove(tmp, ignore);
     setStatus("Couldn't save edits: " + ec.message(), true);
   }
-  else
-    filmMarkEdited(state.imagePath); // the strip's "has edits" dot
+  else if (editsChanged)
+    filmMarkEdited(state.imagePath); // the strip's "has edits" dot (a rating alone doesn't set it)
 }
 
 // Saves now if anything changed since the last save / load.
 static void flushSidecar()
 {
-  if (state.original && state.adjust.version() != state.sidecarSaved)
+  if (state.original &&
+      (state.adjust.version() != state.sidecarSaved || state.metaDirty))
     saveSidecar();
 }
 
@@ -1689,7 +1696,8 @@ static void flushSidecar()
 // dragging a slider or a mask (that would write on every frame).
 static void autosaveSidecar()
 {
-  if (!state.original || state.adjust.version() == state.sidecarSaved)
+  if (!state.original ||
+      (state.adjust.version() == state.sidecarSaved && !state.metaDirty))
     return;
   if (state.dragging || state.mask.drag != MaskUi::Drag::None)
     return;
@@ -1702,6 +1710,8 @@ static void autosaveSidecar()
 static void loadSidecar()
 {
   state.sidecarSaved = state.adjust.version(); // pristine unless loaded below
+  state.meta = PhotoMeta{};                    // unrated unless the file says so
+  state.metaDirty = false;
   std::ifstream f(sidecarPath(state.imagePath),
                   std::ios::binary | std::ios::ate);
   if (!f)
@@ -1749,7 +1759,9 @@ static void loadSidecar()
     return;
   }
   state.sidecarSaved = state.adjust.version();
-  setStatus("Restored saved edits", false);
+  state.meta = sidecarMetaFromRoot(root);
+  if (edits->dump() != sidecarNeutralEditsDump()) // a rating alone isn't "edits"
+    setStatus("Restored saved edits", false);
 }
 
 // ---------------- Sync Settings: one look onto other pictures ----------------
@@ -1763,19 +1775,29 @@ static void loadSidecar()
 // a second sync is refused while one runs, and opening pictures waits too, so
 // no one reads a sidecar that is about to be replaced. The open picture is
 // never in the batch (its edits live in memory and autosave).
+//
+// The same worker also does the **batch rating**: when pictures are selected,
+// a rating / flag / color label command is applied to the open picture at once
+// and to the other selected pictures here, as `metaOnly` jobs (see
+// applyMetaPatch). That is a sidecarPatchMeta per picture instead of a
+// sidecarSyncLook, with the same rules and the same refusals.
 struct SyncJob
 {
   std::vector<std::string> paths;
   Preset look; // only its values, curves, mix and grade are used
+  bool metaOnly = false; // rate / flag / label the pictures instead
+  MetaPatch patch;       // ... with this
 };
 struct SyncOutcome
 {
   std::string path;
   bool ok = false;
   std::string error; // why it was skipped
+  PhotoMeta meta;    // metaOnly: the picture's meta after the patch
 };
 struct SyncResult
 {
+  bool metaOnly = false;
   std::vector<SyncOutcome> items;
 };
 
@@ -1828,6 +1850,7 @@ static bool writeTextAtomic(const std::filesystem::path &path,
 static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
 {
   SyncResult res;
+  res.metaOnly = job.metaOnly;
   for (const std::string &path : job.paths)
   {
     SyncOutcome o;
@@ -1835,6 +1858,12 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
     std::string old;
     int w = 0, h = 0;
     const int have = readSidecarText(path, &old);
+    if (have == 0 && job.metaOnly && job.patch.applyTo(PhotoMeta{}).isDefault())
+    { // nothing to record and no file to change: not worth a decode
+      o.ok = true;
+      res.items.push_back(std::move(o));
+      continue;
+    }
     if (have < 0)
       o.error = "couldn't read its saved edits";
     else
@@ -1855,9 +1884,14 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
       if (o.error.empty())
       {
         std::string text;
-        if (sidecarSyncLook(old, baseName(path), w, h, job.look.values,
-                            job.look.curves, job.look.mix, job.look.grade,
-                            &text, &o.error))
+        const bool built =
+            job.metaOnly
+                ? sidecarPatchMeta(old, baseName(path), w, h, job.patch, &text,
+                                   &o.meta, &o.error)
+                : sidecarSyncLook(old, baseName(path), w, h, job.look.values,
+                                  job.look.curves, job.look.mix, job.look.grade,
+                                  &text, &o.error);
+        if (built)
           o.ok = writeTextAtomic(sidecarPath(path), text, &o.error);
       }
     }
@@ -1890,10 +1924,23 @@ static void collectSyncJob()
     if (o.ok)
     {
       ++ok;
-      filmMarkEdited(o.path); // the strip's "has edits" dot
+      if (r->metaOnly)
+        filmApplyMeta(o.path, o.meta); // a rating alone sets no "has edits" dot
+      else
+        filmMarkEdited(o.path); // the strip's "has edits" dot
     }
     else if (++bad == 1)
       firstErr = baseName(o.path) + ": " + o.error;
+  }
+  if (r->metaOnly)
+  {
+    if (bad == 0)
+      setStatus("Updated " + std::to_string(ok) + " selected photo(s)", false);
+    else
+      setStatus("Updated " + std::to_string(ok) + ", skipped " +
+                    std::to_string(bad) + " (" + firstErr + ")",
+                true);
+    return;
   }
   if (bad == 0)
     setStatus("Synced settings to " + std::to_string(ok) + " photo(s)", false);
@@ -1911,7 +1958,8 @@ static void syncSettings()
   const FilmStrip &f = state.film;
   SyncJob job;
   for (size_t i = 0; i < f.files.size(); ++i)
-    if (f.files[i].selected && static_cast<int>(i) != f.current)
+    if (f.files[i].selected && static_cast<int>(i) != f.current &&
+        filmViewPos(static_cast<int>(i)) >= 0) // never one the filter hides
       job.paths.push_back(f.files[i].path);
   if (job.paths.empty())
   {
@@ -1933,7 +1981,9 @@ static void syncSettings()
 // in view, so a folder of thousands costs nothing extra. Thumbnails are made
 // by a background thread, nearest-to-the-open-picture first, and the open
 // picture's thumbnail is refreshed (edits included) when you leave it.
-constexpr float kFilmH = 104.0f;
+constexpr float kFilmBarH = 26.0f;   // the filter bar on top of the cells
+constexpr float kFilmCellsH = 104.0f; // the row of thumbnails below it
+constexpr float kFilmH = kFilmBarH + kFilmCellsH;
 constexpr float kFilmCellW = 108.0f;
 constexpr size_t kFilmMaxFiles = 5000; // a bigger folder shows its first 5000
 
@@ -1959,19 +2009,45 @@ static FilmStrip filmListFolder(const std::string &folder)
   return f;
 }
 
+// The strip shows `view`: the files that pass the filter. The open picture and
+// the one being opened always stay in, so rating the picture you are looking at
+// under a filter can't make it vanish. UI thread only.
+static void filmRebuildView()
+{
+  FilmStrip &f = state.film;
+  f.view.clear();
+  const bool all = !f.filter.active();
+  for (size_t i = 0; i < f.files.size(); ++i)
+  {
+    const int ii = static_cast<int>(i);
+    if (all || ii == f.current || ii == f.target || f.filter.matches(f.files[i].meta))
+      f.view.push_back(ii);
+  }
+  f.dirty = true;
+}
+
+// Where file `i` sits in the strip, or -1 if it isn't shown.
+static int filmViewPos(int i)
+{
+  const std::vector<int> &v = state.film.view;
+  const auto it = std::lower_bound(v.begin(), v.end(), i);
+  return it != v.end() && *it == i ? static_cast<int>(it - v.begin()) : -1;
+}
+
 static void filmClampScroll()
 {
   FilmStrip &f = state.film;
-  const float total = static_cast<float>(f.files.size()) * kFilmCellW;
+  const float total = static_cast<float>(f.view.size()) * kFilmCellW;
   f.scrollX = std::clamp(f.scrollX, 0.0f, std::max(0.0f, total - f.viewW));
 }
 
 static void filmEnsureVisible(int i)
 {
   FilmStrip &f = state.film;
-  if (i < 0)
+  const int pos = i < 0 ? -1 : filmViewPos(i);
+  if (pos < 0)
     return;
-  const float x0 = static_cast<float>(i) * kFilmCellW, x1 = x0 + kFilmCellW;
+  const float x0 = static_cast<float>(pos) * kFilmCellW, x1 = x0 + kFilmCellW;
   const float w = f.viewW > 0.0f ? f.viewW : 800.0f; // before the first paint
   if (x0 < f.scrollX)
     f.scrollX = x0;
@@ -2029,6 +2105,7 @@ static void filmAdoptFiles(const std::vector<std::string> &paths)
     next.files.push_back(std::move(e));
   }
   state.film = std::move(next);
+  filmRebuildView(); // a new strip starts with no filter
   state.film.dirty = true;
 }
 
@@ -2041,6 +2118,7 @@ static bool filmAdoptFolder(const std::string &folder)
     return false;
   next.visible = state.film.visible;
   state.film = std::move(next);
+  filmRebuildView(); // a new strip starts with no filter
   state.film.dirty = true;
   return true;
 }
@@ -2063,6 +2141,13 @@ static void filmSync(const std::string &imagePath)
   FilmStrip &g = state.film;
   const auto it = g.byName.find(filmLower(u8ToString(p.filename())));
   g.current = g.target = it == g.byName.end() ? -1 : static_cast<int>(it->second);
+  if (g.current >= 0)
+  { // the open picture's rating etc. are the editor's own (loaded with its sidecar)
+    FilmEntry &cur = g.files[static_cast<size_t>(g.current)];
+    cur.meta = state.meta;
+    cur.scanned = true;
+  }
+  filmRebuildView();
   g.thumbVersion = state.adjust.version();
   filmEnsureVisible(g.current);
   filmQueueThumbs();
@@ -2102,9 +2187,26 @@ static void filmMarkEdited(const std::string &path)
   }
 }
 
+// A batch rating finished for `path`: the strip shows its new rating, flag and
+// label. (If a filter is on, the picture may now appear or disappear.)
+static void filmApplyMeta(const std::string &path, const PhotoMeta &m)
+{
+  FilmStrip &f = state.film;
+  const auto it = f.byName.find(filmLower(baseName(path)));
+  if (it == f.byName.end() || static_cast<int>(it->second) == f.current)
+    return; // the open picture's value is the editor's own
+  FilmEntry &e = f.files[it->second];
+  e.meta = m;
+  e.scanned = true;
+  if (f.filter.active())
+    filmRebuildView();
+  f.dirty = true;
+}
+
 // UI thread: takes in the thumbnails the worker has made.
 static void collectThumbJobs()
 {
+  bool metaChanged = false;
   for (auto &r : thumbWorker.collect())
   {
     FilmStrip &f = state.film;
@@ -2122,8 +2224,17 @@ static void collectThumbJobs()
     else
       e.failed = true;
     e.edited = e.edited || r.edited;
+    if (!e.scanned)
+    { // only the first reading counts: after that the editor's own value is the
+      // truth (a late result could carry what the sidecar said before a rating)
+      e.scanned = true;
+      e.meta = r.meta;
+      metaChanged = metaChanged || !r.meta.isDefault();
+    }
     f.dirty = true;
   }
+  if (metaChanged && state.film.filter.active())
+    filmRebuildView(); // a filter is waiting for these
 }
 
 // Opens the picture at index `i` (same background decode as File > Open).
@@ -2134,6 +2245,8 @@ static void filmOpenIndex(int i)
       state.dragging || syncBusy())
     return;
   f.target = i;
+  if (f.filter.active())
+    filmRebuildView(); // the picture being opened stays in the strip
   f.dirty = true;
   filmEnsureVisible(i);
   setStatus("Opening " + f.files[static_cast<size_t>(i)].name + "...", false);
@@ -2146,10 +2259,15 @@ static void filmOpenIndex(int i)
 static void filmStep(int d)
 {
   const FilmStrip &f = state.film;
-  if (f.files.empty())
+  if (f.view.empty())
     return;
+  // Steps through the pictures the strip shows (all of them with no filter).
   const int base = f.target >= 0 ? f.target : f.current;
-  filmOpenIndex(std::clamp(base + d, 0, static_cast<int>(f.files.size()) - 1));
+  int pos = filmViewPos(base);
+  if (pos < 0)
+    pos = d > 0 ? -1 : static_cast<int>(f.view.size());
+  pos = std::clamp(pos + d, 0, static_cast<int>(f.view.size()) - 1);
+  filmOpenIndex(f.view[static_cast<size_t>(pos)]);
 }
 
 static void filmScrollBy(float dx)
@@ -2167,23 +2285,137 @@ static void filmClearSelection()
 }
 
 static void filmSelectAll()
-{
+{ // only what the strip shows: Sync Settings must not reach hidden pictures
   for (FilmEntry &e : state.film.files)
-    e.selected = true;
+    e.selected = false;
+  for (int i : state.film.view)
+    state.film.files[static_cast<size_t>(i)].selected = true;
   state.film.dirty = true;
 }
 
-// Plain click opens a picture (and clears the selection). Ctrl+click toggles
-// one picture in the selection, Shift+click selects the range from the last
-// one clicked. The open picture joins the selection the first time, so it is
-// part of the range.
-static void filmClick(float localX, const KeyModifiers &mods)
+// ---- The filter bar (top of the strip) ----
+// Five stars ("at least N", click the lit one again to switch it off), Pick and
+// Reject, five color labels, and "Clear" while a filter is on. Painting and
+// clicking both read the same list, so they can't disagree.
+constexpr float kBarPad = 8.0f, kBarBtn = 22.0f, kBarGap = 14.0f;
+constexpr float kBarPickW = 38.0f, kBarRejectW = 52.0f, kBarClearW = 44.0f;
+constexpr std::array<Color, kLabelCount> kLabelColors = {
+    Color{225, 70, 70}, Color{232, 196, 60}, Color{80, 185, 100},
+    Color{70, 130, 230}, Color{165, 100, 215}};
+static const char *const kLabelDisplay[kLabelCount] = {"Red", "Yellow", "Green",
+                                                       "Blue", "Purple"};
+
+struct FilmBarItem
+{
+  enum Kind
+  {
+    None,
+    Star,
+    Pick,
+    Reject,
+    Label,
+    Clear
+  };
+  Kind kind = None;
+  int n = 0; // the star count or the label number
+  float x = 0.0f, w = 0.0f;
+};
+
+static std::vector<FilmBarItem> filmBarItems()
+{
+  std::vector<FilmBarItem> v;
+  float x = kBarPad;
+  auto add = [&](FilmBarItem::Kind k, int n, float w)
+  {
+    FilmBarItem it;
+    it.kind = k;
+    it.n = n;
+    it.x = x;
+    it.w = w;
+    v.push_back(it);
+    x += w;
+  };
+  for (int s = 1; s <= kMaxRating; ++s)
+    add(FilmBarItem::Star, s, kBarBtn);
+  x += kBarGap;
+  add(FilmBarItem::Pick, 0, kBarPickW);
+  add(FilmBarItem::Reject, 0, kBarRejectW);
+  x += kBarGap;
+  for (int c = 1; c <= kLabelCount; ++c)
+    add(FilmBarItem::Label, c, kBarBtn);
+  if (state.film.filter.active())
+  {
+    x += kBarGap;
+    add(FilmBarItem::Clear, 0, kBarClearW);
+  }
+  return v;
+}
+
+// The filter changed: re-pick what the strip shows. Nothing hidden stays
+// selected (Sync Settings would write into it unseen).
+static void filmFilterChanged()
 {
   FilmStrip &f = state.film;
-  const int n = static_cast<int>(f.files.size());
-  const int i = static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
-  if (i < 0 || i >= n)
+  filmRebuildView();
+  for (size_t i = 0; i < f.files.size(); ++i)
+    if (f.files[i].selected && filmViewPos(static_cast<int>(i)) < 0)
+      f.files[i].selected = false;
+  filmClampScroll();
+  filmEnsureVisible(f.current);
+  f.dirty = true;
+}
+
+static void filmBarClick(float x)
+{
+  FilmStrip &f = state.film;
+  for (const FilmBarItem &it : filmBarItems())
+  {
+    if (x < it.x || x >= it.x + it.w)
+      continue;
+    switch (it.kind)
+    {
+    case FilmBarItem::Star:
+      f.filter.toggleRating(it.n);
+      break;
+    case FilmBarItem::Pick:
+      f.filter.toggleFlag(PhotoFlag::Pick);
+      break;
+    case FilmBarItem::Reject:
+      f.filter.toggleFlag(PhotoFlag::Reject);
+      break;
+    case FilmBarItem::Label:
+      f.filter.toggleLabel(it.n);
+      break;
+    case FilmBarItem::Clear:
+      f.filter = MetaFilter{};
+      break;
+    default:
+      return;
+    }
+    filmFilterChanged();
     return;
+  }
+}
+
+// A click in the filter bar (y above the cells) or on a picture. A plain click
+// on a picture opens it (and clears the selection). Ctrl+click toggles one
+// picture in the selection, Shift+click selects the range from the last one
+// clicked (among the pictures shown). The open picture joins the selection the
+// first time, so it is part of the range.
+static void filmClick(float localX, float localY, const KeyModifiers &mods)
+{
+  FilmStrip &f = state.film;
+  if (localY < kFilmBarH)
+  {
+    filmBarClick(localX);
+    return;
+  }
+  const int total = static_cast<int>(f.files.size());
+  const int n = static_cast<int>(f.view.size());
+  const int pos = static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
+  if (pos < 0 || pos >= n)
+    return;
+  const int i = f.view[static_cast<size_t>(pos)];
   if (mods.ctrl || mods.shift)
   {
     const int base = f.current >= 0 ? f.current : i;
@@ -2194,11 +2426,16 @@ static void filmClick(float localX, const KeyModifiers &mods)
       f.files[static_cast<size_t>(base)].selected = true;
     if (mods.shift)
     {
-      const int a = f.anchor >= 0 && f.anchor < n ? f.anchor : base;
+      const int a = f.anchor >= 0 && f.anchor < total ? f.anchor : base;
+      int pa = filmViewPos(a);
+      if (pa < 0)
+        pa = filmViewPos(base);
+      if (pa < 0)
+        pa = pos;
       for (FilmEntry &e : f.files)
         e.selected = false;
-      for (int k = std::min(a, i); k <= std::max(a, i); ++k)
-        f.files[static_cast<size_t>(k)].selected = true;
+      for (int k = std::min(pa, pos); k <= std::max(pa, pos); ++k)
+        f.files[static_cast<size_t>(f.view[static_cast<size_t>(k)])].selected = true;
     }
     else
     {
@@ -2242,43 +2479,141 @@ static void openFolder()
   filmOpenIndex(0);
 }
 
+static std::string starsText(int n)
+{
+  std::string s;
+  for (int i = 0; i < n; ++i)
+    s += "\xE2\x98\x85"; // U+2605 BLACK STAR
+  return s;
+}
+
 static void paintFilmstrip(CanvasContext &ctx)
 {
   FilmStrip &f = state.film;
-  const float W = ctx.width(), H = ctx.height();
+  const float W = ctx.width();
   f.viewW = W;
   filmClampScroll();
   ctx.setFillColor(kColorRootBg);
-  ctx.fillRect(0, 0, W, H);
+  ctx.fillRect(0, 0, W, kFilmH);
   if (f.files.empty())
     return;
 
-  const int n = static_cast<int>(f.files.size());
+  // ---- filter bar ----
+  {
+    const MetaFilter &fl = f.filter;
+    const Color gold{255, 205, 60};
+    ctx.setFont("", 12.0f);
+    ctx.setTextBaseline(TextBaseline::Top);
+    ctx.setTextAlign(TextAlign::Center);
+    for (const FilmBarItem &it : filmBarItems())
+    {
+      const float cx = it.x + it.w / 2.0f;
+      bool on = false;
+      switch (it.kind)
+      {
+      case FilmBarItem::Star:
+        on = it.n <= fl.minRating;
+        break;
+      case FilmBarItem::Pick:
+        on = (fl.flags & (1u << static_cast<unsigned>(PhotoFlag::Pick))) != 0;
+        break;
+      case FilmBarItem::Reject:
+        on = (fl.flags & (1u << static_cast<unsigned>(PhotoFlag::Reject))) != 0;
+        break;
+      case FilmBarItem::Label:
+        on = (fl.labels & (1u << static_cast<unsigned>(it.n))) != 0;
+        break;
+      default:
+        break;
+      }
+      if (on && it.kind != FilmBarItem::Star)
+      {
+        ctx.setFillColor(kColorTrack);
+        ctx.fillRect(it.x, 3, it.w, kFilmBarH - 6);
+      }
+      switch (it.kind)
+      {
+      case FilmBarItem::Star:
+        ctx.setFillColor(on ? gold : kColorTextFaint);
+        ctx.fillText("\xE2\x98\x85", cx, 6);
+        break;
+      case FilmBarItem::Pick:
+        ctx.setFillColor(on ? kColorTextDark : kColorTextMuted);
+        ctx.fillText("Pick", cx, 6);
+        break;
+      case FilmBarItem::Reject:
+        ctx.setFillColor(on ? kColorTextDark : kColorTextMuted);
+        ctx.fillText("Reject", cx, 6);
+        break;
+      case FilmBarItem::Label:
+      {
+        Color c = kLabelColors[static_cast<size_t>(it.n - 1)];
+        if (!on)
+          c.a = 140;
+        ctx.setFillColor(c);
+        ctx.beginPath();
+        ctx.roundRect(cx - 6, 7, 12, 12, 6);
+        ctx.fill();
+        break;
+      }
+      case FilmBarItem::Clear:
+        ctx.setFillColor(kColorAccent);
+        ctx.fillText("Clear", cx, 6);
+        break;
+      default:
+        break;
+      }
+    }
+    if (fl.active())
+    {
+      size_t unread = 0;
+      for (const FilmEntry &e : f.files)
+        unread += e.scanned ? 0 : 1;
+      std::string t = std::to_string(f.view.size()) + " of " +
+                      std::to_string(f.files.size());
+      if (unread > 0)
+        t += " (reading ratings\u2026)"; // thumbnails bring each picture's rating in
+      ctx.setTextAlign(TextAlign::End);
+      ctx.setFillColor(kColorTextMuted);
+      ctx.fillText(t, W - kBarPad, 6);
+    }
+  }
+
+  // ---- cells ----
+  const float oy = kFilmBarH, H = kFilmCellsH;
+  const int n = static_cast<int>(f.view.size());
+  if (n == 0)
+  {
+    ctx.setFont("", 12.0f);
+    ctx.setTextAlign(TextAlign::Center);
+    ctx.setTextBaseline(TextBaseline::Top);
+    ctx.setFillColor(kColorTextMuted);
+    ctx.fillText("No photos match the filter", W / 2.0f, oy + H / 2.0f - 6);
+    return;
+  }
   const int first = std::max(0, static_cast<int>(f.scrollX / kFilmCellW));
   const int last =
       std::min(n - 1, static_cast<int>((f.scrollX + W) / kFilmCellW));
-  ctx.setFont("", 11.0f);
-  ctx.setTextAlign(TextAlign::Center);
-  ctx.setTextBaseline(TextBaseline::Top);
-  for (int i = first; i <= last; ++i)
+  for (int p = first; p <= last; ++p)
   {
+    const int i = f.view[static_cast<size_t>(p)];
     const FilmEntry &e = f.files[static_cast<size_t>(i)];
-    const float cx = static_cast<float>(i) * kFilmCellW - f.scrollX;
+    const float cx = static_cast<float>(p) * kFilmCellW - f.scrollX;
     const bool selected = i == f.target;
     if (selected)
     {
       ctx.setFillColor(kColorActivityActive);
-      ctx.fillRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+      ctx.fillRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
     }
     else if (e.selected)
     { // picked for Sync Settings
       ctx.setFillColor(kColorTrack);
-      ctx.fillRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+      ctx.fillRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
       ctx.setStrokeColor(kColorAccent);
       ctx.setLineWidth(1.0f);
-      ctx.strokeRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+      ctx.strokeRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
     }
-    const float bx = cx + (kFilmCellW - kFilmThumbW) / 2.0f, by = 6.0f;
+    const float bx = cx + (kFilmCellW - kFilmThumbW) / 2.0f, by = oy + 6.0f;
     if (e.thumb)
     {
       const float x = bx + (kFilmThumbW - e.thumb->width) / 2.0f;
@@ -2290,11 +2625,16 @@ static void paintFilmstrip(CanvasContext &ctx)
       ctx.setFillColor(kColorTrack);
       ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
     }
+    if (e.meta.flag == PhotoFlag::Reject)
+    { // dimmed, like a rejected frame on a contact sheet
+      ctx.setFillColor(Color{0, 0, 0, 130});
+      ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
+    }
     if (selected)
     {
       ctx.setStrokeColor(kColorAccent);
       ctx.setLineWidth(2.0f);
-      ctx.strokeRect(cx + 2, 2, kFilmCellW - 4, H - 4);
+      ctx.strokeRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
     }
     if (e.edited)
     { // a dot in the thumbnail's bottom-right corner
@@ -2302,6 +2642,40 @@ static void paintFilmstrip(CanvasContext &ctx)
       ctx.beginPath();
       ctx.roundRect(bx + kFilmThumbW - 12, by + kFilmThumbH - 12, 8, 8, 4);
       ctx.fill();
+    }
+    if (e.meta.rating > 0)
+    { // gold stars on the bottom-left corner
+      ctx.setFillColor(Color{0, 0, 0, 150});
+      ctx.fillRect(bx + 2, by + kFilmThumbH - 15, 7.0f + 9.0f * e.meta.rating, 13);
+      ctx.setFont("", 9.0f);
+      ctx.setTextAlign(TextAlign::Start);
+      ctx.setTextBaseline(TextBaseline::Top);
+      ctx.setFillColor(Color{255, 205, 60});
+      ctx.fillText(starsText(e.meta.rating), bx + 5, by + kFilmThumbH - 14);
+    }
+    if (e.meta.label > 0)
+    { // color dot, top-left
+      ctx.setFillColor(Color{0, 0, 0, 150});
+      ctx.beginPath();
+      ctx.roundRect(bx + 3, by + 3, 14, 14, 7);
+      ctx.fill();
+      ctx.setFillColor(kLabelColors[static_cast<size_t>(e.meta.label - 1)]);
+      ctx.beginPath();
+      ctx.roundRect(bx + 5, by + 5, 10, 10, 5);
+      ctx.fill();
+    }
+    if (e.meta.flag != PhotoFlag::None)
+    { // "P" / "X" badge, top-right
+      const bool pick = e.meta.flag == PhotoFlag::Pick;
+      ctx.setFillColor(pick ? Color{70, 165, 90} : Color{205, 60, 60});
+      ctx.beginPath();
+      ctx.roundRect(bx + kFilmThumbW - 17, by + 3, 14, 14, 3);
+      ctx.fill();
+      ctx.setFont("", 10.0f);
+      ctx.setTextAlign(TextAlign::Center);
+      ctx.setTextBaseline(TextBaseline::Top);
+      ctx.setFillColor(Color{255, 255, 255});
+      ctx.fillText(pick ? "P" : "X", bx + kFilmThumbW - 10, by + 4);
     }
     std::string label = e.name;
     constexpr size_t kMaxChars = 15;
@@ -2312,11 +2686,114 @@ static void paintFilmstrip(CanvasContext &ctx)
         --cut;
       label = label.substr(0, cut) + "\u2026";
     }
+    ctx.setFont("", 11.0f);
+    ctx.setTextAlign(TextAlign::Center);
+    ctx.setTextBaseline(TextBaseline::Top);
     ctx.setFillColor(selected ? kColorTextDark : kColorTextMuted);
     ctx.fillText(label, cx + kFilmCellW / 2.0f, by + kFilmThumbH + 6.0f);
   }
 }
 // END filmstrip
+
+// ---------------- Rating, flag and color label (open picture + selection) ----------------
+// Not edits: no undo step, no History label, adjust.version() is not touched.
+// The open picture's value lives in state.meta, is mirrored into the strip's
+// entry, and is saved in the sidecar's "meta" object (autosaveSidecar /
+// flushSidecar look at state.metaDirty).
+//
+// A command (applyMetaPatch) changes the open picture at once. If other
+// pictures are selected in the filmstrip it changes them too, on the Sync
+// Settings worker: their sidecars are patched in the background
+// (sidecarPatchMeta) and the strip updates when the batch finishes. The open
+// picture is never in that batch, so it can't race with autosave. "Choose the
+// value it already has to clear it" is decided from the open picture, and the
+// result (set or clear) is then applied to every selected picture alike.
+static void setPhotoMeta(const PhotoMeta &in, const std::string &message)
+{
+  const PhotoMeta m = photoMetaSanitized(in);
+  if (m == state.meta)
+    return;
+  state.meta = m;
+  state.metaDirty = true;
+  FilmStrip &f = state.film;
+  if (f.current >= 0 && static_cast<size_t>(f.current) < f.files.size())
+  {
+    FilmEntry &e = f.files[static_cast<size_t>(f.current)];
+    e.meta = m;
+    e.scanned = true;
+  }
+  if (f.filter.active())
+    filmRebuildView(); // the open picture stays in; others may come or go
+  f.dirty = true;
+  setStatus(message, false);
+}
+
+// The selected pictures other than the open one that the strip shows.
+static std::vector<std::string> metaBatchTargets()
+{
+  const FilmStrip &f = state.film;
+  std::vector<std::string> paths;
+  for (size_t i = 0; i < f.files.size(); ++i)
+    if (f.files[i].selected && static_cast<int>(i) != f.current &&
+        filmViewPos(static_cast<int>(i)) >= 0) // never one the filter hides
+      paths.push_back(f.files[i].path);
+  return paths;
+}
+
+static void applyMetaPatch(const MetaPatch &patch, const std::string &message)
+{
+  if (!state.original || state.imagePath.empty())
+  {
+    setStatus("Open a picture first", true);
+    return;
+  }
+  std::vector<std::string> others = metaBatchTargets();
+  if (!others.empty() && syncBusy()) // one batch at a time; nothing changes yet
+    return;
+  setPhotoMeta(patch.applyTo(state.meta), message);
+  if (others.empty())
+    return;
+  SyncJob job;
+  job.paths = std::move(others);
+  job.metaOnly = true;
+  job.patch = patch;
+  const size_t n = job.paths.size();
+  syncWorker.submit(std::move(job));
+  setStatus(message + " \u2014 updating " + std::to_string(n) +
+                " selected photo(s)...",
+            false);
+}
+
+static void ratePhoto(int n)
+{
+  n = std::clamp(n, 0, kMaxRating);
+  const int v = n == state.meta.rating ? 0 : n;
+  MetaPatch p;
+  p.rating = v;
+  applyMetaPatch(p, v > 0 ? "Rating: " + starsText(v) : std::string("Rating cleared"));
+}
+
+// Pick or Reject toggles; PhotoFlag::None clears.
+static void flagPhoto(PhotoFlag flag)
+{
+  const PhotoFlag v = flag == state.meta.flag ? PhotoFlag::None : flag;
+  MetaPatch p;
+  p.flag = v;
+  applyMetaPatch(p, v == PhotoFlag::Pick     ? "Flagged as pick"
+                    : v == PhotoFlag::Reject ? "Flagged as rejected"
+                                             : "Flag cleared");
+}
+
+// 1..kLabelCount toggles that color; 0 clears.
+static void labelPhoto(int c)
+{
+  c = std::clamp(c, 0, kLabelCount);
+  const int v = c == state.meta.label ? 0 : c;
+  MetaPatch p;
+  p.label = v;
+  applyMetaPatch(p, v > 0 ? std::string("Label: ") + kLabelDisplay[v - 1]
+                          : std::string("Label cleared"));
+}
 
 static void adoptDecoded(DecodeWorker::Result &&r)
 {
@@ -6839,6 +7316,22 @@ int main()
     ui.addShortcut(shiftOnly, Key::J, notTyping(toggleChannelClipping)); // per-channel colors
     ui.addShortcut(none, Key::W, notTyping(toggleWbPicker)); // white-balance picker
     ui.addShortcut(none, Key::A, notTyping(autoTone));       // Auto Tone
+    // Rating (0 clears, 1-5), flag (P pick, X reject, U unflag) and color label
+    // (6 red, 7 yellow, 8 green, 9 blue) of the open picture. Not edits.
+    for (int s = 0; s <= kMaxRating; ++s)
+      ui.addShortcut(none, static_cast<Key>(static_cast<int>(Key::N0) + s),
+                     notTyping([s]
+                               { ratePhoto(s); }));
+    ui.addShortcut(none, Key::P, notTyping([]
+                                           { flagPhoto(PhotoFlag::Pick); }));
+    ui.addShortcut(none, Key::X, notTyping([]
+                                           { flagPhoto(PhotoFlag::Reject); }));
+    ui.addShortcut(none, Key::U, notTyping([]
+                                           { flagPhoto(PhotoFlag::None); }));
+    for (int c = 1; c <= 4; ++c)
+      ui.addShortcut(none, static_cast<Key>(static_cast<int>(Key::N0) + 5 + c),
+                     notTyping([c]
+                               { labelPhoto(c); }));
     ui.addShortcut(none, Key::Escape, []
                    {
                      state.openMenu = -1;
@@ -6954,6 +7447,28 @@ int main()
                      {"Select All Photos", filmSelectAll, "Ctrl+A"},
                      {"Sync Settings to Selected", syncSettings, "Ctrl+Shift+S"},
                  }));
+
+  { // Photo: rating, flag and color label of the open picture (see ratePhoto)
+    std::vector<MenuItem> photo;
+    for (int s = 1; s <= kMaxRating; ++s)
+      photo.push_back({"Rate " + starsText(s), [s]
+                       { ratePhoto(s); }, std::to_string(s)});
+    photo.push_back({"Clear Rating", []
+                     { ratePhoto(0); }, "0"});
+    photo.push_back({"Flag as Pick", []
+                     { flagPhoto(PhotoFlag::Pick); }, "P"});
+    photo.push_back({"Flag as Rejected", []
+                     { flagPhoto(PhotoFlag::Reject); }, "X"});
+    photo.push_back({"Remove Flag", []
+                     { flagPhoto(PhotoFlag::None); }, "U"});
+    for (int c = 1; c <= kLabelCount; ++c)
+      photo.push_back({std::string("Label ") + kLabelDisplay[c - 1], [c]
+                       { labelPhoto(c); },
+                       c <= 4 ? std::to_string(5 + c) : std::string()});
+    photo.push_back({"Clear Label", []
+                     { labelPhoto(0); }});
+    titlebar.addChild(menuButton("Photo", 3, std::move(photo)));
+  }
 
   View undoRedoGap;
   undoRedoGap.style.width = Size::pixel(8);
@@ -8913,8 +9428,8 @@ int main()
     state.film.dirty = false;
     return d;
   };
-  filmstrip.onPressAt = [&ui](float lx, float)
-  { filmClick(lx, ui.modifiers()); };
+  filmstrip.onPressAt = [&ui](float lx, float ly)
+  { filmClick(lx, ly, ui.modifiers()); };
   filmstrip.onScrollUp = []
   { filmScrollBy(-2.0f * kFilmCellW); };
   filmstrip.onScrollDown = []

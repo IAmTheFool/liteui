@@ -59,6 +59,7 @@ set(LITEROOM_HEADERS
     src/io/exif.hpp
     src/io/image_meta.hpp
     src/io/preset.hpp
+    src/io/photo_meta.hpp
 
     # background work
     src/workers/latest_worker.hpp
@@ -179,7 +180,7 @@ if(LITEROOM_TESTS)
     foreach(t minijson exif
               pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves
               mask_geom mask_raster mask_brush mask_range mask_object mask
-              sidecar render_params adjustment_set file_utils image_meta preset sam_segmenter)
+              sidecar photo_meta render_params adjustment_set file_utils image_meta preset sam_segmenter)
         literoom_add_test(${t})
     endforeach()
 

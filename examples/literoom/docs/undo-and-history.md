@@ -13,6 +13,8 @@ The edit state is everything needed to reproduce the picture from the original:
 - the committed crop, the 90° orientation (turns and flip), the straighten angle and the corner mode
 - the list of masks (shapes, brush strokes, object bitmaps, and each mask's own sliders)
 
+A picture's **rating, flag and color label** are not edits either. They are kept beside the edit state (see [sidecar-format.md](sidecar-format.md#rating-flag-color-label-and-the-filmstrip-filter)), have no undo step and no History label, and never bump `version()`.
+
 A **preset** is not another kind of edit. It is a way of setting the first four groups (sliders, curves, Color Mixer, Color Grading) in one go; see [Presets](#presets) below.
 
 ## Snapshots
