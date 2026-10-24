@@ -59,6 +59,10 @@ static void testSliderStepsAndCoalescing()
   CHECK(lastLabel(s) == "Shadows +3");      // 0.04 is not
   s.set(AdjId::Sepia, 60.0f);
   CHECK(lastLabel(s) == "Sepia +60");        // the Filters get History labels from the table too
+  s.set(AdjId::BleachBypass, 40.0f);
+  CHECK(lastLabel(s) == "Bleach Bypass +40");
+  s.set(AdjId::CrossProcess, 25.0f);
+  CHECK(lastLabel(s) == "Cross Process +25");
   CHECK(kMaxUndoSteps == 200);
 }
 
@@ -477,11 +481,12 @@ static void testFilterSlidersReachTheColorPass()
   Mask m = radialMask();
   m.adj = AdjValues{};
   float v = 15.0f;
-  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize})
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize,
+                   AdjId::BleachBypass, AdjId::Threshold, AdjId::CrossProcess})
   {
     t.set(id, v);
     m.adj[static_cast<size_t>(id)] = v;
-    v += 12.0f;
+    v += 8.0f; // 15 ... 87: ten different strengths, none clamped
   }
   t.setMasks(MaskSet{m}, -1);
   const RenderParams r2 = t.buildRenderParams();
@@ -489,6 +494,8 @@ static void testFilterSlidersReachTheColorPass()
   const FilterPass &g = r2.color.filters, &l = r2.masks[0].color.filters;
   CHECK(g.any && l.any && g.grey == l.grey && g.sepia == l.sepia && g.vintage == l.vintage && g.fade == l.fade);
   CHECK(g.negative == l.negative && g.solarize == l.solarize && g.posterLevels == l.posterLevels);
+  CHECK(g.bleach == l.bleach && g.threshold == l.threshold && g.cross == l.cross);
+  CHECK(g.bleach > 0.0f && g.threshold > 0.0f && g.cross > 0.0f); // really read at the global call site too
 }
 
 static void testMasksFollowTheGeometry()

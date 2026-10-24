@@ -331,8 +331,8 @@ namespace golden
 
   static size_t idx(AdjId id) { return static_cast<size_t>(id); }
 
-  // The Filters (Greyscale ... Solarize) are one contiguous block of the table.
-  static bool isFilter(AdjId id) { return id >= AdjId::Greyscale && id <= AdjId::Solarize; }
+  // The Filters (Greyscale ... Cross Process) are one contiguous block of the table.
+  static bool isFilter(AdjId id) { return id >= AdjId::Greyscale && id <= AdjId::CrossProcess; }
   // Position of slider i among the sliders that are NOT filters. The "every
   // other slider goes negative" pattern of the kitchen-sink scenarios (all_*,
   // fullEffect, buildSink) uses it, so inserting the Filters into the table
@@ -340,7 +340,7 @@ namespace golden
   // fingerprints for any reason except the Filters themselves).
   static size_t sinkPos(size_t i)
   {
-    const size_t first = idx(AdjId::Greyscale), count = idx(AdjId::Solarize) - first + 1;
+    const size_t first = idx(AdjId::Greyscale), count = idx(AdjId::CrossProcess) - first + 1;
     return i < first ? i : i - count; // only meaningful for non-filter i
   }
   // Strength the kitchen-sink scenarios give every Filter. Modest on purpose:
@@ -571,6 +571,18 @@ namespace golden
       s.set(AdjId::Posterize, 25);
       s.set(AdjId::Negative, 20);
       renderScenario("adj/filters_stack", s, img);
+    }
+    {
+      // The newer three together (fixed order: Bleach Bypass, Cross Process,
+      // Threshold), plus Posterize and Negative after them.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::BleachBypass, 60);
+      s.set(AdjId::CrossProcess, 50);
+      s.set(AdjId::Threshold, 30);
+      s.set(AdjId::Posterize, 20);
+      s.set(AdjId::Negative, 20);
+      renderScenario("adj/filters_new_stack", s, img);
     }
     {
       // Filters run after every other color stage: Negative over a picture the

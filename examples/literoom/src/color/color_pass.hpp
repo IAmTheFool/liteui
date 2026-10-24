@@ -17,17 +17,22 @@ constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction
 // Every filter is a strength 0..100 (0 = untouched). At strength s the result
 // is lerp(pixel, filtered(pixel), s / 100), so 0 is exactly the identity and
 // existing renders (and the golden fingerprints) cannot change. Fixed order:
-// Vintage -> Fade -> Greyscale -> Sepia -> (clamp) -> Solarize -> Posterize -> Negative.
+// Vintage -> Fade -> Greyscale -> Sepia -> (clamp) -> Solarize -> Bleach Bypass
+// -> Cross Process -> Threshold -> Posterize -> Negative.
 struct FilterValues
 {
   float greyscale = 0, sepia = 0, vintage = 0, fade = 0, negative = 0,
-        posterize = 0, solarize = 0;
+        posterize = 0, solarize = 0, bleachBypass = 0, threshold = 0,
+        crossProcess = 0;
 };
+
+constexpr float kThresholdLevel = 128.0f; // Threshold: luma at or above this goes white, below goes black
 
 struct FilterPass
 {
   bool any = false; // false = skip the filter block entirely
   float grey = 0, sepia = 0, vintage = 0, fade = 0, negative = 0, solarize = 0; // 0..1
+  float bleach = 0, threshold = 0, cross = 0;                                   // 0..1 (Bleach Bypass, Threshold, Cross Process)
   int posterLevels = 0;                                                         // 0 = off, else 2..255
   float posterScale = 0, posterInv = 0;                                         // (L-1)/255 and 255/(L-1)
 };
@@ -44,6 +49,9 @@ inline FilterPass makeFilterPass(const FilterValues &v)
   f.fade = amt(v.fade);
   f.negative = amt(v.negative);
   f.solarize = amt(v.solarize);
+  f.bleach = amt(v.bleachBypass);
+  f.threshold = amt(v.threshold);
+  f.cross = amt(v.crossProcess);
   const float p = amt(v.posterize);
   if (p > 0.0f)
   {
@@ -61,12 +69,32 @@ inline FilterPass makeFilterPass(const FilterValues &v)
     }
   }
   f.any = f.grey > 0.0f || f.sepia > 0.0f || f.vintage > 0.0f || f.fade > 0.0f ||
-          f.negative > 0.0f || f.solarize > 0.0f || f.posterLevels != 0;
+          f.negative > 0.0f || f.solarize > 0.0f || f.bleach > 0.0f ||
+          f.threshold > 0.0f || f.cross > 0.0f || f.posterLevels != 0;
   return f;
 }
 
 inline float filterLerp(float a, float b, float t) { return a + (b - a) * t; }
 inline float filterClamp255(float x) { return x < 0.0f ? 0.0f : (x > 255.0f ? 255.0f : x); }
+
+// Bleach Bypass, one channel: overlay blend of the channel (x, 0..1) with the
+// pixel's luma (lum, 0..1). Dark pixels multiply (2 x lum), light ones screen
+// (1 - 2 (1 - x)(1 - lum)); k (0..1) fades from one to the other around
+// lum = 0.45..0.55. Black and white map to themselves.
+inline float filterBleachChannel(float x, float lum, float k)
+{
+  const float dark = 2.0f * x * lum;
+  const float light = 1.0f - 2.0f * (1.0f - x) * (1.0f - lum);
+  return dark + (light - dark) * k;
+}
+
+// Cross Process, R and G: a smoothstep S-curve blended in by `amt` (0 = straight).
+inline float filterSCurve255(float v, float amt)
+{
+  const float x = v * (1.0f / 255.0f);
+  const float s = x * x * (3.0f - 2.0f * x);
+  return (x + (s - x) * amt) * 255.0f;
+}
 
 // One pixel, float in and out (0..255, may leave the range; the caller rounds
 // and clamps once). Plain code, no std:: helpers, for the Debug-build reason
@@ -124,6 +152,43 @@ inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
     r = filterLerp(r, r > 128.0f ? 255.0f - r : r, f.solarize);
     g = filterLerp(g, g > 128.0f ? 255.0f - g : g, f.solarize);
     b = filterLerp(b, b > 128.0f ? 255.0f - b : b, f.solarize);
+  }
+  if (f.bleach > 0.0f)
+  {
+    // Half-desaturate (luma is kept), then overlay the luma on the result:
+    // muted color, harder contrast. Blacks and whites stay put.
+    const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
+    const float lum = l * (1.0f / 255.0f);
+    float k = (lum - 0.45f) * 10.0f;
+    k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+    const float dr = filterLerp(r, l, 0.5f) * (1.0f / 255.0f);
+    const float dg = filterLerp(g, l, 0.5f) * (1.0f / 255.0f);
+    const float db = filterLerp(b, l, 0.5f) * (1.0f / 255.0f);
+    r = filterLerp(r, filterBleachChannel(dr, lum, k) * 255.0f, f.bleach);
+    g = filterLerp(g, filterBleachChannel(dg, lum, k) * 255.0f, f.bleach);
+    b = filterLerp(b, filterBleachChannel(db, lum, k) * 255.0f, f.bleach);
+  }
+  if (f.cross > 0.0f)
+  {
+    // Slide film in the wrong chemistry: R gets a strong S-curve, G a mild one,
+    // B is lifted in the shadows (0 -> 32) and pulled down in the highlights
+    // (255 -> 225). Blacks go blue, whites go yellow.
+    const float cr = filterSCurve255(r, 0.9f);
+    const float cg = filterSCurve255(g, 0.5f);
+    const float cb = 32.0f + b * (193.0f / 255.0f);
+    r = filterLerp(r, cr, f.cross);
+    g = filterLerp(g, cg, f.cross);
+    b = filterLerp(b, cb, f.cross);
+  }
+  if (f.threshold > 0.0f)
+  {
+    // Pure black and white on the pixel's luma (a fixed cutoff; the slider is
+    // the blend strength, so 100 is 1-bit).
+    const float l = kGradeLumaR * r + kGradeLumaG * g + kGradeLumaB * b;
+    const float bw = l >= kThresholdLevel ? 255.0f : 0.0f;
+    r = filterLerp(r, bw, f.threshold);
+    g = filterLerp(g, bw, f.threshold);
+    b = filterLerp(b, bw, f.threshold);
   }
   if (f.posterLevels != 0)
   {

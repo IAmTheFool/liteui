@@ -49,7 +49,8 @@ static void testRanges()
   for (AdjId id : {AdjId::Sharpness, AdjId::NoiseLuma, AdjId::NoiseColor, AdjId::Blur})
     CHECK(spec(id).min == 0.0f && spec(id).max == 100.0f);
   // The Filters are strengths too: 0 (off) to 100.
-  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize})
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize,
+                   AdjId::BleachBypass, AdjId::Threshold, AdjId::CrossProcess})
     CHECK(spec(id).min == 0.0f && spec(id).max == 100.0f);
   // Two-sided ones are symmetric.
   for (AdjId id : {AdjId::Contrast, AdjId::Highlights, AdjId::Shadows, AdjId::Whites, AdjId::Blacks,
@@ -117,14 +118,16 @@ static void testToneDirections()
 }
 
 
-// The Filters block: seven Color-stage strengths, kept together between
+// The Filters block: ten Color-stage strengths, kept together between
 // Colorize Amount and the first Detail entry (main.cpp starts its "Filters"
 // header at Greyscale, so the block must stay contiguous and in this order).
 static void testFilterBlock()
 {
-  const AdjId filters[] = {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize};
-  const char *labels[] = {"Greyscale", "Sepia", "Vintage", "Fade", "Negative", "Posterize", "Solarize"};
-  for (size_t i = 0; i < 7; ++i)
+  const AdjId filters[] = {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize,
+                           AdjId::BleachBypass, AdjId::Threshold, AdjId::CrossProcess};
+  const char *labels[] = {"Greyscale", "Sepia", "Vintage", "Fade", "Negative", "Posterize", "Solarize",
+                          "Bleach Bypass", "Threshold", "Cross Process"};
+  for (size_t i = 0; i < 10; ++i)
   {
     const AdjustmentSpec &s = spec(filters[i]);
     CHECK(s.stage == AdjustmentSpec::Stage::Color && s.apply == nullptr);
@@ -132,7 +135,8 @@ static void testFilterBlock()
     CHECK(adjIndex(filters[i]) == adjIndex(AdjId::Greyscale) + i); // contiguous, in order
   }
   CHECK(adjIndex(AdjId::Greyscale) == adjIndex(AdjId::ColorizeAmount) + 1);
-  CHECK(adjIndex(AdjId::Texture) == adjIndex(AdjId::Solarize) + 1);
+  CHECK(adjIndex(AdjId::Solarize) + 1 == adjIndex(AdjId::BleachBypass)); // the newer three follow Solarize
+  CHECK(adjIndex(AdjId::Texture) == adjIndex(AdjId::CrossProcess) + 1);
   // Values are sanitized into 0..100 like every other slider.
   CHECK(sanitizedValue(spec(AdjId::Greyscale), 250.0f) == 100.0f);
   CHECK(sanitizedValue(spec(AdjId::Greyscale), -5.0f) == 0.0f);

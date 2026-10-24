@@ -27,7 +27,8 @@ static ColorPass pass(float temperature = 0, float tint = 0, float vibrance = 0,
 static ColorPass filterPass(const FilterValues &f) { return pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, f); }
 static constexpr float FilterValues::*kFilterFields[] = {&FilterValues::greyscale, &FilterValues::sepia, &FilterValues::vintage,
                                                           &FilterValues::fade, &FilterValues::negative, &FilterValues::posterize,
-                                                          &FilterValues::solarize};
+                                                          &FilterValues::solarize, &FilterValues::bleachBypass, &FilterValues::threshold,
+                                                          &FilterValues::crossProcess};
 static int luma(const Px &p) { return static_cast<int>(std::lround(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])); }
 
 static void testActiveFlags()
@@ -364,6 +365,117 @@ static void testSepiaFadeVintageFilters()
   CHECK(white[0] == 255 && white[2] < 255);
 }
 
+// ---- Bleach Bypass, Threshold, Cross Process ----
+static int spread(const Px &p) { return std::max({int(p[0]), int(p[1]), int(p[2])}) - std::min({int(p[0]), int(p[1]), int(p[2])}); }
+
+static void testNewFilterValuesAreSanitized()
+{
+  FilterValues v;
+  v.bleachBypass = 250.0f;  // clamped to 100
+  v.threshold = std::nanf(""); // NaN becomes 0
+  v.crossProcess = -5.0f;   // clamped to 0
+  const FilterPass f = makeFilterPass(v);
+  CHECK(f.bleach == 1.0f && f.threshold == 0.0f && f.cross == 0.0f && f.any);
+  v.bleachBypass = 40.0f;
+  v.threshold = 25.0f;
+  v.crossProcess = 75.0f;
+  const FilterPass g = makeFilterPass(v);
+  CHECK_NEAR(g.bleach, 0.4f, 1e-6);
+  CHECK_NEAR(g.threshold, 0.25f, 1e-6);
+  CHECK_NEAR(g.cross, 0.75f, 1e-6);
+  CHECK(g.grey == 0.0f && g.solarize == 0.0f && g.posterLevels == 0); // the others stay off
+  // Each one alone turns the block on, and only itself.
+  for (float FilterValues::*field : {&FilterValues::bleachBypass, &FilterValues::threshold, &FilterValues::crossProcess})
+  {
+    FilterValues one1;
+    one1.*field = 1.0f;
+    CHECK(makeFilterPass(one1).any);
+  }
+}
+
+static void testBleachBypassFilter()
+{
+  FilterValues f;
+  f.bleachBypass = 100.0f;
+  const ColorPass cp = filterPass(f);
+  // Black and white map to themselves.
+  CHECK(run(cp, one(0, 0, 0)) == one(0, 0, 0) && run(cp, one(255, 255, 255)) == one(255, 255, 255));
+  // More contrast: dark grays go darker, light grays go lighter, and grays stay gray.
+  CHECK(run(cp, one(64, 64, 64))[0] < 64 && run(cp, one(192, 192, 192))[0] > 192);
+  for (int v = 0; v <= 255; v += 5)
+  {
+    const Px out = run(cp, one(v, v, v));
+    CHECK(std::abs(out[0] - out[1]) <= 1 && std::abs(out[1] - out[2]) <= 1);
+  }
+  // Colors lose much of their color (an orange-red keeps well under half its spread).
+  const Px orange = one(200, 60, 30);
+  CHECK(spread(run(cp, orange)) * 2 < spread(orange));
+  // Half strength lands halfway between the pixel and the full effect.
+  f.bleachBypass = 50.0f;
+  const Px full = run(cp, orange), half = run(filterPass(f), orange);
+  for (size_t c = 0; c < 3; ++c)
+    CHECK(std::abs(half[c] - (orange[c] + full[c]) / 2) <= 1);
+  CHECK(half[3] == 255);
+}
+
+static void testThresholdFilter()
+{
+  FilterValues f;
+  f.threshold = 100.0f;
+  const ColorPass cp = filterPass(f);
+  // Gray: black below the cutoff, white above (the few levels around it are left out: the float luma sits on the line).
+  for (int v = 0; v < 256; ++v)
+  {
+    if (v >= 126 && v <= 130)
+      continue;
+    const Px out = run(cp, one(v, v, v));
+    CHECK(out[0] == (v > 128 ? 255 : 0) && out[1] == out[0] && out[2] == out[0]);
+  }
+  // It goes by luma, not by the brightest channel: yellow is bright, pure red and blue are dark.
+  CHECK(run(cp, one(255, 255, 0)) == one(255, 255, 255));
+  CHECK(run(cp, one(255, 0, 0)) == one(0, 0, 0));
+  CHECK(run(cp, one(0, 0, 255)) == one(0, 0, 0));
+  // Half strength: halfway between the pixel and black or white.
+  f.threshold = 50.0f;
+  const Px dark = run(filterPass(f), one(100, 100, 100)), light = run(filterPass(f), one(200, 200, 200));
+  CHECK(std::abs(dark[0] - 50) <= 1 && std::abs(light[0] - 228) <= 1);
+  // It runs before Negative: Threshold + Negative is the inverted black and white.
+  FilterValues both;
+  both.threshold = 100.0f;
+  both.negative = 100.0f;
+  CHECK(run(filterPass(both), one(200, 200, 200)) == one(0, 0, 0));
+  CHECK(run(filterPass(both), one(20, 20, 20)) == one(255, 255, 255));
+}
+
+static void testCrossProcessFilter()
+{
+  FilterValues f;
+  f.crossProcess = 100.0f;
+  const ColorPass cp = filterPass(f);
+  // Blacks go blue (B lifted to 32), whites go yellow (B pulled down to 225).
+  const Px black = run(cp, one(0, 0, 0)), white = run(cp, one(255, 255, 255));
+  CHECK(black[0] == 0 && black[1] == 0 && black[2] == 32);
+  CHECK(white[0] == 255 && white[1] == 255 && std::abs(white[2] - 225) <= 1);
+  // Mid-gray keeps its brightness (the S-curves cross at the middle).
+  const Px mid = run(cp, one(128, 128, 128));
+  CHECK(std::abs(mid[0] - 128) <= 1 && std::abs(mid[1] - 128) <= 1 && std::abs(mid[2] - 129) <= 1);
+  // R has the strongest contrast, G a milder one, B none (it is a straight lift).
+  const Px d = run(cp, one(64, 64, 64)), l = run(cp, one(192, 192, 192));
+  CHECK(d[0] < d[1] && d[1] < 64 && l[0] > l[1] && l[1] > 192);
+  // No channel ever runs backwards, and B stays inside 32..225.
+  Px prev = run(cp, one(0, 0, 0));
+  for (int v = 1; v < 256; ++v)
+  {
+    const Px out = run(cp, one(v, v, v));
+    CHECK(out[0] >= prev[0] && out[1] >= prev[1] && out[2] >= prev[2]);
+    CHECK(out[2] >= 32 && out[2] <= 226);
+    prev = out;
+  }
+  // Half strength lifts the black's blue halfway.
+  f.crossProcess = 50.0f;
+  CHECK(std::abs(run(filterPass(f), one(0, 0, 0))[2] - 16) <= 1);
+}
+
 static void testFilterOrderAndPlacement()
 {
   // Greyscale runs before Sepia: both on equals Sepia applied to the greyscaled pixel (not Sepia alone).
@@ -516,6 +628,10 @@ int main()
   testPosterizeFilter();
   testSolarizeFilter();
   testSepiaFadeVintageFilters();
+  testNewFilterValuesAreSanitized();
+  testBleachBypassFilter();
+  testThresholdFilter();
+  testCrossProcessFilter();
   testFilterOrderAndPlacement();
   testFilterBufferHandling();
   testBufferHandling();

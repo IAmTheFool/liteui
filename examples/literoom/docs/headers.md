@@ -86,7 +86,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 
 **Three stages**
 - **Tone**: pointwise per channel (0..255 in, float out). Composed into one lookup table by `toneLutFromValues`. Runs first.
-- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize): 0..100 strengths that run as the last block of the color pass.
+- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process): 0..100 strengths that run as the last block of the color pass.
 - **Detail**: needs neighbor pixels. `apply` is `nullptr`; read by `detail_layer.hpp` and `neighbor_fx.hpp`.
 
 **Constants**
@@ -99,7 +99,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | `kToneMin` / `kToneMax` | `int` | = `kBipolar*` | Older names for the same range, kept so old code compiles |
 
 **Types**
-- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
 - `struct AdjustmentSpec`
 
   | Field | Type | Meaning |
@@ -125,7 +125,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | Temperature, Tint, Vibrance, Saturation, Hue | -100..100 | Color | none (see `color_pass.hpp`) |
 | ColorizeHue | 0..360 (degrees) | Color | none |
 | ColorizeAmount | 0..100 | Color | none |
-| Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize | 0..100 | Color | none (the Filters block of `color_pass.hpp`; 0 = off). Their labels are sidecar keys, so never rename them |
+| Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process | 0..100 | Color | none (the Filters block of `color_pass.hpp`; 0 = off). Their labels are sidecar keys, so never rename them |
 | Texture, Clarity, Dehaze | -100..100 | Detail | none |
 | Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
 
@@ -322,7 +322,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const`**
 - Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what `renderWith`'s fast path checks).
 
-**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade and the seven Filters (via `filterValuesFromAdj(values_)`).
+**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade and the ten Filters (via `filterValuesFromAdj(values_)`).
 
 **`RenderParams buildRenderParams() const`**
 - Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), and `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks).
@@ -350,7 +350,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 
 **Functions**
 
-**`inline FilterValues filterValuesFromAdj(const AdjValues &a)`**: picks the seven Filter sliders (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize) out of an `AdjValues` in the form `makeColorPass` takes. It must be passed at **both** `makeColorPass` call sites (`AdjustmentSet::buildColorPass()` and `buildMaskPasses()`); a site that forgets it silently ignores the Filters.
+**`inline FilterValues filterValuesFromAdj(const AdjValues &a)`**: picks the ten Filter sliders (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process) out of an `AdjValues` in the form `makeColorPass` takes. It must be passed at **both** `makeColorPass` call sites (`AdjustmentSet::buildColorPass()` and `buildMaskPasses()`); a site that forgets it silently ignores the Filters.
 
 **`inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks, const GeoFrame &frame)`**
 - Inputs: the user's masks (stored against the original picture) and the `GeoFrame` of the picture being rendered.
@@ -400,14 +400,14 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 | `gradeLut` | `GradeLut` | zeros | Only filled when `grade` |
 | `filters` | `FilterPass` | all off | The Filters block; `filters.any` = on. Counts toward `active` |
 
-`struct FilterValues`: the seven Filter slider values as given by the UI (0..100 each, default 0): `greyscale`, `sepia`, `vintage`, `fade`, `negative`, `posterize`, `solarize`.
+`struct FilterValues`: the ten Filter slider values as given by the UI (0..100 each, default 0): `greyscale`, `sepia`, `vintage`, `fade`, `negative`, `posterize`, `solarize`, `bleachBypass`, `threshold`, `crossProcess`.
 
 `struct FilterPass`: the Filters frozen for the loop, built by `makeFilterPass`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `any` | `bool` | false | False = skip the whole block |
-| `grey`, `sepia`, `vintage`, `fade`, `negative`, `solarize` | `float` | 0 | Strength 0..1 (slider / 100) |
+| `grey`, `sepia`, `vintage`, `fade`, `negative`, `solarize`, `bleach`, `threshold`, `cross` | `float` | 0 | Strength 0..1 (slider / 100) |
 | `posterLevels` | `int` | 0 | 0 = off, otherwise 2..255 levels per channel |
 | `posterScale`, `posterInv` | `float` | 0 | `(levels − 1) / 255` and its inverse, so the loop has no division |
 
@@ -420,7 +420,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   - `grade`: the four-wheel `ColorGrade`.
   - `colorizeHue`: degrees; only checked for finiteness (it wraps, so any value works).
   - `colorizeAmount`: 0..100.
-  - `filters`: the seven Filter strengths, 0..100 (default: all off). Sanitized by `makeFilterPass` (NaN/infinity → 0, clamped).
+  - `filters`: the ten Filter strengths, 0..100 (default: all off). Sanitized by `makeFilterPass` (NaN/infinity → 0, clamped).
 - Returns: a `ColorPass`. If nothing is non-neutral, `active` is false and the rest is left at defaults.
 - Sanitizing: each slider is clamped to its range and NaN/infinity become 0, so the loop only ever sees finite values and its table indexes are in range. `grade` is sanitized inside `buildGradeLut`.
 - Details:
@@ -445,7 +445,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   5. **Mixer**: clamp to 0..255, RGB → HSL, apply `hueShift`/`satMul`/`lumAdj` from `mixLut`, HSL → RGB. Pure grays (max = min) are skipped. The effect fades in with chroma (smoothstep up to `kMixChromaFull`), so near-gray noise does not become colored speckle. Luminance moves toward white (positive) or black (negative) by `lumAdj × w × kMixLumAmount`.
   6. **Colorize**: adds `tintVec × 4·l·(1 − l)` where `l` is luma 0..1 (strongest in midtones, zero at black and white).
   7. **Grading**: clamp to 0..255, `yi = int(luma + 0.5)`, add `gradeLut[c][yi]`.
-  8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
+  8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Bleach Bypass (half-desaturate, then overlay the luma: more contrast, less color, black and white fixed) → Cross Process (S-curve on R at 0.9, on G at 0.5, B lifted from 0 to 32 and lowered from 255 to 225) → Threshold (luma at or above `kThresholdLevel` = 128 goes white, below goes black; the slider is the blend strength) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
   9. Write back with `toU8Clamped`, once.
 - Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
 
@@ -1563,7 +1563,7 @@ Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Win
 | Name | Type | Value | Meaning |
 |---|---|---|---|
 | `kJpegQualityDefault` | `int` | 92 | Default JPEG quality |
-| `kJpegMaxSide` | `int` | 65500 | Largest side allowed (the format's limit is 65535). **Declared here but not checked by the encoders**; the caller must enforce it |
+| `kJpegMaxSide` | `int` | 65500 | Largest side allowed (the format's limit is 65535). Enforced by `jpegSizeOk`, which `encodeJpegMemory` calls before anything else. PNG has no such limit |
 
 **Functions**
 
@@ -1571,6 +1571,8 @@ Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Win
 - Inputs: output path, the picture (RGBA8, straight alpha), and an optional (may be null) error string.
 - Returns: true if the file was written; otherwise false with `*errorOut` set.
 - Details: 8-bit RGBA PNG, alpha kept. Linux uses libpng (a failure `longjmp`s to the cleanup path); Windows uses WIC, swaps R and B if the encoder substitutes BGRA, and fails on any other pixel format. The Linux version opens the file with `fopen(path.c_str())`.
+
+**`inline bool jpegSizeOk(int w, int h)`**: true when both sides are at least 1 and at most `kJpegMaxSide` (JPEG stores each side in 16 bits). `encodeJpegMemory` uses it as its first step; a caller can use it to explain the refusal before encoding.
 
 **`inline void flattenRow(const CanvasImage &img, int y, uint8_t *dst, bool bgr)`**
 - Inputs: the picture, row index `y` (not range-checked), destination for `width × 3` bytes, and the channel order (`true` = BGR for WIC, `false` = RGB for libjpeg).
@@ -1581,7 +1583,7 @@ Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Win
 **`inline bool encodeJpegMemory(const CanvasImage &img, int quality, std::vector<uint8_t> *out, std::string *errorOut)`**
 - Inputs: the picture, quality (about 1..100; libjpeg clamps it, WIC uses `quality/100`), the output buffer, and an optional error string.
 - Returns: true on success, with the whole JPEG in `*out`; otherwise false and `*errorOut` is set.
-- Details: encoded **to memory** so the source photo's EXIF and ICC can be spliced in before the file is written (`embedSourceMetadata`, then `writeFileAtomic`). Alpha is flattened onto white. Linux installs a custom libjpeg error handler (`JpegEncErr`, `jpegEncErrExit`) that `longjmp`s back instead of letting libjpeg `exit()` the app. Windows writes in chunks of 64 rows and asks for 4:4:4 as a best-effort property. Image size is not validated here.
+- Details: encoded **to memory** so the source photo's EXIF and ICC can be spliced in before the file is written (`embedSourceMetadata`, then `writeFileAtomic`). Alpha is flattened onto white. Linux installs a custom libjpeg error handler (`JpegEncErr`, `jpegEncErrExit`) that `longjmp`s back instead of letting libjpeg `exit()` the app. Windows writes in chunks of 64 rows and asks for 4:4:4 as a best-effort property. The size is checked first, on both platforms: a picture that fails `jpegSizeOk` (empty, negative, or a side over `kJpegMaxSide`) is refused with the error "JPEG can't hold a picture this size", before any pixel is read and with `*out` untouched. So no caller can skip the limit.
 
 ### `exif.hpp`
 JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a source JPEG's EXIF block and ICC profile into a re-encoded one. Everything is in `namespace exif`. Every read is bounds-checked, so a damaged or hostile file yields "no metadata" rather than reading out of range.

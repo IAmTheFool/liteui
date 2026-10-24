@@ -63,6 +63,9 @@ enum class AdjId : int
   Negative,
   Posterize,
   Solarize,
+  BleachBypass,
+  Threshold,
+  CrossProcess,
   Texture,
   Clarity,
   Sharpness,
@@ -210,6 +213,12 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
         {AdjId::Posterize, "Posterize", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         {AdjId::Solarize, "Solarize", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::BleachBypass, "Bleach Bypass", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::Threshold, "Threshold", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::CrossProcess, "Cross Process", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         // Detail stage (see detail_layer.hpp). Texture and Clarity soften when
         // negative; Sharpness only sharpens.

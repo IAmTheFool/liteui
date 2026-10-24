@@ -27,6 +27,9 @@ inline FilterValues filterValuesFromAdj(const AdjValues &a)
   f.negative = a[adjIndex(AdjId::Negative)];
   f.posterize = a[adjIndex(AdjId::Posterize)];
   f.solarize = a[adjIndex(AdjId::Solarize)];
+  f.bleachBypass = a[adjIndex(AdjId::BleachBypass)];
+  f.threshold = a[adjIndex(AdjId::Threshold)];
+  f.crossProcess = a[adjIndex(AdjId::CrossProcess)];
   return f;
 }
 
