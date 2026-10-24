@@ -20,6 +20,7 @@ set(LITEROOM_HEADERS
     src/core/pixel_math.hpp
     src/core/geometry.hpp
     src/core/adjustments.hpp
+    src/core/auto_tone.hpp
     src/core/raster_ops.hpp
 
     # color
@@ -176,7 +177,7 @@ if(LITEROOM_TESTS)
 
     # Pure header tests: no liteui, no threads.
     foreach(t minijson exif
-              pixel_math adjustments color_mix color_grade color_pass geometry curves
+              pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves
               mask_geom mask_raster mask_brush mask_range mask_object mask
               sidecar render_params adjustment_set file_utils image_meta preset sam_segmenter)
         literoom_add_test(${t})

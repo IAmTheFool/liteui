@@ -34,7 +34,7 @@ Every header sits under `src/`, which is the include root, so a header is always
 
 | Folder | Headers |
 |---|---|
-| `core/` | `pixel_math`, `geometry`, `adjustments`, `raster_ops` |
+| `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops` |
 | `color/` | `color_mix`, `color_grade`, `color_pass`, `curves` |
 | `detail/` | `detail_layer`, `neighbor_fx` |
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
@@ -160,6 +160,43 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
   - The optional curve is applied last, indexed by the already-rounded level, and rounded again.
   - Shared by `AdjustmentSet::buildLut` and by masks.
 
+### `auto_tone.hpp`
+Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and Blacks. A pure function of 256 counts. No UI, no pixels, no editor state. See [architecture.md](architecture.md#auto-tone).
+
+**Depends on:** `adjustments.hpp` (it checks its own result through the real `toneLutFromValues`). **Test:** `auto_tone_test`. **In the app** (`main.cpp`, not this header): the Adjust pane's **Auto Tone (A)** button, the A key and Image > Auto Tone measure `state.source` with `histogram::compute`, call `solveAutoTone` and apply the result with `AdjustmentSet::setAutoTone`.
+
+**How it works.** The tonal range is the 0.5 % and 99.5 % points of the luma histogram (so a few stray pixels cannot decide). Exposure and Contrast are solved together so that the black point lands on `kAutoToneTargetLo` and the white point on `kAutoToneTargetHi`; Whites and Blacks then close what is left. The steps follow the tone table's own order (Exposure, Contrast, Whites, Blacks) and round the way it does. It stretches the *measured range* rather than aiming the median at mid-gray, so a night scene stays dark and a snow scene stays bright, and a picture that already uses the whole range is left nearly alone. Brightness, Highlights, Shadows and the curves are neither read nor changed.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kAutoToneMinPixels` | `uint64_t` | 64 | Fewer samples than this give `NoPixels` |
+| `kAutoToneClipFraction` | `double` | 0.005 | The black / white point are the levels below / above which this fraction of pixels lie |
+| `kAutoToneMinSpread` | `int` | 16 | A range narrower than this (levels) is `Flat` |
+| `kAutoToneTargetLo` / `kAutoToneTargetHi` | `float` | 6 / 248 | Where the black and white points are sent (a little room before clipping) |
+| `kAutoToneExposureFactorMin` / `Max` | `float` | 0.5 / 2.0 | Limits on Exposure's gain (the slider gives `1 + v/100`, so -50..+100) |
+| `kAutoToneContrastFactorMin` / `Max` | `float` | 0.5 / 2.0 | Limits on Contrast's gain |
+| `kAutoToneMinBandWeight` | `float` | 0.1 | Whites / Blacks only act in a narrow band at the ends. If the point sits where the band's weight is below this, the slider is left at 0 instead of being pushed to its limit for no effect |
+| `kAutoToneLimitedTolerance` | `float` | 24 | After solving, if either point ends up further than this from its target, the status is `Limited` |
+
+**Types**
+- `enum class AutoToneStatus`: `Ok` (both points reach their targets), `Limited` (usable, but the slider ranges stopped short of a target, for example a very dark picture that would need more than +100 Exposure), `Flat`, `NoPixels` (both of these change nothing).
+- `struct AutoTone`: `exposure`, `contrast`, `whites`, `blacks` (whole slider values within their ranges, never a negative zero; all 0 unless usable), `status` (default `NoPixels`), and `usable()` (true for `Ok` and `Limited`).
+
+**Functions**
+
+**`inline AutoTone solveAutoTone(const std::array<uint32_t, 256> &luma)`**
+- Input: counts per luma level 0..255 of the picture **before** the tone tables (`histogram::Counts::l` of the source picture, not of the shown picture, which already has the tone sliders applied). Only the shape matters, so the number of pixels does not change the answer, and the same histogram always gives the same answer.
+- Returns: the four values and a status. Never changes anything itself.
+- Details:
+  - Exposure is applied first and rounds and clamps, so it is never allowed to push the white point past 255 (a picture with clipped highlights never gets a positive-gain boost from it; Whites may still pull the top down).
+  - Contrast pivots on 128, so its gain is limited so that neither end of the measured range is clipped.
+  - The result is judged by running it through `toneLutFromValues`: `Limited` means a point ended more than `kAutoToneLimitedTolerance` from its target.
+  - Rounding uses `lround`, so a zero is never `-0` (a History label would print it).
+
+---
+
 ### `adjustment_set.hpp`
 `AdjustmentSet`: the live value of every edit, the undo/redo history, the History labels, the sidecar JSON and the `RenderParams`. No UI, no pixels. See [undo-and-history.md](undo-and-history.md).
 
@@ -173,7 +210,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
 - Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
 
-**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step and a white-balance pick**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step, a white-balance pick and an Auto Tone**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
 
 **Read access**
 
@@ -242,6 +279,15 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress and the next slider touch (even Temperature) starts a fresh step instead of overwriting the pick. Its label is `"White Balance <temperature> / <tint>"` with signed numbers (for example `White Balance -67 / +14`; a zero prints as `+0`). The label is stored in the snapshot, so it survives undo, redo and History jumps.
 - Nothing else changes: the other sliders, curves, Mixer, grade, crop, orientation and masks are left alone. The values are ordinary slider values, so the sidecar, presets, Copy / Paste and Sync Settings carry them with no extra code. The label is History-only and is not saved.
 
+**Auto Tone** (the button's edit; the math is `solveAutoTone` in [`auto_tone.hpp`](#auto_tonehpp))
+
+**`bool setAutoTone(float exposure, float contrast, float whites, float blacks)`**
+- Sets **Exposure, Contrast, Whites and Blacks together as one undo step**. Four `set()` calls would be four steps.
+- All four values go through `sanitizedValue`, like a preset's.
+- Returns false, and adds **no step** and does not bump `version()`, if all four sanitized values already equal the current ones. Otherwise returns true.
+- Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress and the next slider touch (even Exposure) starts a fresh step. Its label is `Auto Tone`, stored in the snapshot, so it survives undo, redo and History jumps.
+- Nothing else changes: Brightness, Highlights, Shadows, the curves, the other sliders, Mixer, grade, crop, orientation and masks are left alone. The values are ordinary slider values, so the sidecar, presets, Copy / Paste and Sync Settings carry them with no extra code. The label is History-only and is not saved.
+
 **Loading, saving and resetting**
 
 **`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
@@ -259,7 +305,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 - **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
 - **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
 
-**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset` and `setWhiteBalance` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset`, `setWhiteBalance` and `setAutoTone` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
 1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
 2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
 3. `Tone Curve: RGB / Red / Green / Blue`.

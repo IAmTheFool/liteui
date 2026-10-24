@@ -365,6 +365,35 @@ public:
     return true;
   }
 
+  // ---- Auto Tone ----
+  // Sets Exposure, Contrast, Whites and Blacks together as ONE undo step
+  // labelled "Auto Tone" (four set() calls would be four steps). Only those four
+  // sliders move: Brightness, Highlights, Shadows, the curves and everything
+  // else are left alone. Values are sanitized like a preset's. Returns false,
+  // adding no step, if all four already have these values. Ends any drag in
+  // progress, like applyPreset. The numbers come from solveAutoTone
+  // (core/auto_tone.hpp).
+  bool setAutoTone(float exposure, float contrast, float whites, float blacks)
+  {
+    const AdjId ids[4] = {AdjId::Exposure, AdjId::Contrast, AdjId::Whites,
+                          AdjId::Blacks};
+    const float in[4] = {exposure, contrast, whites, blacks};
+    float v[4];
+    bool changed = false;
+    for (int i = 0; i < 4; ++i)
+    {
+      v[i] = sanitizedValue(kAdjustmentSpecs[adjIndex(ids[i])], in[i]);
+      changed = changed || v[i] != get(ids[i]);
+    }
+    if (!changed)
+      return false;
+    for (int i = 0; i < 4; ++i)
+      values_[adjIndex(ids[i])] = v[i];
+    pushStep();
+    history_.back().label = "Auto Tone";
+    return true;
+  }
+
   // Fresh baseline for a newly opened image: every slider back to 0, no
   // crop, no rotation/flip, no history to undo into.
   void reset()
@@ -502,7 +531,7 @@ private:
     ColorGrade grade;
     MaskSet masks;
     // Non-empty only for steps that carry their own History label (a preset,
-    // a white-balance pick);
+    // a white-balance pick, an Auto Tone);
     // every other step is labelled by diffing it against the one before.
     std::string label;
   };

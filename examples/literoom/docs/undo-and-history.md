@@ -21,7 +21,7 @@ The history is a list of **snapshots**, each a complete copy of the edit state a
 
 Why whole copies rather than "deltas"? It is simple and robust: restoring a step is a plain assignment, and nothing can drift out of sync. Object bitmaps, the largest items, are immutable and shared by pointer (and compared by an id), so copying a mask list does not copy them.
 
-- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)) and a white-balance pick (see [White balance picker](#white-balance-picker)). It is not part of the edit state: it is never compared with another snapshot and never restored.
+- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)) a white-balance pick (see [White balance picker](#white-balance-picker)) and an Auto Tone (see [Auto Tone](#auto-tone)). It is not part of the edit state: it is never compared with another snapshot and never restored.
 - Up to **200** steps can be undone (`kMaxUndoSteps`). Older ones are dropped as new edits arrive.
 - A new edit after an undo **discards the redo tail**, like most editors.
 - Opening a picture (`reset()`) or loading saved edits (`loadJson()`) starts a fresh history containing only the starting state. **The history itself is not saved to disk.**
@@ -68,6 +68,7 @@ Where the UI *does* know a gesture ended, it says so: `endCurveEdit()`, `endGrad
 | `setGrade(grade, key)` | See keys above. |
 | `setMasks(masks, key)` | See keys above. |
 | `setWhiteBalance(temp, tint)` | Always its own step, and it ends any drag in progress. Sets Temperature and Tint together; see [White balance picker](#white-balance-picker). |
+| `setAutoTone(exp, contrast, whites, blacks)` | Always its own step, and it ends any drag in progress. Sets Exposure, Contrast, Whites and Blacks together; see [Auto Tone](#auto-tone). |
 | `applyPreset(preset)` | Always its own step, and it ends any drag in progress. Replaces the sliders, curves, Color Mixer and Color Grading together; see [Presets](#presets). |
 
 All of them except `set` skip the step if nothing actually changed (the new value compares equal to the old), so no-op edits never clutter the history. `set(id, value)` has no such check: a call with an unchanged value still overwrites the current step (same slider) or appends a new one (a different control), and it still bumps `version()`.
@@ -76,7 +77,7 @@ All of them except `set` skip the step if nothing actually changed (the new valu
 
 Labels are not stored with the steps. Instead, each step is **described by comparing it with the step before it** (`describeStep`). This has two benefits: the setters need to know nothing about labels, and a coalesced drag that overwrites a step can never leave a stale label behind.
 
-`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step and a white-balance pick have one), that text is the label and nothing is diffed. Otherwise it checks, in order: global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
+`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step, a white-balance pick and an Auto Tone have one), that text is the label and nothing is diffed. Otherwise it checks, in order: global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
 
 The per-mask labels are `Mask <n>: ` followed by `Rename`, a slider and its value ("Mask 2: Exposure +30"), `Amount <n>`, `Color Mix`, `Color Grading`, `Curve`, `On` / `Off`, `Invert`, `Parts` (a part was added or removed), or `Edit`. A change to a shape itself (feather, radius, a brush stroke, an object selection) has no label of its own and shows as `Mask <n>: Edit`.
 
@@ -121,6 +122,21 @@ The Adjust pane's white-balance eyedropper sets two sliders from one click, so i
 - **No-op picks add nothing.** If both values already equal the current ones it returns false, adds no step and does not bump `version()`.
 - **Sanitized.** Values are clamped to the slider range and NaN becomes 0, as in `applyPreset`.
 - **Nothing else moves.** Other sliders, curves, the Mixer, grading, crop, orientation and masks are untouched.
+
+It is a normal edit afterwards: it bumps `version()`, is autosaved to the sidecar, and travels with Copy / Paste Settings, presets and Sync Settings, because those carry slider values.
+
+## Auto Tone
+
+The Adjust pane's **Auto Tone** button sets four sliders from one press, so like the white-balance pick it needs a call that changes them as a single step. `set()` cannot do that: it coalesces per slider, so four calls would leave four History entries and four Ctrl+Z presses to undo one click.
+
+`setAutoTone(exposure, contrast, whites, blacks)` (the numbers come from `solveAutoTone` in `auto_tone.hpp`, see [headers.md](headers.md#auto_tonehpp)):
+
+- **One step.** Undo puts all four sliders back together; redo restores them.
+- **Always its own step.** It goes through the same "start a new step" path as a preset, a white-balance pick or a crop, so it ends any drag in progress. The next slider touch, even on Exposure, starts a new step instead of overwriting it.
+- **Its own label.** `Auto Tone`. Like a preset step, the label is stored in the snapshot, so it survives undo, redo and History jumps. It is not saved: the sidecar stores only the four slider values.
+- **No-op presses add nothing.** If all four values already equal the current ones it returns false, adds no step and does not bump `version()`. This is also what makes a second press harmless: the solver reads the picture before the tone tables, so it gives the same four numbers again.
+- **Sanitized.** Values are clamped to the slider range and NaN becomes 0, as in `applyPreset`.
+- **Nothing else moves.** Brightness, Highlights, Shadows, the curves, the other sliders, the Mixer, grading, crop, orientation and masks are untouched.
 
 It is a normal edit afterwards: it bumps `version()`, is autosaved to the sidecar, and travels with Copy / Paste Settings, presets and Sync Settings, because those carry slider values.
 

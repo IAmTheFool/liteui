@@ -33,6 +33,7 @@
 #include "core/pixel_math.hpp"
 #include "core/geometry.hpp"
 #include "core/adjustments.hpp"
+#include "core/auto_tone.hpp"
 #include "core/raster_ops.hpp"
 
 // color
@@ -5800,6 +5801,58 @@ static bool wbPress(float lx, float ly)
   return true;
 }
 
+// ---------------- Auto Tone ----------------
+// The Adjust pane's Auto Tone button, the A key and Image > Auto Tone. The math
+// is solveAutoTone (core/auto_tone.hpp); the edit is AdjustmentSet::setAutoTone
+// (Exposure, Contrast, Whites and Blacks in one undo step). This is only the UI
+// side: measuring the picture and reporting the result.
+//
+// Measured on `source`, the picture the adjustments run on, NOT on the shown
+// picture: the shown one already has the tone sliders applied, so its histogram
+// would change every time Auto Tone ran. Reading `source` makes the answer the
+// same whatever the sliders say, so pressing it twice is a no-op.
+static void autoTone()
+{
+  if (state.dragging || !state.source)
+    return;
+  if (geometryBusy())
+  {
+    setStatus("Wait for the changes to finish applying", true);
+    return;
+  }
+  const histogram::Counts c = histogram::compute(state.source.get());
+  const AutoTone at = solveAutoTone(c.l);
+  if (at.status == AutoToneStatus::NoPixels)
+  {
+    setStatus("Auto Tone: nothing to measure in this picture", true);
+    return;
+  }
+  if (at.status == AutoToneStatus::Flat)
+  {
+    setStatus("Auto Tone: this picture has almost no tonal range to adjust", true);
+    return;
+  }
+  if (!state.adjust.setAutoTone(at.exposure, at.contrast, at.whites, at.blacks))
+  {
+    setStatus("Auto Tone: the tone is already set for this picture", false);
+    return;
+  }
+  state.markAdjustDirty(); // re-render through the normal (drag-safe) path
+  state.markDirty();
+  auto sgn = [](float v)
+  {
+    const int i = static_cast<int>(std::lround(v));
+    return (i > 0 ? "+" : "") + std::to_string(i);
+  };
+  setStatus("Auto Tone: Exposure " + sgn(at.exposure) + ", Contrast " +
+                sgn(at.contrast) + ", Whites " + sgn(at.whites) + ", Blacks " +
+                sgn(at.blacks) +
+                (at.status == AutoToneStatus::Limited
+                     ? " (the slider ranges are not enough to go further)"
+                     : ""),
+            false);
+}
+
 // Runs the deferred, expensive part of a slider drag (rebuilding the shown
 // image) exactly once per pending change. Idempotent: the main canvas and the
 // histogram canvas both call it from their dirty polls, and whichever is
@@ -6753,6 +6806,7 @@ int main()
     ui.addShortcut(none, Key::J, notTyping(toggleClipping));             // clipping warnings
     ui.addShortcut(shiftOnly, Key::J, notTyping(toggleChannelClipping)); // per-channel colors
     ui.addShortcut(none, Key::W, notTyping(toggleWbPicker)); // white-balance picker
+    ui.addShortcut(none, Key::A, notTyping(autoTone));       // Auto Tone
     ui.addShortcut(none, Key::Escape, []
                    {
                      state.openMenu = -1;
@@ -6862,6 +6916,7 @@ int main()
                       { applyGeoOp(GeoOp::FlipH); }},
                      {"Flip Vertical", []
                       { applyGeoOp(GeoOp::FlipV); }},
+                     {"Auto Tone", autoTone, "A"},
                      {"Copy Settings", copySettings, "Ctrl+Shift+C"},
                      {"Paste Settings", pasteSettings, "Ctrl+Shift+V"},
                      {"Select All Photos", filmSelectAll, "Ctrl+A"},
@@ -7112,6 +7167,9 @@ int main()
   };
   bool colorHeaderAdded = false, filtersHeaderAdded = false, detailHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
+  adjustPane.addChild(sidebarButton(
+      "Auto Tone (A)", [] { autoTone(); }, {}, false,
+      [] { return state.source != nullptr && !state.dragging; }));
   for (const auto &spec : kAdjustmentSpecs)
   {
     if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)

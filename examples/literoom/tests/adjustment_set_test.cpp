@@ -645,6 +645,78 @@ static void testWhiteBalancePick()
   CHECK(r.historySize() == 1);
 }
 
+static void testAutoTonePick()
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Brightness, 7.0f);
+  s.set(AdjId::Highlights, -20.0f);
+  const size_t before = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One call, ONE step (four set() calls would be four), with its own label.
+  CHECK(s.setAutoTone(-5.0f, 40.0f, 12.0f, -30.0f));
+  CHECK(s.historySize() == before + 1);
+  CHECK(s.get(AdjId::Exposure) == -5.0f && s.get(AdjId::Contrast) == 40.0f);
+  CHECK(s.get(AdjId::Whites) == 12.0f && s.get(AdjId::Blacks) == -30.0f);
+  // Nothing else moves: not the other Tone sliders, not the color ones.
+  CHECK(s.get(AdjId::Brightness) == 7.0f && s.get(AdjId::Highlights) == -20.0f);
+  CHECK(s.get(AdjId::Shadows) == 0.0f && s.get(AdjId::Temperature) == 0.0f);
+  CHECK(lastLabel(s) == "Auto Tone");
+  CHECK(s.version() != v0);
+
+  // Same values again: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK(!s.setAutoTone(-5.0f, 40.0f, 12.0f, -30.0f));
+  CHECK(s.historySize() == before + 1 && s.version() == v1);
+
+  // Undo puts all four back together (and leaves the others); redo restores them and the label.
+  s.undo();
+  CHECK(s.get(AdjId::Exposure) == 0.0f && s.get(AdjId::Contrast) == 0.0f);
+  CHECK(s.get(AdjId::Whites) == 0.0f && s.get(AdjId::Blacks) == 0.0f);
+  CHECK(s.get(AdjId::Brightness) == 7.0f && s.get(AdjId::Highlights) == -20.0f);
+  s.redo();
+  CHECK(s.get(AdjId::Exposure) == -5.0f && s.get(AdjId::Blacks) == -30.0f);
+  CHECK(lastLabel(s) == "Auto Tone");
+
+  // A later slider touch is a new step: it never overwrites the Auto Tone step, even the same slider.
+  const size_t autoIdx = s.historySize() - 1;
+  s.set(AdjId::Exposure, -2.0f);
+  CHECK(s.historySize() == autoIdx + 2 && label(s, autoIdx) == "Auto Tone");
+  CHECK(lastLabel(s) == "Exposure -2");
+  // ...and Auto Tone ends a drag in progress: the next touch of that slider is a new step again.
+  s.set(AdjId::Exposure, 30.0f);
+  s.set(AdjId::Exposure, 31.0f); // coalesced drag
+  const size_t n = s.historySize();
+  CHECK(s.setAutoTone(1.0f, 2.0f, 3.0f, 4.0f));
+  s.set(AdjId::Exposure, 32.0f);
+  CHECK(s.historySize() == n + 2);
+
+  // Only one of the four changing still counts.
+  AdjustmentSet u;
+  fresh(u);
+  CHECK(u.setAutoTone(0.0f, 0.0f, 0.0f, 10.0f));
+  CHECK(u.historySize() == 2 && lastLabel(u) == "Auto Tone" && u.get(AdjId::Blacks) == 10.0f);
+  // All zeros on an untouched set is a no-op.
+  AdjustmentSet z;
+  fresh(z);
+  CHECK(!z.setAutoTone(0.0f, 0.0f, 0.0f, 0.0f) && z.historySize() == 1);
+
+  // Hand-built values are sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  CHECK(h.setAutoTone(1e9f, -1e9f, std::nanf(""), 500.0f));
+  CHECK(h.get(AdjId::Exposure) == 100.0f && h.get(AdjId::Contrast) == -100.0f);
+  CHECK(h.get(AdjId::Whites) == 0.0f && h.get(AdjId::Blacks) == 100.0f);
+  CHECK(!h.setAutoTone(500.0f, -500.0f, std::nanf(""), 1000.0f)); // sanitizes to the same values: no step
+
+  // Saved with the edits like any slider values (the label is History-only and not saved).
+  AdjustmentSet r;
+  fresh(r);
+  CHECK(r.loadJson(s.toJson()) && r.get(AdjId::Whites) == s.get(AdjId::Whites));
+  CHECK(r.get(AdjId::Blacks) == s.get(AdjId::Blacks) && r.historySize() == 1);
+}
+
 int main()
 {
   testFreshState();
@@ -663,5 +735,6 @@ int main()
   testMaskTablesMatchTheGlobalOnes();
   testPresets();
   testWhiteBalancePick();
+  testAutoTonePick();
   return finish();
 }

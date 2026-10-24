@@ -147,6 +147,22 @@ The UI side lives in `main.cpp` and is small:
 - **Not while the geometry worker is busy.** `state.source` still describes the previous geometry then, so `wbPress` waits (see [threading.md](threading.md#the-geometry-worker-rebuilds-everything)).
 - **Global edit only.** Masks keep their own Temperature and Tint; the picker never touches them.
 
+## Auto tone
+
+The Adjust pane has an **Auto Tone (A)** button at the top of the Tone block (also the A key and Image > Auto Tone). It adds no new kind of data: it sets four ordinary sliders, Exposure, Contrast, Whites and Blacks, in one undo step.
+
+The engine does the work and stays UI-free:
+
+- **The math** is `solveAutoTone` in `core/auto_tone.hpp`: a function of the luma histogram that finds the picture's black and white points (the 0.5 % and 99.5 % levels) and picks the sliders that send them to fixed targets. It stretches the measured range instead of aiming at mid-gray, so a dark scene stays dark and a well-exposed picture is barely touched. See [headers.md](headers.md#auto_tonehpp).
+- **The edit** is `AdjustmentSet::setAutoTone`: the four sliders in one undo step labelled `Auto Tone`. See [undo-and-history.md](undo-and-history.md#auto-tone).
+
+The UI side lives in `main.cpp` (`autoTone()`) and is small:
+
+- **Which pixels it reads.** `state.source`, the picture the adjustments run on, counted with `histogram::compute`. Not the shown picture: that one already has the tone sliders applied, so its histogram would change every time Auto Tone ran. Reading the source makes the answer independent of the sliders already set, so pressing it twice is a no-op ("already set").
+- **What it leaves alone.** Brightness, Highlights, Shadows, curves and masks. Auto Tone is a global edit: masks keep their own sliders.
+- **Messages.** A flat picture or one with nothing to measure says so and changes nothing. If the slider ranges are not enough to reach the targets (a very dark or very washed-out picture), the edit is still applied and the status bar says the ranges are not enough.
+- **Not while the geometry worker is busy** (`source` still describes the previous geometry then; see [threading.md](threading.md#the-geometry-worker-rebuilds-everything)), and not mid-drag.
+
 ## Where state lives
 
 All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). The white-balance picker's armed flag (`state.wbPicking`) is plain UI state and is never saved. Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
