@@ -451,6 +451,9 @@ struct EditorState
   bool exportJpeg = true;   // the format the Export dialog offers first
   int jpegQuality = 92;     // 1..100
   bool keepMetadata = true; // carry the photo's EXIF + ICC profile into a JPEG
+  bool removeGps = false;   // ...but without the GPS location (JPEG only; needs keepMetadata)
+  bool exportResize = false; // shrink the export so its long side is exportLongEdge
+  int exportLongEdge = 2048; // px, kExportLongEdgeMin..kExportLongEdgeMax; never enlarges
 
   FilmStrip film;                         // the open folder's pictures (bottom strip)
   CompareMode compare = CompareMode::Off; // Before / After view
@@ -2406,16 +2409,18 @@ static void openImage()
 // Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the
 // EXIF block and ICC profile of the photo at `sourcePath` ride along
 // (orientation reset to "upright", because the pixels already are; picture
-// size updated; see embedSourceMetadata).
+// size updated; see embedSourceMetadata). With `removeGps` as well, the GPS
+// location is cut out of that EXIF block. A picture JPEG can't hold (see
+// jpegSizeOk) is refused by encodeJpegMemory.
 static bool saveJpegFile(const std::string &path, const CanvasImage &img,
-                         int quality, bool keepMetadata,
+                         int quality, bool keepMetadata, bool removeGps,
                          const std::string &sourcePath, std::string *errorOut)
 {
   std::vector<uint8_t> jpeg;
   if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
     return false;
   if (keepMetadata)
-    embedSourceMetadata(&jpeg, sourcePath, img.width, img.height);
+    embedSourceMetadata(&jpeg, sourcePath, img.width, img.height, removeGps);
   return writeFileAtomic(path, jpeg, errorOut);
 }
 
@@ -2458,13 +2463,35 @@ static void exportImage()
     out += jpeg ? ".jpg" : ".png";
   }
 
+  // The size that will be written: with "Resize", the long side is shrunk to
+  // the chosen length (never enlarged). Checked here, before any work, so a
+  // picture JPEG can't hold gets a message that says what to do about it.
+  const Dims outSize = fitLongEdge(state.image->width, state.image->height,
+                                   state.exportResize ? state.exportLongEdge : 0);
+  if (jpeg && !jpegSizeOk(outSize.w, outSize.h))
+  {
+    setStatus("Too large for JPEG (" + std::to_string(kJpegMaxSide) +
+                  " px per side at most): turn on Resize, or export as PNG",
+              true);
+    return;
+  }
+  const bool resized =
+      outSize.w != state.image->width || outSize.h != state.image->height;
+  const std::shared_ptr<CanvasImage> outImage =
+      resized ? resizeToLongEdge(state.image, state.exportLongEdge) : state.image;
+
   std::string err;
   const bool ok =
-      jpeg ? saveJpegFile(out, *state.image, state.jpegQuality,
-                          state.keepMetadata, state.imagePath, &err)
-           : encodePngFile(out, *state.image, &err);
+      jpeg ? saveJpegFile(out, *outImage, state.jpegQuality,
+                          state.keepMetadata, state.removeGps,
+                          state.imagePath, &err)
+           : encodePngFile(out, *outImage, &err);
   if (ok)
-    setStatus("Exported " + baseName(out), false);
+    setStatus("Exported " + baseName(out) +
+                  (resized ? " (" + std::to_string(outSize.w) + " × " +
+                                 std::to_string(outSize.h) + ")"
+                           : std::string()),
+              false);
   else
     setStatus("Export failed: " +
                   (err.empty() ? "couldn't write " + baseName(out) : err),
@@ -2666,6 +2693,11 @@ static View sidebarButton(const std::string &label,
 // What a slider row needs to know: its label, range, how to read/write the
 // value, and how to print it. Shared by the Adjust sliders (via
 // buildAdjustmentSlider) and the Straighten angle slider.
+// Export's "Resize" slider: the long side, in px, in steps of kExportLongEdgeStep.
+constexpr int kExportLongEdgeMin = 128;
+constexpr int kExportLongEdgeMax = 8192;
+constexpr int kExportLongEdgeStep = 16;
+
 struct SliderSpec
 {
   std::string name;
@@ -8632,7 +8664,71 @@ int main()
       { state.keepMetadata = !state.keepMetadata; },
       []
       { return state.keepMetadata; }));
+  // Only meaningful with the metadata kept (without it there is no GPS block to
+  // carry), so it is dimmed otherwise.
+  jpegOptions.addChild(sidebarButton(
+      "Remove location (GPS)", []
+      { state.removeGps = !state.removeGps; },
+      []
+      { return state.removeGps && state.keepMetadata; },
+      false, []
+      { return state.keepMetadata; }));
   exportPane.addChild(std::move(jpegOptions));
+
+  // Resize applies to both formats, so it sits outside the JPEG-only options.
+  View resizeOptions;
+  resizeOptions.style.width = Size::full();
+  resizeOptions.style.direction = FlexDirection::Column;
+  resizeOptions.style.gap = 6.0f;
+  resizeOptions.style.margin = EdgeInsets{6, 0, 0, 0};
+  resizeOptions.addChild(sidebarButton(
+      "Resize to long edge", []
+      { state.exportResize = !state.exportResize; },
+      []
+      { return state.exportResize; }));
+
+  View resizeDetail;
+  resizeDetail.style.width = Size::full();
+  resizeDetail.style.direction = FlexDirection::Column;
+  resizeDetail.style.gap = 6.0f;
+  resizeDetail.style.display = std::function<Display()>(
+      []
+      { return state.exportResize ? Display::Flex : Display::None; });
+
+  SliderSpec edgeSlider;
+  edgeSlider.name = "Long edge";
+  edgeSlider.lo = static_cast<float>(kExportLongEdgeMin);
+  edgeSlider.hi = static_cast<float>(kExportLongEdgeMax);
+  edgeSlider.get = []
+  { return static_cast<float>(state.exportLongEdge); };
+  edgeSlider.set = [](float v)
+  {
+    const int stepped = static_cast<int>(std::lround(v / kExportLongEdgeStep)) * kExportLongEdgeStep;
+    state.exportLongEdge = std::clamp(stepped, kExportLongEdgeMin, kExportLongEdgeMax);
+  };
+  edgeSlider.format = [](float v)
+  { return std::to_string(static_cast<int>(std::lround(v))) + " px"; };
+  edgeSlider.affectsPixels = false; // a setting, not an edit: no re-render
+  resizeDetail.addChild(buildSliderRow(edgeSlider));
+
+  Text resizeInfo;
+  resizeInfo.label = std::function<std::string()>([]() -> std::string
+                                                  {
+    if (!state.image)
+      return "";
+    const int w = state.image->width, h = state.image->height;
+    const Dims d = fitLongEdge(w, h, state.exportLongEdge);
+    if (d.w == w && d.h == h)
+      return "Already within " + std::to_string(state.exportLongEdge) +
+             " px: exported at full size (" + std::to_string(w) + " × " +
+             std::to_string(h) + ").";
+    return "Exports at " + std::to_string(d.w) + " × " + std::to_string(d.h) +
+           " px (from " + std::to_string(w) + " × " + std::to_string(h) + ")."; });
+  resizeInfo.fontSize = 12.0f;
+  resizeInfo.color = kColorTextMuted;
+  resizeDetail.addChild(std::move(resizeInfo));
+  resizeOptions.addChild(std::move(resizeDetail));
+  exportPane.addChild(std::move(resizeOptions));
 
   View exportGap;
   exportGap.style.height = Size::pixel(6);

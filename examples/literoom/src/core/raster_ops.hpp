@@ -1,13 +1,15 @@
 // raster_ops.hpp - Pixel-buffer operations on a CanvasImage (RGBA8): crop, rotate by
-// quarter turns, mirror, orient, straighten by any angle, and the box
-// downsample behind the interactive preview. Needs liteui.hpp only for
-// the CanvasImage struct.
+// quarter turns, mirror, orient, straighten by any angle, the box
+// downsample behind the interactive preview, and the area-average resize used
+// by Export's "long edge" option. Needs liteui.hpp only for the CanvasImage
+// struct.
 #pragma once
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "core/geometry.hpp"
 #include "liteui.hpp"
@@ -66,6 +68,128 @@ inline std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)
         o[c] = static_cast<uint8_t>((sum[c] + area / 2) / area);
     }
   return out;
+}
+
+// ---- Resize (Export: "Resize to long edge") ----
+
+// The size `w` x `h` becomes when scaled so its long side is `longEdge`, with
+// the aspect ratio kept (the short side is rounded, and is at least 1). It
+// never enlarges: a picture whose long side is already `longEdge` or less, a
+// `longEdge` below 1 and a non-positive size all come back unchanged.
+inline Dims fitLongEdge(int w, int h, int longEdge)
+{
+  Dims d{};
+  d.w = w;
+  d.h = h;
+  const int longSide = std::max(w, h);
+  if (w < 1 || h < 1 || longEdge < 1 || longSide <= longEdge)
+    return d;
+  const double s = static_cast<double>(longEdge) / longSide;
+  if (w >= h)
+  {
+    d.w = longEdge;
+    d.h = std::max(1, static_cast<int>(std::lround(h * s)));
+  }
+  else
+  {
+    d.h = longEdge;
+    d.w = std::max(1, static_cast<int>(std::lround(w * s)));
+  }
+  return d;
+}
+
+// `src` resampled to dw x dh by area averaging: every output pixel is the
+// average of the part of the source it covers, with fractional weights at the
+// edges, so any ratio works and nothing aliases. That is the right filter for
+// shrinking; enlarging works but looks blocky. Color is averaged weighted by
+// alpha (like rotateArbitrary), so a transparent corner never darkens its
+// neighbors. A fully opaque, flat area keeps its exact value.
+// An invalid size (dw or dh below 1, or an empty `src`) returns a copy of `src`.
+inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
+                                               int dh)
+{
+  const int sw = src.width, sh = src.height;
+  if (dw < 1 || dh < 1 || sw < 1 || sh < 1)
+    return std::make_shared<CanvasImage>(src);
+  if (dw == sw && dh == sh)
+    return std::make_shared<CanvasImage>(src);
+  auto out = std::make_shared<CanvasImage>(dw, dh);
+  const double xr = static_cast<double>(sw) / dw;
+  const double yr = static_cast<double>(sh) / dh;
+  // One source row's worth of alpha-weighted sums: (c0 a, c1 a, c2 a, a) per column.
+  std::vector<double> acc(static_cast<size_t>(sw) * 4);
+  for (int dy = 0; dy < dh; ++dy)
+  {
+    const double sy0 = dy * yr;
+    const double sy1 = std::min(static_cast<double>(sh), (dy + 1) * yr);
+    const int iy0 = static_cast<int>(std::floor(sy0));
+    const int iy1 = std::min(sh, static_cast<int>(std::ceil(sy1)));
+    std::fill(acc.begin(), acc.end(), 0.0);
+    double wyTotal = 0.0;
+    for (int iy = iy0; iy < iy1; ++iy)
+    {
+      const double wy = std::min(iy + 1.0, sy1) - std::max(static_cast<double>(iy), sy0);
+      if (wy <= 0.0)
+        continue;
+      wyTotal += wy;
+      const uint8_t *p = &src.pixels[static_cast<size_t>(iy) * sw * 4];
+      double *a = acc.data();
+      for (int x = 0; x < sw; ++x, p += 4, a += 4)
+      {
+        const double wa = wy * p[3];
+        a[0] += p[0] * wa;
+        a[1] += p[1] * wa;
+        a[2] += p[2] * wa;
+        a[3] += wa;
+      }
+    }
+    uint8_t *o = &out->pixels[static_cast<size_t>(dy) * dw * 4];
+    for (int dx = 0; dx < dw; ++dx, o += 4)
+    {
+      const double sx0 = dx * xr;
+      const double sx1 = std::min(static_cast<double>(sw), (dx + 1) * xr);
+      const int ix0 = static_cast<int>(std::floor(sx0));
+      const int ix1 = std::min(sw, static_cast<int>(std::ceil(sx1)));
+      double s0 = 0, s1 = 0, s2 = 0, sa = 0, wxTotal = 0;
+      for (int ix = ix0; ix < ix1; ++ix)
+      {
+        const double wx = std::min(ix + 1.0, sx1) - std::max(static_cast<double>(ix), sx0);
+        if (wx <= 0.0)
+          continue;
+        wxTotal += wx;
+        const double *a = &acc[static_cast<size_t>(ix) * 4];
+        s0 += a[0] * wx;
+        s1 += a[1] * wx;
+        s2 += a[2] * wx;
+        sa += a[3] * wx;
+      }
+      const double area = wxTotal * wyTotal;
+      if (sa <= 0.0 || area <= 0.0)
+      { // nothing visible under this pixel
+        o[0] = o[1] = o[2] = o[3] = 0;
+        continue;
+      }
+      o[0] = static_cast<uint8_t>(std::clamp(s0 / sa + 0.5, 0.0, 255.0));
+      o[1] = static_cast<uint8_t>(std::clamp(s1 / sa + 0.5, 0.0, 255.0));
+      o[2] = static_cast<uint8_t>(std::clamp(s2 / sa + 0.5, 0.0, 255.0));
+      o[3] = static_cast<uint8_t>(std::clamp(sa / area + 0.5, 0.0, 255.0));
+    }
+  }
+  return out;
+}
+
+// `src` scaled so its long side is `longEdge` (see fitLongEdge). When nothing
+// changes (already small enough, or `longEdge` < 1) it returns `src` itself, so
+// a picture that needs no resize costs no copy.
+inline std::shared_ptr<CanvasImage>
+resizeToLongEdge(const std::shared_ptr<CanvasImage> &src, int longEdge)
+{
+  if (!src)
+    return src;
+  const Dims d = fitLongEdge(src->width, src->height, longEdge);
+  if (d.w == src->width && d.h == src->height)
+    return src;
+  return resizeArea(*src, d.w, d.h);
 }
 
 // Copies the `r` region of `src` into a new image (clamped to src's bounds).

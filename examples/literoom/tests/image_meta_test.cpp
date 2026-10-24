@@ -82,6 +82,7 @@ static void putEntry(Bytes &b, uint16_t tag, uint16_t type, uint32_t count, uint
 }
 
 constexpr uint8_t kThumbByte = 0xAB;
+constexpr uint8_t kGpsByte = 0xCD; // fills the GPS latitude data, so any leftover shows
 
 struct ExifSpec
 {
@@ -89,11 +90,13 @@ struct ExifSpec
   unsigned orientation = 1; // the value stored in the Orientation tag
   uint16_t orientType = 3;  // 3 = SHORT (the only valid type)
   bool thumbnail = true;    // IFD1 + 16 bytes of kThumbByte
+  bool gps = false;         // a GPSInfo tag in IFD0 and a GPS IFD with 24 bytes of kGpsByte
   uint32_t width = 4000, height = 3000;
 };
 
 // TIFF block: IFD0 {ImageWidth, ImageLength, Orientation, ExifIFD}, the Exif
-// sub-IFD {PixelXDimension, PixelYDimension}, and optionally IFD1 + thumbnail.
+// sub-IFD {PixelXDimension, PixelYDimension}, optionally IFD1 + thumbnail, and
+// optionally (IFD0 then also holds GPSInfo) a GPS IFD at the very end.
 static Bytes makeTiff(const ExifSpec &s)
 {
   const bool le = s.le;
@@ -103,14 +106,18 @@ static Bytes makeTiff(const ExifSpec &s)
   put16(t, 42, le);
   put32(t, 8, le);
   const uint32_t ifd0 = 8;
-  const uint32_t sub = ifd0 + 2 + 4 * 12 + 4;
+  const unsigned n0 = s.gps ? 5 : 4; // entries in IFD0
+  const uint32_t sub = ifd0 + 2 + n0 * 12 + 4;
   const uint32_t ifd1 = sub + 2 + 2 * 12 + 4;
   const uint32_t thumb = ifd1 + 2 + 2 * 12 + 4;
-  put16(t, 4, le);
+  const uint32_t gpsOff = s.thumbnail ? thumb + 16 : ifd1; // where the GPS IFD goes
+  put16(t, n0, le);
   putEntry(t, 0x0100, 4, 1, s.width, le);
   putEntry(t, 0x0101, 4, 1, s.height, le);
   putEntry(t, 0x0112, s.orientType, 1, s.orientation, le);
   putEntry(t, 0x8769, 4, 1, sub, le);
+  if (s.gps)
+    putEntry(t, 0x8825, 4, 1, gpsOff, le);
   put32(t, s.thumbnail ? ifd1 : 0, le);
   put16(t, 2, le);
   putEntry(t, 0xA002, 4, 1, s.width, le);
@@ -123,6 +130,14 @@ static Bytes makeTiff(const ExifSpec &s)
     putEntry(t, 0x0202, 4, 1, 16, le);
     put32(t, 0, le);
     t.insert(t.end(), 16, kThumbByte);
+  }
+  if (s.gps)
+  {
+    put16(t, 2, le); // GPS IFD: LatitudeRef (inline) and Latitude (24 bytes after the IFD)
+    putEntry(t, 0x0001, 2, 2, 0x4E000000, le);
+    putEntry(t, 0x0002, 5, 3, gpsOff + 2 + 2 * 12 + 4, le);
+    put32(t, 0, le);
+    t.insert(t.end(), 24, kGpsByte);
   }
   return t;
 }
@@ -397,6 +412,81 @@ static void testEmbedBigEndianNoThumbnail()
   CHECK(readLong(jpeg, true, 0xA003, &v) && v == 480);
 }
 
+// ----------------------------------------------- embed: removing the location
+static bool hasByte(const Bytes &b, uint8_t v) { return std::find(b.begin(), b.end(), v) != b.end(); }
+
+static bool hasGpsTag(const Bytes &jpeg)
+{
+  Bytes tiff = tiffOf(jpeg);
+  exif::detail::Tiff t{tiff};
+  uint32_t ifd0 = 0;
+  uint64_t e = 0;
+  return exif::detail::tiffHeader(t, &ifd0) && exif::detail::findEntry(t, ifd0, 0x8825, &e);
+}
+
+static void testEmbedRemovesGps()
+{
+  TempDir d("gps");
+  for (bool le : {true, false})
+    for (bool thumb : {true, false})
+    {
+      ExifSpec s;
+      s.le = le;
+      s.thumbnail = thumb;
+      s.orientation = 6;
+      s.gps = true;
+      const std::string src = d.file("gps.jpg");
+      writeFile(src, jpegOf({exifSegment(s)}));
+
+      // Default: the location is carried over, as before.
+      Bytes kept = encodedJpeg();
+      CHECK(embedSourceMetadata(&kept, src, 100, 80));
+      CHECK(hasByte(tiffOf(kept), kGpsByte) && hasGpsTag(kept));
+
+      // Asked to remove it: the tag and every coordinate byte are gone...
+      Bytes clean = encodedJpeg();
+      CHECK(embedSourceMetadata(&clean, src, 100, 80, true));
+      const Bytes tiff = tiffOf(clean);
+      CHECK(!tiff.empty() && !hasByte(tiff, kGpsByte) && !hasGpsTag(clean));
+      CHECK(clean.size() == kept.size()); // zeroed and shifted, not shortened
+
+      // ...and everything else is as with the default: upright, new size, thumbnail erased.
+      exif::JpegMeta m;
+      CHECK(exif::readJpegMeta(clean.data(), clean.size(), &m) && m.orientation == 1);
+      uint32_t v = 0;
+      CHECK(readLong(clean, false, 0x0100, &v) && v == 100);
+      CHECK(readLong(clean, false, 0x0101, &v) && v == 80);
+      CHECK(readLong(clean, true, 0xA002, &v) && v == 100);
+      CHECK(readLong(clean, true, 0xA003, &v) && v == 80);
+      CHECK(!hasByte(tiff, kThumbByte));
+      const std::string outPath = d.file("clean.jpg");
+      writeFile(outPath, clean);
+      CHECK(exifOrientationOf(outPath).identity());
+
+      // The source file is only read: asking again for the location still finds it.
+      Bytes again = encodedJpeg();
+      CHECK(embedSourceMetadata(&again, src, 100, 80));
+      CHECK(again == kept);
+
+      // A source with no GPS block: the option changes nothing.
+      ExifSpec p = s;
+      p.gps = false;
+      writeFile(d.file("nogps.jpg"), jpegOf({exifSegment(p)}));
+      Bytes a = encodedJpeg(), b = encodedJpeg();
+      CHECK(embedSourceMetadata(&a, d.file("nogps.jpg"), 100, 80));
+      CHECK(embedSourceMetadata(&b, d.file("nogps.jpg"), 100, 80, true));
+      CHECK(a == b && !hasGpsTag(a));
+    }
+
+  // The option is ignored where there is nothing to embed.
+  writeFile(d.file("plain.jpg"), jpegOf({jfifSegment()}));
+  Bytes plain = encodedJpeg();
+  const Bytes target = plain;
+  CHECK(embedSourceMetadata(&plain, d.file("plain.jpg"), 10, 10, true) && plain == target);
+  Bytes refused = target;
+  CHECK(!embedSourceMetadata(&refused, d.file("missing.jpg"), 10, 10, true) && refused == target);
+}
+
 // ------------------------------------------------- embed: nothing to carry
 static void testEmbedLeavesJpegAlone()
 {
@@ -440,6 +530,7 @@ int main()
   testOrientationWindow();
   testEmbedCarriesMetadata();
   testEmbedBigEndianNoThumbnail();
+  testEmbedRemovesGps();
   testEmbedLeavesJpegAlone();
   return finish();
 }

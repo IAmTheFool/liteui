@@ -113,8 +113,129 @@ static Bytes jpeg(const Bytes &app1Tiff, bool exifFirst, bool icc)
     return j;
 }
 
+// ---- GPS removal (Export: "Remove location") ----
+constexpr uint8_t kGpsByte = 0xCD; // fills the GPS latitude data, so any leftover shows
+
+// A TIFF block with a GPS IFD: IFD0 {Make, Orientation, ExifIFD, GPSInfo}, the
+// Exif sub-IFD {PixelXDimension 111, PixelYDimension 222}, and at 100 the GPS
+// IFD {VersionID, LatitudeRef, Latitude}, whose RATIONAL latitude sits outside
+// the entry at 160 (24 bytes of kGpsByte). `gpsPtr` / `gpsType` let a test aim
+// the GPSInfo tag somewhere bad.
+static Bytes tiffGps(bool le, uint32_t gpsPtr = 100, int gpsType = 4)
+{
+    W w{{}, le};
+    auto entry = [&w](int tag, int type, uint32_t cnt, uint32_t val)
+    { w.u16(tag); w.u16(type); w.u32(cnt); w.u32(val); };
+    w.u8(le ? 'I' : 'M');
+    w.u8(le ? 'I' : 'M');
+    w.u16(42);
+    w.u32(8);
+    w.u16(4); // IFD0 at 8: 2 + 4 * 12 + 4 = 54 -> ends at 62
+    entry(0x010F, 2, 4, 0x43616D00);
+    w.u16(0x0112);
+    w.u16(3);
+    w.u32(1);
+    w.u16(6);
+    w.u16(0);
+    entry(0x8769, 4, 1, 70);
+    entry(0x8825, gpsType, 1, gpsPtr);
+    w.u32(0); // no IFD1
+    while (w.b.size() < 70)
+        w.u8(0);
+    w.u16(2); // Exif sub-IFD at 70, ends at 100
+    entry(0xA002, 4, 1, 111);
+    entry(0xA003, 4, 1, 222);
+    w.u32(0);
+    w.u16(3); // GPS IFD at 100, ends at 142
+    entry(0x0000, 1, 4, 0x02020000);
+    entry(0x0001, 2, 2, 0x4E000000);
+    entry(0x0002, 5, 3, 160);
+    w.u32(0);
+    while (w.b.size() < 160)
+        w.u8(0);
+    for (int i = 0; i < 24; ++i)
+        w.u8(kGpsByte);
+    return w.b;
+}
+
+static bool hasGpsBytes(const Bytes &b) { return std::find(b.begin(), b.end(), kGpsByte) != b.end(); }
+
+static void testStripGps()
+{
+    for (bool le : {true, false})
+    {
+        const Bytes src = jpeg(tiffGps(le), true, true);
+        exif::JpegMeta m;
+        CHECK(exif::readJpegMeta(src.data(), src.size(), &m));
+        CHECK(m.orientation == 6 && hasGpsBytes(m.exif)); // carried over unless asked otherwise
+        const Bytes before = m.exif;
+
+        CHECK(exif::stripGps(&m));
+        CHECK(!hasGpsBytes(m.exif));            // the coordinates are gone, not just unlinked
+        CHECK(m.exif.size() == before.size());  // same size: only zeroed and shifted
+        CHECK(m.icc.size() == 1);               // the rest of the metadata is untouched
+
+        Bytes tb(m.exif.begin() + 6, m.exif.end());
+        exif::detail::Tiff t{tb};
+        uint32_t ifd0 = 0, nextIfd = 7, sub = 0, v = 0;
+        uint64_t e = 0, end = 0;
+        uint16_t cnt = 0, o = 0;
+        CHECK(exif::detail::tiffHeader(t, &ifd0));
+        CHECK(!exif::detail::findEntry(t, ifd0, 0x8825, &e));              // the tag is cut out
+        CHECK(exif::detail::findEntry(t, ifd0, 0x0112, &e, &cnt, &end) && cnt == 3);
+        CHECK(t.rd16(e + 8, &o) && o == 1);                                // still upright
+        CHECK(t.rd32(end, &nextIfd) && nextIfd == 0);                      // next pointer moved with it
+        CHECK(exif::detail::findEntry(t, ifd0, 0x010F, &e));               // Make survived
+        CHECK(exif::detail::findEntry(t, ifd0, 0x8769, &e) && t.rd32(e + 8, &sub));
+        CHECK(exif::detail::findEntry(t, sub, 0xA002, &e) && t.rd32(e + 8, &v) && v == 111);
+        CHECK(exif::detail::findEntry(t, sub, 0xA003, &e) && t.rd32(e + 8, &v) && v == 222);
+        for (size_t i = 100; i < 184; ++i) // the whole GPS IFD and its data
+            CHECK(tb[i] == 0);
+
+        CHECK(!exif::stripGps(&m)); // nothing left to remove
+
+        // Through embed: still a good file, size tags set, no location.
+        const Bytes out = exif::embed(jpeg({}, false, false), m, 640, 480);
+        exif::JpegMeta m2;
+        CHECK(exif::readJpegMeta(out.data(), out.size(), &m2));
+        CHECK(m2.orientation == 1 && !m2.exif.empty() && !hasGpsBytes(m2.exif) && m2.icc.size() == 1);
+    }
+
+    // No GPS block, no EXIF at all, or garbage: nothing happens.
+    {
+        exif::JpegMeta m;
+        const Bytes plain = jpeg(tiff(true, 6), true, false);
+        CHECK(exif::readJpegMeta(plain.data(), plain.size(), &m));
+        const Bytes same = m.exif;
+        CHECK(!exif::stripGps(&m) && m.exif == same);
+        exif::JpegMeta none;
+        CHECK(!exif::stripGps(&none) && none.exif.empty());
+        exif::JpegMeta junk;
+        junk.exif = Bytes(40, 0x55);
+        CHECK(!exif::stripGps(&junk) && junk.exif == Bytes(40, 0x55));
+    }
+
+    // A GPSInfo tag that points nowhere, or has the wrong type, is still removed,
+    // and nothing is read or written out of range.
+    for (bool le : {true, false})
+        for (uint32_t ptr : {0u, 4u, 0xFFFFFFF0u, 70u, 5000u})
+            for (int type : {4, 3, 2})
+            {
+                const Bytes src = jpeg(tiffGps(le, ptr, type), true, false);
+                exif::JpegMeta m;
+                CHECK(exif::readJpegMeta(src.data(), src.size(), &m));
+                CHECK(exif::stripGps(&m));
+                Bytes tb(m.exif.begin() + 6, m.exif.end());
+                exif::detail::Tiff t{tb};
+                uint32_t ifd0 = 0;
+                uint64_t e = 0;
+                CHECK(exif::detail::tiffHeader(t, &ifd0) && !exif::detail::findEntry(t, ifd0, 0x8825, &e));
+            }
+}
+
 int main()
 {
+    testStripGps();
     for (bool le : {true, false})
         for (int o = 1; o <= 8; ++o)
         {
@@ -200,6 +321,22 @@ int main()
         exif::JpegMeta m;
         if (exif::readJpegMeta(b.data(), b.size(), &m))
             (void)exif::embed(base, m, static_cast<int>(rng() % 70000), static_cast<int>(rng() % 70000));
+    }
+    // The same for the GPS stripper: damaged headers never crash it.
+    const Bytes gpsBase = jpeg(tiffGps(true), true, true);
+    for (int it = 0; it < 100000; ++it)
+    {
+        Bytes b = gpsBase;
+        for (int k = 1 + static_cast<int>(rng() % 5); k > 0; --k)
+            b[rng() % b.size()] = static_cast<uint8_t>(rng());
+        if (rng() % 4 == 0)
+            b.resize(rng() % b.size());
+        exif::JpegMeta m;
+        if (exif::readJpegMeta(b.data(), b.size(), &m))
+        {
+            exif::stripGps(&m);
+            (void)exif::embed(base, m, 640, 480);
+        }
     }
 
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);

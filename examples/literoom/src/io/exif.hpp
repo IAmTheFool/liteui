@@ -9,8 +9,8 @@
 // Not carried over: XMP and IPTC (so captions, copyright fields and any
 // develop settings stored in XMP are dropped), and thumbnails/previews stored
 // anywhere other than IFD1 (e.g. inside a MakerNote). GPS data in the EXIF
-// block IS carried over verbatim; strip it yourself for "remove location"
-// exports.
+// block IS carried over verbatim, unless the caller asks for stripGps() on the
+// JpegMeta before embedding it (Export's "Remove location" option).
 //
 // Embedding the source ICC profile is only right if the pixels are still in
 // that profile's color space. If the pipeline converts to sRGB (or any working
@@ -274,6 +274,87 @@ namespace exif
             }
         }
 
+        // Bytes one value of an IFD entry takes, by TIFF type (0 for unknown types).
+        inline uint64_t tiffTypeSize(uint16_t type)
+        {
+            switch (type)
+            {
+            case 1:  // BYTE
+            case 2:  // ASCII
+            case 6:  // SBYTE
+            case 7:  // UNDEFINED
+                return 1;
+            case 3:  // SHORT
+            case 8:  // SSHORT
+                return 2;
+            case 4:  // LONG
+            case 9:  // SLONG
+            case 11: // FLOAT
+                return 4;
+            case 5:  // RATIONAL
+            case 10: // SRATIONAL
+            case 12: // DOUBLE
+                return 8;
+            default:
+                return 0;
+            }
+        }
+
+        // Removes the GPS block: the GPS IFD that IFD0's GPSInfo tag (0x8825)
+        // points to is zeroed (its entries, its next pointer and every value it
+        // keeps outside the entries), and the tag itself is cut out of IFD0, with
+        // the entries after it moving up. Merely dropping the tag would leave the
+        // coordinates in the file. Returns true if there was a GPSInfo tag.
+        // Only this standard GPS IFD is handled: location a camera hides inside
+        // its own MakerNote is not touched.
+        inline bool dropGps(Tiff &t, uint32_t ifd0)
+        {
+            uint64_t entry = 0, end = 0;
+            uint16_t count = 0;
+            if (!findEntry(t, ifd0, 0x8825, &entry, &count, &end))
+                return false;
+
+            // Read everything first, then zero (the GPS IFD of a hostile file may
+            // overlap other structures; this keeps the reads honest).
+            uint16_t type = 0;
+            uint32_t cnt = 0, gps = 0;
+            const bool wellFormed = t.rd16(entry + 2, &type) && type == 4 &&
+                                    t.rd32(entry + 4, &cnt) && cnt == 1 &&
+                                    t.rd32(entry + 8, &gps) && gps >= 8;
+            if (wellFormed)
+            {
+                uint16_t n = 0;
+                if (t.rd16(gps, &n) && t.ok(uint64_t{gps} + 2, uint64_t{n} * 12 + 4))
+                {
+                    for (uint16_t i = 0; i < n; ++i)
+                    {
+                        const uint64_t e = uint64_t{gps} + 2 + uint64_t{i} * 12;
+                        uint16_t vt = 0;
+                        uint32_t vc = 0, off = 0;
+                        if (t.rd16(e + 2, &vt) && t.rd32(e + 4, &vc) && t.rd32(e + 8, &off))
+                        {
+                            const uint64_t bytes = tiffTypeSize(vt) * vc;
+                            if (bytes > 4 && off >= 8)
+                                t.zero(off, bytes); // the value lives outside the entry
+                        }
+                    }
+                    t.zero(gps, uint64_t{n} * 12 + 6); // count + entries + next pointer
+                }
+            }
+
+            // Cut the tag out of IFD0: entries after it (and the next-IFD pointer)
+            // move up 12 bytes, the freed tail is zeroed, the count goes down by 1.
+            const uint64_t blockEnd = end + 4; // just past IFD0's next pointer
+            if (!t.ok(entry, blockEnd - entry) || count == 0)
+                return true; // can't happen after findEntry, but never go out of range
+            std::copy(t.b.begin() + static_cast<std::ptrdiff_t>(entry + 12),
+                      t.b.begin() + static_cast<std::ptrdiff_t>(blockEnd),
+                      t.b.begin() + static_cast<std::ptrdiff_t>(entry));
+            t.zero(blockEnd - 12, 12);
+            t.wr16(ifd0, static_cast<uint16_t>(count - 1));
+            return true;
+        }
+
         inline bool isExifPayload(const uint8_t *p, size_t n)
         {
             return p && n > 14 && std::memcmp(p, "Exif\0\0", 6) == 0;
@@ -371,6 +452,22 @@ namespace exif
         }
         if (iccBad || !detail::normalizeIcc(out->icc))
             out->icc.clear();
+        return true;
+    }
+
+    // Removes the GPS location from `meta->exif` (see detail::dropGps), leaving
+    // everything else in it alone. Returns true if there was a GPS block. Does
+    // nothing (false) for an empty or malformed EXIF block.
+    inline bool stripGps(JpegMeta *meta)
+    {
+        if (!detail::isExifPayload(meta->exif.data(), meta->exif.size()))
+            return false;
+        std::vector<uint8_t> tiffBytes(meta->exif.begin() + 6, meta->exif.end());
+        detail::Tiff t{tiffBytes};
+        uint32_t ifd0;
+        if (!detail::tiffHeader(t, &ifd0) || !detail::dropGps(t, ifd0))
+            return false;
+        std::copy(tiffBytes.begin(), tiffBytes.end(), meta->exif.begin() + 6);
         return true;
     }
 

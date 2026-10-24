@@ -46,6 +46,9 @@ inline Orient exifOrientationOf(const std::string &path)
 // reset to "upright" (the pixels already are), the embedded thumbnail is erased
 // and the picture size fields are updated (see exif::embed).
 //
+// With `removeGps`, the GPS location is cut out of the EXIF block first (see
+// exif::stripGps); everything else in it is kept.
+//
 // Returns true when the source is a JPEG (by extension) whose header could be
 // read, i.e. when exif::embed ran; `*jpeg` is then rewritten, and stays
 // byte-identical if the source had no EXIF or ICC data. Returns false, with
@@ -53,7 +56,7 @@ inline Orient exifOrientationOf(const std::string &path)
 // empty, or does not start like a JPEG.
 inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg,
                                 const std::string &sourcePath, int width,
-                                int height)
+                                int height, bool removeGps = false)
 {
   std::vector<uint8_t> head;
   exif::JpegMeta meta;
@@ -61,6 +64,8 @@ inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg,
       !readFilePrefix(sourcePath, kMetaPrefixBytes, &head) ||
       !exif::readJpegMeta(head.data(), head.size(), &meta))
     return false;
+  if (removeGps)
+    exif::stripGps(&meta);
   *jpeg = exif::embed(*jpeg, meta, width, height);
   return true;
 }

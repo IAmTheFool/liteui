@@ -871,7 +871,7 @@ With `detail_layer`'s own cache (384 MiB) the worst case is about 700 MB of cach
 - Returns `deg` rounded to 0.1° and clamped to `±kAngleMax`; exactly `0` near zero (never -0); NaN/infinity → 0.
 
 ### `raster_ops.hpp`
-Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turns, mirror, orient, straighten by any angle, and the box downsample behind the preview. (Needs LiteUI for `CanvasImage`.)
+Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turns, mirror, orient, straighten by any angle, the box downsample behind the preview, and the area-average resize behind Export's "Resize to long edge". (Needs LiteUI for `CanvasImage`.)
 
 **Depends on:** `geometry.hpp`, `liteui.hpp`. **Test:** `raster_ops_test`.
 
@@ -888,6 +888,15 @@ Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turn
 
 **`inline std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)`**
 - Returns: null unless `isLargeImage(src)` (also null if the result would be empty). Otherwise a box-downsampled copy by the smallest integer factor `k = ceil(longEdge / 1024)`, with size `(width / k) × (height / k)` (integer division, so up to `k − 1` edge pixels are dropped). Each output channel, alpha included, is the rounded mean of its `k × k` block. Runs once per opened image.
+
+**`inline Dims fitLongEdge(int w, int h, int longEdge)`**
+- Returns: the size `w × h` becomes when scaled so its long side is exactly `longEdge`, aspect ratio kept (the short side is rounded to the nearest pixel and is at least 1). **Never enlarges**: a picture already `longEdge` or smaller, a `longEdge` below 1 and a non-positive size all come back unchanged. Example: 6000 × 4000 at 2048 gives 2048 × 1365.
+
+**`inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw, int dh)`**
+- Returns: `src` resampled to `dw × dh` by **area averaging**: each output pixel is the average of the part of the source it covers, with fractional weights at the edges, so any ratio works and nothing aliases. The right filter for shrinking; enlarging works but is blocky.
+- Details: color is averaged **weighted by alpha**, so a transparent corner (left by Straighten) never darkens its neighbors, and a region with nothing visible comes out as `(0, 0, 0, 0)`. A fully opaque, flat area keeps its exact value; at exactly half size the result is the rounded 2 × 2 mean. Same size, or an invalid size (`dw`/`dh` below 1, empty `src`), returns a copy of `src`. Works one output row at a time with `double` sums (memory is one source row), so a 24 MP photo takes a fraction of a second.
+
+**`inline std::shared_ptr<CanvasImage> resizeToLongEdge(const std::shared_ptr<CanvasImage> &src, int longEdge)`**: `resizeArea` to the size `fitLongEdge` gives. When nothing changes (already small enough, or `longEdge < 1`) it returns `src` **itself**, so no resize costs no copy; null stays null. Used by `exportImage`.
 
 **`inline std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src, const CropRect &r)`**
 - Returns: a **new** image of the `r` region, clamped to `src`'s bounds (a rectangle outside the picture gives a 0-pixel dimension). Never null.
@@ -1593,7 +1602,7 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 **What happens on export**
 - The orientation is reset to upright (the pixels already are), the embedded thumbnail is erased (its data zeroed, not just unlinked), and the picture size fields are updated.
 - **Not carried over:** XMP and IPTC (captions, copyright fields and any develop settings stored in XMP are dropped), and thumbnails stored anywhere other than IFD1 (e.g. inside a MakerNote).
-- **Carried over verbatim:** GPS data inside the EXIF block. Strip it yourself for a "remove location" export.
+- **Carried over:** GPS data inside the EXIF block, unless `stripGps` is called on the `JpegMeta` before `embed` (Export's "Remove location (GPS)"). Only the standard GPS IFD is handled: location a camera hides inside its own MakerNote is not touched.
 - Embedding the source ICC profile is only right if the pixels are still in that profile's color space.
 
 **Types**
@@ -1633,6 +1642,11 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 - Returns: a copy of `jpeg` with the EXIF segment and ICC segments inserted right after SOI (after a leading APP0 if the file starts with one, as JFIF requires). A buffer that isn't a JPEG is returned unchanged.
 - Details: the EXIF segment is left out if `meta.exif` is malformed or `w`/`h` aren't positive (its size fields would be stale). Size fields written: IFD0 ImageWidth/ImageLength and the EXIF sub-IFD's PixelXDimension/PixelYDimension, where present, each rewritten as a LONG. Invalid ICC chunks and any segment over 65533 bytes of payload are skipped.
 
+**`inline bool stripGps(JpegMeta *meta)`**
+- Removes the GPS location from `meta->exif` and leaves everything else in it alone (size, orientation, Make, the Exif sub-IFD and so on). Returns true if there was a GPS block; false, with nothing changed, for an empty or malformed EXIF block or one without GPS (so calling it twice is harmless).
+- Details: it works on a copy of the TIFF part and copies it back. The GPS IFD that IFD0's GPSInfo tag (0x8825) points to is **zeroed**, including every value it keeps outside its entries (the latitude and longitude rationals), and the tag is then cut out of IFD0 with the entries after it, and the next-IFD pointer, moving up by 12 bytes. The block keeps its size. Dropping only the tag would leave the coordinates in the file. A GPSInfo tag that points out of range or has the wrong type is still removed, and nothing is read or written outside the block.
+- Use: call it between `readJpegMeta` and `embed` (`embedSourceMetadata` does this for you with `removeGps`).
+
 **`namespace exif::detail`** (internal; listed so you can find things)
 - `kMaxIccBytes` (`size_t`, 16 MiB).
 - `struct Tiff`: a bounds-checked, endian-aware view over a TIFF block with `ok`, `rd16`, `rd32`, `wr16`, `wr32`, `zero`. Every read or write that would fall outside the block fails or is skipped.
@@ -1641,6 +1655,8 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 - `dropThumbnail(t, nextIfdPtr)`: zeroes the IFD1 thumbnail's data and IFD, then unlinks IFD1.
 - `resetOrientation(t, ifd0)`: sets tag 0x0112 to 1 (only if SHORT, count 1), drops the thumbnail, and returns the original value.
 - `setLong(t, ifd, tag, value)` and `setDimensions(t, ifd0, w, h)`: rewrite size tags.
+- `tiffTypeSize(type)`: bytes per value for a TIFF type (0 for an unknown one).
+- `dropGps(t, ifd0)`: the work behind `stripGps` (see there). Everything it needs is read before anything is zeroed.
 - `isExifPayload`, `isIccPayload`: header checks. `normalizeIcc(icc)`: validates and orders the chunks.
 
 ### `image_meta.hpp`
@@ -1657,10 +1673,10 @@ Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's cam
 - Returns: the `Orient` that makes the picture upright. Identity for anything that isn't a `.jpg`/`.jpeg`, can't be read, isn't a JPEG, or has no valid orientation tag.
 - Why: decoders hand back the stored pixels, so a portrait shot would otherwise open on its side. It is applied **once**, as the file is opened: the "original" the editor (and its saved edits and masks) work on is the upright picture.
 
-**`inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg, const std::string &sourcePath, int width, int height)`**
-- Inputs: `jpeg` (a freshly encoded JPEG, modified in place), the source photo's path, and the new picture size.
+**`inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg, const std::string &sourcePath, int width, int height, bool removeGps = false)`**
+- Inputs: `jpeg` (a freshly encoded JPEG, modified in place), the source photo's path, the new picture size (the exported size, so after a resize it is the smaller one), and `removeGps` (default false).
 - Returns: true when the source is a `.jpg`/`.jpeg` whose header could be read (i.e. `exif::embed` ran). `*jpeg` is then rewritten, and stays byte-identical if the source had no EXIF or ICC data. Returns false with `*jpeg` untouched for a non-JPEG, missing or empty source, or one that doesn't start like a JPEG.
-- Effects: orientation reset to upright, thumbnail erased, size fields updated (see `exif::embed`). GPS is carried over.
+- Effects: orientation reset to upright, thumbnail erased, size fields updated (see `exif::embed`). GPS is carried over unless `removeGps` is true, in which case it is cut out first (`exif::stripGps`); the result is otherwise byte-identical to the default, and a source without a GPS block gives the same bytes either way. The source file is only read, never changed.
 
 ---
 
