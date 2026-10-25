@@ -8,6 +8,7 @@
 static constexpr size_t N = static_cast<size_t>(AdjId::Count);
 
 static const AdjustmentSpec &spec(AdjId id) { return kAdjustmentSpecs[static_cast<size_t>(id)]; }
+static AdjValues only(AdjId id, float v);
 
 static void testTable()
 {
@@ -30,6 +31,8 @@ static void testTable()
   }
   CHECK(spec(AdjId::Exposure).stage == AdjustmentSpec::Stage::Tone);
   CHECK(spec(AdjId::Blacks).stage == AdjustmentSpec::Stage::Tone);
+  for (AdjId id : {AdjId::BlackPoint, AdjId::WhitePoint, AdjId::Gamma})
+    CHECK(spec(id).stage == AdjustmentSpec::Stage::Tone);
   CHECK(spec(AdjId::Temperature).stage == AdjustmentSpec::Stage::Color);
   CHECK(spec(AdjId::ColorizeAmount).stage == AdjustmentSpec::Stage::Color);
   CHECK(spec(AdjId::Greyscale).stage == AdjustmentSpec::Stage::Color);
@@ -42,6 +45,8 @@ static void testRanges()
 {
   CHECK(spec(AdjId::Exposure).min == kExposureMin && spec(AdjId::Exposure).max == kExposureMax);
   CHECK(spec(AdjId::Brightness).min == kBrightnessMin && spec(AdjId::Brightness).max == kBrightnessMax);
+  CHECK(spec(AdjId::BlackPoint).min == 0.0f && spec(AdjId::BlackPoint).max == static_cast<float>(kBlackPointMax));
+  CHECK(spec(AdjId::WhitePoint).min == 0.0f && spec(AdjId::WhitePoint).max == static_cast<float>(kWhitePointMax));
   CHECK(spec(AdjId::Contrast).min == kToneMin && spec(AdjId::Contrast).max == kToneMax);
   CHECK(spec(AdjId::ColorizeHue).min == 0.0f && spec(AdjId::ColorizeHue).max == 360.0f);
   CHECK(spec(AdjId::ColorizeAmount).min == 0.0f && spec(AdjId::ColorizeAmount).max == 100.0f);
@@ -54,7 +59,7 @@ static void testRanges()
     CHECK(spec(id).min == 0.0f && spec(id).max == 100.0f);
   // Two-sided ones are symmetric.
   for (AdjId id : {AdjId::Contrast, AdjId::Highlights, AdjId::Shadows, AdjId::Whites, AdjId::Blacks,
-                   AdjId::Temperature, AdjId::Tint, AdjId::Vibrance, AdjId::Saturation, AdjId::Hue,
+                   AdjId::Gamma, AdjId::Temperature, AdjId::Tint, AdjId::Vibrance, AdjId::Saturation, AdjId::Hue,
                    AdjId::Texture, AdjId::Clarity, AdjId::Dehaze})
     CHECK(spec(id).min == -spec(id).max);
 }
@@ -150,6 +155,91 @@ static void testFilterBlock()
     CHECK(lut[static_cast<size_t>(i)] == i);
 }
 
+// ------------------------------------------------------------------- Levels
+static void testLevels()
+{
+  const AdjustmentSpec &bp = spec(AdjId::BlackPoint), &wp = spec(AdjId::WhitePoint), &gm = spec(AdjId::Gamma);
+  // The labels are sidecar keys, and the three sit together after Blacks, in this order.
+  CHECK(bp.label == "Black Point" && wp.label == "White Point" && gm.label == "Gamma");
+  CHECK(adjIndex(AdjId::BlackPoint) == adjIndex(AdjId::Blacks) + 1);
+  CHECK(adjIndex(AdjId::WhitePoint) == adjIndex(AdjId::BlackPoint) + 1 && adjIndex(AdjId::Gamma) == adjIndex(AdjId::WhitePoint) + 1);
+  CHECK(adjIndex(AdjId::Temperature) == adjIndex(AdjId::Gamma) + 1);
+
+  // Black Point v: level v goes to 0, 255 stays 255, below v is negative (the LUT clamps).
+  CHECK_NEAR(bp.apply(40.0f, 40.0f), 0.0f, 1e-3);
+  CHECK_NEAR(bp.apply(255.0f, 40.0f), 255.0f, 1e-3);
+  CHECK(bp.apply(10.0f, 40.0f) < 0.0f);
+  CHECK_NEAR(bp.apply(147.5f, 40.0f), 127.5f, 1e-3); // halfway between 40 and 255 lands halfway
+  // White Point v: level 255 - v goes to 255, 0 stays 0, above it exceeds 255.
+  CHECK_NEAR(wp.apply(215.0f, 40.0f), 255.0f, 1e-3);
+  CHECK_NEAR(wp.apply(0.0f, 40.0f), 0.0f, 1e-4);
+  CHECK(wp.apply(250.0f, 40.0f) > 255.0f);
+  // Gamma: the ends never move; positive brightens the midtones, negative darkens them.
+  for (float v : {-100.0f, -37.0f, 25.0f, 100.0f})
+  {
+    CHECK_NEAR(gm.apply(0.0f, v), 0.0f, 1e-4);
+    CHECK_NEAR(gm.apply(255.0f, v), 255.0f, 1e-2);
+    CHECK((gm.apply(128.0f, v) > 128.0f) == (v > 0.0f));
+  }
+  // +100 is the exponent 0.25: a quarter-gray input comes out at 0.25^0.25 = sqrt(0.5) of white.
+  CHECK_NEAR(gm.apply(255.0f * 0.25f, 100.0f), 255.0f * std::sqrt(0.5f), 1e-2);
+  // A negative input (never produced by the LUT builder) must not give NaN.
+  CHECK(!std::isnan(gm.apply(-5.0f, 50.0f)) && !std::isnan(gm.apply(-5.0f, -50.0f)));
+
+  // Through the table: the identity at 0, and never decreasing at any strength.
+  for (AdjId id : {AdjId::BlackPoint, AdjId::WhitePoint, AdjId::Gamma})
+  {
+    const AdjustmentSpec &s = spec(id);
+    const auto idl = toneLutFromValues(only(id, 0.0f), nullptr);
+    for (int i = 0; i < 256; ++i)
+      CHECK(idl[static_cast<size_t>(i)] == i);
+    for (float v = s.min; v <= s.max; v += 5.0f)
+    {
+      const auto l = toneLutFromValues(only(id, v), nullptr);
+      for (int i = 1; i < 256; ++i)
+        CHECK(l[static_cast<size_t>(i)] >= l[static_cast<size_t>(i) - 1]);
+    }
+  }
+  // Black Point and White Point crush / clip exactly where they say.
+  const auto lb = toneLutFromValues(only(AdjId::BlackPoint, 40.0f), nullptr);
+  const auto lw = toneLutFromValues(only(AdjId::WhitePoint, 40.0f), nullptr);
+  for (int i = 0; i <= 40; ++i)
+    CHECK(lb[static_cast<size_t>(i)] == 0);
+  for (int i = 215; i < 256; ++i)
+    CHECK(lw[static_cast<size_t>(i)] == 255);
+
+  // All three at once, at every combination of the slider extremes, stay monotonic,
+  // and equal the one-slider tables run one after another in table order.
+  for (float b : {0.0f, 100.0f})
+    for (float w : {0.0f, 100.0f})
+      for (float g : {-100.0f, 0.0f, 100.0f})
+      {
+        AdjValues v{};
+        v[adjIndex(AdjId::BlackPoint)] = b;
+        v[adjIndex(AdjId::WhitePoint)] = w;
+        v[adjIndex(AdjId::Gamma)] = g;
+        const auto l = toneLutFromValues(v, nullptr);
+        const auto l1 = toneLutFromValues(only(AdjId::BlackPoint, b), nullptr);
+        const auto l2 = toneLutFromValues(only(AdjId::WhitePoint, w), nullptr);
+        const auto l3 = toneLutFromValues(only(AdjId::Gamma, g), nullptr);
+        for (int i = 0; i < 256; ++i)
+        {
+          if (i > 0)
+            CHECK(l[static_cast<size_t>(i)] >= l[static_cast<size_t>(i) - 1]);
+          CHECK(l[static_cast<size_t>(i)] == l3[l2[l1[static_cast<size_t>(i)]]]);
+        }
+      }
+  // They run after the older Tone sliders (Exposure first, then Black Point).
+  AdjValues mix{};
+  mix[adjIndex(AdjId::Exposure)] = 30.0f;
+  mix[adjIndex(AdjId::BlackPoint)] = 20.0f;
+  const auto lm = toneLutFromValues(mix, nullptr);
+  const auto le = toneLutFromValues(only(AdjId::Exposure, 30.0f), nullptr);
+  const auto lbp = toneLutFromValues(only(AdjId::BlackPoint, 20.0f), nullptr);
+  for (int i = 0; i < 256; ++i)
+    CHECK(lm[static_cast<size_t>(i)] == lbp[le[static_cast<size_t>(i)]]);
+}
+
 // ---------------------------------------------------------- toneLutFromValues
 static AdjValues only(AdjId id, float v)
 {
@@ -238,6 +328,7 @@ int main()
   testTable();
   testRanges();
   testFilterBlock();
+  testLevels();
   testToneFunctions();
   testToneDirections();
   return finish();

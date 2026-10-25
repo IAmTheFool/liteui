@@ -30,7 +30,15 @@ The stage decides where the slider acts and what else you need to write.
 - `apply` returns an *unrounded, unclamped* value. The table builder rounds and clamps after each slider.
 - It must be pointwise per channel. If it needs neighbors, it is not a Tone slider.
 - The order of Tone entries in the table is the order they are applied. Each one runs on the previous one's output.
-- If your curve should stay monotonic (never make darker input brighter than lighter input), check it at both extremes of the range. The existing Highlights/Shadows/Whites/Blacks comments show how the margin was worked out.
+- If your curve should stay monotonic (never make darker input brighter than lighter input), check it at both extremes of the range. The existing Highlights/Shadows/Whites/Blacks comments show how the margin was worked out. A linear curve is monotonic when its slope stays positive over the whole range (Black Point and White Point cap their range so `255 - v` never nears 0); a power curve is monotonic for any positive exponent (Gamma).
+- Return `x` unchanged when `value == 0`. The identity is then exact, with no float noise from `pow(x, 1)` or `x / 255 * 255`.
+- Floor any input at 0 before `pow` or `sqrt`, so an out-of-range input cannot give NaN.
+- Black Point, White Point and Gamma (the Levels sliders) are a worked example. They sit last in the Tone block, after Blacks. New Tone sliders may go anywhere in the Tone block, but remember that it changes the processing order for the sliders after it.
+
+For a Tone slider, also add:
+
+- A test of its anchor points, the identity at 0, and monotonic tables at both ends of the range and with the neighbors that run before and after it (see `testLevels` in `adjustments_test.cpp`).
+- To the golden test: nothing, unless the slider's half-range value would clip or flatten the picture in the kitchen-sink scenarios. Then add it to `isFixedSink` / `fixedSinkValue` (as Levels are). If you insert it in the middle of the table, extend `sinkPos` so older sliders keep their signs. Re-record as in [testing.md](testing.md#checking-a-re-record).
 
 **Color sliders** also need:
 

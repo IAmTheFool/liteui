@@ -340,15 +340,41 @@ namespace golden
   // fingerprints for any reason except the Filters themselves).
   static size_t sinkPos(size_t i)
   {
+    // Only meaningful for sliders that are neither Levels nor Filters. Both
+    // blocks are skipped, so every older slider keeps the sign it had before
+    // they existed (and so keeps its kitchen-sink contribution).
+    const size_t levelsEnd = idx(AdjId::Gamma) + 1, levelsCount = 3;
     const size_t first = idx(AdjId::Greyscale), count = idx(AdjId::CrossProcess) - first + 1;
-    return i < first ? i : i - count; // only meaningful for non-filter i
+    size_t pos = i;
+    if (i >= levelsEnd)
+      pos -= levelsCount;
+    if (i > idx(AdjId::CrossProcess))
+      pos -= count;
+    return pos;
   }
+  // The Levels sliders (Black Point ... Gamma) are one contiguous block too.
+  static bool isLevels(AdjId id) { return id >= AdjId::BlackPoint && id <= AdjId::Gamma; }
   // Strength the kitchen-sink scenarios give every Filter. Modest on purpose:
   // at 50 %, Negative and Solarize map every bright pixel to the same mid-gray,
   // which would hide regressions in everything upstream of them (tone, color,
   // mixer, grade) in those fingerprints. 0 reproduces the pre-Filters
   // fingerprints exactly (used once to prove nothing else changed).
   static constexpr float kSinkFilterStrength = 20.0f;
+  // Sliders that get a fixed, modest value in the kitchen-sink scenarios rather
+  // than the "half of max, every other one negative" pattern. Levels at half of
+  // max would clip a fifth of the tonal range at each end and hide what is
+  // upstream. Setting them to 0 reproduces the pre-Levels fingerprints.
+  static bool isFixedSink(AdjId id) { return isFilter(id) || isLevels(id); }
+  static float fixedSinkValue(AdjId id)
+  {
+    switch (id)
+    {
+    case AdjId::BlackPoint: return 8.0f;
+    case AdjId::WhitePoint: return 8.0f;
+    case AdjId::Gamma: return 20.0f;
+    default: return kSinkFilterStrength;
+    }
+  }
 
   // Renders twice (cold, then with whatever the first render cached) and
   // fingerprints the first. Returns the cold result.
@@ -484,9 +510,9 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-      if (isFilter(sp.id))
+      if (isFixedSink(sp.id))
       {
-        m.adj[i] = kSinkFilterStrength;
+        m.adj[i] = fixedSinkValue(sp.id);
         continue;
       }
       m.adj[i] = (sinkPos(i) % 2 && sp.min < 0) ? sp.min * 0.4f : sp.max * 0.4f;
@@ -569,8 +595,8 @@ namespace golden
       for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
       {
         const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-        s.set(sp.id, isFilter(sp.id) ? kSinkFilterStrength
-                                     : ((pol == 1 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
+        s.set(sp.id, isFixedSink(sp.id) ? fixedSinkValue(sp.id)
+                                        : ((pol == 1 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
       }
       renderScenario(pol == 0 ? "adj/all_pos" : "adj/all_neg", s, img);
     }
@@ -1015,8 +1041,8 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
-      s.set(sp.id, isFilter(sp.id) ? kSinkFilterStrength
-                                   : ((sinkPos(i) % 2 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
+      s.set(sp.id, isFixedSink(sp.id) ? fixedSinkValue(sp.id)
+                                      : ((sinkPos(i) % 2 && sp.min < 0) ? sp.min * 0.5f : sp.max * 0.5f));
     }
     for (size_t c = 0; c < kMixChanCount; ++c)
       for (size_t b = 0; b < kMixBandCount; ++b)

@@ -11,6 +11,15 @@
 
 #include "core/pixel_math.hpp"
 
+// Levels. Black Point / White Point are 0..100 "levels" moved in from either
+// end of the 0..255 range; the limits keep the stretch denominators (255 - 100)
+// well above zero, so both curves stay finite and increasing. Gamma is bipolar:
+// +100 brightens the midtones (exponent 2^-2 = 0.25), -100 darkens them
+// (exponent 2^2 = 4). Gamma = 0 is exactly the identity.
+constexpr int kBlackPointMax = 100;
+constexpr int kWhitePointMax = 100;
+constexpr float kGammaOctaves = 2.0f; // exponent = 2^(-value / 100 * kGammaOctaves)
+
 // Exposure range (percentage; scales each R/G/B channel multiplicatively,
 // applied before brightness's flat offset — see kAdjustmentSpecs below).
 constexpr int kExposureMin = -100;
@@ -22,7 +31,7 @@ constexpr int kBrightnessMax = 100;
 
 // The shared -100..+100 range (0 = untouched) used by Contrast, Highlights,
 // Shadows, Whites, Blacks, and also by Temperature, Tint, Vibrance, Saturation,
-// Hue, Texture, Clarity and Dehaze.
+// Hue, Texture, Clarity and Dehaze (and Gamma).
 constexpr int kBipolarMin = -100;
 constexpr int kBipolarMax = 100;
 // Older names for the same range; kept so existing code keeps compiling.
@@ -47,6 +56,12 @@ enum class AdjId : int
   Shadows,
   Whites,
   Blacks,
+  // Levels, as three Tone sliders: BlackPoint and WhitePoint clip and stretch
+  // the input range, Gamma bends the midtones. They run last in the Tone
+  // block (after Blacks), in this order.
+  BlackPoint,
+  WhitePoint,
+  Gamma,
   Temperature,
   Tint,
   Vibrance,
@@ -177,6 +192,43 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
          {
            return x +
                   value * 0.4f * (1.0f - smoothStep01(0.0f, 0.25f, x / 255.0f));
+         }},
+        // Levels. Pointwise per channel, so Tone sliders. Each is the identity
+        // at 0 (early return: no pow(x, 1) or x / 255 * 255 float noise).
+        // Black Point: input levels 0..value become black, the rest is
+        // stretched back to 255. Linear with slope 255 / (255 - value) >= 1,
+        // so monotonic over the whole range (value <= 100 < 255). Negative
+        // results are clamped by the LUT builder.
+        {AdjId::BlackPoint, "Black Point", 0.0f,
+         static_cast<float>(kBlackPointMax),
+         [](float x, float value)
+         {
+           if (value == 0.0f)
+             return x;
+           return (x - value) * (255.0f / (255.0f - value));
+         }},
+        // White Point: input level 255 - value becomes white, everything above
+        // clips. Linear with slope 255 / (255 - value), monotonic.
+        {AdjId::WhitePoint, "White Point", 0.0f,
+         static_cast<float>(kWhitePointMax),
+         [](float x, float value)
+         {
+           if (value == 0.0f)
+             return x;
+           return x * (255.0f / (255.0f - value));
+         }},
+        // Gamma: 255 * (x / 255)^e with e = 2^(-value / 100 * kGammaOctaves),
+        // so positive brightens the midtones and 0 and 255 never move.
+        // Monotonic for any e > 0; the input is floored at 0 first so pow never
+        // sees a negative base (NaN). The LUT builder maps a NaN to 0 anyway.
+        {AdjId::Gamma, "Gamma", static_cast<float>(kBipolarMin),
+         static_cast<float>(kBipolarMax),
+         [](float x, float value)
+         {
+           if (value == 0.0f)
+             return x;
+           const float e = std::exp2(-value / 100.0f * kGammaOctaves);
+           return 255.0f * std::pow(std::max(x, 0.0f) / 255.0f, e);
          }},
         // Color stage (see ColorPass below). Positive Temperature = warmer,
         // positive Tint = more magenta (negative = greener).

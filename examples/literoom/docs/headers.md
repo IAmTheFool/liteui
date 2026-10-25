@@ -97,9 +97,11 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | `kBrightnessMin` / `kBrightnessMax` | `int` | -100 / 100 | Brightness range (flat offset in levels) |
 | `kBipolarMin` / `kBipolarMax` | `int` | -100 / 100 | The shared range; 0 is "untouched" |
 | `kToneMin` / `kToneMax` | `int` | = `kBipolar*` | Older names for the same range, kept so old code compiles |
+| `kBlackPointMax` / `kWhitePointMax` | `int` | 100 / 100 | Upper limits of Black Point and White Point (both start at 0). Capped well below 255 so the stretch denominator `255 - v` stays at 155 or more |
+| `kGammaOctaves` | `float` | 2 | Gamma's exponent is `2^(-v / 100 * kGammaOctaves)`, so the exponent runs from 0.25 (+100) to 4 (-100) |
 
 **Types**
-- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, BlackPoint, WhitePoint, Gamma, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
 - `struct AdjustmentSpec`
 
   | Field | Type | Meaning |
@@ -109,9 +111,9 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
   | `min`, `max` | `float` | Slider range; `min < max` is enforced at compile time |
   | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color and Detail |
   | `stage` | `Stage` (`Tone`, `Color`, `Detail`) | Which pass consumes it. Defaults to `Tone` |
-- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 28 floats, indexed by `adjIndex(id)`.
+- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 34 floats, indexed by `adjIndex(id)`.
 
-**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 28>`). Declaration order is the sidebar order and, within Tone, the processing order.
+**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 34>`). Declaration order is the sidebar order and, within Tone, the processing order.
 
 | Slider | Range | Stage | Per-channel function (x = channel 0..255, v = value) |
 |---|---|---|---|
@@ -122,6 +124,9 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | Shadows | -100..100 | Tone | `x + v * 0.6 * (1 - smoothStep01(0, 0.6, x/255))` |
 | Whites | -100..100 | Tone | `x + v * 0.4 * smoothStep01(0.75, 1, x/255)` |
 | Blacks | -100..100 | Tone | `x + v * 0.4 * (1 - smoothStep01(0, 0.25, x/255))` |
+| Black Point | 0..100 | Tone | `(x - v) * 255 / (255 - v)`; `x` unchanged when `v == 0` |
+| White Point | 0..100 | Tone | `x * 255 / (255 - v)`; `x` unchanged when `v == 0` |
+| Gamma | -100..100 | Tone | `255 * (max(x, 0)/255) ^ e` with `e = 2^(-v/100 * kGammaOctaves)`; `x` unchanged when `v == 0` |
 | Temperature, Tint, Vibrance, Saturation, Hue | -100..100 | Color | none (see `color_pass.hpp`) |
 | ColorizeHue | 0..360 (degrees) | Color | none |
 | ColorizeAmount | 0..100 | Color | none |
@@ -130,6 +135,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
 
 - The Highlights/Shadows/Whites/Blacks scales (0.6 / 0.4) were chosen so the curve stays monotonic. Whites and Blacks have the thinnest margin (about 0.94); raising their 0.4 much past 0.42 breaks it.
+- **Levels** (Black Point, White Point, Gamma) come last in the Tone block, in that order, so each runs on the previous one's rounded output. Black Point and White Point are linear with slope `255 / (255 - v)`, at least 1 and finite because `v <= 100`, so they are monotonic. Gamma is monotonic for any positive exponent, never moves 0 or 255, and floors its input at 0 so `pow` never sees a negative base. Each returns `x` untouched at 0 (no `pow(x, 1)` rounding noise). Black Point returns negative values below `v` and White Point values above 255; the table builder clamps them.
 - These four act per channel through the shared table, so they are a tone-curve approximation, not a luminance-preserving recovery.
 
 **Functions**

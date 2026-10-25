@@ -48,7 +48,7 @@ When you drag a slider, the edit state (`AdjustmentSet`) is **frozen** into a sm
 
 That value is then handed to `renderWith()` in `render.hpp`, which processes the picture in blocks of 128 rows. Per pixel, the order is always:
 
-1. **Tone tables.** Exposure, Brightness, Contrast, Highlights, Shadows, Whites and Blacks are composed into one lookup table, followed by the master curve, then each channel's own curve. A pixel costs one table read per channel.
+1. **Tone tables.** Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks and the three Levels sliders (Black Point, White Point, Gamma) are composed into one lookup table, in that order, followed by the master curve, then each channel's own curve. A pixel costs one table read per channel.
 2. **Color pass.** One float calculation per pixel, in this order: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. It rounds to 8 bits only **once, at the end**, so stacking several color sliders does not pile up rounding errors.
 3. **Neighbor effects.** Dehaze, then Texture / Clarity / Sharpness, then noise reduction, then Blur (last, so it wins).
 4. **Masks**, in list order. Each mask repeats steps 1 to 3 on its own copy of the pixels and blends the result back.
