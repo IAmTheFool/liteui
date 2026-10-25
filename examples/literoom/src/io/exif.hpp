@@ -2,7 +2,10 @@
 //   * the EXIF orientation tag (what camera rotation a photo was shot with),
 //   * carrying a source JPEG's EXIF block and ICC profile into a re-encoded
 //     JPEG, with the orientation reset (the pixels are already upright), the
-//     embedded thumbnail erased, and the picture's new size filled in.
+//     embedded thumbnail erased, and the picture's new size filled in,
+//   * the camera data the Info panel shows (readPhotoInfo): make, model, lens,
+//     date taken, ISO, shutter, aperture and focal length, plus the functions
+//     that turn them into display text.
 // Everything works on byte buffers and bounds-checks every read, so a damaged
 // or hostile file can't read out of range; it just yields "no metadata".
 //
@@ -19,7 +22,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace exif
@@ -525,6 +532,380 @@ namespace exif
 
         out.insert(out.end(), jpeg.begin() + static_cast<std::ptrdiff_t>(at), jpeg.end());
         return out;
+    }
+
+    // ------------------------------------------------------------ Photo info
+    // The camera data the Info panel shows. Read from the ORIGINAL EXIF block of
+    // the file (readJpegMeta rewrites its copy for an upright re-encode, so the
+    // two never share a buffer). Every field is optional: text is empty, numbers
+    // are 0 when the file does not say, or says something implausible.
+    //
+    // GPS is deliberately not read: the Info panel never shows a location.
+    struct PhotoInfo
+    {
+        std::string make;      // IFD0 Make, e.g. "Canon"
+        std::string model;     // IFD0 Model, e.g. "Canon EOS R5"
+        std::string lens;      // LensModel (Exif tag 0xA434); empty if not recorded
+        std::string dateTaken; // "YYYY-MM-DD HH:MM:SS" (DateTimeOriginal), or empty
+        int iso = 0;           // 1..kInfoMaxIso, or 0
+        double exposureTime = 0.0; // shutter, seconds (0, 86400], or 0
+        double fNumber = 0.0;      // (0, 1000], or 0
+        double focalLength = 0.0;  // millimetres, (0, 10000], or 0
+
+        bool empty() const
+        {
+            return make.empty() && model.empty() && lens.empty() && dateTaken.empty() &&
+                   iso == 0 && exposureTime == 0.0 && fNumber == 0.0 && focalLength == 0.0;
+        }
+    };
+
+    // Text fields are cut to this many characters (a hostile file can claim a
+    // multi-gigabyte string). ISO values above this are not believed.
+    constexpr size_t kInfoMaxText = 128;
+    constexpr int kInfoMaxIso = 10000000;
+
+    namespace detail
+    {
+
+        // The payload ("Exif\0\0" + TIFF data) of the first EXIF APP1 segment, found
+        // with the same marker walk as readJpegMeta. The pointer points into `data`.
+        inline bool findExifSegment(const uint8_t *data, size_t size,
+                                    const uint8_t **payload, size_t *payloadLen)
+        {
+            if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8)
+                return false;
+            size_t i = 2;
+            while (i + 4 <= size)
+            {
+                if (data[i] != 0xFF)
+                    break;
+                const uint8_t marker = data[i + 1];
+                if (marker == 0xFF)
+                {
+                    ++i;
+                    continue;
+                }
+                if (marker == 0xD9 || marker == 0xDA)
+                    break;
+                if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8))
+                {
+                    i += 2;
+                    continue;
+                }
+                const size_t len = (static_cast<size_t>(data[i + 2]) << 8) | data[i + 3];
+                if (len < 2 || i + 2 + len > size)
+                    break;
+                if (marker == 0xE1 && isExifPayload(data + i + 4, len - 2))
+                {
+                    *payload = data + i + 4;
+                    *payloadLen = len - 2;
+                    return true;
+                }
+                i += 2 + len;
+            }
+            return false;
+        }
+
+        // EXIF "ASCII" bytes made safe to show: reading stops at the first NUL;
+        // spaces, tabs and line breaks become single spaces (none at either end);
+        // other control characters are dropped; anything outside 7-bit ASCII becomes
+        // '?'; at most kInfoMaxText characters.
+        inline std::string cleanText(const uint8_t *p, size_t n)
+        {
+            std::string s;
+            bool pendingSpace = false;
+            for (size_t i = 0; i < n && p[i] != 0 && s.size() < kInfoMaxText; ++i)
+            {
+                const unsigned char c = p[i];
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                {
+                    pendingSpace = !s.empty();
+                    continue;
+                }
+                if (c < 0x20 || c == 0x7F)
+                    continue;
+                if (pendingSpace)
+                {
+                    s.push_back(' ');
+                    pendingSpace = false;
+                    if (s.size() >= kInfoMaxText)
+                        break;
+                }
+                s.push_back(c < 0x7F ? static_cast<char>(c) : '?');
+            }
+            return s;
+        }
+
+        // Where the `count` values of type `type` of the entry at `entry` live: in
+        // the entry's own 4 value bytes if they fit, else at the offset stored
+        // there. False if that is out of range.
+        inline bool valueOffset(const Tiff &t, uint64_t entry, uint64_t bytes, uint64_t *off)
+        {
+            if (bytes <= 4)
+            {
+                *off = entry + 8;
+                return t.ok(*off, bytes);
+            }
+            uint32_t o = 0;
+            if (!t.rd32(entry + 8, &o) || o < 8 || !t.ok(o, bytes))
+                return false;
+            *off = o;
+            return true;
+        }
+
+        // An ASCII entry as clean text; false if the type is wrong, the value is out
+        // of range, or nothing printable is left.
+        inline bool readText(const Tiff &t, uint64_t entry, std::string *out)
+        {
+            uint16_t type = 0;
+            uint32_t cnt = 0;
+            uint64_t off = 0;
+            if (!t.rd16(entry + 2, &type) || type != 2 || !t.rd32(entry + 4, &cnt) || cnt == 0 ||
+                !valueOffset(t, entry, cnt, &off))
+                return false;
+            *out = cleanText(t.b.data() + off, std::min<uint64_t>(cnt, 4096));
+            return !out->empty();
+        }
+
+        // The first value of a RATIONAL entry as a double; false for the wrong type,
+        // out-of-range data or a zero denominator.
+        inline bool readRational(const Tiff &t, uint64_t entry, double *out)
+        {
+            uint16_t type = 0;
+            uint32_t cnt = 0, num = 0, den = 0;
+            uint64_t off = 0;
+            if (!t.rd16(entry + 2, &type) || type != 5 || !t.rd32(entry + 4, &cnt) || cnt == 0 ||
+                !valueOffset(t, entry, uint64_t{cnt} * 8, &off) || !t.rd32(off, &num) ||
+                !t.rd32(off + 4, &den) || den == 0)
+                return false;
+            *out = static_cast<double>(num) / static_cast<double>(den);
+            return true;
+        }
+
+        // The first value of a SHORT or LONG entry.
+        inline bool readFirstUInt(const Tiff &t, uint64_t entry, uint32_t *out)
+        {
+            uint16_t type = 0;
+            uint32_t cnt = 0;
+            uint64_t off = 0;
+            if (!t.rd16(entry + 2, &type) || (type != 3 && type != 4) || !t.rd32(entry + 4, &cnt) ||
+                cnt == 0)
+                return false;
+            const uint64_t size = type == 3 ? 2 : 4;
+            if (!valueOffset(t, entry, uint64_t{cnt} * size, &off))
+                return false;
+            uint16_t v16 = 0;
+            if (type == 3)
+            {
+                if (!t.rd16(off, &v16))
+                    return false;
+                *out = v16;
+                return true;
+            }
+            return t.rd32(off, out);
+        }
+
+        inline bool textTag(const Tiff &t, uint32_t ifd, uint16_t tag, std::string *out)
+        {
+            uint64_t e = 0;
+            return findEntry(t, ifd, tag, &e) && readText(t, e, out);
+        }
+        inline bool rationalTag(const Tiff &t, uint32_t ifd, uint16_t tag, double *out)
+        {
+            uint64_t e = 0;
+            return findEntry(t, ifd, tag, &e) && readRational(t, e, out);
+        }
+        inline bool uintTag(const Tiff &t, uint32_t ifd, uint16_t tag, uint32_t *out)
+        {
+            uint64_t e = 0;
+            return findEntry(t, ifd, tag, &e) && readFirstUInt(t, e, out);
+        }
+
+        // "2024:06:15 14:30:05" (the EXIF form; '-' also accepted between the date
+        // parts, anything after the first 19 characters ignored) -> "2024-06-15
+        // 14:30:05". Empty for anything that is not a real date and time (cameras
+        // write "0000:00:00 00:00:00" or blanks when the clock was never set).
+        inline std::string normalizeDate(const std::string &s)
+        {
+            if (s.size() < 19)
+                return {};
+            auto dig = [&s](size_t i)
+            { return s[i] >= '0' && s[i] <= '9'; };
+            auto num = [&s](size_t i, size_t n)
+            {
+                int v = 0;
+                for (size_t k = 0; k < n; ++k)
+                    v = v * 10 + (s[i + k] - '0');
+                return v;
+            };
+            static const size_t kDigits[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+            for (size_t i : kDigits)
+                if (!dig(i))
+                    return {};
+            if ((s[4] != ':' && s[4] != '-') || (s[7] != ':' && s[7] != '-') || s[10] != ' ' ||
+                s[13] != ':' || s[16] != ':')
+                return {};
+            const int y = num(0, 4), mo = num(5, 2), d = num(8, 2), h = num(11, 2), mi = num(14, 2),
+                      se = num(17, 2);
+            if (y < 1 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 59)
+                return {};
+            std::string out = s.substr(0, 19);
+            out[4] = out[7] = '-';
+            return out;
+        }
+
+        // Fixed-point text with trailing zeros (and a trailing '.') removed.
+        inline std::string trimmedFixed(double v, int decimals)
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%.*f", decimals, v);
+            std::string s = buf;
+            if (s.find('.') != std::string::npos)
+            {
+                while (!s.empty() && s.back() == '0')
+                    s.pop_back();
+                if (!s.empty() && s.back() == '.')
+                    s.pop_back();
+            }
+            return s;
+        }
+
+    } // namespace detail
+
+    // Reads the camera data of a JPEG held in memory (a prefix of the file is
+    // fine, like readJpegMeta). False if it isn't a JPEG at all; true otherwise,
+    // even when it has no EXIF block or none of the fields (see PhotoInfo::empty).
+    // Reads the first EXIF APP1 only. Every read is bounds-checked, and every
+    // value is range-checked, so a damaged or hostile file gives empty fields,
+    // never an out-of-range read or a value the UI could not show.
+    inline bool readPhotoInfo(const uint8_t *data, size_t size, PhotoInfo *out)
+    {
+        *out = PhotoInfo{};
+        if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8)
+            return false;
+        const uint8_t *payload = nullptr;
+        size_t plen = 0;
+        if (!detail::findExifSegment(data, size, &payload, &plen))
+            return true;
+        std::vector<uint8_t> tiffBytes(payload + 6, payload + plen); // Tiff wants a mutable vector
+        detail::Tiff t{tiffBytes};
+        uint32_t ifd0 = 0;
+        if (!detail::tiffHeader(t, &ifd0))
+            return true;
+
+        detail::textTag(t, ifd0, 0x010F, &out->make);
+        detail::textTag(t, ifd0, 0x0110, &out->model);
+
+        uint64_t e = 0;
+        uint16_t type = 0;
+        uint32_t cnt = 0, sub = 0;
+        if (!(detail::findEntry(t, ifd0, 0x8769, &e) && t.rd16(e + 2, &type) && type == 4 &&
+              t.rd32(e + 4, &cnt) && cnt == 1 && t.rd32(e + 8, &sub) && sub >= 8))
+            return true; // no Exif sub-IFD: make and model only
+
+        detail::textTag(t, sub, 0xA434, &out->lens);
+
+        std::string date;
+        if (detail::textTag(t, sub, 0x9003, &date))
+            out->dateTaken = detail::normalizeDate(date);
+        if (out->dateTaken.empty() && detail::textTag(t, sub, 0x9004, &date)) // DateTimeDigitized
+            out->dateTaken = detail::normalizeDate(date);
+
+        double v = 0.0;
+        if (detail::rationalTag(t, sub, 0x829A, &v) && v > 0.0 && v <= 86400.0)
+            out->exposureTime = v;
+        if (detail::rationalTag(t, sub, 0x829D, &v) && v > 0.0 && v <= 1000.0)
+            out->fNumber = v;
+        if (detail::rationalTag(t, sub, 0x920A, &v) && v > 0.0 && v <= 10000.0)
+            out->focalLength = v;
+
+        // ISO: PhotographicSensitivity (0x8827); 65535 or 0 there means "see
+        // ISOSpeed" (0x8833, a LONG that can hold values above 65534).
+        uint32_t iso = 0;
+        const bool haveIso = detail::uintTag(t, sub, 0x8827, &iso);
+        if (!haveIso || iso == 0 || iso == 65535)
+        {
+            uint32_t wide = 0;
+            iso = detail::uintTag(t, sub, 0x8833, &wide) ? wide : 0;
+        }
+        if (iso >= 1 && iso <= static_cast<uint32_t>(kInfoMaxIso))
+            out->iso = static_cast<int>(iso);
+        return true;
+    }
+
+    // ----------------------------------------------------------- Display text
+    // All of these return an empty string for "unknown", so a caller can skip the
+    // row. Plain ASCII, no locale.
+
+    // "1/250 s" for fast shutters, "0.4 s" when the time is not close to 1/N,
+    // "2.5 s" / "30 s" for long ones. Empty for 0, negative, NaN or under a microsecond.
+    inline std::string describeShutter(double seconds)
+    {
+        if (!(seconds >= 1e-6) || !std::isfinite(seconds))
+            return {};
+        if (seconds >= 1.0)
+            return detail::trimmedFixed(seconds, seconds < 10.0 ? 1 : 0) + " s";
+        const double n = 1.0 / seconds;
+        const double r = std::round(n);
+        if (r >= 2.0 && std::fabs(n - r) <= 0.03 * r)
+            return "1/" + std::to_string(static_cast<long long>(r)) + " s";
+        return detail::trimmedFixed(seconds, 2) + " s";
+    }
+
+    // "f/2.8", "f/11".
+    inline std::string describeAperture(double f)
+    {
+        if (!(f > 0.0) || !std::isfinite(f))
+            return {};
+        return "f/" + detail::trimmedFixed(f, 1);
+    }
+
+    // "85 mm", "24.5 mm".
+    inline std::string describeFocalLength(double mm)
+    {
+        if (!(mm > 0.0) || !std::isfinite(mm))
+            return {};
+        return detail::trimmedFixed(mm, 1) + " mm";
+    }
+
+    // "ISO 400".
+    inline std::string describeIso(int iso)
+    {
+        return iso > 0 ? "ISO " + std::to_string(iso) : std::string();
+    }
+
+    // "1/250 s, f/2.8, ISO 400" with the unknown parts left out.
+    inline std::string describeExposure(const PhotoInfo &p)
+    {
+        std::string s;
+        for (const std::string &part :
+             {describeShutter(p.exposureTime), describeAperture(p.fNumber), describeIso(p.iso)})
+        {
+            if (part.empty())
+                continue;
+            if (!s.empty())
+                s += ", ";
+            s += part;
+        }
+        return s;
+    }
+
+    // "Canon EOS R5" for make "Canon" + model "Canon EOS R5" (models usually repeat
+    // the make's first word); "SONY ILCE-7M3" when they don't. Either part may be
+    // missing.
+    inline std::string describeCamera(const PhotoInfo &p)
+    {
+        if (p.make.empty())
+            return p.model;
+        if (p.model.empty())
+            return p.make;
+        const size_t sp = p.make.find(' ');
+        const std::string first = p.make.substr(0, sp);
+        bool repeated = p.model.size() >= first.size();
+        for (size_t i = 0; repeated && i < first.size(); ++i)
+            repeated = std::tolower(static_cast<unsigned char>(p.model[i])) ==
+                       std::tolower(static_cast<unsigned char>(first[i]));
+        return repeated ? p.model : p.make + " " + p.model;
     }
 
 } // namespace exif

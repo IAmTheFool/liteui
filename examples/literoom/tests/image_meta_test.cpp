@@ -1,8 +1,9 @@
-// image_meta_test.cpp - exifOrientationOf and embedSourceMetadata against
+// image_meta_test.cpp - exifOrientationOf, embedSourceMetadata and photoInfoOf against
 // synthetic JPEG files (hand-built EXIF / ICC segments, no encoder, no liteui)
 // written to a throw-away folder under the system temp directory.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -522,6 +523,143 @@ static void testEmbedLeavesJpegAlone()
   CHECK(kMetaPrefixBytes == (8u << 20));
 }
 
+// ------------------------------------------------------------ photo info
+// A TIFF block with camera data: IFD0 {Make, Model, ExifIFD} and the Exif
+// sub-IFD {ExposureTime, FNumber, ISO, DateTimeOriginal, FocalLength, LensModel}.
+// Layout: IFD0 at 8 (3 entries) -> sub-IFD at 50 (6 entries) -> data from 128.
+static Bytes makeInfoTiff(bool le)
+{
+  const std::string make = "Canon", model = "Canon EOS R5", lens = "RF85mm F1.2 L USM";
+  const std::string date = "2024:06:15 14:30:05";
+  uint32_t next = 128;
+  auto take = [&next](size_t n)
+  {
+    const uint32_t o = next;
+    next += static_cast<uint32_t>(n);
+    return o;
+  };
+  const uint32_t oMake = take(make.size() + 1), oModel = take(model.size() + 1), oExp = take(8),
+                 oF = take(8), oDate = take(date.size() + 1), oFocal = take(8),
+                 oLens = take(lens.size() + 1);
+  Bytes t;
+  t.push_back(le ? 'I' : 'M');
+  t.push_back(le ? 'I' : 'M');
+  put16(t, 42, le);
+  put32(t, 8, le);
+  put16(t, 3, le);
+  putEntry(t, 0x010F, 2, static_cast<uint32_t>(make.size() + 1), oMake, le);
+  putEntry(t, 0x0110, 2, static_cast<uint32_t>(model.size() + 1), oModel, le);
+  putEntry(t, 0x8769, 4, 1, 50, le);
+  put32(t, 0, le);
+  put16(t, 6, le); // at 50
+  putEntry(t, 0x829A, 5, 1, oExp, le);
+  putEntry(t, 0x829D, 5, 1, oF, le);
+  putEntry(t, 0x8827, 3, 1, 400, le);
+  putEntry(t, 0x9003, 2, static_cast<uint32_t>(date.size() + 1), oDate, le);
+  putEntry(t, 0x920A, 5, 1, oFocal, le);
+  putEntry(t, 0xA434, 2, static_cast<uint32_t>(lens.size() + 1), oLens, le);
+  put32(t, 0, le);
+  auto text = [&t](const std::string &s)
+  {
+    t.insert(t.end(), s.begin(), s.end());
+    t.push_back(0);
+  };
+  auto rat = [&t, le](uint32_t n, uint32_t d)
+  {
+    put32(t, n, le);
+    put32(t, d, le);
+  };
+  text(make);
+  text(model);
+  rat(1, 250);
+  rat(28, 10);
+  text(date);
+  rat(85, 1);
+  text(lens);
+  return t;
+}
+
+static Bytes infoSegment(bool le = true)
+{
+  Bytes p{'E', 'x', 'i', 'f', 0, 0};
+  const Bytes tiff = makeInfoTiff(le);
+  p.insert(p.end(), tiff.begin(), tiff.end());
+  return segment(0xE1, p);
+}
+
+static bool isCanonInfo(const exif::PhotoInfo &p)
+{
+  return p.make == "Canon" && p.model == "Canon EOS R5" && p.lens == "RF85mm F1.2 L USM" && p.iso == 400 &&
+         p.dateTaken == "2024-06-15 14:30:05" && std::fabs(p.exposureTime - 0.004) < 1e-12 &&
+         std::fabs(p.fNumber - 2.8) < 1e-12 && p.focalLength == 85.0;
+}
+
+static void testPhotoInfoOf()
+{
+  TempDir d("info");
+  const Bytes full = jpegOf({jfifSegment(), infoSegment(true)});
+  const Bytes fullBe = jpegOf({jfifSegment(), infoSegment(false)});
+
+  // Read from disk, in both byte orders and any case of the extension.
+  exif::PhotoInfo p;
+  writeFile(d.file("a.jpg"), full);
+  CHECK(photoInfoOf(d.file("a.jpg"), &p) && isCanonInfo(p));
+  writeFile(d.file("b.JPEG"), fullBe);
+  CHECK(photoInfoOf(d.file("b.JPEG"), &p) && isCanonInfo(p));
+  writeFile(d.file("c.Jpg"), full);
+  CHECK(photoInfoOf(d.file("c.Jpg"), &p) && isCanonInfo(p));
+
+  // A virtual copy has no file of its own: it reads the picture behind it.
+  CHECK(photoInfoOf(vcPath(d.file("a.jpg"), 2), &p) && isCanonInfo(p));
+  CHECK(photoInfoOf(vcPath(d.file("b.JPEG"), 9), &p) && isCanonInfo(p));
+  CHECK(!photoInfoOf(vcPath(d.file("missing.jpg"), 1), &p) && p.empty());
+
+  // The camera data does not disturb the orientation reader, and vice versa.
+  ExifSpec s;
+  s.orientation = 6;
+  writeFile(d.file("rot.jpg"), jpegOf({exifSegment(s)}));
+  CHECK(photoInfoOf(d.file("rot.jpg"), &p) && p.empty()); // an EXIF block with no camera fields
+  CHECK(isOrient(exifOrientationOf(d.file("rot.jpg")), 1, false));
+  CHECK(exifOrientationOf(d.file("a.jpg")).identity());
+
+  // A JPEG with no EXIF at all: readable, nothing in it.
+  writeFile(d.file("plain.jpg"), encodedJpeg());
+  p.make = "stale";
+  CHECK(photoInfoOf(d.file("plain.jpg"), &p) && p.empty());
+
+  // Refused, and `out` comes back empty even if it held something.
+  writeFile(d.file("pic.png"), full); // right bytes, wrong name
+  const std::string text = "not a jpeg";
+  writeFile(d.file("junk.jpg"), Bytes(text.begin(), text.end()));
+  writeFile(d.file("empty.jpg"), {});
+  for (const char *name : {"pic.png", "junk.jpg", "empty.jpg", "missing.jpg", ""})
+  {
+    p.make = "stale";
+    p.iso = 123;
+    CHECK(!photoInfoOf(name[0] ? d.file(name) : std::string(), &p));
+    CHECK(p.empty());
+  }
+
+  // Only the first 256 KiB are searched (the same window as the orientation).
+  CHECK(kInfoPrefixBytes == (256u << 10));
+  writeFile(d.file("near.jpg"), jpegOf({comSegment(65533), comSegment(65533), comSegment(65533), infoSegment()}));
+  CHECK(photoInfoOf(d.file("near.jpg"), &p) && isCanonInfo(p)); // ends near 197 KB
+  writeFile(d.file("late.jpg"), jpegOf({comSegment(65533), comSegment(65533), comSegment(65533), comSegment(65533),
+                                        comSegment(65533), infoSegment()}));
+  CHECK(photoInfoOf(d.file("late.jpg"), &p) && p.empty()); // starts past 327 KB: not found, still a JPEG
+
+  // A damaged file gives a partial answer, never a crash or a wrong one.
+  Bytes cut = full;
+  for (size_t keep = 0; keep < cut.size(); keep += 7)
+  {
+    writeFile(d.file("cut.jpg"), Bytes(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(keep)));
+    p = exif::PhotoInfo{};
+    (void)photoInfoOf(d.file("cut.jpg"), &p);
+    CHECK(p.make.empty() || p.make == "Canon");
+    CHECK(p.iso == 0 || p.iso == 400);
+  }
+}
+
 int main()
 {
   testOrientationTable();
@@ -532,5 +670,6 @@ int main()
   testEmbedBigEndianNoThumbnail();
   testEmbedRemovesGps();
   testEmbedLeavesJpegAlone();
+  testPhotoInfoOf();
   return finish();
 }

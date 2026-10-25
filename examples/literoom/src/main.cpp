@@ -464,6 +464,8 @@ struct EditorState
   std::shared_ptr<CanvasImage> image;   // source + adjustments applied —
                                         // this is what's drawn and exported
   std::string imagePath;                // full path of the opened file
+  exif::PhotoInfo photoInfo;            // its camera data (Info pane); see currentPhotoInfo()
+  uint64_t photoInfoSerial = ~uint64_t{0}; // the imageSerial photoInfo was read for
   float zoom = 1.0f;
   AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
@@ -1668,6 +1670,24 @@ static std::string pictureLabel(const std::string &path)
   if (const int n = vcCopyOf(path); n > 0)
     s += " [Copy " + std::to_string(n) + "]";
   return s;
+}
+
+// The open picture's camera data for the Info pane (make, model, lens, ISO,
+// shutter, ...), read from the file once per opened picture: the first time the
+// pane asks after imageSerial changed. It reads the first 256 KiB of the file on
+// the UI thread, which is a fraction of a millisecond; nothing here touches the
+// render pipeline. A picture with no readable camera data (a PNG, a JPEG without
+// EXIF) gives an empty PhotoInfo.
+static const exif::PhotoInfo &currentPhotoInfo()
+{
+  if (state.photoInfoSerial != state.imageSerial)
+  {
+    state.photoInfoSerial = state.imageSerial;
+    state.photoInfo = exif::PhotoInfo{};
+    if (!state.imagePath.empty())
+      photoInfoOf(state.imagePath, &state.photoInfo);
+  }
+  return state.photoInfo;
 }
 
 // Writes the sidecar for the open picture. On failure (read-only folder...)
@@ -8665,6 +8685,54 @@ int main()
   infoZoom.fontSize = 13.0f;
   infoZoom.color = kColorTextMid;
   infoPane.addChild(std::move(infoZoom));
+
+  // Camera data from the file's EXIF block. Each row hides itself when the file
+  // doesn't say; a picture with none of it gets one muted line instead. GPS is
+  // never shown.
+  const auto infoRow = [](std::function<std::string()> text, bool muted = false)
+  {
+    Text row;
+    row.label = text;
+    row.fontSize = 13.0f;
+    row.color = muted ? kColorTextMuted : kColorTextMid;
+    row.style.display = std::function<Display()>([text]
+                                                 { return text().empty() ? Display::None : Display::Flex; });
+    return row;
+  };
+  infoPane.addChild(infoRow([]() -> std::string
+                            {
+    if (!state.image)
+      return {};
+    const std::string s = exif::describeCamera(currentPhotoInfo());
+    return s.empty() ? s : "Camera: " + s; }));
+  infoPane.addChild(infoRow([]() -> std::string
+                            {
+    if (!state.image)
+      return {};
+    const std::string &s = currentPhotoInfo().lens;
+    return s.empty() ? s : "Lens: " + s; }));
+  infoPane.addChild(infoRow([]() -> std::string
+                            {
+    if (!state.image)
+      return {};
+    const std::string s = exif::describeExposure(currentPhotoInfo());
+    return s.empty() ? s : "Exposure: " + s; }));
+  infoPane.addChild(infoRow([]() -> std::string
+                            {
+    if (!state.image)
+      return {};
+    const std::string s = exif::describeFocalLength(currentPhotoInfo().focalLength);
+    return s.empty() ? s : "Focal length: " + s; }));
+  infoPane.addChild(infoRow([]() -> std::string
+                            {
+    if (!state.image)
+      return {};
+    const std::string &s = currentPhotoInfo().dateTaken;
+    return s.empty() ? s : "Taken: " + s; }));
+  infoPane.addChild(infoRow(
+      []() -> std::string
+      { return state.image && currentPhotoInfo().empty() ? "No camera data in this file" : std::string(); },
+      true));
 
   sidebar.addChild(std::move(infoPane));
 

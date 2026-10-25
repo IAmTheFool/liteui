@@ -1699,7 +1699,7 @@ Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Win
 - Details: encoded **to memory** so the source photo's EXIF and ICC can be spliced in before the file is written (`embedSourceMetadata`, then `writeFileAtomic`). Alpha is flattened onto white. Linux installs a custom libjpeg error handler (`JpegEncErr`, `jpegEncErrExit`) that `longjmp`s back instead of letting libjpeg `exit()` the app. Windows writes in chunks of 64 rows and asks for 4:4:4 as a best-effort property. The size is checked first, on both platforms: a picture that fails `jpegSizeOk` (empty, negative, or a side over `kJpegMaxSide`) is refused with the error "JPEG can't hold a picture this size", before any pixel is read and with `*out` untouched. So no caller can skip the limit.
 
 ### `exif.hpp`
-JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a source JPEG's EXIF block and ICC profile into a re-encoded one. Everything is in `namespace exif`. Every read is bounds-checked, so a damaged or hostile file yields "no metadata" rather than reading out of range.
+JPEG metadata with no dependencies: the EXIF orientation tag, carrying a source JPEG's EXIF block and ICC profile into a re-encoded one, and the camera data the Info pane shows (make, model, lens, ISO, shutter, aperture, focal length, date taken) with the functions that turn it into display text. Everything is in `namespace exif`. Every read is bounds-checked, so a damaged or hostile file yields "no metadata" rather than reading out of range.
 
 **Depends on:** standard library only. No UI. **Test:** `exif_test`.
 
@@ -1708,6 +1708,8 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 - **Not carried over:** XMP and IPTC (captions, copyright fields and any develop settings stored in XMP are dropped), and thumbnails stored anywhere other than IFD1 (e.g. inside a MakerNote).
 - **Carried over:** GPS data inside the EXIF block, unless `stripGps` is called on the `JpegMeta` before `embed` (Export's "Remove location (GPS)"). Only the standard GPS IFD is handled: location a camera hides inside its own MakerNote is not touched.
 - Embedding the source ICC profile is only right if the pixels are still in that profile's color space.
+
+**Two readers, on purpose.** `readJpegMeta` returns an EXIF block **rewritten** for an upright re-encode (orientation 1, thumbnail erased), which is right for export and wrong for showing the file's own data. `readPhotoInfo` reads the first EXIF APP1 of the file as it is and never produces a block to write back, so the two never share a buffer.
 
 **Types**
 - `struct Transform { int rot = 0; bool flip = false; }`: how to turn a picture upright: mirror left-right first (if `flip`), then `rot` clockwise quarter turns. Same convention as `Orient` in `geometry.hpp`.
@@ -1718,6 +1720,21 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
   | `orientation` | `int` | 1 | The stored EXIF orientation, 1..8 (1 if absent or invalid) |
   | `exif` | `std::vector<uint8_t>` | empty | The EXIF APP1 payload (`"Exif\0\0"` + TIFF data), **already rewritten** for an upright re-encode: orientation 1, thumbnail erased and unlinked. Empty if the file had none |
   | `icc` | `std::vector<std::vector<uint8_t>>` | empty | The ICC APP2 payloads (`"ICC_PROFILE\0"` + chunk header + data), verbatim, in sequence order. Empty if none, or if the chunks were incomplete, inconsistent or over 16 MiB (a broken profile is worse than none) |
+- `struct PhotoInfo`: what the Info pane shows. Every field is optional: text is empty and numbers are 0 when the file does not say, or says something implausible.
+
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `make` | `std::string` | IFD0 Make (0x010F), e.g. `Canon` |
+  | `model` | `std::string` | IFD0 Model (0x0110), e.g. `Canon EOS R5` |
+  | `lens` | `std::string` | LensModel (Exif 0xA434); empty if not recorded |
+  | `dateTaken` | `std::string` | `YYYY-MM-DD HH:MM:SS` from DateTimeOriginal (0x9003), else DateTimeDigitized (0x9004); empty for a missing, unset (`0000:00:00 ...`) or invalid date |
+  | `iso` | `int` | 1..`kInfoMaxIso`, else 0. From PhotographicSensitivity (0x8827); when that is 0 or 65535 (the "see ISOSpeed" escape) from ISOSpeed (0x8833, a LONG) |
+  | `exposureTime` | `double` | Shutter in seconds, (0, 86400], else 0 |
+  | `fNumber` | `double` | (0, 1000], else 0 |
+  | `focalLength` | `double` | Millimetres, (0, 10000], else 0 |
+
+  `bool empty() const` is true when every field is unset. **GPS is deliberately not read:** the Info pane never shows a location.
+- Constants: `kInfoMaxText` (`size_t`, 128): text fields are cut to this many characters; `kInfoMaxIso` (`int`, 10,000,000): larger ISO values are not believed.
 
 **Functions**
 
@@ -1751,6 +1768,18 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 - Details: it works on a copy of the TIFF part and copies it back. The GPS IFD that IFD0's GPSInfo tag (0x8825) points to is **zeroed**, including every value it keeps outside its entries (the latitude and longitude rationals), and the tag is then cut out of IFD0 with the entries after it, and the next-IFD pointer, moving up by 12 bytes. The block keeps its size. Dropping only the tag would leave the coordinates in the file. A GPSInfo tag that points out of range or has the wrong type is still removed, and nothing is read or written outside the block.
 - Use: call it between `readJpegMeta` and `embed` (`embedSourceMetadata` does this for you with `removeGps`).
 
+**`inline bool readPhotoInfo(const uint8_t *data, size_t size, PhotoInfo *out)`**
+- Inputs: bytes of a JPEG (a prefix is fine), its length, and the output (always reset first).
+- Returns: false if it isn't a JPEG; true otherwise, **even when there is no EXIF or none of the fields** (check `out->empty()`).
+- Details: finds the first EXIF APP1 with the same marker walk as `readJpegMeta` and reads Make and Model from IFD0, the rest from the Exif sub-IFD (the pointer must be a LONG, count 1, offset ≥ 8; without one only Make and Model are read). Works on a copy of the TIFF part. Every read is bounds-checked and every value range-checked (see the table above), so a damaged or hostile file gives empty fields, never an out-of-range read or a value the UI could not show.
+- **Text is made safe to show:** reading stops at the first NUL; spaces, tabs and line breaks become single spaces (none at either end, which removes the usual space padding); other control characters are dropped; anything outside 7-bit ASCII becomes `?`; at most 128 characters. Lens or camera names with accented letters therefore show `?` for them.
+
+**Display text.** All return an empty string for "unknown", so the caller can hide the row. Plain ASCII, no locale.
+- `describeShutter(double seconds)`: `1/250 s` when the time is within 3 % of 1/N (N ≥ 2), `0.4 s` otherwise, `2.5 s` / `30 s` from one second up. Empty for 0, negative, NaN, infinite or under a microsecond.
+- `describeAperture(double f)`: `f/2.8`, `f/11`. `describeFocalLength(double mm)`: `85 mm`, `24.5 mm`. `describeIso(int iso)`: `ISO 400`.
+- `describeExposure(const PhotoInfo &)`: `1/250 s, f/2.8, ISO 400`, leaving out the parts that are unknown.
+- `describeCamera(const PhotoInfo &)`: the model alone when it begins with the make's first word, ignoring case (`Canon` + `Canon EOS R5` gives `Canon EOS R5`, `NIKON CORPORATION` + `NIKON D850` gives `NIKON D850`), otherwise make and model joined (`SONY ILCE-7M3`). Either may be missing.
+
 **`namespace exif::detail`** (internal; listed so you can find things)
 - `kMaxIccBytes` (`size_t`, 16 MiB).
 - `struct Tiff`: a bounds-checked, endian-aware view over a TIFF block with `ok`, `rd16`, `rd32`, `wr16`, `wr32`, `zero`. Every read or write that would fall outside the block fails or is skipped.
@@ -1762,13 +1791,14 @@ JPEG metadata with no dependencies: the EXIF orientation tag, and carrying a sou
 - `tiffTypeSize(type)`: bytes per value for a TIFF type (0 for an unknown one).
 - `dropGps(t, ifd0)`: the work behind `stripGps` (see there). Everything it needs is read before anything is zeroed.
 - `isExifPayload`, `isIccPayload`: header checks. `normalizeIcc(icc)`: validates and orders the chunks.
+- For `readPhotoInfo`: `findExifSegment` (the first EXIF APP1 payload, pointing into the input), `cleanText` (the text rules above), `valueOffset` (where an entry's values live: inline if they fit in 4 bytes, else at the stored offset, range-checked), `readText`, `readRational` (zero denominators rejected), `readFirstUInt` (SHORT or LONG), the one-call `textTag` / `rationalTag` / `uintTag`, `normalizeDate`, and `trimmedFixed` (fixed-point text without trailing zeros).
 
 ### `image_meta.hpp`
-Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's camera rotation as an `Orient` and copies metadata into an export. No UI, no editor state, so both functions are tested with synthetic JPEG files in a temp folder.
+Glue between `file_utils.hpp`, `virtual_copy.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's camera rotation as an `Orient`, reads its camera data for the Info pane, and copies metadata into an export. No UI, no editor state, so all three functions are tested with synthetic JPEG files in a temp folder.
 
-**Depends on:** `exif.hpp`, `file_utils.hpp`, `geometry.hpp`. **Test:** `image_meta_test`.
+**Depends on:** `exif.hpp`, `file_utils.hpp`, `virtual_copy.hpp`, `geometry.hpp`. **Test:** `image_meta_test`.
 
-**Constants:** `kMetaPrefixBytes` (`size_t`, 8 MiB): how much of the source file is searched for its EXIF/ICC segments when exporting. (`exifOrientationOf` looks at only the first 256 KiB.)
+**Constants:** `kMetaPrefixBytes` (`size_t`, 8 MiB): how much of the source file is searched for its EXIF/ICC segments when exporting. `kInfoPrefixBytes` (`size_t`, 256 KiB): how much is searched for the Info pane's camera data. (`exifOrientationOf` also looks at only the first 256 KiB.)
 
 **Functions**
 
@@ -1781,6 +1811,11 @@ Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's cam
 - Inputs: `jpeg` (a freshly encoded JPEG, modified in place), the source photo's path, the new picture size (the exported size, so after a resize it is the smaller one), and `removeGps` (default false).
 - Returns: true when the source is a `.jpg`/`.jpeg` whose header could be read (i.e. `exif::embed` ran). `*jpeg` is then rewritten, and stays byte-identical if the source had no EXIF or ICC data. Returns false with `*jpeg` untouched for a non-JPEG, missing or empty source, or one that doesn't start like a JPEG.
 - Effects: orientation reset to upright, thumbnail erased, size fields updated (see `exif::embed`). GPS is carried over unless `removeGps` is true, in which case it is cut out first (`exif::stripGps`); the result is otherwise byte-identical to the default, and a source without a GPS block gives the same bytes either way. The source file is only read, never changed.
+
+**`inline bool photoInfoOf(const std::string &path, exif::PhotoInfo *out)`**
+- Input: UTF-8 path of a picture or of a virtual copy (`photo.jpg|vc2`: the data is read from the real file behind it through `vcImageOf`, since a copy has no file of its own), and the output (always reset first).
+- Returns: true when the file is a `.jpg`/`.jpeg` that could be read and starts like a JPEG; `*out` is then filled in and may still be `empty()` if the file has no EXIF. False, with `*out` empty, for another extension, a missing or empty file, or one that is not a JPEG. Only the first 256 KiB are searched; GPS is never read.
+- Use: the Info pane calls it once per opened picture (see `currentPhotoInfo()` in `main.cpp`), on the UI thread: it is one small read and touches neither the render pipeline nor any worker.
 
 ---
 
