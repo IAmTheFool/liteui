@@ -336,7 +336,7 @@ struct MaskUi
   float brushDensity = 1.0f;
   float brushFlow = 1.0f;
   bool brushErase = false;
-  bool brushTint = true;      // paint the selected brush's coverage in red
+  bool brushTint = true;      // paint the selected brush's coverage in the overlay color
   float lastX = 0, lastY = 0; // Paint: last recorded point, document px
   float curX = 0, curY = 0;   // Paint: pointer, document px (cursor ring)
 
@@ -503,7 +503,8 @@ struct EditorState
   // Masks pane (activity 7). The masks themselves live in `adjust` (so they
   // are undoable); this is only which one is selected and how it is shown.
   int maskSel = -1;          // index into adjust.masks(); read it through selMask()
-  bool maskShowTint = false; // paint the selected mask's weight in red
+  bool maskShowTint = false; // paint the selected mask's weight in the overlay color
+  int maskTintColor = 0;     // index into kMaskTintPalette (session only, not saved)
   MaskUi mask;
 
   int activeActivity = 0; // -1 = sidebar closed
@@ -3849,6 +3850,10 @@ static void resetColorGrade()
 // The Masks pane (activity 7) edits `state.adjust.masks()`. Sliders go through
 // buildSliderRow like everywhere else; the shape can also be dragged on the
 // canvas (press inside = move, press a square handle = resize).
+// Undo key of a mask edit: (mask * kMaxMaskParts + part) * kMaskCtlStride + control.
+// Every control id of one mask must be different and below kMaskCtlStride, or
+// two controls would fold into one undo step (a static_assert below checks it).
+constexpr int kMaskCtlStride = 1000;
 constexpr int kMaskCtlMove = 90; // undo-coalescing control ids (see maskEdit)
 constexpr int kMaskCtlResizeX = 91;
 constexpr int kMaskCtlResizeY = 92;
@@ -3863,8 +3868,48 @@ constexpr int kMaskCtlAngle = 2;
 constexpr int kMaskCtlWidth = 3;
 constexpr int kMaskCtlHeight = 4;
 constexpr int kMaskCtlLength = 5;
-constexpr int kMaskCtlAdj = 10; // + AdjId
+constexpr int kMaskCtlAdj = 100; // + AdjId (100..100+Count-1, clear of every id below)
 constexpr int kMaskCtlName = 86;
+
+// ---- Mask overlay color ----
+// The tint painted over the picture for the selected mask (radial / linear
+// gradients, brush, luminosity, color range and combined bitmaps). One place,
+// so every overlay agrees. Session-only: the choice is not saved anywhere.
+struct MaskTintRgb
+{
+  uint8_t r, g, b;
+  const char *name;
+};
+constexpr MaskTintRgb kMaskTintPalette[] = {
+    {255, 40, 40, "Red"},
+    {60, 220, 90, "Green"},
+    {70, 140, 255, "Blue"},
+    {255, 210, 40, "Yellow"},
+    {255, 255, 255, "White"}};
+constexpr int kMaskTintCount =
+    static_cast<int>(sizeof(kMaskTintPalette) / sizeof(kMaskTintPalette[0]));
+
+static const MaskTintRgb &maskTint()
+{
+  const int i = std::clamp(state.maskTintColor, 0, kMaskTintCount - 1);
+  return kMaskTintPalette[i];
+}
+// The overlay color with the given alpha.
+static Color maskTintColor(uint8_t alpha)
+{
+  const MaskTintRgb &t = maskTint();
+  return Color{t.r, t.g, t.b, alpha};
+}
+// Picks the overlay color. The cached tint bitmaps carry the old color, so they
+// are dropped here; they are rebuilt on the next paint.
+static void setMaskTintColor(int idx)
+{
+  state.maskTintColor = std::clamp(idx, 0, kMaskTintCount - 1);
+  state.mask.tint.reset();
+  state.mask.lumTint.reset();
+  state.mask.compTint.reset();
+  state.markDirty();
+}
 
 static bool maskToolActive()
 {
@@ -4012,7 +4057,7 @@ static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
   state.adjust.setMasks(
       ms, control < 0
               ? -1
-              : (idx * static_cast<int>(kMaxMaskParts) + part) * 100 + control);
+              : (idx * static_cast<int>(kMaxMaskParts) + part) * kMaskCtlStride + control);
 }
 
 // A one-off change to the selected mask (toggle, reset): its own undo step and
@@ -5323,7 +5368,7 @@ static void paintRadialTint(CanvasContext &ctx, const RadialShape &r,
   const MaskGeom g = radialGeom(r);
   const float W = state.docWidth(), H = state.docHeight();
   const float inner = r.innerFrac();
-  const Color on{255, 40, 40, 120}, off{255, 40, 40, 0};
+  const Color on = maskTintColor(120), off = maskTintColor(0);
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, 0, W, H);
@@ -5413,7 +5458,7 @@ static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
     float w = 1.0f - t * t * (3.0f - 2.0f * t);
     if (invert)
       w = 1.0f - w;
-    return Color{255, 40, 40, static_cast<uint8_t>(std::lround(120.0f * w))};
+    return maskTintColor(static_cast<uint8_t>(std::lround(120.0f * w)));
   };
   CanvasGradient grad = CanvasGradient::linear(g.sx(), g.sy(), g.ex(), g.ey());
   constexpr int kStops = 8;
@@ -5548,9 +5593,9 @@ static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
       if (invert)
         w = 1.0f - w;
       uint8_t *p = row + static_cast<size_t>(x) * 4;
-      p[0] = 255;
-      p[1] = 40;
-      p[2] = 40;
+      p[0] = maskTint().r;
+      p[1] = maskTint().g;
+      p[2] = maskTint().b;
       p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
     }
   }
@@ -5709,9 +5754,9 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
       if (invert)
         w = 1.0f - w;
       uint8_t *p = row + static_cast<size_t>(x) * 4;
-      p[0] = 255;
-      p[1] = 40;
-      p[2] = 40;
+      p[0] = maskTint().r;
+      p[1] = maskTint().g;
+      p[2] = maskTint().b;
       p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
     }
   }
@@ -5800,9 +5845,9 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
       if (m.invert)
         w = 1.0f - w;
       uint8_t *p = row + static_cast<size_t>(x) * 4;
-      p[0] = 255;
-      p[1] = 40;
-      p[2] = 40;
+      p[0] = maskTint().r;
+      p[1] = maskTint().g;
+      p[2] = maskTint().b;
       p[3] = static_cast<uint8_t>(std::lround(120.0f * w));
     }
   }
@@ -7202,13 +7247,60 @@ static void paintCurve(CanvasContext &ctx)
 // The Effect tab of the right-hand mask panel. Everything here edits the
 // SELECTED mask through maskEdit, so it is undoable and a drag folds into one
 // step. The ids below are the "control" part of that undo key: they must stay
-// below 100 and differ from the kMaskCtl* ids above.
+// below kMaskCtlStride and differ from the kMaskCtl* ids above.
 constexpr int kMaskCtlAmount = 6;
 constexpr int kMaskCtlMix = 30;   // + chan * kMixBandCount + band   (30..53)
 constexpr int kMaskCtlGrade = 60; // + field * 4 + range             (60..71)
 constexpr int kMaskCtlBlend = 72;
 constexpr int kMaskCtlBalance = 73;
 constexpr int kMaskCtlCurve = 80; // + channel                       (80..83)
+
+// All control ids of one mask, as inclusive ranges. They must not overlap and
+// must stay in 0..kMaskCtlStride-1, or two different controls would fold into
+// one undo step. (Adj used to be 10+AdjId, which overlapped the Color Mixer ids.)
+static_assert(
+    []
+    {
+      struct R
+      {
+        int lo, hi;
+      };
+      constexpr int kMixN = static_cast<int>(kMixChanCount * kMixBandCount);
+      constexpr R r[] = {
+          {kMaskCtlFeather, kMaskCtlFeather},
+          {kMaskCtlAngle, kMaskCtlAngle},
+          {kMaskCtlWidth, kMaskCtlWidth},
+          {kMaskCtlHeight, kMaskCtlHeight},
+          {kMaskCtlLength, kMaskCtlLength},
+          {kMaskCtlAmount, kMaskCtlAmount},
+          {kMaskCtlMix, kMaskCtlMix + kMixN - 1},
+          {kMaskCtlGrade, kMaskCtlGrade + 11},
+          {kMaskCtlBlend, kMaskCtlBlend},
+          {kMaskCtlBalance, kMaskCtlBalance},
+          {kMaskCtlCurve, kMaskCtlCurve + 3},
+          {kMaskCtlRange, kMaskCtlRange},
+          {kMaskCtlName, kMaskCtlName},
+          {kMaskCtlMove, kMaskCtlMove},
+          {kMaskCtlResizeX, kMaskCtlResizeX},
+          {kMaskCtlResizeY, kMaskCtlResizeY},
+          {kMaskCtlLinEnd, kMaskCtlLinEnd},
+          {kMaskCtlLinStart, kMaskCtlLinStart},
+          {kMaskCtlBrush, kMaskCtlBrush},
+          {kMaskCtlLumLo, kMaskCtlLumLo},
+          {kMaskCtlLumHi, kMaskCtlLumHi},
+          {kMaskCtlAdj, kMaskCtlAdj + static_cast<int>(AdjId::Count) - 1}};
+      constexpr int n = static_cast<int>(sizeof(r) / sizeof(r[0]));
+      for (int i = 0; i < n; ++i)
+      {
+        if (r[i].lo < 0 || r[i].hi >= kMaskCtlStride || r[i].lo > r[i].hi)
+          return false;
+        for (int j = i + 1; j < n; ++j)
+          if (r[i].lo <= r[j].hi && r[j].lo <= r[i].hi)
+            return false;
+      }
+      return true;
+    }(),
+    "mask control ids overlap or exceed kMaskCtlStride (see maskEdit)");
 constexpr float kMaskCurveSizePx = 240.0f;
 
 static MixChan gMaskMixChan = MixChan::Hue;              // Mix: Hue / Sat / Lum
@@ -8787,6 +8879,20 @@ int main()
   maskEditor.addChild(std::move(maskNameRow));
 
   maskEditor.addChild(std::move(maskFlags));
+
+  // Overlay color: one chip per kMaskTintPalette entry.
+  View maskTintRow;
+  maskTintRow.style.direction = FlexDirection::Row;
+  maskTintRow.style.gap = 4.0f;
+  maskTintRow.style.flexShrink = 0;
+  for (int k = 0; k < kMaskTintCount; ++k)
+    maskTintRow.addChild(maskChip(
+        kMaskTintPalette[k].name, kMaskTintCount,
+        [k]
+        { setMaskTintColor(k); },
+        [k]
+        { return state.maskTintColor == k; }));
+  maskEditor.addChild(std::move(maskTintRow));
 
   // The three tab bodies. Only the one picked in state.maskTab is shown.
   const auto maskTabView = [](int tab)

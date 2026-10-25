@@ -60,7 +60,7 @@
 // the per-mask sliders all work on the variants and need no changes.
 
 // Limits of the Masks pane's list.
-constexpr size_t kMaxMasks = 8;         // rows in the Masks pane's list
+constexpr size_t kMaxMasks = 16;        // rows in the Masks pane's list
 constexpr size_t kMaxMaskParts = 6;     // shapes combined inside one mask
 
 // Same order as the alternatives of MaskShape / MaskEval below.
