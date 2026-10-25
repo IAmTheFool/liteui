@@ -1,7 +1,8 @@
 // sidecar.hpp - The saved edits as JSON: sliders, curves, Color Mixer, Color Grading,
 // geometry and every mask, plus the picture's rating / flag / color label (the
-// wrapper's "meta" object). Pure functions on plain values; loading
-// validates and clamps everything.
+// wrapper's "meta" object) and its named snapshots (the wrapper's "snapshots"
+// array). Pure functions on plain values; loading validates and clamps
+// everything.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@
 #include "core/geometry.hpp"
 #include "mask/mask.hpp"
 #include "io/minijson.hpp"
+#include "io/virtual_copy.hpp"
 #include "io/photo_meta.hpp"
 
 // ---------------- Saved edits (the sidecar file's content) ----------------
@@ -32,11 +34,14 @@
 // hand-edited or damaged file can never put the editor in a state its own UI
 // couldn't reach. The undo history is not saved.
 constexpr int kSidecarVersion = 1;
-constexpr const char *kSidecarExt = ".literoom.json";
+// kSidecarExt (".literoom.json") lives in io/virtual_copy.hpp, with the rest of
+// the sidecar naming.
 // The sidecar file's name for a picture: "photo.jpg" -> "photo.jpg.literoom.json".
+// For a virtual copy's path ("photo.jpg|vc2", see virtual_copy.hpp) it is that
+// copy's own file, "photo.jpg.vc2.literoom.json".
 inline std::string sidecarFileOf(const std::string &imagePath)
 {
-  return imagePath + kSidecarExt;
+  return vcSidecarFileOf(imagePath);
 }
 constexpr size_t kSidecarMaxPrompts = 256;
 constexpr int64_t kSidecarMaxMapPixels = int64_t{1} << 26; // 8192 x 8192
@@ -618,6 +623,103 @@ inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH,
   return true;
 }
 
+// ---- named snapshots (the wrapper's "snapshots") ----
+// A snapshot is a name plus a COMPLETE copy of the edits (a SidecarEdits: the
+// look, curves, Color Mixer, Color Grading, crop, rotation, straighten and every
+// mask), so restoring one puts the picture back exactly as it was. Like "meta"
+// they are not edits: they have no undo step of their own (restoring one is
+// ONE undo step, see AdjustmentSet::restoreEdits) and sit beside "edits", not
+// inside it. They are written only when there is at least one, after "edits",
+// so a picture without snapshots has exactly the layout it always had.
+//
+// Each snapshot's edits go through sidecarEditsToJson / sidecarEditsFromJson,
+// so a loaded snapshot is validated and clamped like the live edits (its crop
+// is checked against the picture's size, at most kMaxMasks masks, ...).
+constexpr size_t kMaxSnapshots = 20;
+constexpr size_t kSnapshotNameMax = 32;
+// A snapshot copies every mask, and an object mask carries its bitmap, so the
+// list is bounded in bytes too. The app refuses to add a snapshot that would
+// push the list past this; it is well under the 64 MiB a sidecar may have.
+constexpr size_t kSnapshotsMaxBytes = size_t{24} << 20;
+
+struct NamedSnapshot
+{
+  std::string name;
+  SidecarEdits edits;
+};
+using SnapshotList = std::vector<NamedSnapshot>;
+
+// Printable ASCII only (the TextInput widget is ASCII), trimmed, capped: the
+// same rules as a preset name. May return an empty string.
+inline std::string sanitizeSnapshotName(const std::string &s)
+{
+  std::string o;
+  for (char c : s)
+    if (c >= 0x20 && c <= 0x7E)
+      o.push_back(c);
+  const size_t b = o.find_first_not_of(' ');
+  if (b == std::string::npos)
+    return {};
+  const size_t e = o.find_last_not_of(' ');
+  o = o.substr(b, e - b + 1);
+  if (o.size() > kSnapshotNameMax)
+  {
+    o.resize(kSnapshotNameMax);
+    o.resize(o.find_last_not_of(' ') + 1);
+  }
+  return o;
+}
+
+// The name a snapshot is stored and shown under: the sanitized name, or
+// "Snapshot" when that is empty. The writer and the loader both use it, so a
+// file with a blank name reads and writes back the same.
+inline std::string snapshotNameOrDefault(const std::string &s)
+{
+  std::string n = sanitizeSnapshotName(s);
+  return n.empty() ? std::string("Snapshot") : n;
+}
+
+// [ { "name": "...", "edits": { ... } }, ... ]; at most kMaxSnapshots.
+inline mj::Json sidecarSnapshotsToJson(const SnapshotList &list)
+{
+  using mj::Json;
+  Json arr = Json::array();
+  for (size_t i = 0; i < list.size() && i < kMaxSnapshots; ++i)
+  {
+    Json o = Json::object();
+    o.set("name", Json::str(snapshotNameOrDefault(list[i].name)));
+    o.set("edits", sidecarEditsToJson(list[i].edits));
+    arr.push(std::move(o));
+  }
+  return arr;
+}
+
+// Reads the "snapshots" value of a sidecar (null pointer = no such key).
+// origW / origH: the picture's size, to check each crop. Never fails: a value
+// that isn't an array gives an empty list, an entry that isn't an object or has
+// no loadable "edits" is skipped, and at most kMaxSnapshots are kept.
+inline SnapshotList sidecarSnapshotsFromJson(const mj::Json *j, int origW,
+                                             int origH)
+{
+  SnapshotList out;
+  if (!j || !j->isArray())
+    return out;
+  for (const mj::Json &o : j->items())
+  {
+    if (out.size() >= kMaxSnapshots)
+      break;
+    if (!o.isObject())
+      continue;
+    const mj::Json *ed = o.find("edits");
+    NamedSnapshot s;
+    if (!ed || !sidecarEditsFromJson(*ed, origW, origH, &s.edits))
+      continue;
+    s.name = snapshotNameOrDefault(o.get("name").asStr());
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
 // ---- rating, flag, color label (the wrapper's "meta") ----
 // Not part of `edits`: they have no undo step and Sync Settings must leave a
 // picture's own rating alone. The "meta" key is written only when something
@@ -634,9 +736,12 @@ inline PhotoMeta sidecarMetaFromRoot(const mj::Json &root)
 }
 
 // The whole sidecar file: the wrapper (app, version, image, and meta when it is
-// not the default) around `edits`. `w` / `h` are the picture's size.
+// not the default) around `edits`, then "snapshots" when there are any. `w` / `h`
+// are the picture's size. Every writer passes the picture's snapshots, so none
+// of them can drop them (the default is the empty list: the old layout).
 inline std::string sidecarFileText(const std::string &imageName, int w, int h,
-                                   mj::Json edits, const PhotoMeta &meta)
+                                   mj::Json edits, const PhotoMeta &meta,
+                                   const SnapshotList &snapshots = {})
 {
   using mj::Json;
   Json img = Json::object();
@@ -650,6 +755,8 @@ inline std::string sidecarFileText(const std::string &imageName, int w, int h,
   if (!meta.isDefault())
     root.set("meta", photoMetaToJson(meta));
   root.set("edits", std::move(edits));
+  if (!snapshots.empty())
+    root.set("snapshots", sidecarSnapshotsToJson(snapshots));
   return root.dump();
 }
 
@@ -703,10 +810,12 @@ inline SidecarScan sidecarScan(const std::string &text)
 // JSON object, not from a newer version, with a picture size that matches
 // imgW x imgH (when those are given). Anything else is refused, with a reason in
 // *err, so a file that might still be recoverable by hand is never overwritten.
-// On success *e holds the file's edits, *meta its rating / flag / label, and
-// *W x *H the picture's size.
+// On success *e holds the file's edits, *meta its rating / flag / label, *snaps
+// its named snapshots (validated like the edits), and *W x *H the picture's
+// size. A rewriter must write *meta and *snaps back, or it would drop them.
 inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH,
-                                  SidecarEdits *e, PhotoMeta *meta, int *W, int *H,
+                                  SidecarEdits *e, PhotoMeta *meta,
+                                  SnapshotList *snaps, int *W, int *H,
                                   std::string *err)
 {
   using mj::Json;
@@ -718,6 +827,7 @@ inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH
   };
   *e = SidecarEdits{};
   *meta = PhotoMeta{};
+  snaps->clear();
   *W = imgW;
   *H = imgH;
   if (oldText.empty())
@@ -742,6 +852,7 @@ inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH
   if (!edits || !sidecarEditsFromJson(*edits, fw, fh, e))
     return fail("its saved edits are unreadable");
   *meta = sidecarMetaFromRoot(root);
+  *snaps = sidecarSnapshotsFromJson(root.find("snapshots"), fw, fh);
   *W = fw;
   *H = fh;
   return true;
@@ -755,8 +866,9 @@ inline bool sidecarSyncLook(const std::string &oldText,
 {
   SidecarEdits e;
   PhotoMeta meta; // the picture's own rating / flag / label: kept as it is
+  SnapshotList snaps; // ...and its own snapshots: each keeps the look it captured
   int W = 0, H = 0;
-  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &W, &H, err))
+  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &snaps, &W, &H, err))
     return false;
 
   e.values = values;
@@ -765,7 +877,7 @@ inline bool sidecarSyncLook(const std::string &oldText,
   e.grade = grade;
 
   if (outText)
-    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta);
+    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta, snaps);
   return true;
 }
 
@@ -783,13 +895,14 @@ inline bool sidecarPatchMeta(const std::string &oldText,
 {
   SidecarEdits e;
   PhotoMeta meta;
+  SnapshotList snaps;
   int W = 0, H = 0;
-  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &W, &H, err))
+  if (!sidecarReadForRewrite(oldText, imgW, imgH, &e, &meta, &snaps, &W, &H, err))
     return false;
   meta = patch.applyTo(meta);
   if (outMeta)
     *outMeta = meta;
   if (outText)
-    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta);
+    *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta, snaps);
   return true;
 }

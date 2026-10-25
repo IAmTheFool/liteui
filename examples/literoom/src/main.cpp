@@ -129,6 +129,9 @@ constexpr int kHistoryActivity = 9;
 // view tree is built once, like the mask and history lists).
 constexpr int kPresetsActivity = 10;
 constexpr size_t kPresetRows = 24;
+// Activity id of the Snapshots panel. It has kMaxSnapshots rows (sidecar.hpp);
+// the view tree is built once, like the preset and history lists.
+constexpr int kSnapshotsActivity = 11;
 
 // Masks, UI side: tint-bitmap sizes and overlay handle sizes. The engine
 // constants live next to their algorithms: mask_geom.hpp (radii), mask_brush.hpp,
@@ -394,6 +397,9 @@ struct FilmEntry
   bool selected = false;                    // in the multi-selection (Sync Settings)
   PhotoMeta meta;                           // rating / flag / color label
   bool scanned = false;                     // `meta` has been read from the sidecar
+  int copy = 0;                             // 0: the picture's own edits; n: virtual
+                                            // copy n (its `path` is "<file>|vc<n>",
+                                            // see virtual_copy.hpp; `name` is the file's)
 };
 
 // The pictures of the folder the open picture lives in (JPEG / PNG, natural
@@ -455,6 +461,9 @@ struct EditorState
   PhotoMeta meta;            // the open picture's rating / flag / color label
                              // (not an edit: no undo step, see ratePhoto)
   bool metaDirty = false;    // meta changed since the last sidecar save / load
+  SnapshotList snapshots;      // the open picture's named snapshots: saved in its
+                               // sidecar, not edits (see addSnapshot)
+  bool snapshotsDirty = false; // snapshots changed since the last sidecar save / load
 
   // Export pane settings.
   bool exportJpeg = true;   // the format the Export dialog offers first
@@ -1382,12 +1391,12 @@ static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel)
 {
   DecodeResult r;
   r.path = job.path;
-  r.image = liteui_image::decodeFile(job.path, &r.error);
+  r.image = liteui_image::decodeFile(vcImageOf(job.path), &r.error); // a copy decodes its picture
 
   if (r.image)
   { // a camera's rotation (EXIF) is applied here, once: from now on the
     // picture is upright everywhere (editor, masks, saved edits, export)
-    const Orient o = exifOrientationOf(job.path);
+    const Orient o = exifOrientationOf(vcImageOf(job.path));
     if (!o.identity())
     {
       auto turned = orientImage(
@@ -1641,6 +1650,16 @@ static std::filesystem::path sidecarPath(const std::string &imagePath)
   return fsPath(sidecarFileOf(imagePath));
 }
 
+// A picture's name for messages and the title bar: a virtual copy shows as
+// "photo.jpg [Copy 2]".
+static std::string pictureLabel(const std::string &path)
+{
+  std::string s = baseName(vcImageOf(path));
+  if (const int n = vcCopyOf(path); n > 0)
+    s += " [Copy " + std::to_string(n) + "]";
+  return s;
+}
+
 // Writes the sidecar for the open picture. On failure (read-only folder...)
 // the status bar says so; the change still counts as "seen" so a failing
 // disk isn't retried every frame, only on the next edit.
@@ -1651,10 +1670,11 @@ static void saveSidecar()
   const bool editsChanged = state.adjust.version() != state.sidecarSaved;
   state.sidecarSaved = state.adjust.version();
   state.metaDirty = false;
+  state.snapshotsDirty = false;
 
   const std::string text = sidecarFileText(
-      baseName(state.imagePath), state.original->width, state.original->height,
-      state.adjust.toJson(), state.meta);
+      baseName(vcImageOf(state.imagePath)), state.original->width,
+      state.original->height, state.adjust.toJson(), state.meta, state.snapshots);
 
   const std::filesystem::path path = sidecarPath(state.imagePath);
   std::filesystem::path tmp = path;
@@ -1668,7 +1688,7 @@ static void saveSidecar()
     {
       f.close();
       std::filesystem::remove(tmp, ec);
-      setStatus("Couldn't save edits next to " + baseName(state.imagePath),
+      setStatus("Couldn't save edits next to " + pictureLabel(state.imagePath),
                 true);
       return;
     }
@@ -1688,7 +1708,8 @@ static void saveSidecar()
 static void flushSidecar()
 {
   if (state.original &&
-      (state.adjust.version() != state.sidecarSaved || state.metaDirty))
+      (state.adjust.version() != state.sidecarSaved || state.metaDirty ||
+       state.snapshotsDirty))
     saveSidecar();
 }
 
@@ -1697,7 +1718,8 @@ static void flushSidecar()
 static void autosaveSidecar()
 {
   if (!state.original ||
-      (state.adjust.version() == state.sidecarSaved && !state.metaDirty))
+      (state.adjust.version() == state.sidecarSaved && !state.metaDirty &&
+       !state.snapshotsDirty))
     return;
   if (state.dragging || state.mask.drag != MaskUi::Drag::None)
     return;
@@ -1712,6 +1734,8 @@ static void loadSidecar()
   state.sidecarSaved = state.adjust.version(); // pristine unless loaded below
   state.meta = PhotoMeta{};                    // unrated unless the file says so
   state.metaDirty = false;
+  state.snapshots.clear(); // none unless the file has some
+  state.snapshotsDirty = false;
   std::ifstream f(sidecarPath(state.imagePath),
                   std::ios::binary | std::ios::ate);
   if (!f)
@@ -1760,6 +1784,9 @@ static void loadSidecar()
   }
   state.sidecarSaved = state.adjust.version();
   state.meta = sidecarMetaFromRoot(root);
+  state.snapshots = sidecarSnapshotsFromJson(root.find("snapshots"),
+                                             state.original->width,
+                                             state.original->height);
   if (edits->dump() != sidecarNeutralEditsDump()) // a rating alone isn't "edits"
     setStatus("Restored saved edits", false);
 }
@@ -1871,11 +1898,11 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
       if (have == 0)
       { // no sidecar yet: record the picture's (upright) size
         std::string derr;
-        if (auto img = liteui_image::decodeFile(path, &derr))
+        if (auto img = liteui_image::decodeFile(vcImageOf(path), &derr))
         {
           w = img->width;
           h = img->height;
-          if (exifOrientationOf(path).rot & 1) // a quarter turn swaps the sides
+          if (exifOrientationOf(vcImageOf(path)).rot & 1) // a quarter turn swaps the sides
             std::swap(w, h);
         }
         else
@@ -1886,9 +1913,9 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
         std::string text;
         const bool built =
             job.metaOnly
-                ? sidecarPatchMeta(old, baseName(path), w, h, job.patch, &text,
+                ? sidecarPatchMeta(old, baseName(vcImageOf(path)), w, h, job.patch, &text,
                                    &o.meta, &o.error)
-                : sidecarSyncLook(old, baseName(path), w, h, job.look.values,
+                : sidecarSyncLook(old, baseName(vcImageOf(path)), w, h, job.look.values,
                                   job.look.curves, job.look.mix, job.look.grade,
                                   &text, &o.error);
         if (built)
@@ -1930,7 +1957,7 @@ static void collectSyncJob()
         filmMarkEdited(o.path); // the strip's "has edits" dot
     }
     else if (++bad == 1)
-      firstErr = baseName(o.path) + ": " + o.error;
+      firstErr = pictureLabel(o.path) + ": " + o.error;
   }
   if (r->metaOnly)
   {
@@ -1993,19 +2020,39 @@ static ThumbWorker thumbWorker{
     { return exifOrientationOf(path); }};
 
 // Lists the JPEG / PNG files of `folder` into a new strip (not yet shown).
+using VcMap = std::map<std::string, std::vector<int>>; // see listVirtualCopies
+
+// Adds one entry. The name index is keyed by the path's own last part, so a
+// virtual copy ("photo.jpg|vc2") never collides with its picture.
+static void filmPushEntry(FilmStrip &f, const std::string &path,
+                          const std::string &name, int copy)
+{
+  FilmEntry e;
+  e.path = path;
+  e.name = name;
+  e.copy = copy;
+  f.byName[filmLower(baseName(path))] = f.files.size();
+  f.files.push_back(std::move(e));
+}
+
+// A picture, then its virtual copies (`copies`: the folder's, by lower-case name).
+static void filmPushWithCopies(FilmStrip &f, const std::string &path,
+                               const std::string &name, const VcMap &copies)
+{
+  filmPushEntry(f, path, name, 0);
+  if (const auto it = copies.find(filmLower(name)); it != copies.end())
+    for (const int n : it->second)
+      filmPushEntry(f, vcPath(path, n), name, n);
+}
+
 static FilmStrip filmListFolder(const std::string &folder)
 {
   FilmStrip f;
   f.folder = folder;
   const std::filesystem::path base = fsPath(folder);
+  const VcMap copies = listVirtualCopies(folder, kFilmMaxFiles);
   for (auto &name : listImageFiles(folder, kFilmMaxFiles))
-  {
-    FilmEntry e;
-    e.path = u8ToString(base / fsPath(name));
-    e.name = name;
-    f.byName[filmLower(name)] = f.files.size();
-    f.files.push_back(std::move(e));
-  }
+    filmPushWithCopies(f, u8ToString(base / fsPath(name)), name, copies);
   return f;
 }
 
@@ -2091,18 +2138,20 @@ static void filmAdoptFiles(const std::vector<std::string> &paths)
 {
   FilmStrip next;
   next.visible = state.film.visible;
+  VcMap copies;
   for (const std::string &p : paths)
   {
-    FilmEntry e;
-    e.path = p;
-    e.name = baseName(p);
+    // A virtual copy's path adopts its picture and all of that picture's copies.
+    const std::string real = vcImageOf(p);
     if (next.folder.empty())
     {
-      std::string dir = u8ToString(fsPath(p).parent_path());
+      std::string dir = u8ToString(fsPath(real).parent_path());
       next.folder = dir.empty() ? "." : dir;
+      copies = listVirtualCopies(next.folder, kFilmMaxFiles);
     }
-    next.byName[filmLower(e.name)] = next.files.size();
-    next.files.push_back(std::move(e));
+    if (next.byName.count(filmLower(baseName(real))))
+      continue; // already in
+    filmPushWithCopies(next, real, baseName(real), copies);
   }
   state.film = std::move(next);
   filmRebuildView(); // a new strip starts with no filter
@@ -2216,13 +2265,19 @@ static void collectThumbJobs()
     FilmEntry &e = f.files[it->second];
     if (r.thumb)
     {
+      const std::shared_ptr<const CanvasImage> raw = r.thumb;
       // The open picture's own thumbnail already shows its edits: keep that.
       if (!(static_cast<int>(it->second) == f.current &&
             state.adjust.version() != f.thumbVersion))
         e.thumb = std::move(r.thumb);
+      // The virtual copies right after it show the same picture until opened.
+      if (e.copy == 0)
+        for (size_t k = it->second + 1; k < f.files.size() && f.files[k].copy > 0; ++k)
+          if (!f.files[k].thumb)
+            f.files[k].thumb = raw;
     }
-    else
-      e.failed = true;
+    else if (!r.thumbSkipped)
+      e.failed = true; // (a virtual copy is skipped on purpose: not a failure)
     e.edited = e.edited || r.edited;
     if (!e.scanned)
     { // only the first reading counts: after that the editor's own value is the
@@ -2237,7 +2292,11 @@ static void collectThumbJobs()
     filmRebuildView(); // a filter is waiting for these
 }
 
-// Opens the picture at index `i` (same background decode as File > Open).
+static void adoptDecoded(DecodeWorker::Result &&r); // defined below
+static std::string gVcDeleteArmed; // path of the copy "Delete Virtual Copy" was pressed for
+
+// Opens the picture at index `i` (same background decode as File > Open; a
+// virtual copy of the picture that is already open reuses its pixels instead).
 static void filmOpenIndex(int i)
 {
   FilmStrip &f = state.film;
@@ -2249,8 +2308,20 @@ static void filmOpenIndex(int i)
     filmRebuildView(); // the picture being opened stays in the strip
   f.dirty = true;
   filmEnsureVisible(i);
+  const std::string &path = f.files[static_cast<size_t>(i)].path;
+  if (state.original && !state.imagePath.empty() && path != state.imagePath &&
+      vcImageOf(path) == vcImageOf(state.imagePath))
+  { // another set of edits for the picture on screen: same file, same pixels,
+    // so skip the decode and adopt them exactly as a finished decode would
+    decodeWorker.invalidate(); // a decode of some other file is no longer wanted
+    DecodeWorker::Result r;
+    r.path = path;
+    r.image.emplace(*state.original);
+    adoptDecoded(std::move(r)); // flushes the old copy's edits, loads this one's
+    return;
+  }
   setStatus("Opening " + f.files[static_cast<size_t>(i)].name + "...", false);
-  decodeWorker.submit(f.files[static_cast<size_t>(i)].path);
+  decodeWorker.submit(path);
   filmQueueThumbs();
 }
 
@@ -2643,6 +2714,16 @@ static void paintFilmstrip(CanvasContext &ctx)
       ctx.roundRect(bx + kFilmThumbW - 12, by + kFilmThumbH - 12, 8, 8, 4);
       ctx.fill();
     }
+    if (e.copy > 0)
+    { // "C2": this cell is virtual copy 2 of the picture before it
+      ctx.setFillColor(Color{0, 0, 0, 150});
+      ctx.fillRect(bx + kFilmThumbW - 36, by + kFilmThumbH - 15, 20, 13);
+      ctx.setFont("", 9.0f);
+      ctx.setTextAlign(TextAlign::Center);
+      ctx.setTextBaseline(TextBaseline::Top);
+      ctx.setFillColor(Color{255, 255, 255});
+      ctx.fillText("C" + std::to_string(e.copy), bx + kFilmThumbW - 26, by + kFilmThumbH - 14);
+    }
     if (e.meta.rating > 0)
     { // gold stars on the bottom-left corner
       ctx.setFillColor(Color{0, 0, 0, 150});
@@ -2800,7 +2881,7 @@ static void adoptDecoded(DecodeWorker::Result &&r)
   if (!r.image)
   {
     // Leave whatever image is already open untouched and say what happened.
-    setStatus("Couldn't open " + baseName(r.path) + ": " +
+    setStatus("Couldn't open " + pictureLabel(r.path) + ": " +
                   (r.error.empty() ? std::string("unsupported or damaged image")
                                    : r.error),
               true);
@@ -2810,6 +2891,7 @@ static void adoptDecoded(DecodeWorker::Result &&r)
     return;
   }
   state.wbPicking = false; // a new picture: the picker must be armed again
+  gVcDeleteArmed.clear();
   clearStatus();
   flushSidecar(); // the picture being replaced keeps its latest edits
   filmLeave();    // ...and its filmstrip thumbnail shows them
@@ -2912,12 +2994,14 @@ static void exportImage()
   finishGeometryJob(); // never export the stale (pre-rebuild) picture
   finishFullRender();  // never export the stale frame of a pending render
 
-  std::string stem = baseName(state.imagePath);
+  std::string stem = baseName(vcImageOf(state.imagePath));
   if (const auto dot = stem.find_last_of('.');
       dot != std::string::npos && dot > 0)
     stem.resize(dot);
   if (stem.empty())
     stem = "export";
+  if (const int n = vcCopyOf(state.imagePath); n > 0)
+    stem += "-copy" + std::to_string(n); // keeps a copy's export apart from the original's
 
   const bool wantJpeg = state.exportJpeg;
   auto path = wantJpeg
@@ -2961,7 +3045,7 @@ static void exportImage()
   const bool ok =
       jpeg ? saveJpegFile(out, *outImage, state.jpegQuality,
                           state.keepMetadata, state.removeGps,
-                          state.imagePath, &err)
+                          vcImageOf(state.imagePath), &err)
            : encodePngFile(out, *outImage, &err);
   if (ok)
     setStatus("Exported " + baseName(out) +
@@ -3949,6 +4033,8 @@ static void maskEditDiscrete(const std::function<void(Mask &)> &fn)
 static std::shared_ptr<TextInputState> gMaskNameState;
 // The Presets pane's name field (see "Presets" below).
 static std::shared_ptr<TextInputState> gPresetNameState;
+// The Snapshots pane's name field (see "Snapshots" below).
+static std::shared_ptr<TextInputState> gSnapNameState;
 
 // True while a name field has keyboard focus: the global shortcuts that
 // would also fire on plain keys (Y, J, Left, Right, Delete...) must stand
@@ -3956,7 +4042,8 @@ static std::shared_ptr<TextInputState> gPresetNameState;
 static bool typingInTextField()
 {
   return (gMaskNameState && gMaskNameState->focused) ||
-         (gPresetNameState && gPresetNameState->focused);
+         (gPresetNameState && gPresetNameState->focused) ||
+         (gSnapNameState && gSnapNameState->focused);
 }
 
 // Makes the field show the selected mask's name. Cheap; polled from the
@@ -4112,7 +4199,7 @@ static void copySettings()
   if (!state.original)
     return;
   gSettingsClip = state.adjust.currentPreset(std::string());
-  gSettingsClipFrom = baseName(state.imagePath);
+  gSettingsClipFrom = pictureLabel(state.imagePath);
   setStatus("Copied settings from " + gSettingsClipFrom, false);
 }
 
@@ -4135,6 +4222,257 @@ static void pasteSettings()
   state.markAdjustDirty();
   state.markDirty();
   setStatus("Pasted settings from " + gSettingsClipFrom, false);
+}
+
+// ---------------- Snapshots ----------------
+// A snapshot is a named, complete copy of the picture's edits (sliders, curves,
+// Color Mix, Color Grading, crop, rotation, straighten AND masks; see
+// NamedSnapshot in io/sidecar.hpp). They live in state.snapshots, are saved in
+// the picture's sidecar with everything else (snapshotsDirty makes autosave
+// write when only the list changed), and are not edits themselves: adding or
+// deleting one is not an undo step. Restoring one IS: one step, "Snapshot: <n>".
+static int gSnapSel = -1; // the last snapshot clicked, or -1
+
+// "Snapshot 1", "Snapshot 2", ...: the first one no snapshot already uses.
+static std::string nextSnapshotName()
+{
+  for (size_t n = 1; n <= kMaxSnapshots + 1; ++n)
+  {
+    const std::string cand = "Snapshot " + std::to_string(n);
+    bool used = false;
+    for (const NamedSnapshot &s : state.snapshots)
+      used = used || s.name == cand;
+    if (!used)
+      return cand;
+  }
+  return "Snapshot";
+}
+
+// Keeps the name field to printable ASCII and the name cap (trimming happens
+// on save, so typing spaces between words still works).
+static void filterSnapshotNameField(const std::string &typed)
+{
+  std::string s;
+  for (char c : typed)
+    if (c >= 0x20 && c <= 0x7E && s.size() < kSnapshotNameMax)
+      s.push_back(c);
+  if (gSnapNameState && gSnapNameState->text != s)
+  {
+    gSnapNameState->text = s;
+    gSnapNameState->cursor = std::min(gSnapNameState->cursor, s.size());
+    gSnapNameState->dirty = true;
+  }
+}
+
+// Saves the picture's current edits as a snapshot named like the field (or
+// "Snapshot <n>" when it is blank).
+static void addSnapshot()
+{
+  if (!state.original)
+    return;
+  if (state.snapshots.size() >= kMaxSnapshots)
+  {
+    setStatus("A picture holds at most " + std::to_string(kMaxSnapshots) +
+                  " snapshots: delete one first",
+              true);
+    return;
+  }
+  std::string name = sanitizeSnapshotName(
+      gSnapNameState ? gSnapNameState->text : std::string());
+  if (name.empty())
+    name = nextSnapshotName();
+  NamedSnapshot s;
+  s.name = name;
+  s.edits = state.adjust.currentEdits();
+  // Every snapshot repeats every mask (object bitmaps included) in the
+  // sidecar, so the list is bounded in bytes as well as in count.
+  SnapshotList trial = state.snapshots;
+  trial.push_back(s);
+  if (sidecarSnapshotsToJson(trial).dump().size() > kSnapshotsMaxBytes)
+  {
+    setStatus("Too many masks to keep another snapshot: delete one first", true);
+    return;
+  }
+  state.snapshots = std::move(trial);
+  state.snapshotsDirty = true; // autosave writes it
+  gSnapSel = static_cast<int>(state.snapshots.size()) - 1;
+  if (gSnapNameState)
+  {
+    gSnapNameState->text.clear();
+    gSnapNameState->cursor = 0;
+    gSnapNameState->scrollOffset = 0.0f;
+    gSnapNameState->dirty = true;
+  }
+  state.markDirty();
+  setStatus("Saved snapshot: " + name, false);
+}
+
+// Puts the picture back as snapshot i describes it: one undo step. Geometry and
+// masks come back too, so the picture is refreshed exactly as after an undo.
+static void applySnapshotEntry(size_t i)
+{
+  if (state.dragging || !state.original || i >= state.snapshots.size())
+    return;
+  gSnapSel = static_cast<int>(i);
+  const NamedSnapshot &s = state.snapshots[i];
+  if (!state.adjust.restoreEdits(s.edits, s.name))
+  {
+    setStatus("Already looks like \"" + s.name + "\"", false);
+    state.markDirty();
+    return;
+  }
+  updateImageFromAdjustments(); // same follow-up as undo() / redo(); clears the status
+  setStatus("Restored snapshot: " + s.name, false);
+}
+
+static void deleteSelectedSnapshot()
+{
+  if (gSnapSel < 0 || static_cast<size_t>(gSnapSel) >= state.snapshots.size())
+    return;
+  const std::string name = state.snapshots[static_cast<size_t>(gSnapSel)].name;
+  state.snapshots.erase(state.snapshots.begin() + gSnapSel);
+  gSnapSel = -1;
+  state.snapshotsDirty = true;
+  state.markDirty();
+  setStatus("Deleted snapshot: " + name, false);
+}
+
+// ---------------- Virtual copies ----------------
+// A virtual copy is another set of edits for the same picture file: its own
+// sidecar ("photo.jpg.vc2.literoom.json"), its own filmstrip cell right after
+// the picture's, its own rating, flag, label and snapshots. See
+// virtual_copy.hpp. Opening one of the open picture's copies reuses the pixels
+// (see filmOpenIndex), so switching is instant.
+
+// Puts `e` at index `at` of the strip and keeps every stored index right.
+static void filmInsertEntry(size_t at, FilmEntry e)
+{
+  FilmStrip &f = state.film;
+  f.files.insert(f.files.begin() + static_cast<std::ptrdiff_t>(at), std::move(e));
+  for (int *i : {&f.current, &f.target, &f.anchor})
+    if (*i >= static_cast<int>(at))
+      ++*i;
+  f.byName.clear();
+  for (size_t i = 0; i < f.files.size(); ++i)
+    f.byName[filmLower(baseName(f.files[i].path))] = i;
+  filmRebuildView();
+}
+
+// Takes entry `at` out of the strip. The open picture's index is forgotten
+// (-1) when it was the one removed; the caller opens something else.
+static void filmRemoveEntry(size_t at)
+{
+  FilmStrip &f = state.film;
+  f.files.erase(f.files.begin() + static_cast<std::ptrdiff_t>(at));
+  for (int *i : {&f.current, &f.target, &f.anchor})
+  {
+    if (*i == static_cast<int>(at))
+      *i = -1;
+    else if (*i > static_cast<int>(at))
+      --*i;
+  }
+  f.byName.clear();
+  for (size_t i = 0; i < f.files.size(); ++i)
+    f.byName[filmLower(baseName(f.files[i].path))] = i;
+  filmRebuildView();
+}
+
+// A new virtual copy of the open picture, starting from its current edits
+// (snapshots and the rating are not copied), opened at once.
+static void createVirtualCopy()
+{
+  FilmStrip &f = state.film;
+  if (!state.original || state.imagePath.empty() || state.dragging || syncBusy())
+    return;
+  const std::string real = vcImageOf(state.imagePath);
+  std::vector<int> used;
+  size_t last = f.files.size(); // the last cell of this picture (it and its copies)
+  for (size_t i = 0; i < f.files.size(); ++i)
+    if (vcImageOf(f.files[i].path) == real)
+    {
+      last = i;
+      if (f.files[i].copy > 0)
+        used.push_back(f.files[i].copy);
+    }
+  if (last == f.files.size())
+  {
+    setStatus("This picture is not in the filmstrip", true);
+    return;
+  }
+  const int id = vcFreeId(used);
+  if (id == 0)
+  {
+    setStatus("A picture holds at most " + std::to_string(kMaxVirtualCopies) +
+                  " virtual copies",
+              true);
+    return;
+  }
+  flushSidecar(); // the picture being copied keeps its latest edits too
+  const std::string path = vcPath(real, id);
+  const std::string text =
+      sidecarFileText(baseName(real), state.original->width, state.original->height,
+                      state.adjust.toJson(), PhotoMeta{});
+  std::string err;
+  if (!writeTextAtomic(sidecarPath(path), text, &err))
+  {
+    setStatus("Couldn't create the virtual copy: " + err, true);
+    return;
+  }
+  FilmEntry e;
+  e.path = path;
+  e.name = baseName(real);
+  e.copy = id;
+  e.scanned = true; // default rating, flag and label: nothing to read
+  e.edited = sidecarScan(text).edited;
+  if (state.image)
+    e.thumb = makeThumb(*state.image); // it starts out looking like the source
+  filmInsertEntry(last + 1, std::move(e));
+  filmOpenIndex(static_cast<int>(last) + 1);
+  setStatus("Created virtual copy " + std::to_string(id), false);
+}
+
+// Deletes the open virtual copy's edits file (the picture and its other copies
+// are untouched) and goes back to the original. Asks to be chosen twice.
+static void deleteVirtualCopy()
+{
+  FilmStrip &f = state.film;
+  if (!state.original || state.imagePath.empty() || state.dragging || syncBusy())
+    return;
+  const int n = vcCopyOf(state.imagePath);
+  if (n == 0)
+  {
+    setStatus("Only a virtual copy can be deleted: this is the original", true);
+    return;
+  }
+  if (gVcDeleteArmed != state.imagePath)
+  {
+    gVcDeleteArmed = state.imagePath;
+    setStatus("Choose Delete Virtual Copy again to delete copy " + std::to_string(n) +
+                  " and its edits",
+              false);
+    return;
+  }
+  gVcDeleteArmed.clear();
+  const std::string path = state.imagePath;
+  std::error_code ec;
+  std::filesystem::remove(sidecarPath(path), ec);
+  if (ec)
+  {
+    setStatus("Couldn't delete the virtual copy: " + ec.message(), true);
+    return;
+  }
+  // Nothing of it may be written back when the editor moves on.
+  state.sidecarSaved = state.adjust.version();
+  state.metaDirty = false;
+  state.snapshotsDirty = false;
+  const std::string real = vcImageOf(path);
+  const auto it = f.byName.find(filmLower(baseName(path)));
+  if (it != f.byName.end())
+    filmRemoveEntry(it->second);
+  const auto master = f.byName.find(filmLower(baseName(real)));
+  if (master != f.byName.end())
+    filmOpenIndex(static_cast<int>(master->second));
+  setStatus("Deleted virtual copy " + std::to_string(n), false);
 }
 
 static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
@@ -5702,6 +6040,44 @@ static View buildPresetRow(size_t i)
   Text t;
   t.label = std::function<std::string()>([i]() -> std::string
                                          { return i < gPresets.size() ? gPresets[i].name : std::string(); });
+  t.fontSize = 13.0f;
+  t.wrap = TextWrap::NoWrap;
+  t.color = kColorTextDark;
+  b.addChild(std::move(t));
+  return b;
+}
+
+// One row of the Snapshots list. Click restores the snapshot (undoable).
+static View buildSnapshotRow(size_t i)
+{
+  View b;
+  b.style.width = Size::full();
+  b.style.height = Size::pixel(28);
+  b.style.flexShrink = 0;
+  b.style.borderRadius = 4.0f;
+  b.style.alignItems = Align::Center;
+  b.style.padding = EdgeInsets{0, 10, 0, 10};
+  b.style.overflowX = Overflow::Hidden;
+  b.style.hoverColor = kColorActivityHover;
+  b.style.display = std::function<Display()>([i]
+                                             { return state.activeActivity == kSnapshotsActivity &&
+                                                              i < state.snapshots.size()
+                                                          ? Display::Flex
+                                                          : Display::None; });
+  const auto isSel = [i]
+  { return gSnapSel == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
+                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.borderWidth =
+      std::function<float()>([isSel]
+                             { return isSel() ? 1.0f : 0.0f; });
+  b.style.borderColor = kColorDividerHover;
+  b.onClick = [i]
+  { applySnapshotEntry(i); };
+
+  Text t;
+  t.label = std::function<std::string()>([i]() -> std::string
+                                         { return i < state.snapshots.size() ? state.snapshots[i].name : std::string(); });
   t.fontSize = 13.0f;
   t.wrap = TextWrap::NoWrap;
   t.color = kColorTextDark;
@@ -7355,6 +7731,7 @@ int main()
   const std::vector<Activity> activities = {
       {0, "Info", "I"},
       {kHistoryActivity, "History", "H"},
+      {kSnapshotsActivity, "Snapshots", "S"},
       {1, "Adjust", "A"},
       {kPresetsActivity, "Presets", "P"},
       {4, "Curve", "~"},
@@ -7446,6 +7823,8 @@ int main()
                      {"Paste Settings", pasteSettings, "Ctrl+Shift+V"},
                      {"Select All Photos", filmSelectAll, "Ctrl+A"},
                      {"Sync Settings to Selected", syncSettings, "Ctrl+Shift+S"},
+                     {"Create Virtual Copy", createVirtualCopy, "Ctrl+Shift+N"},
+                     {"Delete Virtual Copy", deleteVirtualCopy},
                  }));
 
   { // Photo: rating, flag and color label of the open picture (see ratePhoto)
@@ -7641,7 +8020,7 @@ int main()
 
   Text infoName;
   infoName.label = std::function<std::string()>([]
-                                                { return state.image ? ("File: " + baseName(state.imagePath))
+                                                { return state.image ? ("File: " + pictureLabel(state.imagePath))
                                                                      : std::string("No image open"); });
   infoName.fontSize = 13.0f;
   infoName.color = kColorTextMid;
@@ -7691,6 +8070,77 @@ int main()
   for (size_t r = 0; r < kMaxUndoSteps + 1; ++r)
     historyPane.addChild(buildHistoryRow(r));
   sidebar.addChild(std::move(historyPane));
+
+  // -- "Snapshots" pane: named copies of every edit on this picture. Click one
+  // to restore it (one undo step); type a name and Save to keep the current
+  // state. They are saved in the picture's edits file, not in the presets folder.
+  View snapshotsPane;
+  snapshotsPane.style.width = Size::full();
+  snapshotsPane.style.direction = FlexDirection::Column;
+  snapshotsPane.style.gap = 6.0f;
+  snapshotsPane.style.display = std::function<Display()>(
+      []
+      { return state.activeActivity == kSnapshotsActivity ? Display::Flex : Display::None; });
+
+  Text snapshotsHint;
+  snapshotsHint.label = std::function<std::string()>([]() -> std::string
+                                                     { return state.original
+                                                                  ? "A snapshot is a named copy of every edit on this picture: "
+                                                                    "sliders, curves, Color Mix, Color Grading, crop, rotation "
+                                                                    "and masks. Restoring one replaces all of them and can be "
+                                                                    "undone. Snapshots are saved with the picture's edits."
+                                                                  : "Open an image to keep snapshots of its edits."; });
+  snapshotsHint.fontSize = 12.0f;
+  snapshotsHint.color = kColorTextMuted;
+  snapshotsHint.style.margin = EdgeInsets{0, 0, 6, 0};
+  snapshotsPane.addChild(std::move(snapshotsHint));
+
+  {
+    TextInput ti;
+    ti.placeholder = "Name this snapshot";
+    ti.fontSize = 13.0f;
+    ti.textColor = kColorTextDark;
+    ti.placeholderColor = kColorTextMuted;
+    ti.caretColor = kColorTextDark;
+    ti.borderColor = kColorDividerHover;
+    ti.focusedBorderColor = Color{90, 150, 235, 255};
+    ti.style.width = Size::full();
+    ti.style.height = Size::pixel(28);
+    ti.style.flexShrink = 0;
+    ti.style.borderWidth = 1.0f;
+    ti.style.borderRadius = 4.0f;
+    ti.style.backgroundColor = kColorActivityBarBg;
+    ti.onChange = [](const std::string &s)
+    { filterSnapshotNameField(s); };
+    ti.onSubmit = [](const std::string &)
+    { addSnapshot(); }; // Enter saves, like the button
+    gSnapNameState = ti.state;
+    snapshotsPane.addChild(std::move(ti));
+  }
+  snapshotsPane.addChild(sidebarButton(
+      "Save snapshot", addSnapshot, {}, true,
+      []
+      { return state.original != nullptr && state.snapshots.size() < kMaxSnapshots; }));
+
+  Text snapshotsEmpty;
+  snapshotsEmpty.label = std::string("No snapshots yet. Name the current state and save it.");
+  snapshotsEmpty.fontSize = 12.0f;
+  snapshotsEmpty.color = kColorTextMuted;
+  snapshotsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
+  snapshotsEmpty.style.display = std::function<Display()>(
+      []
+      { return state.snapshots.empty() ? Display::Flex : Display::None; });
+  snapshotsPane.addChild(std::move(snapshotsEmpty));
+
+  for (size_t i = 0; i < kMaxSnapshots; ++i)
+    snapshotsPane.addChild(buildSnapshotRow(i));
+
+  snapshotsPane.addChild(sidebarButton(
+      "Delete selected snapshot", deleteSelectedSnapshot, {}, false,
+      []
+      { return gSnapSel >= 0 && static_cast<size_t>(gSnapSel) < state.snapshots.size(); }));
+
+  sidebar.addChild(std::move(snapshotsPane));
 
   // -- "Adjust" pane: one slider row per entry in kAdjustmentSpecs. Adding
   // a new adjustment later is a one-line addition to that table — this
@@ -9521,7 +9971,7 @@ int main()
   statusLeft.label = std::function<std::string()>([]
                                                   {
     std::string s = state.image
-                        ? baseName(state.imagePath) + "  —  " +
+                        ? pictureLabel(state.imagePath) + "  —  " +
                               std::to_string(state.image->width) + " x " +
                               std::to_string(state.image->height) + " px"
                         : std::string("No image open");

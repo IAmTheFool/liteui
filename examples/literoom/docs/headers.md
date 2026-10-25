@@ -40,7 +40,7 @@ Every header sits under `src/`, which is the include root, so a header is always
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram` |
-| `io/` | `sidecar`, `photo_meta`, `preset`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
+| `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
 | `workers/` | `latest_worker`, `thumb_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
@@ -210,7 +210,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
 - Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
 
-**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step, a white-balance pick and an Auto Tone**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step, a white-balance pick, an Auto Tone and a snapshot restore**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
 
 **Read access**
 
@@ -288,13 +288,24 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress and the next slider touch (even Exposure) starts a fresh step. Its label is `Auto Tone`, stored in the snapshot, so it survives undo, redo and History jumps.
 - Nothing else changes: Brightness, Highlights, Shadows, the curves, the other sliders, Mixer, grade, crop, orientation and masks are left alone. The values are ordinary slider values, so the sidecar, presets, Copy / Paste and Sync Settings carry them with no extra code. The label is History-only and is not saved.
 
+**Named snapshots** (a saved copy of the *whole* edit state; the list lives in `main.cpp`, see [undo-and-history.md](undo-and-history.md#named-snapshots) and [`sidecar.hpp`](#sidecarhpp))
+
+**`SidecarEdits currentEdits() const`**
+- The whole edit state as a plain value: sliders, crop, orientation, angle, corner mode, curves, Mixer, grade and masks. This is what `toJson()` writes and what *Save snapshot* stores. Does not touch the history or `version()`. It builds the struct field by field, so a new field of `SidecarEdits` must be added here.
+
+**`bool restoreEdits(const SidecarEdits &e, const std::string &name)`**
+- Puts the picture back exactly as `e` describes it as **one undo step**. Unlike `applyPreset` it replaces the geometry (crop, orientation, angle, corner mode) and the masks too, so the caller must refresh the picture the way it does after an undo.
+- Slider values go through `sanitizedValue` (clamped, NaN/infinity become 0). Everything else is taken **as given**, so `e` must come from `currentEdits()` or `sidecarSnapshotsFromJson` (which checks the crop against the picture's size).
+- Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders and every other field already equal the current ones. Otherwise returns true.
+- Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress. Its label is `"Snapshot: <name>"` (the name sanitized again with `sanitizeSnapshotName`), or `"Snapshot"` for a blank name; it is stored in the history step, so it survives undo, redo and History jumps, and it is not saved.
+
 **Loading, saving and resetting**
 
 **`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
 
 **`void reset()`**: a fresh baseline for a newly opened image: every slider, Mixer value, grade, mask, crop, orientation and angle back to neutral, curves to identity, history reduced to that one baseline step.
 
-**`mj::Json toJson() const`**: everything the user has done, as the sidecar JSON (the undo history is not included). Calls `sidecarEditsToJson`.
+**`mj::Json toJson() const`**: everything the user has done, as the sidecar JSON (the undo history is not included). Calls `sidecarEditsToJson(currentEdits())`.
 
 **`bool loadJson(const mj::Json &j)`**
 - Replaces every edit with the saved ones (call after `reset()` and `setOriginalSize()`). Returns false with **nothing changed** if `j` isn't usable (not an object, or the original size isn't set). Otherwise the undo history restarts from the loaded state. Everything else is validated and clamped by `sidecarEditsFromJson`.
@@ -305,7 +316,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
 - **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
 
-**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset`, `setWhiteBalance` and `setAutoTone` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset`, `setWhiteBalance`, `setAutoTone` and `restoreEdits` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
 1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
 2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
 3. `Tone Curve: RGB / Red / Green / Blue`.
@@ -1340,22 +1351,27 @@ Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the 
 ## Saving and files
 
 ### `sidecar.hpp`
-The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`. `preset.hpp` reuses the per-group functions (`sidecarAdjToJson` / `FromJson`, the curve, Mixer and grade ones), so a preset is validated and clamped exactly like a saved edit. `sidecarSyncLook` (last entry below) is how Sync Settings puts a look into another picture's sidecar.
+The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`. `preset.hpp` reuses the per-group functions (`sidecarAdjToJson` / `FromJson`, the curve, Mixer and grade ones), so a preset is validated and clamped exactly like a saved edit. `sidecarSyncLook` (last entry below) is how Sync Settings puts a look into another picture's sidecar. The wrapper also carries the picture's **named snapshots** (see below), and `sidecarFileOf` understands a virtual copy's path.
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`. No UI. **Test:** `sidecar_test`.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `photo_meta.hpp`, `virtual_copy.hpp`. No UI. **Test:** `sidecar_test`.
 
 **Constants**
 
 | Name | Type | Value | Meaning |
 |---|---|---|---|
 | `kSidecarVersion` | `int` | 1 | Declared here; this header neither writes nor checks it |
-| `kSidecarExt` | `const char *` | `".literoom.json"` | Appended to the picture's path |
+| `kSidecarExt` | `const char *` | `".literoom.json"` | Appended to the picture's path. Defined in `virtual_copy.hpp` (which holds the rest of the file-name rules) and visible here |
+| `kMaxSnapshots` | `size_t` | 20 | Named snapshots kept per picture (written and read) |
+| `kSnapshotNameMax` | `size_t` | 32 | Longest snapshot name |
+| `kSnapshotsMaxBytes` | `size_t` | 24 MiB | Largest the snapshot list may grow to (the app refuses to add one past it) |
 | `kSidecarMaxPrompts` | `size_t` | 256 | Object prompts kept per mask part |
 | `kSidecarMaxMapPixels` | `int64_t` | 2^26 | Largest object bitmap (8192 × 8192) |
 
 **Types:** `struct SidecarEdits { AdjValues values{}; CropRect crop; Orient orient; float angle = 0; bool expand = false; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; MaskSet masks; }`: everything the user did to a picture.
 
-**File layout** (written by `sidecarEditsToJson`)
+**`struct NamedSnapshot { std::string name; SidecarEdits edits; }`** and **`using SnapshotList = std::vector<NamedSnapshot>`**: a saved, named copy of the whole edit state.
+
+**File layout** (written by `sidecarEditsToJson`; the wrapper's `snapshots` array is described under the snapshot functions below)
 - `adjust`: object keyed by **slider label** (e.g. `"Exposure"`, `"Noise Reduction"`, `"Color Noise"`, `"Colorize Hue"`); zero sliders are left out.
 - `curves`: keys `rgb`, `r`, `g`, `b`, each an array of `[x, y]` pairs; identity curves left out.
 - `colorMix`: keys `hue`, `sat`, `lum`, each an array of 8 numbers; `{}` if all zero.
@@ -1366,7 +1382,7 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 
 **Functions**
 
-**`inline std::string sidecarFileOf(const std::string &imagePath)`**: `"photo.jpg"` → `"photo.jpg.literoom.json"`.
+**`inline std::string sidecarFileOf(const std::string &imagePath)`**: `"photo.jpg"` → `"photo.jpg.literoom.json"`. For a virtual copy's path (`"photo.jpg|vc2"`, see [`virtual_copy.hpp`](#virtual_copyhpp)) it is that copy's own file, `"photo.jpg.vc2.literoom.json"`. Implemented by `vcSidecarFileOf`.
 
 **`inline float sidecarNum(const mj::Json &o, const char *key, float def, float lo, float hi)`**: the number under `key` in object `o`, clamped to `[lo, hi]`; `def` (**not clamped**) if the key is missing or not a number.
 
@@ -1402,6 +1418,16 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 
 **`inline mj::Json sidecarEditsToJson(const SidecarEdits &e)`**: the whole file's content (layout above).
 
+**Named snapshots** (the wrapper's `snapshots` array, see [sidecar-format.md](sidecar-format.md#named-snapshots))
+
+**`inline std::string sanitizeSnapshotName(const std::string &s)`**: printable ASCII only, trimmed, at most `kSnapshotNameMax` characters (no trailing space after the cut). May return an empty string. The same rules as a preset name. **`inline std::string snapshotNameOrDefault(const std::string &s)`**: the sanitized name, or `"Snapshot"` when it is empty; the writer and the loader both use it, so a blank name reads and writes back the same.
+
+**`inline mj::Json sidecarSnapshotsToJson(const SnapshotList &list)`**: `[ { "name": ..., "edits": { ... } }, ... ]`, at most `kMaxSnapshots` entries, each `edits` written by `sidecarEditsToJson`.
+
+**`inline SnapshotList sidecarSnapshotsFromJson(const mj::Json *j, int origW, int origH)`**
+- Inputs: the `snapshots` value of a parsed sidecar (a null pointer if the key is missing) and the picture's original size, which each snapshot's crop is checked against.
+- Never fails. A value that isn't an array gives an empty list; an entry that isn't an object, or whose `edits` `sidecarEditsFromJson` refuses (this includes a non-positive size), is skipped; at most `kMaxSnapshots` are kept. Each kept snapshot is validated and clamped like the live edits, and its name goes through `snapshotNameOrDefault`.
+
 **`inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH, SidecarEdits *out)`**
 - Inputs: the parsed JSON, the picture's original size (needed to check the crop), and the output.
 - Returns: false (and leaves `*out` untouched) only if `o` isn't an object or `origW`/`origH` aren't positive. Anything wrong inside is dropped or clamped instead.
@@ -1410,21 +1436,21 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 **`inline bool sidecarSyncLook(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const AdjValues &values, const CurveSet &curves, const MixValues &mix, const ColorGrade &grade, std::string *outText, std::string *err)`**: puts a look into **another picture's** sidecar text without opening it (Image > Sync Settings to Selected). See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
 - Inputs: `oldText` is the picture's current sidecar file (`""` if it has none). `imageName` is written to `image.name` (informational). `imgW` / `imgH` are the picture's upright size: **required only when `oldText` is empty** (a new file must record it); otherwise the size recorded in the file is used, and if `imgW` and `imgH` are both positive they must match it. The look is the four groups a preset holds. `outText` receives the whole new file (wrapper plus edits); `err` receives a short reason.
 - Returns: true with `*outText` set. False, with a reason in `*err` and `*outText` untouched, when the old file can't be trusted: not valid JSON or not an object, a missing, non-numeric or higher `version`, no `image.width` / `image.height`, a different size than the one given, or an `edits` part that `sidecarEditsFromJson` refuses. Or when there is no old file and `imgW` / `imgH` aren't both positive. The caller skips that picture rather than overwrite edits it can't read.
-- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix` and `grade` are replaced, and the result is written by `sidecarEditsToJson`. The picture's own rating, flag and color label (`meta`) are read from the old file and written back as they were. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
+- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix` and `grade` are replaced, and the result is written by `sidecarEditsToJson`. The picture's own rating, flag and color label (`meta`) are read from the old file and written back as they were. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. The picture's named snapshots are read from the old file and written back as they were (each keeps the look it captured). Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
 
 **Rating, flag and color label** (the wrapper's `meta` object; see [sidecar-format.md](sidecar-format.md)). `sidecar.hpp` includes `photo_meta.hpp`.
 
-**`inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH, SidecarEdits *e, PhotoMeta *meta, int *W, int *H, std::string *err)`**: the trust rules shared by every function that rewrites another picture's sidecar. With no text, the edits are neutral and the size must be given. With text, the file must be a JSON object, not from a newer version, with a picture size that matches `imgW x imgH` (when given) and loadable `edits`; otherwise it is refused with a reason in `*err`. On success it returns the file's edits, `meta` and size.
+**`inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH, SidecarEdits *e, PhotoMeta *meta, SnapshotList *snaps, int *W, int *H, std::string *err)`**: the trust rules shared by every function that rewrites another picture's sidecar. With no text, the edits are neutral and the size must be given. With text, the file must be a JSON object, not from a newer version, with a picture size that matches `imgW x imgH` (when given) and loadable `edits`; otherwise it is refused with a reason in `*err`. On success it returns the file's edits, `meta`, named snapshots (validated by `sidecarSnapshotsFromJson`, empty if there are none) and size. A rewriter must write `meta` and `snaps` back through `sidecarFileText`, or it would drop them.
 
 **`inline bool sidecarPatchMeta(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const MetaPatch &patch, std::string *outText, PhotoMeta *outMeta, std::string *err)`**: the batch rating. Applies `patch` to the picture's rating / flag / color label in its sidecar text and keeps everything else; same trust rules as `sidecarSyncLook` (both are built on `sidecarReadForRewrite`). `*outMeta` is the meta after the patch. A caller can skip a picture with no sidecar when `patch.applyTo(PhotoMeta{})` is the default, since there is nothing to record. Pure.
 
 **`inline PhotoMeta sidecarMetaFromRoot(const mj::Json &root)`**: the `meta` object of a parsed sidecar, clamped; the default `PhotoMeta` if it is missing or malformed.
 
-**`inline std::string sidecarFileText(const std::string &imageName, int w, int h, mj::Json edits, const PhotoMeta &meta)`**: the whole sidecar file: `app`, `version`, `image`, `meta` (only if it is not the default) and `edits`. The app's own save and `sidecarSyncLook` both write through it, so no writer can drop `meta`. With a default `meta` the output is exactly the layout the app wrote before `meta` existed.
+**`inline std::string sidecarFileText(const std::string &imageName, int w, int h, mj::Json edits, const PhotoMeta &meta, const SnapshotList &snapshots = {})`**: the whole sidecar file: `app`, `version`, `image`, `meta` (only if it is not the default), `edits`, and `snapshots` (only if there are any). The app's own save, `sidecarSyncLook` and `sidecarPatchMeta` all write through it, so no writer can drop `meta` or `snapshots`. With a default `meta` and no snapshots the output is exactly the layout the app wrote before either existed. `imageName` is the real picture's name, also for a virtual copy.
 
 **`inline const std::string &sidecarNeutralEditsDump()`**: the text `sidecarEditsToJson` gives for an untouched `SidecarEdits{}`.
 
-**`struct SidecarScan { bool edited = true; PhotoMeta meta; }`** and **`inline SidecarScan sidecarScan(const std::string &text)`**: what the filmstrip wants from a sidecar without opening the picture. `edited` is false only for a file that parses as an object whose `edits` dump equals the neutral dump (a file that exists because the picture was rated); an unreadable file, a non-object, or one with no `edits` counts as edited, as any existing file always did. `meta` is the file's rating, flag and label (the default if the file can't be read). Pure; the thumbnail worker calls it on its own thread.
+**`struct SidecarScan { bool edited = true; PhotoMeta meta; }`** and **`inline SidecarScan sidecarScan(const std::string &text)`**: what the filmstrip wants from a sidecar without opening the picture. `edited` is false only for a file that parses as an object whose `edits` dump equals the neutral dump (a file that exists because the picture was rated, or only has snapshots: `snapshots` is not looked at); an unreadable file, a non-object, or one with no `edits` counts as edited, as any existing file always did. `meta` is the file's rating, flag and label (the default if the file can't be read). Pure; the thumbnail worker calls it on its own thread.
 
 ### `photo_meta.hpp`
 A picture's **rating, flag and color label**, their JSON form, and the filmstrip filter. Pure values: no UI, no files, no editor state. They are **not edits**: they never go through `AdjustmentSet`, so there is no undo step or History label. They live in the sidecar's top-level `meta` object (see [sidecar-format.md](sidecar-format.md)).
@@ -1597,6 +1623,33 @@ Paths, extensions, folder listing, natural sort and atomic writes. Standard libr
 - Returns: file names (UTF-8, no directory part) of regular files ending in `.jpg`, `.jpeg` or `.png` (any case) that lie **directly** in `folder`, in natural order. Equal names under natural order are ordered by plain comparison, so the result never depends on directory order. A missing or unreadable folder gives `{}`; unreadable entries are skipped.
 - Cap behavior (on purpose, pinned by a test): the cap is applied **before** sorting, so a folder over the cap yields an arbitrary (directory-order) subset, sorted.
 
+### `virtual_copy.hpp`
+**Virtual copies**: more than one set of edits for one picture file. Pure string and folder helpers: no UI, no editor state, no pixels. See [sidecar-format.md](sidecar-format.md#virtual-copies) for the design and what the UI does with it.
+
+A copy is an extra sidecar (`photo.jpg.vc2.literoom.json`). The program identifies a picture by one string, its path, so a copy gets its own path by appending a marker no file name can contain: `/photos/photo.jpg|vc2`. Code keyed by path tells copies apart with no change; code that needs the real file calls `vcImageOf()`.
+
+**Depends on:** `file_utils.hpp`. No UI. **Test:** `virtual_copy_test`. **Thread model:** no shared state; every function is safe from any thread.
+
+**Constants:** `kSidecarExt` (`".literoom.json"`; moved here from `sidecar.hpp`, which includes this header), `kMaxVirtualCopies` (`int`, 9: copies are numbered 1 to 9, a single digit in the marker), `kVcMark` (`"|vc"`).
+
+**Functions**
+
+**`inline std::string vcPath(const std::string &imagePath, int n)`**: the path of copy `n`; `imagePath` itself for `n < 1`. Does not check `n` against `kMaxVirtualCopies` (such a path just isn't recognized by `vcSplit`).
+
+**`inline bool vcSplit(const std::string &p, std::string *image, int *n)`**
+- True if `p` is exactly `"<image>|vc<1..9>"`. Then `*image` is the real picture's path and `*n` the number (both outputs optional). False for everything else: no marker, a marker not at the very end, `|vc0`, `|vc10`, a non-digit, capital letters, an empty name before the marker (`"|vc1"`, `"dir/|vc1"`).
+
+**`inline std::string vcImageOf(const std::string &p)`**: the real picture file behind a path; `p` itself if it isn't a copy's path. **`inline int vcCopyOf(const std::string &p)`**: 0 for a picture, else the copy number.
+
+**`inline std::string vcSidecarFileOf(const std::string &p)`**: `"photo.jpg"` → `"photo.jpg.literoom.json"`, `"photo.jpg|vc2"` → `"photo.jpg.vc2.literoom.json"`. `sidecarFileOf` calls it.
+
+**`inline bool vcParseSidecarName(const std::string &fileName, std::string *imageName, int *n)`**: the other direction. True if `fileName` (no directory) is `"<image>.vc<1..9>"` plus the sidecar extension (the extension in any case, `.vc` lower-case); gives the picture's file name and the copy number. A plain `photo.jpg.literoom.json` is false.
+
+**`inline std::map<std::string, std::vector<int>> listVirtualCopies(const std::string &folder, size_t maxFiles)`**
+- The copies found in `folder`: lower-case picture file name → copy numbers, ascending and unique. The picture need not exist (the caller matches names against the pictures it lists). Looks at no more than `maxFiles` folder entries (a cap on entries, not on matches); directories and unreadable entries are skipped; a missing folder gives `{}`. The filmstrip calls it with `kFilmMaxFiles` when it builds a strip.
+
+**`inline int vcFreeId(const std::vector<int> &used)`**: the lowest number in `1..kMaxVirtualCopies` that isn't in `used`; 0 if all are taken. A deleted copy's number is reused.
+
 ### `image_codec.hpp`
 Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Windows. (Needs LiteUI because it reuses the libraries LiteUI already pulls in.) Everything that touches the editor (file pickers, state, status line) stays in `main.cpp`'s `exportImage` / `saveJpegFile`.
 
@@ -1760,7 +1813,7 @@ Glue between `file_utils.hpp`, `exif.hpp` and `geometry.hpp`: reads a file's cam
 ### `thumb_worker.hpp`
 The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a picture to fit 96 × 72, and `ThumbWorker` decodes a queue of files, thumbnails them, and reads each one's sidecar for whether it holds real edits and for its rating, flag and color label. A first-in-first-out queue with **no generations**, so **not** a `LatestWorker`. (Needs LiteUI's decoder.)
 
-**Depends on:** `liteui.hpp` (decoder), `geometry.hpp`, `raster_ops.hpp` (`orientImage`), `file_utils.hpp` (`fsPath`), `sidecar.hpp` (`sidecarFileOf`, `sidecarScan`), `photo_meta.hpp`. **Test:** `thumb_worker_test` (links LiteUI and the thread library).
+**Depends on:** `liteui.hpp` (decoder), `geometry.hpp`, `raster_ops.hpp` (`orientImage`), `file_utils.hpp` (`fsPath`), `sidecar.hpp` (`sidecarFileOf`, `sidecarScan`), `photo_meta.hpp`, `virtual_copy.hpp` (`vcImageOf`, `vcCopyOf`). **Test:** `thumb_worker_test` (links LiteUI and the thread library).
 
 **Constants:** `kFilmThumbW` = 96, `kFilmThumbH` = 72 (`int`).
 
@@ -1771,7 +1824,7 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 
 **`class ThumbWorker`** (non-copyable)
 
-- `struct Result { std::string path; std::shared_ptr<const CanvasImage> thumb; bool edited = false; PhotoMeta meta; }`: `thumb` is **null if the file couldn't be decoded** (the result is still delivered, with its `meta`); `edited` is true if the picture's sidecar holds real edits (a sidecar that exists only because the picture was rated gives false; one that is unreadable, too big (over 64 MiB) or has no `edits` still gives true); `meta` is the rating, flag and color label from that sidecar (the default if there is none or it can't be read).
+- `struct Result { std::string path; std::shared_ptr<const CanvasImage> thumb; bool thumbSkipped = false; bool edited = false; PhotoMeta meta; }`: `thumb` is **null if the file couldn't be decoded** (the result is still delivered, with its `meta`); `thumbSkipped` is true for a **virtual copy** (its path has the `|vc<n>` marker), which is read for its sidecar only: no decode, `thumb` null on purpose, and the caller must not count it as a failure; `edited` is true if the picture's sidecar holds real edits (a sidecar that exists only because the picture was rated gives false; one that is unreadable, too big (over 64 MiB) or has no `edits` still gives true); `meta` is the rating, flag and color label from that sidecar (the default if there is none or it can't be read).
 - `using OrientFn = std::function<Orient(const std::string &)>`: says how a file's camera rotation turns it upright. The app passes its own EXIF reader (`exifOrientationOf`), so thumbnails are turned exactly like the editor turns the picture.
 - **`explicit ThumbWorker(OrientFn orientOf)`**: no thread yet.
 - **`~ThumbWorker()`**: calls `shutdown()`.
@@ -1779,7 +1832,7 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 - **`void setQueue(std::vector<std::string> paths)`**: replaces what is still to do (starting the thread on first use). The file being processed finishes; results already made stay until collected. Call it again whenever the open picture changes so the work starts next to it.
 - **`std::vector<Result> collect()`**: returns everything made since the last call and empties the list. Thread-safe, non-blocking.
 - **`void shutdown()`**: clears the queue, requests stop and joins the thread.
-- Per file, the worker: decodes it (`liteui_image::decodeFile`), applies the orientation from `orientOf`, makes the thumbnail, then reads the sidecar (`readSidecarForThumb`, at most 64 MiB) and runs `sidecarScan` on it.
+- Per file, the worker: decodes it (`liteui_image::decodeFile` on `vcImageOf(path)`; skipped for a virtual copy), applies the orientation from `orientOf` (also given the real file's path), makes the thumbnail, then reads the sidecar (`readSidecarForThumb` through `sidecarFileOf`, so a copy reads its own file; at most 64 MiB) and runs `sidecarScan` on it.
 
 ---
 

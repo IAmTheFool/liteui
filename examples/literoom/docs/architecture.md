@@ -129,6 +129,16 @@ These reuse the preset machinery instead of adding a new kind of data. The thing
 
 The engine stays UI-free: `sidecarSyncLook` has no file, window or editor dependency and is tested with plain strings. The selection flags and the clipboard are UI-side state in `main.cpp`.
 
+## Snapshots and virtual copies
+
+Both are ways to keep more than one version of a picture's edits, and both are built from the sidecar rather than from new kinds of data.
+
+**Named snapshots** are saved states of *one* set of edits that you can return to. A snapshot is a name plus a whole `SidecarEdits` (look, curves, Mixer, grading, crop, rotation, straighten **and masks**), stored in a `snapshots` array in the picture's sidecar and written by the same functions as the edits. Unlike a preset it replaces everything, geometry and masks included. Restoring one goes through `AdjustmentSet::restoreEdits`, so it is one undo step labelled `Snapshot: <name>`. The list is kept in `state.snapshots` beside the rating, not in `AdjustmentSet`, because it is not an edit. See [undo-and-history.md](undo-and-history.md#named-snapshots) and [sidecar-format.md](sidecar-format.md#named-snapshots).
+
+**Virtual copies** are *separate* sets of edits for the same picture file: a second sidecar (`photo.jpg.vc2.literoom.json`) and a second filmstrip cell. The trick that keeps this small is that the program already identifies a picture by one string, its path, so a copy simply gets its own path (`photo.jpg|vc2`, a marker no file name can contain). Everything keyed by path (the filmstrip index, thumbnail and sync results, the open picture) then tells copies apart with no other change; only the few places that need the real file translate it back with `vcImageOf()`, and `sidecarFileOf()` yields the copy's own sidecar. Switching between copies of the open picture reuses its pixels instead of decoding. The pure helpers are in `io/virtual_copy.hpp`. See [sidecar-format.md](sidecar-format.md#virtual-copies) and [threading.md](threading.md#virtual-copies-and-the-workers).
+
+Each copy is a complete picture as far as the rest of the program is concerned: its own rating, flag, label, undo history (fresh on every open, as always) and snapshots.
+
 ## White-balance picker
 
 The Adjust pane has a **Pick White Balance (W)** button (above Temperature). Arm it, click something that should be gray, and Temperature and Tint are set so that spot becomes neutral. It adds no new kind of data: it sets two ordinary sliders.

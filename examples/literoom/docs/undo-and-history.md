@@ -15,15 +15,17 @@ The edit state is everything needed to reproduce the picture from the original:
 
 A picture's **rating, flag and color label** are not edits either. They are kept beside the edit state (see [sidecar-format.md](sidecar-format.md#rating-flag-color-label-and-the-filmstrip-filter)), have no undo step and no History label, and never bump `version()`.
 
+**Named snapshots** are not edits either: they are kept beside the edit state, saved in the sidecar, and adding or deleting one has no undo step. Restoring one *is* an edit (see [Named snapshots](#named-snapshots)).
+
 A **preset** is not another kind of edit. It is a way of setting the first four groups (sliders, curves, Color Mixer, Color Grading) in one go; see [Presets](#presets) below.
 
 ## Snapshots
 
-The history is a list of **snapshots**, each a complete copy of the edit state above. Undo and redo move an index along that list and restore the snapshot there.
+The history is a list of **snapshots**, each a complete copy of the edit state above. (These are internal and unnamed, one per undo step. Do not confuse them with the user's [named snapshots](#named-snapshots), which are saved in the sidecar.) Undo and redo move an index along that list and restore the snapshot there.
 
 Why whole copies rather than "deltas"? It is simple and robust: restoring a step is a plain assignment, and nothing can drift out of sync. Object bitmaps, the largest items, are immutable and shared by pointer (and compared by an id), so copying a mask list does not copy them.
 
-- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)) a white-balance pick (see [White balance picker](#white-balance-picker)) and an Auto Tone (see [Auto Tone](#auto-tone)). It is not part of the edit state: it is never compared with another snapshot and never restored.
+- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)), a white-balance pick (see [White balance picker](#white-balance-picker)), an Auto Tone (see [Auto Tone](#auto-tone)) and a snapshot restore (see [Named snapshots](#named-snapshots)). It is not part of the edit state: it is never compared with another snapshot and never restored.
 - Up to **200** steps can be undone (`kMaxUndoSteps`). Older ones are dropped as new edits arrive.
 - A new edit after an undo **discards the redo tail**, like most editors.
 - Opening a picture (`reset()`) or loading saved edits (`loadJson()`) starts a fresh history containing only the starting state. **The history itself is not saved to disk.**
@@ -72,6 +74,7 @@ Where the UI *does* know a gesture ended, it says so: `endCurveEdit()`, `endGrad
 | `setWhiteBalance(temp, tint)` | Always its own step, and it ends any drag in progress. Sets Temperature and Tint together; see [White balance picker](#white-balance-picker). |
 | `setAutoTone(exp, contrast, whites, blacks)` | Always its own step, and it ends any drag in progress. Sets Exposure, Contrast, Whites and Blacks together; see [Auto Tone](#auto-tone). |
 | `applyPreset(preset)` | Always its own step, and it ends any drag in progress. Replaces the sliders, curves, Color Mixer and Color Grading together; see [Presets](#presets). |
+| `restoreEdits(edits, name)` | Always its own step, and it ends any drag in progress. Replaces **everything** (sliders, curves, Mixer, grading, crop, orientation, angle, corner mode and masks); see [Named snapshots](#named-snapshots). |
 
 All of them except `set` skip the step if nothing actually changed (the new value compares equal to the old), so no-op edits never clutter the history. `set(id, value)` has no such check: a call with an unchanged value still overwrites the current step (same slider) or appends a new one (a different control), and it still bumps `version()`.
 
@@ -79,7 +82,7 @@ All of them except `set` skip the step if nothing actually changed (the new valu
 
 Labels are not stored with the steps. Instead, each step is **described by comparing it with the step before it** (`describeStep`). This has two benefits: the setters need to know nothing about labels, and a coalesced drag that overwrites a step can never leave a stale label behind.
 
-`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step, a white-balance pick and an Auto Tone have one), that text is the label and nothing is diffed. Otherwise it checks, in order: global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
+`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step, a white-balance pick, an Auto Tone and a snapshot restore have one), that text is the label and nothing is diffed. Otherwise it checks, in order: global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
 
 The per-mask labels are `Mask <n>: ` followed by `Rename`, a slider and its value ("Mask 2: Exposure +30"), `Amount <n>`, `Color Mix`, `Color Grading`, `Curve`, `On` / `Off`, `Invert`, `Parts` (a part was added or removed), or `Edit`. A change to a shape itself (feather, radius, a brush stroke, an object selection) has no label of its own and shows as `Mask <n>: Edit`.
 
@@ -142,6 +145,26 @@ The Adjust pane's **Auto Tone** button sets four sliders from one press, so like
 
 It is a normal edit afterwards: it bumps `version()`, is autosaved to the sidecar, and travels with Copy / Paste Settings, presets and Sync Settings, because those carry slider values.
 
+## Named snapshots
+
+A **named snapshot** is a saved, named copy of the whole edit state (a `SidecarEdits`: sliders, curves, Color Mixer, Color Grading, crop, orientation, straighten angle, corner mode **and masks**). It is the user-facing cousin of the history's internal snapshots, and it is stored differently: not in the undo history but in the picture's sidecar (see [sidecar-format.md](sidecar-format.md#named-snapshots)), so it survives closing the picture. The list itself lives in `main.cpp` (`state.snapshots`), not in `AdjustmentSet`, for the same reason a rating does: it is not an edit.
+
+`AdjustmentSet` has two calls for them:
+
+- `currentEdits()` returns the whole edit state as a plain `SidecarEdits`. It is what `toJson()` writes and what *Save snapshot* stores. It does not change the history or `version()`.
+- `restoreEdits(edits, name)` puts the picture back as `edits` describes it.
+
+How `restoreEdits` fits the history:
+
+- **One step.** However much it changes, undo puts all of it back, including geometry and masks.
+- **Replaces everything.** Unlike `applyPreset`, which leaves crop, orientation, angle and masks alone, a restore sets those too: "this picture exactly as it was". Slider values are sanitized again (clamped, NaN becomes 0); the rest is taken as given, so `edits` must come from `currentEdits()` or from `sidecarSnapshotsFromJson`, which already checked the crop against the picture's size.
+- **Always its own step.** It goes through the same "start a new step" path as a preset or a crop, so it ends any drag in progress. The next slider touch starts a new step instead of overwriting the restore.
+- **No-op restores add nothing.** If the picture already looks exactly like `edits`, it returns false, adds no step and does not bump `version()`.
+- **Its own label.** `Snapshot: <name>` (the name cleaned again), or `Snapshot` for a blank one. Like a preset's label it is stored in the history step, so it survives undo, redo and History jumps. It is not saved: the sidecar stores the restored edits, not where they came from.
+- **The picture must be refreshed.** Because geometry can change, the caller does what it does after an undo: `applySnapshotEntry` calls `updateImageFromAdjustments()`, which also hands a crop or rotation change to the geometry worker, and sets its status message afterwards (that function clears the status).
+
+Adding or deleting a snapshot only changes `state.snapshots` and sets `state.snapshotsDirty`, so autosave writes the sidecar. It adds no step, no History label and no `version()` bump. The snapshot list is replaced when another picture (or another virtual copy) is opened.
+
 ## The version counter
 
 `version()` increases on every change to the edit state (an edit, undo, redo, reset). The app compares it with its value at the last save or load to decide whether the saved-edits file is stale, and uses it to invalidate the label cache. It is not part of the undo history.
@@ -154,5 +177,6 @@ After an undo, redo or a jump in the History panel, `lastEdited_` is cleared. Ot
 
 - Saving and loading: [sidecar-format.md](sidecar-format.md).
 - Preset files and helpers: [headers.md](headers.md#presethpp).
+- Where named snapshots are stored: [sidecar-format.md](sidecar-format.md#named-snapshots).
 - Putting a look into other pictures' sidecars: [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
 - How an edit becomes pixels: [architecture.md](architecture.md).

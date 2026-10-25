@@ -52,6 +52,12 @@ This is also why the editor never edits images in place: a render job holds a po
 
 The first four and Sync are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
 
+### Virtual copies and the workers
+
+A virtual copy is another set of edits for the same file, identified by a path with a `|vc<n>` marker (see [sidecar-format.md](sidecar-format.md#virtual-copies)). Workers see only that string, so the rule is: **a worker that needs the real file calls `vcImageOf(path)` first.** The decode worker does (`runDecodeJob`), as does the Sync batch when it must learn a picture's size. The thumbnail worker skips decoding for copies altogether (see below), and the other workers never touch files.
+
+Switching between copies of the picture that is already open needs **no decode**: `filmOpenIndex` invalidates the decode worker (a decode of some other file is no longer wanted) and calls `adoptDecoded` directly with a copy of `state.original`, so the usual consequences follow synchronously: the old copy's edits are saved, the render, geometry and segmentation workers are invalidated, and `imageSerial` is bumped. This is safe because the editor never edits images in place and `state.original` is the untouched decoded picture.
+
 ### The geometry worker rebuilds everything
 
 A render job can start from `source`, because the source has not changed. A geometry job might be *changing* the source, so it always rebuilds the entire chain from `original`. That wastes some work (an unchanged straighten is redone when only the crop moved), but it keeps a job a pure function of its inputs with nothing that can drift out of sync, and the cost is only latency on a background thread, never a frozen window.
@@ -69,6 +75,7 @@ Thumbnails are a different kind of work: you want *all* of them, not just the ne
 - Results accumulate until `collect()` drains them.
 - Like `LatestWorker`, `setNotify()` must be called before the first `setQueue()`.
 - For each file it also reads the saved-edits sidecar (up to 64 MiB, like the editor): whether it holds real edits is what puts the dot on a thumbnail, and the rating, flag and color label in it are what the filmstrip filter uses. A picture that can't be decoded still gets those.
+- **A virtual copy is read for its sidecar only.** Its path carries the `|vc<n>` marker (see [sidecar-format.md](sidecar-format.md#virtual-copies)), so `sidecarFileOf` finds the copy's own file. The worker never decodes it (`Result::thumbSkipped`), because it shows the same picture as its original: `collectThumbJobs` hands the original's raw thumbnail to the copies that follow it, and a failed original is the only failure that counts. A copy that is opened and left gets its own thumbnail like any picture.
 
 ### The sync worker is a batch that is never superseded
 
@@ -80,6 +87,7 @@ It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not
 - **A second sync is refused while one is outstanding**, and `syncBusy()` also makes opening a picture (File > Open, a filmstrip click, the arrow keys) or a folder wait ("Wait for the sync to finish"). Nothing reads a sidecar that is about to be replaced.
 - **The open picture is never in the batch.** Its edits live in memory and autosave writes its sidecar; syncing onto it would race with that. It is the *source* of the look, copied on the UI thread by `currentPreset()` when the job is built, so the job holds a plain value and never touches `state`.
 - **Writes are temp-file-then-rename**, as in `saveSidecar`, so a crash or a full disk cannot leave half a sidecar.
+- **Snapshots and copies.** The job rewrites a sidecar through `sidecarReadForRewrite` and `sidecarFileText`, so the picture's named snapshots are carried through unchanged. A selected virtual copy is just another path: its own sidecar is rewritten. The open picture is never in the batch, but its original and its other copies can be, since they are different files.
 - **The same worker does batch ratings.** When pictures are selected, a rating / flag / color label command changes the open picture on the UI thread and submits a `metaOnly` job for the other selected pictures: `sidecarPatchMeta` instead of `sidecarSyncLook`, with the same refusals and the same one-batch-at-a-time rule. Its outcomes carry each picture's new meta, so `collectSyncJob()` updates the strip's entries (and sets no "has edits" dot).
 - `collectSyncJob()` runs once per frame from `flushPendingAdjust`. It sets the "has edits" dot on each synced picture and shows "Synced N" or "Synced N, skipped M (file: reason)" in the status bar.
 

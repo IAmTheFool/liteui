@@ -1,6 +1,6 @@
 # Saved edits (the sidecar file)
 
-Literoom never modifies your photo. Your edits live in a small JSON file next to it, called a **sidecar**. For `photo.jpg` the sidecar is `photo.jpg.literoom.json`.
+Literoom never modifies your photo. Your edits live in a small JSON file next to it, called a **sidecar**. For `photo.jpg` the sidecar is `photo.jpg.literoom.json`. A picture can have more than one: each [virtual copy](#virtual-copies) is another set of edits for the same file, with its own sidecar, `photo.jpg.vc2.literoom.json`.
 
 This page describes what is in that file, when it is written and read, and how loading protects the editor from damaged or hand-edited files.
 
@@ -13,6 +13,8 @@ This page describes what is in that file, when it is written and read, and how l
 | File handling and the top-level wrapper (`app`, `version`, `image`): when to save, the temp-file-and-rename write, the version, size and picture-size checks on load | `main.cpp`, next to `openImage` (`saveSidecar`, `loadSidecar`, `autosaveSidecar`, `flushSidecar`) |
 | `AdjustmentSet::toJson()` / `loadJson()` | `adjustment_set.hpp` (thin wrappers around `sidecar.hpp`) |
 | Rating, flag and color label (the `meta` object) and the filmstrip filter | `photo_meta.hpp` (values, JSON, `MetaFilter`); `sidecarFileText`, `sidecarMetaFromRoot` and `sidecarScan` in `sidecar.hpp`; the commands (`ratePhoto`, `flagPhoto`, `labelPhoto`) and the filter bar in `main.cpp` |
+| **Named snapshots** (the `snapshots` array, see [below](#named-snapshots)) | `NamedSnapshot`, `SnapshotList`, `sidecarSnapshotsToJson` / `FromJson` and `sanitizeSnapshotName` in `sidecar.hpp`; `AdjustmentSet::currentEdits()` / `restoreEdits()` in `adjustment_set.hpp`; the pane and its commands (`addSnapshot`, `applySnapshotEntry`, `deleteSelectedSnapshot`) in `main.cpp` |
+| **Virtual copies** (more sidecars for one picture, see [below](#virtual-copies)) | `virtual_copy.hpp` (the path marker, the file-name rules, the folder scan); `sidecarFileOf` in `sidecar.hpp`; `createVirtualCopy`, `deleteVirtualCopy` and the filmstrip code in `main.cpp` |
 | The separate **preset** file (a saved look, see [Presets](#presets-a-related-file) below) | `preset.hpp`, which reuses the readers and writers in `sidecar.hpp` |
 | Putting a look into **another picture's** sidecar without opening it (Sync Settings, see [below](#syncing-a-look-onto-other-pictures)) | `sidecarSyncLook` in `sidecar.hpp`; the file reading, atomic write and worker are in `main.cpp` (`readSidecarText`, `writeTextAtomic`, `runSyncJob`) |
 
@@ -26,13 +28,16 @@ The top level wraps the edits with a little information about the picture:
   "version": 1,
   "image": { "name": "photo.jpg", "width": 6000, "height": 4000 },
   "meta": { "rating": 4, "flag": "pick", "label": "red" },
-  "edits": { ... }
+  "edits": { ... },
+  "snapshots": [ { "name": "Golden hour", "edits": { ... } } ]
 }
 ```
 
 `image.width` and `image.height` are the size of the **original** picture. They are how a sidecar written for a different-sized picture is detected and ignored. `image.name` is informational only and is never compared. `version` is `kSidecarVersion`: a file with a higher (or a missing) version is ignored.
 
 `meta` is the picture's **rating, flag and color label**. It is optional and written only when something differs from the default, so a picture that was never rated has no `meta` key. These are **not edits**: they have no undo step and no History label, they sit beside `edits` rather than inside it, and Sync Settings leaves them alone. Fields (each left out at its default): `rating` 1 to 5, `flag` `"pick"` or `"reject"`, `label` one of `"red"`, `"yellow"`, `"green"`, `"blue"`, `"purple"`. Loading clamps a rating into 0 to 5 and turns anything it doesn't recognize (a non-number rating, an unknown flag or color name) into "none"; a `meta` that isn't an object is ignored. Adding it needed no `kSidecarVersion` bump: an older build ignores the key and, when it next saves that picture, writes the file without it.
+
+`snapshots` is the picture's **named snapshots**, each a name and a complete copy of the edits (see [Named snapshots](#named-snapshots)). It is optional and written only when there is at least one, after `edits`, so a picture without snapshots has exactly the layout it had before they existed. Like `meta` it needed no `kSidecarVersion` bump, and an older build drops it the next time it saves that picture.
 
 Inside `edits`:
 
@@ -71,7 +76,7 @@ Brush strokes and object-selection bitmaps are saved too. A photo with many stro
 
 ## When it is written and read
 
-- **Written** after any change (once no mouse drag is in progress; applying a preset counts as a change, and so does changing the rating, flag or color label), when another picture replaces this one, and when the app closes.
+- **Written** after any change (once no mouse drag is in progress; applying a preset counts as a change, and so does changing the rating, flag or color label, or adding or deleting a snapshot), when another picture replaces this one, and when the app closes.
 - **Written safely:** to a temporary file first, then renamed over the real one, so a crash can never leave half a file.
 - **If saving fails** (a read-only folder, for example) the status bar says "Couldn't save edits...". The change still counts as seen, so a failing disk is not retried every frame, only on the next edit. After a successful save of **edits** the picture's thumbnail in the filmstrip gets its "has edits" dot; a save that only records a rating, flag or color label does not set it.
 - **Written for other pictures** by Sync Settings, and by a batch rating when pictures are selected: the sidecars of the pictures selected in the filmstrip are rewritten in the background (see [below](#syncing-a-look-onto-other-pictures)). The open picture is never one of them.
@@ -90,6 +95,7 @@ A sidecar can be damaged, hand-edited, written by a newer version, or written fo
 - At most 8 masks are read (`kMaxMasks`) and at most 6 parts per mask (`kMaxMaskParts`). Further ones are ignored. A mask with no valid part is dropped.
 - Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped.
 - Object masks are limited: at most 256 prompts per selection, and a stored bitmap must be 1 to 16,384 pixels on each side, no more than about 67 million pixels in total (`kSidecarMaxMapPixels`), and decode to exactly `w × h` bytes.
+- **Snapshots never make a file bad.** `snapshots` that isn't an array gives none. Each entry is skipped if it isn't an object or its `edits` can't be loaded, and each one that is kept goes through `sidecarEditsFromJson` like the live edits (sliders clamped, the crop checked against the picture's size, at most 8 masks, and so on). At most `kMaxSnapshots` (20) are kept, and the name is cleaned (printable ASCII, trimmed, at most 32 characters; a blank one becomes `Snapshot`).
 
 ## Details of the JSON code
 
@@ -142,6 +148,7 @@ Things that differ from a sidecar:
 - **A sidecar exists:** its recorded `image.width` and `image.height` are used, so no decode is needed. The file is read through `sidecarEditsFromJson`, **only the four look groups are replaced**, and the whole thing is written back through `sidecarEditsToJson`. The picture's own crop, rotation, straighten angle and masks are kept, so a crop that suits one photo is never pushed onto another.
 - **A file that can't be trusted is never overwritten.** The picture is *skipped*, and the status bar says why, when the file is not valid JSON or not an object, is from a newer version (or has none), has no picture size, was written for a different size than the one given, or has an `edits` part that can't be loaded. The edits in such a file might still be recoverable by hand, so syncing leaves it alone.
 - The picture's own `meta` (rating, flag, color label) is read from the old file and written back unchanged: syncing a look never changes how a picture is rated. A picture with no `meta` stays without one.
+- The picture's own **snapshots** are read and written back as well, each keeping the look it captured: syncing a look changes the picture's current edits, never its saved snapshots. A picture with none stays without any.
 - The rewritten file is validated and clamped by the same loader as an opened one. That is what keeps a hand-edited sidecar from carrying bad values across a sync.
 
 The result is the same file the app would write if you had opened the picture, applied the look and closed it, except that there is no undo step: the picture's history is not saved, and it starts fresh when the picture is next opened. Syncing the same look twice produces an identical file. Thumbnails of synced pictures get the "has edits" dot at once, but, as for any picture that is not open, they show the look only after the picture has been opened and left.
@@ -165,12 +172,60 @@ What the user sees (all in `main.cpp`, on top of `photo_meta.hpp`):
 
 How the strip learns each picture's rating: the thumbnail worker reads each picture's sidecar after its thumbnail (`sidecarScan`), and returns `edited` and `meta` in the same result. So a folder's ratings arrive as its thumbnails do, nearest to the open picture first; while a filter is on and some pictures are still unread the bar says "reading ratings...". Only the first reading of a picture counts (`FilmEntry::scanned`); after that the editor's own value is the truth. `edited` is now false for a file that holds only a rating (its `edits` are exactly the neutral ones); a file that can't be read, or has no `edits`, still counts as edited as before.
 
+## Named snapshots
+
+A **snapshot** is a named copy of every edit on one picture: the look, curves, Color Mixer, Color Grading, crop, rotation, straighten angle, corner mode **and all masks** (brush strokes and object bitmaps included). Restoring one puts the picture back exactly as it was. That is what separates it from a preset, which holds the look only and never touches geometry or masks.
+
+```json
+"snapshots": [
+  { "name": "Golden hour", "edits": { "adjust": { ... }, "geometry": { ... }, "masks": [ ... ] } },
+  { "name": "Black and white", "edits": { ... } }
+]
+```
+
+Each `edits` object is **exactly** the form of the top-level `edits`: the snapshot is a `SidecarEdits` plus a name, written by `sidecarEditsToJson` and read by `sidecarEditsFromJson`. So a new slider, mask type or other field of the edits is saved in snapshots with no extra code. Things to know:
+
+- **Not edits.** Like `meta`, snapshots sit beside `edits`. Adding or deleting one has no undo step and no History label. *Restoring* one is an ordinary edit: one undo step, labelled `Snapshot: <name>` (see [undo-and-history.md](undo-and-history.md#named-snapshots)).
+- **Limits.** At most 20 per picture (`kMaxSnapshots`). A snapshot repeats every mask, and an object mask carries its bitmap, so the list is also capped at 24 MiB of JSON (`kSnapshotsMaxBytes`); the app refuses to add one past that. The whole sidecar is still read only up to 64 MiB.
+- **Written with everything else.** `state.snapshotsDirty` is what makes autosave and `flushSidecar` write when only the list changed. Every writer of a whole sidecar passes the snapshots to `sidecarFileText`: the app's save, `sidecarSyncLook` and `sidecarPatchMeta` (which read them back through `sidecarReadForRewrite`). Names need not be unique.
+- **The "has edits" dot ignores them.** A picture whose current edits are neutral is not marked edited just because it has snapshots (`sidecarScan` looks at `edits` only).
+- **Per picture, and per virtual copy.** A copy has its own sidecar, so its own snapshots. A new copy starts with none.
+
+The Snapshots pane (activity 11, `S`) has a name field, a **Save snapshot** button (Enter also saves), a list (click a row to restore it) and **Delete selected snapshot**. A blank name becomes `Snapshot 1`, `Snapshot 2`, and so on.
+
+## Virtual copies
+
+A **virtual copy** is another set of edits for the same picture file, so one photo can have, say, a color and a black-and-white version without a second file. A copy is only a sidecar, a few kilobytes:
+
+```
+photo.jpg                      the picture
+photo.jpg.literoom.json        the original's edits
+photo.jpg.vc1.literoom.json    virtual copy 1
+photo.jpg.vc2.literoom.json    virtual copy 2   (copies 1 to 9; kMaxVirtualCopies)
+```
+
+A copy's sidecar is an ordinary sidecar (same wrapper, same `edits`, its own `meta` and `snapshots`), so everything on this page applies to it. `image.name` holds the real picture's name. There is no list of copies anywhere: they are found by scanning the folder for names of the form `<picture>.vc<n>.literoom.json` (`listVirtualCopies`) when the filmstrip is built. A copy whose picture isn't in the strip is not shown, and its file is left alone.
+
+**One string identifies a picture in the program**, its path (the filmstrip's name index, thumbnail and sync results, the open picture). A copy gets its own path by appending a marker that no file name can contain: `/photos/photo.jpg|vc2`. Everything that keys on the path then tells copies apart for free. The few places that need the real file call `vcImageOf()` first: decoding, EXIF, the Sync worker's size lookup, the export's metadata copy. `sidecarFileOf()` understands the marker and returns the copy's own file name. See [headers.md](headers.md#virtual_copyhpp).
+
+How the UI treats them (`main.cpp`):
+
+- **Image > Create Virtual Copy** (Ctrl+Shift+N) writes a new sidecar holding the open picture's *current* edits (not its snapshots or rating), puts a cell after the picture's (badge `C2`), and opens it. The lowest free number is used. A tenth copy is refused.
+- **Switching is instant.** Opening another copy of the picture already on screen reuses its pixels (`filmOpenIndex` hands `adoptDecoded` a copy of `state.original`) instead of decoding the file again. Everything else is the normal open: the old copy's edits are saved first, workers are invalidated, the new copy's sidecar is loaded.
+- **Image > Delete Virtual Copy** (choose it twice) deletes the open copy's sidecar and returns to the original. The picture and its other copies are untouched. The original cannot be deleted this way.
+- **Each copy has its own rating, flag, color label and "has edits" dot**, read from its own sidecar by the thumbnail worker. The worker does not decode a copy; a copy's thumbnail is its original's until the copy has been opened and left.
+- **Sync Settings and batch ratings** treat a selected copy as any other picture: its own sidecar is rewritten. The open copy is never in the batch, but the original and the other copies are.
+- **Export** names the file `<picture>-copy2-edit.jpg` by default and copies the real picture's metadata.
+- **Limits of the design.** Renaming or deleting the picture in a file manager leaves its `.vc` files behind (they simply stop being shown). A copy's sidecar is checked against the picture's size like any other.
+
 ## Changing the format
 
 - `kSidecarVersion` (currently 1) is written to every file by `saveSidecar` and checked by `loadSidecar`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
 - The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values in sidecars **and in saved presets** (see [extending.md](extending.md)).
 - Adding a field is safe if the loader gives it a default and clamps it.
-- **Every code path that rewrites a whole sidecar must go through `sidecarFileText`** (the app's own save and `sidecarSyncLook` do). It writes the wrapper, `meta` included, in one place, so a new top-level key added there can't be dropped by one writer and kept by another.
+- **Every code path that rewrites a whole sidecar must go through `sidecarFileText`** (the app's own save, `sidecarSyncLook` and `sidecarPatchMeta` do). It writes the wrapper, `meta` and `snapshots` included, in one place, so a new top-level key added there can't be dropped by one writer and kept by another. A rewriter of *another* picture's file must also read the new key back in `sidecarReadForRewrite` and pass it to `sidecarFileText`, as it does for `meta` and `snapshots`.
 - **Every field must be written by `sidecarEditsToJson` and read by `sidecarEditsFromJson`.** Sync Settings reloads a picture's sidecar and writes it back, so a field that only the app's own code kept (and the loader dropped) would be lost from every picture it syncs onto.
-- A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`. Presets do not store masks, so they need no change.
+- A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`. Presets do not store masks, so they need no change. Snapshots store whole edits, masks included, so they pick the new type up from those two functions.
+- A new field of `SidecarEdits` is saved in snapshots automatically, but `AdjustmentSet::currentEdits()` and `restoreEdits()` must handle it too (see [extending.md](extending.md#two-things-to-watch)).
+- The copy marker (`|vc`) and the `.vc<n>` part of the file name are part of the format now: changing either orphans existing virtual copies.
 - A change to the slider, curve, Mixer or grading forms reaches presets too, because they share the same functions. Presets have their own `kPresetVersion`; bump it only for a change an older reader could not handle safely.

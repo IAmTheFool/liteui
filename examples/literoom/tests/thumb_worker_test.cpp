@@ -415,6 +415,37 @@ static void testMetaAndRealEdits()
   }
 }
 
+static void testVirtualCopy()
+{ // a virtual copy is read for its sidecar only: no decode, so no thumbnail and
+  // no "failed"; its picture is decoded once, for the picture's own entry
+  TempDir td;
+  const std::string pic = td.path("v.png"), copy2 = vcPath(pic, 2),
+                    orphan = vcPath(td.path("none.png"), 1); // its picture doesn't even exist
+  CHECK(writePng(pic, 30, 20));
+  SidecarEdits e;
+  e.values[static_cast<size_t>(AdjId::Exposure)] = 10.0f;
+  const PhotoMeta mCopy{3, PhotoFlag::Pick, 2};
+  writeSidecar(pic, SidecarEdits{}, PhotoMeta{});
+  writeSidecar(copy2, e, mCopy);
+  CHECK(sidecarFileOf(copy2) == td.path("v.png.vc2.literoom.json"));
+  Latch notified;
+  ThumbWorker w(orientFromExif);
+  w.setNotify([&] { notified.signal(); });
+  w.setQueue({pic, copy2, orphan});
+  CHECK(notified.waitFor(3));
+  w.shutdown();
+  auto got = w.collect();
+  CHECK(got.size() == 3);
+  if (got.size() == 3)
+  {
+    CHECK(got[0].path == pic && got[0].thumb && !got[0].thumbSkipped && !got[0].edited);
+    CHECK(got[1].path == copy2 && !got[1].thumb && got[1].thumbSkipped);
+    CHECK(got[1].edited && got[1].meta == mCopy); // read from the copy's own file
+    CHECK(got[2].path == orphan && !got[2].thumb && got[2].thumbSkipped);
+    CHECK(!got[2].edited && got[2].meta.isDefault());
+  }
+}
+
 static void testMetaOfUndecodablePicture()
 { // the rating comes from the sidecar, so it is delivered even if the picture can't be decoded
   TempDir td;
@@ -538,6 +569,7 @@ int main()
   testEditedFlag();
   testMetaAndRealEdits();
   testMetaOfUndecodablePicture();
+  testVirtualCopy();
   testExifOrientation();
   testShutdown();
   return finish();

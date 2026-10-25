@@ -252,11 +252,13 @@ public:
 
   // Everything the user has done, as JSON for the sidecar file (the undo
   // history is not included).
-  mj::Json toJson() const
+  mj::Json toJson() const { return sidecarEditsToJson(currentEdits()); }
+  // The whole edit state as a plain value: what toJson writes, and what a named
+  // snapshot stores. Does not touch the history or version().
+  SidecarEdits currentEdits() const
   {
-    SidecarEdits e{values_, crop_, orient_, angle_, expand_,
-                   curves_, mix_, grade_, masks_};
-    return sidecarEditsToJson(e);
+    return SidecarEdits{values_, crop_, orient_, angle_, expand_,
+                        curves_, mix_, grade_, masks_};
   }
   // Replaces every edit with the saved ones in `j` (call after reset() and
   // setOriginalSize()); undo history restarts from them. False, with nothing
@@ -344,6 +346,44 @@ public:
     pushStep();
     const std::string n = sanitizePresetName(p.name);
     history_.back().label = n.empty() ? std::string("Preset") : "Preset: " + n;
+    return true;
+  }
+
+  // ---- Named snapshots ----
+  // Puts the picture back exactly as `e` describes it (every slider, curve, the
+  // Mixer, Color Grading, crop, rotation, straighten, corner mode and all masks)
+  // as ONE undo step labelled "Snapshot: <name>" (or "Snapshot" for a blank
+  // name). Unlike applyPreset this replaces the geometry and the masks too, so
+  // the caller must refresh the picture the way it does after an undo. Returns
+  // false, adding no step, if the picture already looks exactly like `e`.
+  // Slider values are sanitized again; everything else is taken as given, so `e`
+  // must come from currentEdits() or sidecarSnapshotsFromJson (which checks the
+  // crop against the picture's size). Ends any drag in progress, like
+  // applyPreset.
+  bool restoreEdits(const SidecarEdits &e, const std::string &name)
+  {
+    AdjValues v = e.values;
+    for (const auto &spec : kAdjustmentSpecs)
+    {
+      const size_t k = static_cast<size_t>(spec.id);
+      v[k] = sanitizedValue(spec, v[k]);
+    }
+    if (v == values_ && e.crop == crop_ && e.orient == orient_ &&
+        e.angle == angle_ && e.expand == expand_ && e.curves == curves_ &&
+        e.mix == mix_ && e.grade == grade_ && e.masks == masks_)
+      return false;
+    values_ = v;
+    crop_ = e.crop;
+    orient_ = e.orient;
+    angle_ = e.angle;
+    expand_ = e.expand;
+    curves_ = e.curves;
+    mix_ = e.mix;
+    grade_ = e.grade;
+    masks_ = e.masks;
+    pushStep();
+    const std::string n = sanitizeSnapshotName(name);
+    history_.back().label = n.empty() ? std::string("Snapshot") : "Snapshot: " + n;
     return true;
   }
 
@@ -531,7 +571,7 @@ private:
     ColorGrade grade;
     MaskSet masks;
     // Non-empty only for steps that carry their own History label (a preset,
-    // a white-balance pick, an Auto Tone);
+    // a white-balance pick, an Auto Tone, a snapshot restore);
     // every other step is labelled by diffing it against the one before.
     std::string label;
   };

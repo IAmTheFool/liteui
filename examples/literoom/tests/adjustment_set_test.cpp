@@ -724,6 +724,74 @@ static void testAutoTonePick()
   CHECK(r.get(AdjId::Blacks) == s.get(AdjId::Blacks) && r.historySize() == 1);
 }
 
+static void testSnapshotRestore()
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 20.0f);
+  s.setCrop(CropRect{10, 10, 100, 80});
+  MaskSet ms;
+  ms.push_back(radialMask());
+  s.setMasks(ms, -1);
+  const SidecarEdits saved = s.currentEdits();
+  CHECK(sidecarEditsToJson(saved).dump() == s.toJson().dump()); // toJson is currentEdits
+
+  // Change everything the snapshot holds.
+  s.set(AdjId::Exposure, -30.0f);
+  s.setCrop(CropRect{});
+  s.setMasks(MaskSet{}, -1);
+  const size_t n = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One step, with its own label; geometry and masks come back too.
+  CHECK(s.restoreEdits(saved, "Golden"));
+  CHECK(s.historySize() == n + 1 && lastLabel(s) == "Snapshot: Golden");
+  CHECK(s.get(AdjId::Exposure) == 20.0f && s.crop() == CropRect{10, 10, 100, 80});
+  CHECK(s.masks().size() == 1 && s.version() != v0);
+  CHECK(sidecarEditsToJson(s.currentEdits()).dump() == sidecarEditsToJson(saved).dump());
+
+  // Undo puts all of it back in one press; redo restores it, label included.
+  s.undo();
+  CHECK(s.get(AdjId::Exposure) == -30.0f && s.crop().empty() && s.masks().empty());
+  s.redo();
+  CHECK(s.get(AdjId::Exposure) == 20.0f && s.masks().size() == 1);
+  CHECK(lastLabel(s) == "Snapshot: Golden");
+
+  // The same state again is a no-op: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK(!s.restoreEdits(saved, "Golden") && s.historySize() == n + 1 && s.version() == v1);
+
+  // The next slider touch is its own step, not folded into the restore step.
+  s.set(AdjId::Exposure, 21.0f);
+  CHECK(s.historySize() == n + 2 && label(s, n) == "Snapshot: Golden" && lastLabel(s) == "Exposure +21");
+
+  // Names are sanitized; a blank one is just "Snapshot".
+  AdjustmentSet t;
+  fresh(t);
+  CHECK(t.restoreEdits(saved, "  a\x01" "b  ") && lastLabel(t) == "Snapshot: ab");
+  AdjustmentSet u;
+  fresh(u);
+  CHECK(u.restoreEdits(saved, "   ") && lastLabel(u) == "Snapshot");
+
+  // A hand-built value is sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  SidecarEdits wild = saved;
+  wild.values[static_cast<size_t>(AdjId::Exposure)] = 1e9f;
+  wild.values[static_cast<size_t>(AdjId::Contrast)] = std::nanf("");
+  CHECK(h.restoreEdits(wild, "wild"));
+  CHECK(h.get(AdjId::Exposure) == 100.0f && h.get(AdjId::Contrast) == 0.0f);
+
+  // Restoring onto an untouched picture and saving gives the snapshot's edits.
+  AdjustmentSet r;
+  fresh(r);
+  CHECK(r.restoreEdits(saved, "x"));
+  CHECK(r.toJson().dump() == sidecarEditsToJson(saved).dump());
+  AdjustmentSet z;
+  fresh(z);
+  CHECK(!z.restoreEdits(SidecarEdits{}, "neutral") && z.historySize() == 1); // already neutral
+}
+
 int main()
 {
   testFreshState();
@@ -743,5 +811,6 @@ int main()
   testPresets();
   testWhiteBalancePick();
   testAutoTonePick();
+  testSnapshotRestore();
   return finish();
 }

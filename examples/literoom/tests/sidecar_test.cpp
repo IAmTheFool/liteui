@@ -821,6 +821,215 @@ static void testPatchMeta()
   }
 }
 
+// ------------------------------------------------------------ named snapshots
+static SnapshotList twoSnapshots()
+{
+  SnapshotList l;
+  l.push_back({"Golden hour", rich()});
+  SidecarEdits plain;
+  plain.values[static_cast<size_t>(AdjId::Exposure)] = 15.0f;
+  l.push_back({"Plain", plain});
+  return l;
+}
+
+static std::string snapFile(const SidecarEdits &e, const PhotoMeta &m,
+                            const SnapshotList &l, int w = 400, int h = 300)
+{
+  return sidecarFileText("a.jpg", w, h, sidecarEditsToJson(e), m, l);
+}
+
+static SnapshotList snapsOf(const std::string &text, int w = 400, int h = 300)
+{
+  Json root;
+  std::string err;
+  if (!Json::parse(text, &root, &err) || !root.isObject())
+    return {};
+  return sidecarSnapshotsFromJson(root.find("snapshots"), w, h);
+}
+
+static bool sameSnapshots(const SnapshotList &a, const SnapshotList &b)
+{
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i].name != b[i].name ||
+        sidecarEditsToJson(a[i].edits).dump() != sidecarEditsToJson(b[i].edits).dump())
+      return false;
+  return true;
+}
+
+static void testSnapshots()
+{
+  const PhotoMeta rated{4, PhotoFlag::Pick, 3};
+  const SnapshotList l = twoSnapshots();
+
+  { // names: printable ASCII, trimmed, capped; blank falls back to "Snapshot"
+    CHECK(sanitizeSnapshotName("  Day\x01 one  ") == "Day one");
+    CHECK(sanitizeSnapshotName("caf\xC3\xA9") == "caf"); // non-ASCII bytes are dropped
+    CHECK(sanitizeSnapshotName("   ").empty());
+    CHECK(sanitizeSnapshotName(std::string(40, 'a')).size() == kSnapshotNameMax);
+    // a cut that lands after a space leaves no trailing space
+    CHECK(sanitizeSnapshotName(std::string(kSnapshotNameMax - 1, 'a') + " b") ==
+          std::string(kSnapshotNameMax - 1, 'a'));
+    CHECK(snapshotNameOrDefault("  ") == "Snapshot" && snapshotNameOrDefault("x") == "x");
+  }
+
+  { // layout: nothing without snapshots (the old layout, byte for byte);
+    // with them, "snapshots" comes after "edits"
+    CHECK(snapFile(rich(), PhotoMeta{}, SnapshotList{}) == fileText(rich(), 400, 300));
+    CHECK(sidecarFileText("a.jpg", 400, 300, sidecarEditsToJson(rich()), rated) ==
+          snapFile(rich(), rated, SnapshotList{}));
+    const std::string with = snapFile(rich(), rated, l);
+    const size_t pm = with.find("\"meta\""), pe = with.find("\"edits\""),
+                 ps = with.find("\"snapshots\"");
+    CHECK(pm != std::string::npos && pe != std::string::npos && ps != std::string::npos);
+    CHECK(pm < pe && pe < ps);
+    CHECK(snapFile(rich(), PhotoMeta{}, SnapshotList{}).find("snapshots") == std::string::npos);
+  }
+
+  { // round trip: names and every edit come back; the live edits are unaffected
+    const std::string text = snapFile(rich(), rated, l);
+    CHECK(sameSnapshots(snapsOf(text), l));
+    SidecarEdits back;
+    CHECK(loadFile(text, &back, 400, 300));
+    CHECK(sidecarEditsToJson(back).dump() == sidecarEditsToJson(rich()).dump());
+    // writing what was read gives the same text
+    CHECK(snapFile(rich(), rated, snapsOf(text)) == text);
+  }
+
+  { // at most kMaxSnapshots, on the way out and on the way in
+    SnapshotList many;
+    for (size_t i = 0; i < kMaxSnapshots + 5; ++i)
+      many.push_back({"s" + std::to_string(i), SidecarEdits{}});
+    CHECK(snapsOf(snapFile(SidecarEdits{}, PhotoMeta{}, many)).size() == kMaxSnapshots);
+    Json arr = Json::array();
+    for (size_t i = 0; i < kMaxSnapshots + 5; ++i)
+    {
+      Json o = Json::object();
+      o.set("name", Json::str("s"));
+      o.set("edits", sidecarEditsToJson(SidecarEdits{}));
+      arr.push(std::move(o));
+    }
+    CHECK(sidecarSnapshotsFromJson(&arr, 400, 300).size() == kMaxSnapshots);
+  }
+
+  { // nothing in the file is trusted
+    auto entry = [](const char *name, Json edits)
+    {
+      Json o = Json::object();
+      if (name)
+        o.set("name", Json::str(name));
+      o.set("edits", std::move(edits));
+      return o;
+    };
+    Json wild = sidecarEditsToJson(SidecarEdits{});
+    Json adj = Json::object();
+    adj.set("Exposure", Json::num(1e9));
+    wild.set("adjust", std::move(adj));
+    Json geo = Json::object();
+    Json crop = Json::array();
+    for (double v : {0.0, 0.0, 9999.0, 9999.0})
+      crop.push(Json::num(v));
+    geo.set("crop", std::move(crop));
+    Json bigCrop = sidecarEditsToJson(SidecarEdits{});
+    bigCrop.set("geometry", std::move(geo));
+
+    Json arr = Json::array();
+    arr.push(entry("wild", wild));                             // kept, clamped
+    arr.push(entry("big crop", bigCrop));                      // kept, crop dropped
+    arr.push(Json::num(3));                                    // not an object: skipped
+    Json noEdits = Json::object();
+    noEdits.set("name", Json::str("none"));
+    arr.push(std::move(noEdits));                              // no "edits": skipped
+    arr.push(entry((std::string(500, 'x') + "\x01").c_str(), sidecarEditsToJson(SidecarEdits{})));
+    arr.push(entry(nullptr, sidecarEditsToJson(SidecarEdits{}))); // no name
+    arr.push(entry("  ", sidecarEditsToJson(SidecarEdits{})));  // blank name
+
+    const SnapshotList got = sidecarSnapshotsFromJson(&arr, 400, 300);
+    CHECK(got.size() == 5);
+    if (got.size() == 5)
+    {
+      const size_t ex = static_cast<size_t>(AdjId::Exposure);
+      CHECK(got[0].name == "wild" && got[0].edits.values[ex] == kAdjustmentSpecs[ex].max);
+      CHECK(got[1].name == "big crop" && got[1].edits.crop.empty());
+      CHECK(got[2].name.size() == kSnapshotNameMax);
+      CHECK(got[3].name == "Snapshot" && got[4].name == "Snapshot");
+    }
+    CHECK(sidecarSnapshotsFromJson(nullptr, 400, 300).empty());
+    Json notArray = Json::object();
+    CHECK(sidecarSnapshotsFromJson(&notArray, 400, 300).empty());
+    CHECK(sidecarSnapshotsFromJson(&arr, 0, 0).empty()); // no picture size: nothing loads
+  }
+
+  { // Sync Settings and a batch rating keep the picture's snapshots, each with
+    // the look it captured; neither one writes them into a file that had none
+    const std::string old = snapFile(rich(), rated, l);
+    AdjValues v{};
+    v[static_cast<size_t>(AdjId::Exposure)] = 25.0f;
+    std::string out, err, again;
+    CHECK(sidecarSyncLook(old, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(sameSnapshots(snapsOf(out), l));
+    SidecarEdits back;
+    CHECK(loadFile(out, &back, 400, 300) && back.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
+    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &again, &err));
+    CHECK(again == out);
+
+    MetaPatch p;
+    p.rating = 2;
+    PhotoMeta got;
+    CHECK(sidecarPatchMeta(old, "a.jpg", 0, 0, p, &out, &got, &err));
+    CHECK(got.rating == 2 && sameSnapshots(snapsOf(out), l));
+
+    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(out.find("snapshots") == std::string::npos);
+
+    // a file that can't be trusted is still refused, snapshots or not
+    out = "untouched";
+    CHECK(!sidecarSyncLook(old, "a.jpg", 500, 300, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(out == "untouched" && !err.empty());
+  }
+
+  { // snapshots are validated again when another picture's file is rewritten
+    Json root;
+    std::string err, out;
+    CHECK(Json::parse(snapFile(rich(), PhotoMeta{}, twoSnapshots()), &root, &err));
+    Json geo = Json::object();
+    Json crop = Json::array();
+    for (double v : {0.0, 0.0, 9999.0, 9999.0})
+      crop.push(Json::num(v));
+    geo.set("crop", std::move(crop));
+    Json bad = sidecarEditsToJson(SidecarEdits{});
+    bad.set("geometry", std::move(geo));
+    Json o = Json::object();
+    o.set("name", Json::str("bad"));
+    o.set("edits", std::move(bad));
+    Json arr = Json::array();
+    arr.push(std::move(o));
+    root.set("snapshots", std::move(arr));
+    MetaPatch p;
+    p.rating = 1;
+    PhotoMeta got;
+    CHECK(sidecarPatchMeta(root.dump(), "a.jpg", 0, 0, p, &out, &got, &err));
+    const SnapshotList kept = snapsOf(out);
+    CHECK(kept.size() == 1 && kept[0].name == "bad" && kept[0].edits.crop.empty());
+  }
+
+  { // the filmstrip's "has edits" dot follows the live edits only: a picture
+    // whose edits are neutral is not "edited" just because it has snapshots
+    CHECK(!sidecarScan(snapFile(SidecarEdits{}, PhotoMeta{}, l)).edited);
+    CHECK(sidecarScan(snapFile(rich(), PhotoMeta{}, l)).edited);
+    CHECK(sidecarScan(snapFile(SidecarEdits{}, rated, l)).meta == rated);
+  }
+}
+
+static void testVirtualCopyNames()
+{ // a virtual copy's path names its own sidecar (see virtual_copy.hpp)
+  CHECK(sidecarFileOf("x/photo.jpg") == std::string("x/photo.jpg") + kSidecarExt);
+  CHECK(sidecarFileOf("x/photo.jpg|vc2") == "x/photo.jpg.vc2.literoom.json");
+  CHECK(sidecarFileOf(vcPath("x/photo.jpg", 7)) != sidecarFileOf("x/photo.jpg"));
+  CHECK(sidecarFileOf("x/a|vcX.jpg") == std::string("x/a|vcX.jpg") + kSidecarExt); // not a marker
+}
+
 int main()
 {
   testRoundTrip();
@@ -835,5 +1044,7 @@ int main()
   testSyncLook();
   testMeta();
   testPatchMeta();
+  testSnapshots();
+  testVirtualCopyNames();
   return finish();
 }

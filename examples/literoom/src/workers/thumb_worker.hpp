@@ -4,7 +4,9 @@
 // ThumbWorker decodes a queue of files (EXIF rotation applied, like the
 // editor does), thumbnails them, and reads each one's saved-edits sidecar for
 // two facts: whether it holds real edits (the filmstrip's dot) and the
-// picture's rating, flag and color label. A different kind of worker from LatestWorker: it is a FIFO queue
+// picture's rating, flag and color label. A virtual copy's path (see
+// virtual_copy.hpp) is read for its sidecar only: it shows the same picture as
+// its original, so nothing is decoded for it (Result::thumbSkipped). A different kind of worker from LatestWorker: it is a FIFO queue
 // with no generations - setQueue() replaces what is still to do, the item in
 // flight finishes, and results accumulate until collect() drains them.
 #pragma once
@@ -14,6 +16,7 @@
 #include "io/file_utils.hpp"      // fsPath
 #include "io/photo_meta.hpp"     // PhotoMeta
 #include "io/sidecar.hpp"         // sidecarFileOf, sidecarScan
+#include "io/virtual_copy.hpp"    // vcImageOf, vcCopyOf
 
 #include <algorithm>
 #include <cmath>
@@ -113,6 +116,8 @@ public:
   {
     std::string path;
     std::shared_ptr<const CanvasImage> thumb; // null: couldn't be decoded
+    bool thumbSkipped = false;                // a virtual copy: not decoded on
+                                              // purpose, use its original's
     bool edited = false;                      // its sidecar holds real edits
                                               // (an unreadable one counts)
     PhotoMeta meta;                           // rating / flag / color label
@@ -180,9 +185,12 @@ private:
       Result r;
       r.path = path;
       std::string err;
-      if (auto img = liteui_image::decodeFile(path, &err))
+      const std::string real = vcImageOf(path); // the picture file behind a copy
+      if (vcCopyOf(path) > 0)
+        r.thumbSkipped = true; // only its sidecar is read, below
+      else if (auto img = liteui_image::decodeFile(real, &err))
       {
-        const Orient o = orientOf_(path); // upright, like the editor
+        const Orient o = orientOf_(real); // upright, like the editor
         if (o.identity())
           r.thumb = makeThumb(*img);
         else
