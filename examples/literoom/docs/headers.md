@@ -37,7 +37,7 @@ Every header sits under `src/`, which is the include root, so a header is always
 | `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops` |
 | `color/` | `color_mix`, `color_grade`, `color_pass`, `curves` |
 | `detail/` | `detail_layer`, `neighbor_fx` |
-| `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
+| `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_rect`, `mask_polygon`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram` |
 | `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
@@ -936,7 +936,7 @@ Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turn
 ### `mask.hpp`
 The mask data model: `MaskType`, the `MaskShape` and `MaskEval` variants, the Add/Subtract/Intersect composition, and `Mask` / `MaskSet`. Includes every shape header, and the top of the file contains the long explanation of how masks work.
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask_brush.hpp`, `mask_geom.hpp`, `mask_object.hpp`, `mask_range.hpp`. No UI. **Test:** `mask_test`.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask_brush.hpp`, `mask_geom.hpp`, `mask_object.hpp`, `mask_polygon.hpp`, `mask_range.hpp`, `mask_rect.hpp`. No UI. **Test:** `mask_test`.
 
 **How a mask is applied:** the picture is rendered as usual first. Then for each enabled mask in list order, every pixel is run through **that mask's** adjustments and blended back: `out = base + (adjusted(base) − base) × weight`. Weight 1 = full effect, 0 = untouched; later masks stack on earlier ones.
 
@@ -1104,6 +1104,16 @@ The two masks that select by the picture's own values: **Luminosity** and **Colo
 **`void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix = nullptr) const`**
 - Fills `out[x − x0]` with weights 0..1 (map value / 255, bilinear in both axes). `pix` is unused. Zeros if there is no map or `y` is out of range.
 - Fast path: when `mw == W` there is no horizontal interpolation and it reads `row0[x]` directly, so `x0..x1` must lie inside `[0, W)`.
+
+### `mask_rect.hpp`
+The **Rectangle** mask: a rotated rectangle (center, half-sizes as a fraction of the picture's shorter side, angle, feather), laid out like the Radial mask in `mask_geom.hpp`. The weight is 1 inside the `inner` fraction of the rectangle and eases (smoothstep) to 0 at its sides. `RectEval::rowSpan` is exact: for a row, each pair of opposite sides is an interval of `dx`, and the span is their intersection (padded by a pixel).
+
+**Depends on:** `geometry.hpp`, `mask_geom.hpp` (for `kMaskMinRadius` / `kMaskMaxRadius`). No UI. **Test:** `mask_rect_test`.
+
+### `mask_polygon.hpp`
+The **Polygon** mask (click-placed polygon or freehand lasso): a closed outline of `PolyPt` vertices (fractions of the original picture), filled with the even-odd rule and optionally feathered. Like the Brush it has no closed form, so it is rasterized into a coverage map (`PolygonEval` is a `RasterEval`; anti-aliased with four scanlines per map row, then three box blurs approximate a Gaussian for the feather) and the last few maps are memoized (`polygonCache()`, emptied by `clearMaskCaches()`). The canvas the blur runs on is wider than the map, so a polygon that runs off the picture does not fade at the picture's edge. `rowSpan` is the first to the last non-zero pixel of each map row, so it is as tight as the feathered shape really is. Fewer than three points select nothing. The unit-independent helpers `polyContains`, `polyNearestEdge`, `polySegDist` and `polySimplify` (Ramer-Douglas-Peucker, used to turn a freehand drag into vertices) live here so they can be tested; the UI uses them on document pixels.
+
+**Depends on:** `geometry.hpp`, `mask_raster.hpp`. No UI. **Test:** `mask_polygon_test`.
 
 ### `mask_brush.hpp`
 The **Brush** mask: strokes of round dabs rasterized into a coverage map. A brush's size is its radius as a fraction of the picture's shorter side. A memo of the last few maps means a slider drag, or one more stroke, doesn't start over.

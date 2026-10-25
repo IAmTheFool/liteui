@@ -324,7 +324,10 @@ struct MaskUi
     ResizeY,
     LinEnd,
     LinStart,
-    Paint // a brush stroke is being painted
+    Paint,      // a brush stroke is being painted
+    PolyVertex, // a polygon vertex is being dragged (see polyIdx)
+    PolyMove,   // the whole polygon is being dragged
+    Lasso       // a freehand lasso is being drawn
   } drag = Drag::None;
   float grabX = 0, grabY = 0; // Move: pointer offset from the mask's center
 
@@ -348,6 +351,12 @@ struct MaskUi
     int mask = -1, part = -1;
     std::vector<ObjectPrompt> prompts; // original-picture fractions
   } objPending;
+
+  // Polygon tool. Clicks place / drag / insert vertices; with polyLasso on, a
+  // drag draws a freehand outline instead (simplified live while it is drawn).
+  bool polyLasso = false;
+  int polyIdx = -1;             // PolyVertex: the vertex being dragged
+  std::vector<PolyPt> lassoRaw; // Lasso: the pointer's path, document px
 
   // The red coverage bitmap of the selected brush mask, rebuilt only when the
   // strokes (or the picture's size) change.
@@ -3862,6 +3871,9 @@ constexpr int kMaskCtlLinStart = 94;
 constexpr int kMaskCtlBrush = 95; // one stroke = one undo step
 constexpr int kMaskCtlLumLo = 96;
 constexpr int kMaskCtlLumHi = 97;
+constexpr int kMaskCtlPolyVertex = 98; // a vertex placed / dragged = one undo step
+constexpr int kMaskCtlPolyMove = 99;   // dragging the whole polygon
+constexpr int kMaskCtlPolyLasso = 87;  // one freehand lasso = one undo step
 constexpr int kMaskCtlRange = 84;
 constexpr int kMaskCtlFeather = 1;
 constexpr int kMaskCtlAngle = 2;
@@ -3977,6 +3989,10 @@ static bool selectedIsBrush()
 { // the SELECTED PART is a brush
   return selectedPartType() == MaskType::Brush;
 }
+static bool selectedIsPolygon()
+{ // the SELECTED PART is a polygon / lasso
+  return selectedPartType() == MaskType::Polygon;
+}
 // "Show mask tint": a brush that stands alone has no outline, so it keeps its
 // own switch (on by default); everything else shares the common one.
 static bool &tintFlag()
@@ -4011,6 +4027,16 @@ static std::optional<BrushShape> brushInView(const MaskPart &p,
                                              const GeoFrame &f)
 {
   return shapeInView<BrushShape>(p, f);
+}
+static std::optional<RectShape> rectInView(const MaskPart &p,
+                                           const GeoFrame &f)
+{
+  return shapeInView<RectShape>(p, f);
+}
+static std::optional<PolygonShape> polygonInView(const MaskPart &p,
+                                                 const GeoFrame &f)
+{
+  return shapeInView<PolygonShape>(p, f);
 }
 
 // Edits part `part` of a mask on its in-view form and stores the result back
@@ -4695,6 +4721,11 @@ static std::optional<MaskShape> newMaskShape(MaskType t)
     return ObjectShape{};
   case MaskType::ColorRange:
     return ColorRangeShape{}; // nothing selected until a color is clicked
+  case MaskType::Rectangle:
+    // Centered on the picture as it is shown now.
+    return RectShape::fromSource(RectShape{}, state.adjust.geoFrame());
+  case MaskType::Polygon:
+    return PolygonShape{}; // empty: clicks on the image place the vertices
   default:
     return std::nullopt;
   }
@@ -4997,6 +5028,330 @@ static int linearHit(const LinearShape &l, float px, float py, bool handles)
   return std::fabs(s) <= g.len ? kMaskHitBody : kMaskHitNone;
 }
 
+// ---- Rectangle mask geometry on the canvas (document pixels) ----
+// Same layout as the radial mask: a center, half-sizes along the rotated axes,
+// and four handles on the axes (here at the middle of each side).
+static MaskGeom rectGeom(const RectShape &r)
+{
+  MaskGeom g{};
+  const float W = state.docWidth(), H = state.docHeight();
+  g.S = std::min(W, H);
+  g.cx = r.cx * W;
+  g.cy = r.cy * H;
+  g.rx = std::max(r.rx, kMaskMinRadius) * g.S;
+  g.ry = std::max(r.ry, kMaskMinRadius) * g.S;
+  g.ang = r.angle * (3.14159265358979f / 180.0f);
+  g.c = std::cos(g.ang);
+  g.s = std::sin(g.ang);
+  return g;
+}
+
+// Handles (selected part only) win over the body, which is the rectangle.
+static int rectHit(const RectShape &r, float px, float py, bool handles)
+{
+  const MaskGeom g = rectGeom(r);
+  const float tol = kMaskHitPx / state.zoom;
+  if (handles)
+  {
+    const float hx[2] = {g.cx + g.rx * g.c, g.cx - g.rx * g.c};
+    const float hy[2] = {g.cy + g.rx * g.s, g.cy - g.rx * g.s};
+    const float vx[2] = {g.cx - g.ry * g.s, g.cx + g.ry * g.s};
+    const float vy[2] = {g.cy + g.ry * g.c, g.cy - g.ry * g.c};
+    for (int k = 0; k < 2; ++k)
+    {
+      if (std::hypot(px - hx[k], py - hy[k]) <= tol)
+        return kMaskHitX;
+      if (std::hypot(px - vx[k], py - vy[k]) <= tol)
+        return kMaskHitY;
+    }
+  }
+  const float dx = px - g.cx, dy = py - g.cy;
+  const float u = (dx * g.c + dy * g.s) / g.rx;
+  const float v = (-dx * g.s + dy * g.c) / g.ry;
+  return (std::fabs(u) <= 1.0f && std::fabs(v) <= 1.0f) ? kMaskHitBody
+                                                       : kMaskHitNone;
+}
+
+// ---- Polygon / lasso tool ----
+// With a polygon part selected every press edits its outline (like a brush,
+// pick another part from the list):
+//   click empty space    adds a vertex (on a closed outline: into the nearest
+//                        side), and dragging before release places it
+//   press on a vertex    drags it; right-click on it removes it
+//   press on a side      inserts a vertex there and drags it
+//   press inside         moves the whole polygon
+// With "Freehand lasso" on, a press starts a new outline and the drag draws it
+// (simplified while you draw). The outline is always closed.
+constexpr float kPolyClampLo = -0.25f; // vertices stay near the picture
+constexpr float kPolyClampHi = 1.25f;
+constexpr float kLassoTolPx = 1.5f;    // simplification tolerance, screen px
+
+static float polyClampCoord(float v)
+{
+  return std::clamp(v, kPolyClampLo, kPolyClampHi);
+}
+// The polygon's vertices in document pixels (what the pointer is measured in).
+static std::vector<PolyPt> polyDocPts(const PolygonShape &view)
+{
+  const float W = state.docWidth(), H = state.docHeight();
+  std::vector<PolyPt> out;
+  out.reserve(view.pts.size());
+  for (const PolyPt &p : view.pts)
+    out.push_back(PolyPt{p.x * W, p.y * H});
+  return out;
+}
+// The vertex under (px, py), the closest one within the grab tolerance, or -1.
+static int polyVertexAt(const std::vector<PolyPt> &dp, float px, float py)
+{
+  const float tol = kMaskHitPx / state.zoom;
+  int best = -1;
+  float bestD = tol;
+  for (size_t i = 0; i < dp.size(); ++i)
+  {
+    const float d = std::hypot(px - dp[i].x, py - dp[i].y);
+    if (d <= bestD)
+    {
+      bestD = d;
+      best = static_cast<int>(i);
+    }
+  }
+  return best;
+}
+// What picks an UNSELECTED polygon: a vertex, or inside a closed outline.
+static bool polygonBodyHit(const PolygonShape &view, float px, float py)
+{
+  const std::vector<PolyPt> dp = polyDocPts(view);
+  return polyVertexAt(dp, px, py) >= 0 || polyContains(dp, px, py);
+}
+
+static void polygonEditPts(int mask, size_t part, int control,
+                           const std::function<void(std::vector<PolyPt> &)> &fn)
+{
+  const GeoFrame frame = state.adjust.geoFrame();
+  maskEdit(
+      mask,
+      [&](Mask &m)
+      {
+        editShapeInView<PolygonShape>(m, part, frame,
+                                      [&](PolygonShape &s)
+                                      { fn(s.pts); });
+      },
+      control);
+}
+
+static void polygonDirty()
+{
+  enterDrag(false); // recompute on the cheap preview path while held
+  state.markAdjustDirty();
+  state.markDirty();
+}
+
+static void polygonBegin(float px, float py)
+{
+  const int i = selMask();
+  if (i < 0)
+    return;
+  const size_t part = static_cast<size_t>(selPart());
+  const MaskSet &ms = state.adjust.masks();
+  if (part >= ms[static_cast<size_t>(i)].parts.size())
+    return;
+  const GeoFrame frame = state.adjust.geoFrame();
+  const auto view = polygonInView(ms[static_cast<size_t>(i)].parts[part], frame);
+  if (!view)
+    return;
+  const float W = state.docWidth(), H = state.docHeight();
+  if (W <= 0 || H <= 0)
+    return;
+  MaskUi &u = state.mask;
+  const std::vector<PolyPt> dp = polyDocPts(*view);
+  const PolyPt here{polyClampCoord(px / W), polyClampCoord(py / H)};
+
+  if (u.polyLasso)
+  { // a new outline, drawn by dragging
+    u.lassoRaw.clear();
+    u.lassoRaw.push_back(PolyPt{px, py});
+    polygonEditPts(i, part, kMaskCtlPolyLasso,
+                   [&](std::vector<PolyPt> &pts)
+                   { pts.assign(1, here); });
+    u.drag = MaskUi::Drag::Lasso;
+    polygonDirty();
+    return;
+  }
+
+  const int vi = polyVertexAt(dp, px, py);
+  if (vi >= 0)
+  { // grab a vertex
+    u.drag = MaskUi::Drag::PolyVertex;
+    u.polyIdx = vi;
+    state.markDirty();
+    return;
+  }
+
+  // Where would a new vertex go? Into the nearest side of a closed outline,
+  // else at the end.
+  int edge = -1;
+  float qx = 0, qy = 0;
+  const float dist = polyNearestEdge(dp, px, py, &edge, &qx, &qy);
+  const bool closed = dp.size() >= 3;
+  const float tol = kMaskHitPx / state.zoom;
+  const auto insertAt = [&](size_t at, PolyPt p)
+  {
+    bool full = false;
+    polygonEditPts(i, part, kMaskCtlPolyVertex,
+                   [&](std::vector<PolyPt> &pts)
+                   {
+                     if (pts.size() >= kPolyMaxPoints)
+                     {
+                       full = true;
+                       return;
+                     }
+                     pts.insert(pts.begin() + static_cast<std::ptrdiff_t>(
+                                                  std::min(at, pts.size())),
+                                p);
+                   });
+    if (full)
+    {
+      setStatus("Polygon point limit reached (" +
+                    std::to_string(kPolyMaxPoints) + ")",
+                true);
+      return;
+    }
+    u.drag = MaskUi::Drag::PolyVertex;
+    u.polyIdx = static_cast<int>(at);
+    polygonDirty();
+  };
+  if (closed && edge >= 0 && dist <= tol)
+  { // on a side: split it there
+    insertAt(static_cast<size_t>(edge) + 1,
+             PolyPt{polyClampCoord(qx / W), polyClampCoord(qy / H)});
+    return;
+  }
+  if (closed && polyContains(dp, px, py))
+  { // inside: move the whole polygon
+    u.drag = MaskUi::Drag::PolyMove;
+    u.lastX = px;
+    u.lastY = py;
+    state.markDirty();
+    return;
+  }
+  if (closed && edge >= 0)
+    insertAt(static_cast<size_t>(edge) + 1, here); // outside: grow toward it
+  else
+    insertAt(view->pts.size(), here); // fewer than 3 points: append
+}
+
+static void polygonDragTo(float px, float py, MaskUi::Drag d)
+{
+  const int i = selMask();
+  if (i < 0)
+    return;
+  MaskUi &u = state.mask;
+  const size_t part = static_cast<size_t>(selPart());
+  const float W = state.docWidth(), H = state.docHeight();
+  if (W <= 0 || H <= 0)
+    return;
+  if (d == MaskUi::Drag::PolyVertex)
+  {
+    const size_t k = static_cast<size_t>(std::max(u.polyIdx, 0));
+    const PolyPt p{polyClampCoord(px / W), polyClampCoord(py / H)};
+    polygonEditPts(i, part, kMaskCtlPolyVertex,
+                   [&](std::vector<PolyPt> &pts)
+                   {
+                     if (k < pts.size())
+                       pts[k] = p;
+                   });
+  }
+  else if (d == MaskUi::Drag::PolyMove)
+  {
+    float dx = (px - u.lastX) / W, dy = (py - u.lastY) / H;
+    polygonEditPts(i, part, kMaskCtlPolyMove,
+                   [&](std::vector<PolyPt> &pts)
+                   {
+                     if (pts.empty())
+                       return;
+                     float x0 = pts[0].x, x1 = x0, y0 = pts[0].y, y1 = y0;
+                     for (const PolyPt &p : pts)
+                     {
+                       x0 = std::min(x0, p.x);
+                       x1 = std::max(x1, p.x);
+                       y0 = std::min(y0, p.y);
+                       y1 = std::max(y1, p.y);
+                     }
+                     // Keep the whole outline within reach of the picture.
+                     dx = std::clamp(dx, kPolyClampLo - x0, kPolyClampHi - x1);
+                     dy = std::clamp(dy, kPolyClampLo - y0, kPolyClampHi - y1);
+                     for (PolyPt &p : pts)
+                     {
+                       p.x += dx;
+                       p.y += dy;
+                     }
+                   });
+    u.lastX += dx * W; // by what was really applied, so a clamped edge
+    u.lastY += dy * H; // does not build up a debt
+  }
+  else if (d == MaskUi::Drag::Lasso)
+  {
+    const float gap = kLassoTolPx / state.zoom;
+    if (!u.lassoRaw.empty() &&
+        std::hypot(px - u.lassoRaw.back().x, py - u.lassoRaw.back().y) < gap)
+    {
+      state.markDirty();
+      return;
+    }
+    if (u.lassoRaw.size() < kPolyMaxPoints * 8)
+      u.lassoRaw.push_back(PolyPt{px, py});
+    // Simplify the path so far; loosen the tolerance until it fits.
+    float tol = kLassoTolPx / state.zoom;
+    std::vector<PolyPt> simple = polySimplify(u.lassoRaw, tol);
+    for (int guard = 0; simple.size() > kPolyMaxPoints && guard < 16; ++guard)
+    {
+      tol *= 2.0f;
+      simple = polySimplify(u.lassoRaw, tol);
+    }
+    polygonEditPts(i, part, kMaskCtlPolyLasso,
+                   [&](std::vector<PolyPt> &pts)
+                   {
+                     pts.clear();
+                     for (const PolyPt &p : simple)
+                       pts.push_back(PolyPt{polyClampCoord(p.x / W),
+                                            polyClampCoord(p.y / H)});
+                   });
+  }
+  else
+    return;
+  polygonDirty();
+}
+
+// Right-click on a vertex of the selected polygon removes it.
+static void polygonRightPress(float lx, float ly)
+{
+  if (!maskToolActive() || !selectedIsPolygon())
+    return;
+  const int i = selMask();
+  if (i < 0)
+    return;
+  const size_t part = static_cast<size_t>(selPart());
+  const MaskSet &ms = state.adjust.masks();
+  if (part >= ms[static_cast<size_t>(i)].parts.size())
+    return;
+  const auto view = polygonInView(ms[static_cast<size_t>(i)].parts[part],
+                                  state.adjust.geoFrame());
+  if (!view)
+    return;
+  const float px = lx / state.zoom, py = ly / state.zoom;
+  const int vi = polyVertexAt(polyDocPts(*view), px, py);
+  if (vi < 0)
+    return;
+  const GeoFrame frame = state.adjust.geoFrame();
+  maskEditDiscrete([&](Mask &m)
+                   { editShapeInView<PolygonShape>(
+                         m, part, frame, [&](PolygonShape &s)
+                         {
+                           if (static_cast<size_t>(vi) < s.pts.size())
+                             s.pts.erase(s.pts.begin() + vi);
+                         }); });
+}
+
 // ---- Brush painting ----
 // With a brush part selected, every press on the image starts a stroke and the
 // drag extends it; the whole stroke is one undo step (control kMaskCtlBrush,
@@ -5211,6 +5566,13 @@ static void maskPress(float lx, float ly)
     objectPress(lx, ly, false); // every press is a prompt, like a brush
     return;
   }
+  // Polygon: every press edits the outline (see "Polygon / lasso tool").
+  if (sel >= 0 && partCount(sel) > 0 &&
+      std::holds_alternative<PolygonShape>(partAt(sel, selP).shape))
+  {
+    polygonBegin(px, py);
+    return;
+  }
   // Color Range: every press samples a new color (like a brush, no handles).
   if (sel >= 0 && partCount(sel) > 0 &&
       std::holds_alternative<ColorRangeShape>(partAt(sel, selP).shape))
@@ -5241,6 +5603,23 @@ static void maskPress(float lx, float ly)
     {
       // Nothing to grab on a brush: its pin only selects it.
       if (!brushPinHit(*bv, px, py))
+        return false;
+      state.maskSel = i;
+      state.mask.part = j;
+      state.markDirty();
+      return true;
+    }
+    else if (const auto qv = rectInView(m, frame))
+    {
+      hit = rectHit(*qv, px, py, isSelected);
+      shapeCx = qv->cx;
+      shapeCy = qv->cy;
+    }
+    else if (const auto pv = polygonInView(m, frame))
+    {
+      // An unselected polygon is only picked (its vertices are edited once
+      // it is selected).
+      if (!polygonBodyHit(*pv, px, py))
         return false;
       state.maskSel = i;
       state.mask.part = j;
@@ -5310,6 +5689,12 @@ static void maskDrag(float lx, float ly)
     brushDragTo(px, py);
     return;
   }
+  if (d == MaskUi::Drag::PolyVertex || d == MaskUi::Drag::PolyMove ||
+      d == MaskUi::Drag::Lasso)
+  {
+    polygonDragTo(px, py, d);
+    return;
+  }
   const float grabX = state.mask.grabX, grabY = state.mask.grabY;
   const GeoFrame frame = state.adjust.geoFrame();
   const size_t part = static_cast<size_t>(selPart());
@@ -5330,6 +5715,22 @@ static void maskDrag(float lx, float ly)
               r.rx = std::clamp(std::fabs(dx * g.c + dy * g.s) / g.S,
                                 kMaskMinRadius, kMaskMaxRadius);
             else
+              r.ry = std::clamp(std::fabs(-dx * g.s + dy * g.c) / g.S,
+                                kMaskMinRadius, kMaskMaxRadius);
+          } });
+        editShapeInView<RectShape>(m, part, frame, [&](RectShape &r)
+                                   {
+          if (d == MaskUi::Drag::Move) {
+            r.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
+            r.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
+          } else {
+            // Distance of the pointer from the center along the rotated axis.
+            const MaskGeom g = rectGeom(r);
+            const float dx = px - g.cx, dy = py - g.cy;
+            if (d == MaskUi::Drag::ResizeX)
+              r.rx = std::clamp(std::fabs(dx * g.c + dy * g.s) / g.S,
+                                kMaskMinRadius, kMaskMaxRadius);
+            else if (d == MaskUi::Drag::ResizeY)
               r.ry = std::clamp(std::fabs(-dx * g.s + dy * g.c) / g.S,
                                 kMaskMinRadius, kMaskMaxRadius);
           } });
@@ -5443,6 +5844,115 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
   ctx.setStrokeColor(kColorWhite);
   ctx.setLineWidth(px * 1.5f);
   ctx.stroke();
+}
+
+// Outline of one rectangle mask; the selected one also gets its feather
+// rectangle, handles (middle of each side) and a ring at the center.
+static void paintRectOutline(CanvasContext &ctx, const RectShape &r,
+                             bool selected)
+{
+  const MaskGeom g = rectGeom(r);
+  const float px = 1.0f / state.zoom; // one screen pixel, in image units
+  constexpr float kTwoPi = 6.28318530717959f;
+  // The rectangle `k` times the half-sizes, as a closed path.
+  const auto path = [&](float k)
+  {
+    const float ax = g.rx * k * g.c, ay = g.rx * k * g.s;   // along rx
+    const float bx = -g.ry * k * g.s, by = g.ry * k * g.c;  // along ry
+    ctx.beginPath();
+    ctx.moveTo(g.cx - ax - bx, g.cy - ay - by);
+    ctx.lineTo(g.cx + ax - bx, g.cy + ay - by);
+    ctx.lineTo(g.cx + ax + bx, g.cy + ay + by);
+    ctx.lineTo(g.cx - ax + bx, g.cy - ay + by);
+    ctx.closePath();
+  };
+  path(1.0f);
+  ctx.setStrokeColor(Color{0, 0, 0, selected ? uint8_t{150} : uint8_t{90}});
+  ctx.setLineWidth(px * 3.0f);
+  ctx.stroke();
+  ctx.setStrokeColor(
+      Color{255, 255, 255, selected ? uint8_t{255} : uint8_t{140}});
+  ctx.setLineWidth(px * (selected ? 1.5f : 1.0f));
+  ctx.stroke();
+  if (!selected)
+    return;
+
+  // Where the feather begins (skipped when it sits on the outline or collapses).
+  const float inner = r.innerFrac();
+  if (r.feather > 0.02f && inner > 0.02f)
+  {
+    path(inner);
+    ctx.setLineDash({4.0f * px, 4.0f * px});
+    ctx.setStrokeColor(Color{255, 255, 255, 170});
+    ctx.setLineWidth(px);
+    ctx.stroke();
+    ctx.setLineDash({});
+  }
+
+  // Four square handles on the axes, and a ring at the center.
+  const float hs = kMaskHandlePx * px;
+  const float hx[4] = {g.cx + g.rx * g.c, g.cx - g.rx * g.c, g.cx - g.ry * g.s,
+                       g.cx + g.ry * g.s};
+  const float hy[4] = {g.cy + g.rx * g.s, g.cy - g.rx * g.s, g.cy + g.ry * g.c,
+                       g.cy - g.ry * g.c};
+  ctx.setFillColor(kColorWhite);
+  ctx.setStrokeColor(Color{60, 60, 60, 255});
+  ctx.setLineWidth(px);
+  for (int k = 0; k < 4; ++k)
+  {
+    ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
+    ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
+  }
+  ctx.beginPath();
+  ctx.arc(g.cx, g.cy, hs * 0.55f, 0.0f, kTwoPi);
+  ctx.setFillColor(Color{255, 255, 255, 60});
+  ctx.fill();
+  ctx.setStrokeColor(kColorWhite);
+  ctx.setLineWidth(px * 1.5f);
+  ctx.stroke();
+}
+
+// Outline of one polygon mask. The outline is closed once it has three
+// points; the selected one also shows a square handle on every vertex (the
+// first one filled, so the start of a lasso is easy to see).
+static void paintPolygonOutline(CanvasContext &ctx, const PolygonShape &view,
+                                bool selected)
+{
+  if (view.pts.empty())
+    return;
+  const std::vector<PolyPt> dp = polyDocPts(view);
+  const float px = 1.0f / state.zoom; // one screen pixel, in image units
+  const auto path = [&]
+  {
+    ctx.beginPath();
+    ctx.moveTo(dp[0].x, dp[0].y);
+    for (size_t i = 1; i < dp.size(); ++i)
+      ctx.lineTo(dp[i].x, dp[i].y);
+    if (dp.size() >= 3)
+      ctx.closePath();
+  };
+  if (dp.size() >= 2)
+  {
+    path();
+    ctx.setStrokeColor(Color{0, 0, 0, selected ? uint8_t{150} : uint8_t{90}});
+    ctx.setLineWidth(px * 3.0f);
+    ctx.stroke();
+    ctx.setStrokeColor(
+        Color{255, 255, 255, selected ? uint8_t{255} : uint8_t{140}});
+    ctx.setLineWidth(px * (selected ? 1.5f : 1.0f));
+    ctx.stroke();
+  }
+  if (!selected)
+    return;
+  const float hs = kMaskHandlePx * px * 0.8f;
+  ctx.setStrokeColor(Color{60, 60, 60, 255});
+  ctx.setLineWidth(px);
+  for (size_t i = 0; i < dp.size(); ++i)
+  {
+    ctx.setFillColor(i == 0 ? Color{255, 210, 60, 255} : kColorWhite);
+    ctx.fillRect(dp[i].x - hs / 2.0f, dp[i].y - hs / 2.0f, hs, hs);
+    ctx.strokeRect(dp[i].x - hs / 2.0f, dp[i].y - hs / 2.0f, hs, hs);
+  }
 }
 
 // Red tint of a linear mask: a gradient along the axis from the weight-1 line
@@ -5908,6 +6418,10 @@ static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
     paintLinearOutline(ctx, *l, selected);
   else if (const auto b = brushInView(p, frame))
     paintBrushPin(ctx, *b, selected);
+  else if (const auto q = rectInView(p, frame))
+    paintRectOutline(ctx, *q, selected);
+  else if (const auto pg = polygonInView(p, frame))
+    paintPolygonOutline(ctx, *pg, selected);
 }
 
 static void paintMaskOverlay(CanvasContext &ctx)
@@ -5983,6 +6497,18 @@ static void paintMaskOverlay(CanvasContext &ctx)
     // the whole overlay.
     if (state.maskShowTint)
       paintCompositeTint(ctx, m, sel);
+  }
+  else if (const auto q = rectInView(p, frame))
+  {
+    if (state.maskShowTint)
+      paintCompositeTint(ctx, m, sel);
+    paintRectOutline(ctx, *q, true);
+  }
+  else if (const auto pg = polygonInView(p, frame))
+  {
+    if (state.maskShowTint)
+      paintCompositeTint(ctx, m, sel);
+    paintPolygonOutline(ctx, *pg, true);
   }
 }
 
@@ -7288,6 +7814,9 @@ static_assert(
           {kMaskCtlBrush, kMaskCtlBrush},
           {kMaskCtlLumLo, kMaskCtlLumLo},
           {kMaskCtlLumHi, kMaskCtlLumHi},
+          {kMaskCtlPolyVertex, kMaskCtlPolyVertex},
+          {kMaskCtlPolyMove, kMaskCtlPolyMove},
+          {kMaskCtlPolyLasso, kMaskCtlPolyLasso},
           {kMaskCtlAdj, kMaskCtlAdj + static_cast<int>(AdjId::Count) - 1}};
       constexpr int n = static_cast<int>(sizeof(r) / sizeof(r[0]));
       for (int i = 0; i < n; ++i)
@@ -8715,8 +9244,10 @@ int main()
                                                              ? "Add a mask, then adjust it in the panel on the right. "
                                                                "Drag the shape on the image to move it, or its square "
                                                                "handles to resize (on a linear gradient they also turn "
-                                                               "it). With a brush, drag on the image to paint. Pick "
-                                                               "another mask from the list."
+                                                               "it). With a brush, drag on the image to paint. With a "
+                                                               "polygon, click to place points (right-click a point "
+                                                               "to remove it) or switch on Freehand lasso and drag. "
+                                                               "Pick another mask from the list."
                                                              : "Open an image to add masks."; });
   maskHint.fontSize = 12.0f;
   maskHint.color = kColorTextMuted;
@@ -8732,6 +9263,16 @@ int main()
   maskPane.addChild(sidebarButton(
       "+ Linear Gradient", []
       { addMask(MaskType::Linear); }, {}, true,
+      []
+      { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Rectangle", []
+      { addMask(MaskType::Rectangle); }, {}, true,
+      []
+      { return state.original != nullptr; }));
+  maskPane.addChild(sidebarButton(
+      "+ Polygon / Lasso", []
+      { addMask(MaskType::Polygon); }, {}, true,
       []
       { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
@@ -8942,6 +9483,12 @@ int main()
   partsSec.addChild(sidebarButton("+ Part: Linear",
                                   []
                                   { addPart(MaskType::Linear); }));
+  partsSec.addChild(sidebarButton("+ Part: Rectangle",
+                                  []
+                                  { addPart(MaskType::Rectangle); }));
+  partsSec.addChild(sidebarButton("+ Part: Polygon",
+                                  []
+                                  { addPart(MaskType::Polygon); }));
   partsSec.addChild(sidebarButton("+ Part: Brush",
                                   []
                                   { addPart(MaskType::Brush); }));
@@ -8999,6 +9546,90 @@ int main()
       { r.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskTabShape.addChild(std::move(radialShape));
+
+  View rectShape;
+  rectShape.style.width = Size::full();
+  rectShape.style.direction = FlexDirection::Column;
+  rectShape.style.gap = 12.0f;
+  rectShape.style.display = std::function<Display()>([]() -> Display
+                                                     { return selectedPartType() == MaskType::Rectangle ? Display::Flex
+                                                                                                        : Display::None; });
+  rectShape.addChild(sectionLabel("Shape"));
+  rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
+      "Width", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
+      [](const RectShape &r)
+      { return r.rx * 100.0f; },
+      [](RectShape &r, float v)
+      { r.rx = v / 100.0f; }, kMaskCtlWidth)));
+  rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
+      "Height", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
+      [](const RectShape &r)
+      { return r.ry * 100.0f; },
+      [](RectShape &r, float v)
+      { r.ry = v / 100.0f; }, kMaskCtlHeight)));
+  rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
+      "Angle", -90.0f, 90.0f, [](const RectShape &r)
+      { return r.angle; },
+      [](RectShape &r, float v)
+      { r.angle = v; }, kMaskCtlAngle)));
+  rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
+      "Feather", 0.0f, 100.0f,
+      [](const RectShape &r)
+      { return r.feather * 100.0f; },
+      [](RectShape &r, float v)
+      { r.feather = v / 100.0f; },
+      kMaskCtlFeather)));
+  maskTabShape.addChild(std::move(rectShape));
+
+  View polyShape;
+  polyShape.style.width = Size::full();
+  polyShape.style.direction = FlexDirection::Column;
+  polyShape.style.gap = 12.0f;
+  polyShape.style.display = std::function<Display()>([]() -> Display
+                                                     { return selectedPartType() == MaskType::Polygon ? Display::Flex
+                                                                                                      : Display::None; });
+  polyShape.addChild(sectionLabel("Polygon"));
+  {
+    Text t;
+    t.label = std::function<std::string()>([]() -> std::string
+                                           {
+      const MaskPart *p = selectedPart();
+      const auto *s = p ? std::get_if<PolygonShape>(&p->shape) : nullptr;
+      const size_t n = s ? s->pts.size() : 0;
+      if (state.mask.polyLasso)
+        return "Drag on the picture to draw an outline (it replaces the current one)";
+      if (n == 0)
+        return "Click the picture to place the first point";
+      if (n < 3)
+        return std::to_string(n) + " point(s): add at least 3 to select an area";
+      return std::to_string(n) + " points. Click outside to add one, drag a point or side, "
+                                 "drag inside to move, right-click a point to remove it"; });
+    t.fontSize = 12.0f;
+    t.color = kColorTextMuted;
+    polyShape.addChild(std::move(t));
+  }
+  polyShape.addChild(buildSliderRow(maskShapeSlider<PolygonShape>(
+      "Feather", 0.0f, 100.0f,
+      [](const PolygonShape &s)
+      { return s.feather * 100.0f; },
+      [](PolygonShape &s, float v)
+      { s.feather = v / 100.0f; },
+      kMaskCtlFeather)));
+  polyShape.addChild(sidebarButton(
+      "Freehand lasso",
+      []
+      { state.mask.polyLasso = !state.mask.polyLasso; state.markDirty(); },
+      []
+      { return state.mask.polyLasso; }));
+  polyShape.addChild(sidebarButton("Clear points", []
+                                   {
+    const size_t part = static_cast<size_t>(selPart());
+    const GeoFrame frame = state.adjust.geoFrame();
+    maskEditDiscrete([&](Mask &m) {
+      editShapeInView<PolygonShape>(m, part, frame,
+                                    [](PolygonShape &s) { s.pts.clear(); });
+    }); }));
+  maskTabShape.addChild(std::move(polyShape));
 
   View linearShape;
   linearShape.style.width = Size::full();
@@ -9918,7 +10549,10 @@ int main()
   canvas.onRightPressAt = [](float lx, float ly)
   {
     if (state.compare == CompareMode::Off)
+    {
       objectPress(lx, ly, true);
+      polygonRightPress(lx, ly);
+    }
   };
   canvas.onDragTo = [](float lx, float ly)
   {

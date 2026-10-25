@@ -420,6 +420,24 @@ namespace golden
     b.strokes = {s1, s2, s3};
     return b;
   }
+  static RectShape rect()
+  {
+    RectShape r;
+    r.cx = 0.45f;
+    r.cy = 0.5f;
+    r.rx = 0.32f;
+    r.ry = 0.2f;
+    r.angle = -20.0f;
+    r.feather = 0.4f;
+    return r;
+  }
+  static PolygonShape polygon()
+  {
+    PolygonShape p;
+    p.pts = {{0.12f, 0.25f}, {0.55f, 0.08f}, {0.9f, 0.35f}, {0.78f, 0.85f}, {0.45f, 0.62f}, {0.2f, 0.9f}};
+    p.feather = 0.3f;
+    return p;
+  }
   static LuminosityShape luminosity()
   {
     LuminosityShape s;
@@ -734,6 +752,8 @@ namespace golden
         {"luminosity", luminosity()},
         {"colorrange", colorRange()},
         {"object_blob", object(blob)},
+        {"rect", rect()},
+        {"polygon", polygon()},
     };
     for (const Kind &k : kinds)
     {
@@ -802,6 +822,51 @@ namespace golden
       one("mask/colorrange_widest", {makeMask(c)});
       c.set = false;
       one("mask/colorrange_unset", {makeMask(c)}, false);
+    }
+    // Rectangle and Polygon extremes: hard and fully soft edges, the smallest
+    // and largest rectangle, a three-point polygon, a polygon that runs off the
+    // picture, and an outline with fewer than three points (selects nothing).
+    {
+      RectShape q = rect();
+      q.feather = 0.0f;
+      one("mask/rect_hard_edge", {makeMask(q)});
+      q.feather = 1.0f;
+      one("mask/rect_fully_soft", {makeMask(q)});
+      q = rect();
+      q.rx = q.ry = kMaskMinRadius;
+      one("mask/rect_min_size", {makeMask(q)}, false);
+      q.rx = q.ry = kMaskMaxRadius;
+      one("mask/rect_max_size", {makeMask(q)});
+      q = rect();
+      q.angle = 0.0f;
+      one("mask/rect_axis_aligned", {makeMask(q)});
+      PolygonShape g = polygon();
+      g.feather = 0.0f;
+      one("mask/polygon_hard", {makeMask(g)});
+      g.feather = 1.0f;
+      one("mask/polygon_fully_soft", {makeMask(g)});
+      PolygonShape tri;
+      tri.pts = {{0.5f, 0.1f}, {0.9f, 0.9f}, {0.1f, 0.9f}};
+      tri.feather = 0.2f;
+      one("mask/polygon_triangle", {makeMask(tri)});
+      PolygonShape off;
+      off.pts = {{-0.5f, 0.3f}, {1.5f, 0.3f}, {1.5f, 0.7f}, {-0.5f, 0.7f}};
+      off.feather = 0.5f;
+      one("mask/polygon_off_picture", {makeMask(off)});
+      PolygonShape twoPts;
+      twoPts.pts = {{0.2f, 0.2f}, {0.8f, 0.8f}};
+      one("mask/polygon_two_points", {makeMask(twoPts)}, false);
+      one("mask/polygon_empty", {makeMask(PolygonShape{})}, false);
+      one("mask/rect_amount40", {makeMask(rect(), false, 40.0f)});
+    }
+    {
+      // A rectangle with a polygon cut out of it, and the same inverted.
+      Mask m;
+      m.parts = {MaskPart{rect(), MaskOp::Add}, MaskPart{polygon(), MaskOp::Subtract}};
+      stdEffect(m);
+      one("mask/composite_rect_minus_polygon", {m});
+      m.invert = true;
+      one("mask/composite_rect_minus_polygon_inv", {m});
     }
     one("mask/radial_amount40", {makeMask(radial(), false, 40.0f)});
     {

@@ -78,7 +78,7 @@ Once the table entry exists, these need no changes:
 
 ## Adding a mask type
 
-A mask kind is one alternative in a `std::variant`. The render pipeline, undo, the preview path, the worker threads, export, and the per-mask sliders all work on the variants, so they need no changes. (Color Range was added exactly this way.)
+A mask kind is one alternative in a `std::variant`. The render pipeline, undo, the preview path, the worker threads, export, and the per-mask sliders all work on the variants, so they need no changes. (Color Range, Rectangle and Polygon were added exactly this way.)
 
 You need four things:
 

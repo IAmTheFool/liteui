@@ -16,7 +16,9 @@
 #include "mask/mask_brush.hpp"
 #include "mask/mask_geom.hpp"
 #include "mask/mask_object.hpp"
+#include "mask/mask_polygon.hpp"
 #include "mask/mask_range.hpp"
+#include "mask/mask_rect.hpp"
 
 // ---------------- Masks (local adjustments) ----------------
 // A mask is a shape plus its own set of Adjust sliders (the same table as the
@@ -72,6 +74,8 @@ enum class MaskType : int
   Luminosity,
   ColorRange,
   Object,
+  Rectangle,
+  Polygon,
   Count
 };
 
@@ -91,6 +95,10 @@ inline const char *maskTypeName(MaskType t)
     return "Object";
   case MaskType::ColorRange:
     return "Color Range";
+  case MaskType::Rectangle:
+    return "Rectangle";
+  case MaskType::Polygon:
+    return "Polygon";
   default:
     return "Mask";
   }
@@ -99,9 +107,11 @@ inline const char *maskTypeName(MaskType t)
 // ---- Shape variants: one alternative per MaskType ----
 // The alternatives are in the order of MaskType: MaskPart::type() is the index.
 using MaskShape = std::variant<RadialShape, LinearShape, BrushShape,
-                               LuminosityShape, ColorRangeShape, ObjectShape>;
+                               LuminosityShape, ColorRangeShape, ObjectShape,
+                               RectShape, PolygonShape>;
 using MaskEval = std::variant<RadialEval, LinearEval, BrushEval,
-                              LuminosityEval, ColorRangeEval, ObjectEval>;
+                              LuminosityEval, ColorRangeEval, ObjectEval,
+                              RectEval, PolygonEval>;
 
 // Masks whose weights read the picture's pixels (so the overlay must be built
 // from the picture just before them).
@@ -330,10 +340,12 @@ inline bool maskNameBlank(const std::string &s)
   return s.find_first_not_of(' ') == std::string::npos;
 }
 
-// Empties every mask cache (brush maps, warped / grown object maps).
+// Empties every mask cache (brush maps, polygon maps, warped / grown object
+// maps).
 inline void clearMaskCaches()
 {
   brushCache().clear();
+  polygonCache().clear();
   objectWarpCache().clear();
   objectEvalCache().clear();
 }

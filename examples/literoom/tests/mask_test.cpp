@@ -48,24 +48,26 @@ static std::vector<float> weightsOfOne(const MaskShape &s, const Px &pix)
 
 static void testKinds()
 {
-  CHECK(static_cast<int>(MaskType::Count) == 6);
-  CHECK(std::variant_size_v<MaskShape> == 6 && std::variant_size_v<MaskEval> == 6);
+  CHECK(static_cast<int>(MaskType::Count) == 8);
+  CHECK(std::variant_size_v<MaskShape> == 8 && std::variant_size_v<MaskEval> == 8);
   // The variant alternatives are in the same order as MaskType.
   // (MaskPart::type() is the variant's index; an Object part once reported itself
   // as Color Range and the other way round because the two orders differed.)
-  const MaskShape shapes[] = {RadialShape{}, LinearShape{}, BrushShape{}, LuminosityShape{}, ColorRangeShape{}, ObjectShape{}};
-  const MaskType types[] = {MaskType::Radial, MaskType::Linear, MaskType::Brush, MaskType::Luminosity, MaskType::ColorRange, MaskType::Object};
-  for (int i = 0; i < 6; ++i)
+  const MaskShape shapes[] = {RadialShape{}, LinearShape{}, BrushShape{}, LuminosityShape{}, ColorRangeShape{}, ObjectShape{}, RectShape{}, PolygonShape{}};
+  const MaskType types[] = {MaskType::Radial, MaskType::Linear, MaskType::Brush, MaskType::Luminosity, MaskType::ColorRange, MaskType::Object, MaskType::Rectangle, MaskType::Polygon};
+  for (int i = 0; i < 8; ++i)
   {
     CHECK(MaskPart{shapes[i], MaskOp::Add}.type() == types[i]);
     CHECK(static_cast<int>(types[i]) == i);
   }
   CHECK(std::strcmp(maskTypeName(MaskType::Radial), "Radial") == 0);
   CHECK(std::strcmp(maskTypeName(MaskType::ColorRange), "Color Range") == 0);
+  CHECK(std::strcmp(maskTypeName(MaskType::Rectangle), "Rectangle") == 0);
+  CHECK(std::strcmp(maskTypeName(MaskType::Polygon), "Polygon") == 0);
   CHECK(std::strcmp(maskTypeName(MaskType::Count), "Mask") == 0);
   CHECK(std::strcmp(maskOpName(MaskOp::Add), "Add") == 0 && std::strcmp(maskOpName(MaskOp::Subtract), "Subtract") == 0 &&
         std::strcmp(maskOpName(MaskOp::Intersect), "Intersect") == 0);
-  for (int i = 0; i < 6; ++i)
+  for (int i = 0; i < 8; ++i)
     CHECK((types[i] == MaskType::Luminosity || types[i] == MaskType::ColorRange) == maskTypeUsesPixels(types[i]));
 }
 
@@ -102,9 +104,55 @@ static void testDispatch()
   }
   // Identity frame: shapes come through the mapping unchanged (an Object gets a warped map).
   const GeoFrame id = makeGeoFrame(400, 300, Orient{}, 0.0f, false, CropRect{});
-  for (const MaskShape &s : {MaskShape{r}, MaskShape{l}, MaskShape{BrushShape{}}, MaskShape{LuminosityShape{}}, MaskShape{ColorRangeShape{}}})
+  for (const MaskShape &s : {MaskShape{r}, MaskShape{l}, MaskShape{BrushShape{}}, MaskShape{LuminosityShape{}}, MaskShape{ColorRangeShape{}}, MaskShape{RectShape{}}, MaskShape{PolygonShape{}}})
     CHECK(maskShapeToSource(s, id) == s);
   CHECK(maskShapeToSource(MaskShape{ObjectShape{}}, id).index() == static_cast<size_t>(MaskType::Object));
+}
+
+static void testNewKindsDispatch()
+{
+  // Rectangle and Polygon go through the same generic functions as the others.
+  RectShape r;
+  r.cx = 0.4f;
+  r.cy = 0.5f;
+  r.rx = 0.3f;
+  r.ry = 0.15f;
+  r.angle = 20.0f;
+  PolygonShape p;
+  p.pts = {{0.2f, 0.2f}, {0.8f, 0.3f}, {0.6f, 0.9f}};
+  p.feather = 0.2f;
+  const int W = 40, H = 30;
+  const MaskEval er = prepareMask(r, W, H), ep = prepareMask(p, W, H);
+  CHECK(std::holds_alternative<RectEval>(er) && std::holds_alternative<PolygonEval>(ep));
+  CHECK(MaskPart{MaskShape{r}}.type() == MaskType::Rectangle && MaskPart{MaskShape{p}}.type() == MaskType::Polygon);
+  for (int y = 0; y < H; ++y)
+  {
+    int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+    CHECK(maskRowSpan(er, y, W, a0, a1) == std::get<RectEval>(er).rowSpan(y, W, b0, b1) && a0 == b0 && a1 == b1);
+    CHECK(maskRowSpan(ep, y, W, a0, a1) == std::get<PolygonEval>(ep).rowSpan(y, W, b0, b1) && a0 == b0 && a1 == b1);
+    std::vector<float> w1(W), w2(W);
+    maskRowWeights(er, y, 0, W, w1.data(), nullptr);
+    std::get<RectEval>(er).rowWeights(y, 0, W, w2.data());
+    CHECK(w1 == w2);
+    maskRowWeights(ep, y, 0, W, w1.data(), nullptr);
+    std::get<PolygonEval>(ep).rowWeights(y, 0, W, w2.data());
+    CHECK(w1 == w2);
+  }
+  // They mean something in a composite: a rectangle minus a polygon.
+  RectShape box;
+  box.cx = box.cy = 0.5f;
+  box.rx = box.ry = 0.4f;
+  box.feather = 0.0f;
+  PolygonShape hole;
+  hole.pts = {{0.3f, 0.3f}, {0.7f, 0.3f}, {0.7f, 0.7f}, {0.3f, 0.7f}};
+  hole.feather = 0.0f;
+  const int w = 100, h = 100;
+  const MaskComposite c = compose({{box, MaskOp::Add}, {hole, MaskOp::Subtract}}, w, h);
+  std::vector<float> row(w), tmp(w);
+  c.rowWeights(50, 0, w, row.data(), nullptr, tmp.data());
+  CHECK(row[50] == 0.0f && row[15] > 0.99f && row[85] > 0.99f && row[3] == 0.0f); // ring: edge, hole, outside
+  int x0, x1;
+  CHECK(c.rowSpan(50, w, x0, x1) && x0 <= 15 && x1 >= 85);
 }
 
 static void testComposeFolds()
@@ -197,7 +245,7 @@ static void testSpansCoverEverythingForRandomComposites()
     for (int i = 0; i < n; ++i)
     {
       MaskShape s;
-      switch (rng() % 3)
+      switch (rng() % 5)
       {
       case 0:
         s = disc(static_cast<float>(rng() % 100) / 100.0f, static_cast<float>(rng() % 100) / 100.0f, 0.05f + static_cast<float>(rng() % 30) / 100.0f);
@@ -210,6 +258,28 @@ static void testSpansCoverEverythingForRandomComposites()
         l.angle = static_cast<float>(static_cast<int>(rng() % 360) - 180);
         l.len = 0.05f + static_cast<float>(rng() % 40) / 100.0f;
         s = l;
+        break;
+      }
+      case 3:
+      {
+        RectShape q;
+        q.cx = static_cast<float>(rng() % 100) / 100.0f;
+        q.cy = static_cast<float>(rng() % 100) / 100.0f;
+        q.rx = 0.05f + static_cast<float>(rng() % 40) / 100.0f;
+        q.ry = 0.05f + static_cast<float>(rng() % 40) / 100.0f;
+        q.angle = static_cast<float>(static_cast<int>(rng() % 360) - 180);
+        q.feather = static_cast<float>(rng() % 101) / 100.0f;
+        s = q;
+        break;
+      }
+      case 4:
+      {
+        PolygonShape pg;
+        const int k = 3 + static_cast<int>(rng() % 5);
+        for (int j = 0; j < k; ++j)
+          pg.pts.push_back(PolyPt{static_cast<float>(rng() % 100) / 100.0f, static_cast<float>(rng() % 100) / 100.0f});
+        pg.feather = static_cast<float>(rng() % 101) / 100.0f;
+        s = pg;
         break;
       }
       default:
@@ -308,15 +378,19 @@ static void testClearCaches()
   o.prepare(10, 10);
   const GeoFrame f = makeGeoFrame(40, 40, Orient{}, 0.0f, false, CropRect{});
   warpObjectMap(map, f);
-  CHECK(brushCache().size() > 0 && objectEvalCache().size() > 0 && objectWarpCache().size() > 0);
+  PolygonShape pg;
+  pg.pts = {{0.2f, 0.2f}, {0.8f, 0.2f}, {0.5f, 0.8f}};
+  pg.prepare(30, 30);
+  CHECK(brushCache().size() > 0 && objectEvalCache().size() > 0 && objectWarpCache().size() > 0 && polygonCache().size() > 0);
   clearMaskCaches();
-  CHECK(brushCache().size() == 0 && objectEvalCache().size() == 0 && objectWarpCache().size() == 0);
+  CHECK(brushCache().size() == 0 && objectEvalCache().size() == 0 && objectWarpCache().size() == 0 && polygonCache().size() == 0);
 }
 
 int main()
 {
   testKinds();
   testDispatch();
+  testNewKindsDispatch();
   testComposeFolds();
   testSpans();
   testSpansCoverEverythingForRandomComposites();

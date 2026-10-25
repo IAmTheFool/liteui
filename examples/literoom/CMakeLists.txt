@@ -40,6 +40,8 @@ set(LITEROOM_HEADERS
     src/mask/mask_raster.hpp
     src/mask/mask_brush.hpp
     src/mask/mask_object.hpp
+    src/mask/mask_rect.hpp
+    src/mask/mask_polygon.hpp
     src/mask/seg_basic.hpp
     src/mask/sam_segmenter.hpp
 
@@ -180,7 +182,7 @@ if(LITEROOM_TESTS)
     # Pure header tests: no liteui, no threads.
     foreach(t minijson exif
               pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves
-              mask_geom mask_raster mask_brush mask_range mask_object mask
+              mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
               sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter)
         literoom_add_test(${t})
     endforeach()

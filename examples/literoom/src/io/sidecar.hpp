@@ -338,6 +338,25 @@ inline mj::Json sidecarShapeToJson(const MaskShape &s)
       o.set("map", std::move(m));
     }
   }
+  else if (const auto *re = std::get_if<RectShape>(&s))
+  {
+    o.set("type", Json::str("rect"));
+    o.set("cx", Json::num(re->cx));
+    o.set("cy", Json::num(re->cy));
+    o.set("rx", Json::num(re->rx));
+    o.set("ry", Json::num(re->ry));
+    o.set("angle", Json::num(re->angle));
+    o.set("feather", Json::num(re->feather));
+  }
+  else if (const auto *po = std::get_if<PolygonShape>(&s))
+  {
+    o.set("type", Json::str("polygon"));
+    o.set("feather", Json::num(po->feather));
+    Json pts = Json::array(); // x0, y0, x1, y1, ...
+    for (const PolyPt &p : po->pts)
+      pts.push(Json::num(p.x)).push(Json::num(p.y));
+    o.set("pts", std::move(pts));
+  }
   return o;
 }
 
@@ -463,6 +482,35 @@ inline bool sidecarShapeFromJson(const mj::Json &o, MaskShape *out)
       }
     }
     *out = std::move(s);
+    return true;
+  }
+  if (ty == "rect")
+  {
+    RectShape s;
+    s.cx = sidecarNum(o, "cx", s.cx, -1.0f, 2.0f);
+    s.cy = sidecarNum(o, "cy", s.cy, -1.0f, 2.0f);
+    s.rx = sidecarNum(o, "rx", s.rx, 0.001f, 4.0f);
+    s.ry = sidecarNum(o, "ry", s.ry, 0.001f, 4.0f);
+    s.angle = sidecarNum(o, "angle", s.angle, -360.0f, 360.0f);
+    s.feather = sidecarNum(o, "feather", s.feather, 0.0f, 1.0f);
+    *out = s;
+    return true;
+  }
+  if (ty == "polygon")
+  {
+    PolygonShape s;
+    s.feather = sidecarNum(o, "feather", s.feather, 0.0f, 1.0f);
+    const mj::Json *pj = o.find("pts");
+    if (pj && pj->isArray())
+    {
+      const auto &v = pj->items();
+      for (size_t i = 0; i + 1 < v.size() && s.pts.size() < kPolyMaxPoints;
+           i += 2)
+        if (v[i].isNumber() && v[i + 1].isNumber())
+          s.pts.push_back({sidecarClampNum(v[i], -1.0f, 2.0f),
+                           sidecarClampNum(v[i + 1], -1.0f, 2.0f)});
+    }
+    *out = std::move(s); // fewer than 3 points is kept: it just selects nothing
     return true;
   }
   return false;

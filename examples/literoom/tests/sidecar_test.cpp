@@ -199,6 +199,14 @@ static void checkValid(const SidecarEdits &e, int w, int h, const char *tag)
         need(inRange(lu->lo, 0, 1) && inRange(lu->hi, 0, 1) && inRange(lu->feather, 0, 1), "luminosity");
       else if (const auto *cr = std::get_if<ColorRangeShape>(&p.shape))
         need(inRange(cr->r, 0, 1) && inRange(cr->range, 0, 1) && inRange(cr->feather, 0, 1), "color range");
+      else if (const auto *re = std::get_if<RectShape>(&p.shape))
+        need(inRange(re->rx, 0.001f, 4) && inRange(re->ry, 0.001f, 4) && inRange(re->feather, 0, 1) && inRange(re->cx, -1, 2) && inRange(re->cy, -1, 2) && inRange(re->angle, -360, 360), "rect");
+      else if (const auto *pg = std::get_if<PolygonShape>(&p.shape))
+      {
+        need(pg->pts.size() <= kPolyMaxPoints && inRange(pg->feather, 0, 1), "polygon");
+        for (const PolyPt &pt : pg->pts)
+          need(inRange(pt.x, -1, 2) && inRange(pt.y, -1, 2), "polygon point");
+      }
       else if (const auto *o = std::get_if<ObjectShape>(&p.shape))
       {
         need(o->prompts.size() <= kSidecarMaxPrompts, "prompts");
@@ -405,6 +413,64 @@ static void testMasksAreValidated()
   CHECK(load(maskJson(R"([{"type":"radial"}])", R"(,"adjust":{"Exposure":500},"curves":{"g":[[0,0]]})"), &e));
   CHECK(e.masks[0].adj[static_cast<size_t>(AdjId::Exposure)] == kAdjustmentSpecs[static_cast<size_t>(AdjId::Exposure)].max &&
         e.masks[0].curves[2] == identityCurve());
+}
+
+static void testRectAndPolygon()
+{
+  // Round trip: written, read back equal, written again identical.
+  SidecarEdits a;
+  Mask m;
+  RectShape r;
+  r.cx = 0.3f;
+  r.cy = 0.6f;
+  r.rx = 0.25f;
+  r.ry = 0.1f;
+  r.angle = -33.0f;
+  r.feather = 0.45f;
+  PolygonShape p;
+  p.pts = {{0.1f, 0.2f}, {0.8f, 0.15f}, {0.9f, 0.7f}, {0.4f, 0.95f}, {0.05f, 0.5f}};
+  p.feather = 0.35f;
+  m.parts.push_back({r, MaskOp::Add});
+  m.parts.push_back({p, MaskOp::Subtract});
+  a.masks.push_back(m);
+  Mask few; // fewer than 3 points is kept (it just selects nothing)
+  PolygonShape two;
+  two.pts = {{0.2f, 0.2f}, {0.7f, 0.7f}};
+  few.parts.push_back({two, MaskOp::Add});
+  a.masks.push_back(few);
+  const std::string text = sidecarEditsToJson(a).dump();
+  SidecarEdits b;
+  CHECK(load(text, &b));
+  checkValid(b, 400, 300, "rect and polygon");
+  CHECK(b.masks.size() == 2 && b.masks[0].parts.size() == 2);
+  CHECK(std::get<RectShape>(b.masks[0].parts[0].shape) == r);
+  CHECK(std::get<PolygonShape>(b.masks[0].parts[1].shape) == p);
+  CHECK(b.masks[0].parts[1].op == MaskOp::Subtract);
+  CHECK(std::get<PolygonShape>(b.masks[1].parts[0].shape) == two);
+  CHECK(sidecarEditsToJson(b).dump() == text);
+  const Json j = sidecarShapeToJson(MaskShape{r});
+  CHECK(j.find("type")->asStr() == "rect");
+  CHECK(sidecarShapeToJson(MaskShape{p}).find("type")->asStr() == "polygon");
+
+  // Damaged input is clamped / skipped, never trusted.
+  SidecarEdits e;
+  CHECK(load(maskJson(R"([{"type":"rect","cx":50,"cy":-9,"rx":0,"ry":99,"angle":900,"feather":-3}])"), &e));
+  const RectShape &q = std::get<RectShape>(e.masks[0].parts[0].shape);
+  CHECK(q.cx == 2.0f && q.cy == -1.0f && q.rx == 0.001f && q.ry == 4.0f && q.angle == 360.0f && q.feather == 0.0f);
+  CHECK(load(maskJson(R"([{"type":"rect"}])"), &e) && std::get<RectShape>(e.masks[0].parts[0].shape) == RectShape{});
+  CHECK(load(maskJson(R"([{"type":"polygon","feather":9,"pts":[0.1,0.2,5,-5,"a",1,0.3,0.4,0.9]}])"), &e));
+  const PolygonShape &g = std::get<PolygonShape>(e.masks[0].parts[0].shape);
+  CHECK(g.feather == 1.0f);
+  CHECK(g.pts.size() == 3 && g.pts[1].x == 2.0f && g.pts[1].y == -1.0f); // clamped
+  CHECK(g.pts[2].x == 0.3f && g.pts[2].y == 0.4f);                       // the pair with "a" is skipped, the odd last number ignored
+  CHECK(load(maskJson(R"([{"type":"polygon"}])"), &e) && std::get<PolygonShape>(e.masks[0].parts[0].shape) == PolygonShape{});
+  CHECK(load(maskJson(R"([{"type":"polygon","pts":"nope"}])"), &e) && std::get<PolygonShape>(e.masks[0].parts[0].shape).pts.empty());
+  // The point count is capped.
+  std::string pts = R"([{"type":"polygon","pts":[)";
+  for (size_t i = 0; i < kPolyMaxPoints + 50; ++i)
+    pts += (i ? "," : "") + std::string("0.5,0.5");
+  pts += "]}]";
+  CHECK(load(maskJson(pts), &e) && std::get<PolygonShape>(e.masks[0].parts[0].shape).pts.size() == kPolyMaxPoints);
 }
 
 static void testBrushAndRanges()
@@ -1039,6 +1105,7 @@ int main()
   testCurvesMixGrade();
   testMasksAreValidated();
   testBrushAndRanges();
+  testRectAndPolygon();
   testObjectMaps();
   testFuzz();
   testSyncLook();

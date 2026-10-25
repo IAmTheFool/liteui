@@ -17,7 +17,7 @@ ctest --test-dir build/release -C Release --output-on-failure
 
 `-C Release` (the configuration) is needed with Visual Studio's multi-configuration generator and is harmless with Ninja. To run just one test, filter by name: `ctest --test-dir build/release -C Release -R mask_brush`.
 
-Each test is a target named `literoom_<name>_test` and a CTest entry named `literoom_<name>`, so `-R mask_brush` still matches. There are **34** literoom tests (24 plain unit tests, 4 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`), 5 LiteUI tests and `golden_render`). A plain `ctest -N` from the liteui root lists more (178 at the time of writing, with `preset` and `virtual_copy` included), because it also includes liteui's own Catch2 cases and the `counter` example. To list only literoom's:
+Each test is a target named `literoom_<name>_test` and a CTest entry named `literoom_<name>`, so `-R mask_brush` still matches. There are **36** literoom tests (26 plain unit tests, 4 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`), 5 LiteUI tests and `golden_render`). A plain `ctest -N` from the liteui root lists more (178 at the time of writing, with `preset` and `virtual_copy` included), because it also includes liteui's own Catch2 cases and the `counter` example. To list only literoom's:
 
 ```powershell
 ctest --test-dir build/release -N -R literoom_
@@ -51,7 +51,7 @@ Things worth knowing:
 
 One `tests/<name>_test.cpp` per header. Each is compiled on its own against the engine headers. A test includes a header by its path from `src/`, for example `#include "mask/mask_brush.hpp"`; the test targets have `src/` on their include path, and `tests/` too so that `check.hpp` is found:
 
-`minijson`, `exif`, `pixel_math`, `adjustments`, `auto_tone`, `color_mix`, `color_grade`, `color_pass`, `geometry`, `curves`, `mask_geom`, `mask_raster`, `mask_brush`, `mask_range`, `mask_object`, `mask`, `sidecar`, `render_params`, `adjustment_set`, `file_utils`, `virtual_copy`, `image_meta`, `preset`, `sam_segmenter` (24 in all; `detail_layer` and `neighbor_fx` are also engine tests with no UI, but they start threads, so they are built with the thread library, see below).
+`minijson`, `exif`, `pixel_math`, `adjustments`, `auto_tone`, `color_mix`, `color_grade`, `color_pass`, `geometry`, `curves`, `mask_geom`, `mask_raster`, `mask_brush`, `mask_range`, `mask_object`, `mask_rect`, `mask_polygon`, `mask`, `sidecar`, `render_params`, `adjustment_set`, `file_utils`, `virtual_copy`, `image_meta`, `preset`, `sam_segmenter` (26 in all; `detail_layer` and `neighbor_fx` are also engine tests with no UI, but they start threads, so they are built with the thread library, see below).
 
 Tests that touch the disk (`file_utils`, `virtual_copy`, `image_meta`, `preset`, and also `image_codec` and `thumb_worker` below) work in a throw-away folder under the system temp directory (`literoom_<tag>_<timestamp>`), removed again when the test ends. The metadata tests build their own synthetic JPEG files (hand-made EXIF and ICC segments), so no sample photos are needed.
 
@@ -212,6 +212,8 @@ To prove that the only change in the kitchen-sink scenarios is the new slider, g
 | `mask_geom` | Radial and Linear falloff written out as formulas, feather limits, row spans cover every non-zero pixel on random shapes, round trips through random `GeoFrame`s, `applySourceEdit` leaves unrelated fields untouched. |
 | `mask_raster` | Reading a coverage map at the same size (exact) and at another size (bilinear), row spans cover every non-zero pixel, empty and out-of-range rows. |
 | `mask_brush` | A single dab, density, painting and erasing arithmetic (including rounding), flow build-up, map size caps, spans, incremental rasterizing equals a full one, the LRU cache. |
+| `mask_rect` | The falloff written out as a formula, hard edge and feather, a quarter turn with swapped half-sizes gives the same mask, sizes are a fraction of the shorter side, the span covers every non-zero pixel and is tight (exact for axis-aligned and turned rectangles), round trip through every frame, `applySourceEdit` touches only changed fields. |
+| `mask_polygon` | Geometry helpers (even-odd containment, nearest edge, simplify), fewer than three points select nothing, a hard square's area and half-pixel anti-aliasing, winding and start point do not matter, bow tie / pentagram / concave shapes, feather is centered on the outline and keeps the total weight, a polygon bigger than the picture does not fade at its edge, spans cover every non-zero pixel (including a downscaled map), frame round trip, `applySourceEdit` for a moved / added / removed vertex, the cache. |
 | `mask_range` | Luminosity and Color Range written out as formulas, `setLo` / `setHi`, integer luma used for the weight, unset Color Range selects nothing, these shapes are not spatial. |
 | `mask_object` | Grow, shrink and feather against naive references, the bilinear warp (quarter turns, straighten corners, size cap) and its caches, shape equality by map id, prompts follow the frame. |
 | `mask` | The type order matches the variants, Add / Subtract / Intersect as a fold, composite row spans, `Mask` defaults and equality, mask names, `clearMaskCaches`. |
