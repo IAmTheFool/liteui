@@ -13,7 +13,7 @@ Every slider in the Adjust pane is one entry in the `kAdjustmentSpecs` table in 
 
 A compile-time check (`static_assert`) fails the build if the table and the enum do not line up, if a range is empty, or if a Tone entry has no `apply`. You cannot forget a half silently.
 
-**Keep the table grouped by stage: all Tone entries, then all Color entries, then all Detail entries.** The Adjust pane (and each mask's Basic list) adds its "Color" and "Detail" headers when it reaches the first entry of that stage, so a Color slider placed after a Detail entry would show up under the Detail header. The one exception is **Filters**: they are Color-stage entries, and `main.cpp` adds a "Filters" header (in both the Adjust pane and each mask's Basic list) when its loop reaches `AdjId::Greyscale`. Keep new filters in that block, after `Cross Process` and before the first Detail entry.
+**Keep the table grouped by stage: all Tone entries, then all Color entries, then all Detail entries, then all Effects entries.** The Adjust pane (and each mask's Basic list) adds its "Color" and "Detail" headers when it reaches the first entry of that stage, so a Color slider placed after a Detail entry would show up under the Detail header. The Adjust pane adds an "Effects" header the same way; the mask lists skip the whole Effects stage, because Vignette and Grain are global only. The one exception is **Filters**: they are Color-stage entries, and `main.cpp` adds a "Filters" header (in both the Adjust pane and each mask's Basic list) when its loop reaches `AdjId::Greyscale`. Keep new filters in that block, after `Cross Process` and before the first Detail entry.
 
 ### Step 2: pick the stage
 
@@ -24,6 +24,7 @@ The stage decides where the slider acts and what else you need to write.
 | **Tone** | The result for a pixel depends only on that one channel's value (like Exposure or Contrast). | Just an `apply(float channel, float value)` function. It is composed into the shared lookup table automatically. |
 | **Color** | You need per-channel gains or cross-channel math (like Saturation or Hue). | Set `apply` to `nullptr` and teach the color pass about it (below). |
 | **Detail** | You need neighboring pixels (like Texture or Blur). | Set `apply` to `nullptr` and teach the neighbor effects about it (below). |
+| **Effects** | You need the pixel's *position* in the picture, and the effect belongs on the finished picture (like Vignette or Grain). Global only. | Set `apply` to `nullptr` and teach `film_fx` about it (below). |
 
 **Tone sliders** need nothing else. Keep these rules in mind:
 
@@ -60,6 +61,15 @@ For a Tone slider, also add:
 1. A new gain in `neighbor_fx::Gains` and the math in `detail/neighbor_fx.hpp` (or `detail/detail_layer.hpp`). Include it in `Gains::any()`: when `any()` is false the effects are skipped, and a mask with only that slider set is dropped by `buildMaskPasses`. If your effect needs a new blurred plane, add it to the set that `acquire` builds, and to `need()`.
 2. The new value passed to `neighbor_fx::gainsFromValues` at **both** call sites: `AdjustmentSet::buildRenderParams()` and `buildMaskPasses()`.
 
+**Effects sliders** (Vignette and Grain are the examples) also need:
+
+1. A field in `film_fx::Params` and the math in `film_fx::apply` (`detail/film_fx.hpp`). `paramsFromValues` takes the slider values as parameters, so add a parameter and sanitize it there (clamp, NaN becomes 0). Include it in `Params::any()` (through `hasVignette()` / `hasGrain()` or a new one), because when `any()` is false `renderWith` skips the pass.
+2. The new value passed in `filmFromAdj` (`edit/render_params.hpp`). There is only one call site, `AdjustmentSet::buildRenderParams()`, because masks never get an Effects slider.
+3. Nothing in the mask code: `main.cpp` skips `Stage::Effects` in both slider loops, and `buildMaskPasses` never reads these values (a mask that carries one, from a hand-edited sidecar, is dropped as one with no adjustments).
+4. Keep it a **pure function of position and the sliders**. Anything random must be a hash of (x, y), never a generator or a counter, or the preview, the background render and the export would stop agreeing. Take positions from the whole picture, not from the block: `apply` gets the index of its first pixel for that reason.
+5. Anything that renders "the picture before a mask" (the three `rp.film = {}` lines in `main.cpp`) already clears the whole `film` value, so a new Effects slider needs nothing there. A new effect that is *not* part of `film_fx` but also runs after the masks would have to be cleared at those three sites too.
+6. Tests: add a case to `film_fx_test`, to `filmFromAdj`'s check in `render_params_test`, and to the label and range lists in `testEffectsBlock` (`adjustments_test`). If its half-range value would wipe out the picture in the kitchen-sink scenarios, give it a fixed value in `fixedSinkValue` (the block is found with `isEffects`; move its upper bound if you add after `Grain Roughness`). Then re-record the golden file and check it as described in [testing.md](testing.md#checking-a-re-record).
+
 ### What you get for free
 
 Once the table entry exists, these need no changes:
@@ -69,6 +79,7 @@ Once the table entry exists, these need no changes:
 - Undo, redo, and coalescing of slider drags into one step.
 - The History label ("Name +20").
 - The saved-edits file.
+- **Vignette and Grain are sliders like any other** (an "Effects" header in the Adjust pane, `Vignette -40` in History, saved under their labels), with one exception: a mask has no Effects sliders.
 - **Presets.** A preset stores sliders by label through the same table, so a new slider is saved in presets and applied by them with no preset code. A preset saved before the slider existed simply has no entry for it, which reads as 0.
 - The drag-preview path.
 - **Snapshots and virtual copies.** A snapshot stores the whole `SidecarEdits` and a virtual copy has a whole sidecar, so a new slider is saved, restored and kept per copy with no extra code. A snapshot saved before the slider existed has no entry for it, which reads as 0.
@@ -84,6 +95,7 @@ Once the table entry exists, these need no changes:
 - **A new kind of look data needs three updates.** If you add a new group to the look (not a slider: a new list or table like the curves), add it to `Preset`, to `presetToJson` / `presetFromJson`, and to the parameters of `sidecarSyncLook`, or Copy, Paste and Sync would silently skip it.
 - **A new kind of edit must be loaded by `exportPicture`.** Batch export builds its pipeline from the saved edits alone (`exportLoadEdits`, then orient, straighten, crop, `renderWith`), mirroring `runGeometryJob`. A new geometry step or a new input to the render has to be added there as well as to the geometry worker, or batch export would differ from the editor. `export_worker_test` compares against the same chain, so extend it when you change the pipeline.
 - **A new field of `SidecarEdits` (a new kind of edit) must be handled by `AdjustmentSet::currentEdits()` and `restoreEdits()`.** Snapshots save it automatically, because they are written by `sidecarEditsToJson`. But `currentEdits()` builds the struct field by field and `restoreEdits()` assigns and compares field by field, so a field missing there is silently dropped from snapshots or left unchanged by a restore. Add it to the equality check in `restoreEdits` too, or restoring the same state would add a step.
+- **Effects sliders are offsets from a default look.** Vignette Midpoint, Vignette Feather and Grain Roughness are 0 at their default (midpoint and feather halfway, roughness an even blend), so the neutral value of every slider is still 0 and a file that only sets "Vignette" gives a normal vignette. Keep that rule for a new Effects slider, or zero values stop being left out of the sidecar and an old file would load with a different look.
 - **A new slider at 0 must change nothing.** Default values are 0, and the golden render test (see [testing.md](testing.md)) fingerprints the output. If adding a slider changes an *existing* fingerprint while the new slider is untouched, something is wrong.
 
 ## Adding a mask type

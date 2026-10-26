@@ -36,10 +36,10 @@ Every header sits under `src/`, which is the include root, so a header is always
 |---|---|
 | `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops` |
 | `color/` | `color_mix`, `color_grade`, `color_pass`, `curves` |
-| `detail/` | `detail_layer`, `neighbor_fx` |
+| `detail/` | `detail_layer`, `neighbor_fx`, `film_fx` |
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_rect`, `mask_polygon`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
-| `render/` | `render`, `histogram` |
+| `render/` | `render`, `histogram`, `scopes` |
 | `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
 | `workers/` | `latest_worker`, `thumb_worker`, `export_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
@@ -84,10 +84,11 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 
 **Depends on:** `pixel_math.hpp` (`smoothStep01`, `toU8Clamped`). **Test:** `adjustments_test`.
 
-**Three stages**
+**Four stages**
 - **Tone**: pointwise per channel (0..255 in, float out). Composed into one lookup table by `toneLutFromValues`. Runs first.
 - **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process): 0..100 strengths that run as the last block of the color pass.
 - **Detail**: needs neighbor pixels. `apply` is `nullptr`; read by `detail_layer.hpp` and `neighbor_fx.hpp`.
+- **Effects**: needs the pixel's *position* (Vignette, Grain). `apply` is `nullptr`; read by `film_fx.hpp`, the very last step of `renderWith` (after the masks). Global only: the mask slider lists skip this stage. Last in the table.
 
 **Constants**
 
@@ -101,7 +102,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | `kGammaOctaves` | `float` | 2 | Gamma's exponent is `2^(-v / 100 * kGammaOctaves)`, so the exponent runs from 0.25 (+100) to 4 (-100) |
 
 **Types**
-- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, BlackPoint, WhitePoint, Gamma, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, BlackPoint, WhitePoint, Gamma, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Vignette, VignetteMidpoint, VignetteFeather, Grain, GrainSize, GrainRoughness, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
 - `struct AdjustmentSpec`
 
   | Field | Type | Meaning |
@@ -109,11 +110,11 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
   | `id` | `AdjId` | Must equal the entry's position in the table |
   | `label` | `std::string_view` | Display name (a string literal, so the table is constant-initialized) |
   | `min`, `max` | `float` | Slider range; `min < max` is enforced at compile time |
-  | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color and Detail |
-  | `stage` | `Stage` (`Tone`, `Color`, `Detail`) | Which pass consumes it. Defaults to `Tone` |
-- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 34 floats, indexed by `adjIndex(id)`.
+  | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color, Detail and Effects |
+  | `stage` | `Stage` (`Tone`, `Color`, `Detail`, `Effects`) | Which pass consumes it. Defaults to `Tone` |
+- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 40 floats, indexed by `adjIndex(id)`.
 
-**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 34>`). Declaration order is the sidebar order and, within Tone, the processing order.
+**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 40>`). Declaration order is the sidebar order and, within Tone, the processing order.
 
 | Slider | Range | Stage | Per-channel function (x = channel 0..255, v = value) |
 |---|---|---|---|
@@ -133,6 +134,13 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process | 0..100 | Color | none (the Filters block of `color_pass.hpp`; 0 = off). Their labels are sidecar keys, so never rename them |
 | Texture, Clarity, Dehaze | -100..100 | Detail | none |
 | Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
+| Vignette | -100..100 | Effects | none (`film_fx.hpp`; negative darkens the edges, positive lightens them, 0 = off) |
+| Vignette Midpoint, Vignette Feather | -100..100 | Effects | none (offsets from the default look: 0 = midpoint and feather halfway; + moves the ramp outward / widens it) |
+| Grain | 0..100 | Effects | none (0 = off) |
+| Grain Size | 0..100 | Effects | none (0 = finest) |
+| Grain Roughness | -100..100 | Effects | none (offset from an even blend of smooth and crisp grain; -100 = smooth, +100 = crisp) |
+
+The Effects labels (`Vignette`, `Vignette Midpoint`, `Vignette Feather`, `Grain`, `Grain Size`, `Grain Roughness`) are sidecar keys, so never rename them.
 
 - The Highlights/Shadows/Whites/Blacks scales (0.6 / 0.4) were chosen so the curve stays monotonic. Whites and Blacks have the thinnest margin (about 0.94); raising their 0.4 much past 0.42 breaks it.
 - **Levels** (Black Point, White Point, Gamma) come last in the Tone block, in that order, so each runs on the previous one's rounded output. Black Point and White Point are linear with slope `255 / (255 - v)`, at least 1 and finite because `v <= 100`, so they are monotonic. Gamma is monotonic for any positive exponent, never moves 0 or 255, and floors its input at 0 so `pow` never sees a negative base. Each returns `x` untouched at 0 (no `pow(x, 1)` rounding noise). Black Point returns negative values below `v` and White Point values above 255; the table builder clamps them.
@@ -342,12 +350,12 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade and the ten Filters (via `filterValuesFromAdj(values_)`).
 
 **`RenderParams buildRenderParams() const`**
-- Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), and `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks).
+- Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks), and `film` from `filmFromAdj(values_)` (Vignette and Grain: global, applied after the masks).
 
 ### `render_params.hpp`
 `RenderParams` and `MaskPass`: everything the per-pixel pipeline needs, frozen into one small copyable value. Built from the edit state in O(256), so the UI thread builds one and hands a copy to a worker; the worker never touches the `AdjustmentSet`, which the UI thread keeps mutating. No pixels, no UI.
 
-**Depends on:** `adjustments.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `neighbor_fx.hpp`. **Test:** `render_params_test`.
+**Depends on:** `adjustments.hpp`, `color_pass.hpp`, `curves.hpp`, `film_fx.hpp`, `geometry.hpp`, `mask.hpp`, `neighbor_fx.hpp`. **Test:** `render_params_test`.
 
 **Types**
 
@@ -363,11 +371,13 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 | `color` | `ColorPass` | inactive | The mask's own color pass |
 | `fx` | `neighbor_fx::Gains` | all 0 | The mask's Texture, Clarity, Sharpness, Dehaze, Noise and Blur gains |
 
-`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it).
+`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it), `film` (`film_fx::Params`: Vignette and Grain, the very last step, after the masks).
 
 **Functions**
 
 **`inline FilterValues filterValuesFromAdj(const AdjValues &a)`**: picks the ten Filter sliders (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process) out of an `AdjValues` in the form `makeColorPass` takes. It must be passed at **both** `makeColorPass` call sites (`AdjustmentSet::buildColorPass()` and `buildMaskPasses()`); a site that forgets it silently ignores the Filters.
+
+**`inline film_fx::Params filmFromAdj(const AdjValues &a)`**: picks the six Effects sliders (Vignette, Vignette Midpoint, Vignette Feather, Grain, Grain Size, Grain Roughness) out of an `AdjValues` and sanitizes them through `film_fx::paramsFromValues`. Its only call site is `AdjustmentSet::buildRenderParams()`: masks never read these sliders.
 
 **`inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks, const GeoFrame &frame)`**
 - Inputs: the user's masks (stored against the original picture) and the `GeoFrame` of the picture being rendered.
@@ -378,6 +388,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
   - Tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
   - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount, and the Filters through `filterValuesFromAdj`). A mask with only a Filter slider set counts as having an active color pass, so it is kept.
   - `fx` comes from `neighbor_fx::gainsFromValues` with the seven detail sliders.
+  - The Effects sliders (Vignette, Grain) are **not read**: a mask that carries one has no adjustment from it, and one with nothing else is dropped.
 
 ---
 
@@ -823,6 +834,42 @@ With `detail_layer`'s own cache (384 MiB) the worst case is about 700 MB of cach
 
 **`inline void apply(const Planes &pl, const Gains &g, const uint8_t *src, uint8_t *dst, size_t count, size_t first, int W)`**
 - Runs all the effects in the order above for `count` consecutive pixels. `W` is the picture width and must be positive, otherwise nothing is done. Each effect runs only when its gain is non-zero.
+
+### `film_fx.hpp`
+Vignette and Grain: the two effects that depend on **where a pixel is**, which no other stage knows. Plain functions on plain values, no UI and no editor state. Both are the last step of the pixel pipeline (after the masks, see `renderWith`) and global only.
+
+**Depends on:** `pixel_math.hpp` (`toU8Clamped`). **Test:** `film_fx_test` (and `render_test`, `render_params_test`, `adjustment_set_test`, the golden scenarios `film/` and `geo_film/`).
+
+- **Vignette** is measured against the picture's own frame, i.e. it is "post-crop": centered on the picture as shown or exported and following its aspect ratio, so a crop, rotation or flip just gives the vignette of the new frame. The distance `d` is 0 at the center and 1 at the corners (an ellipse through all four corners). A smoothstep ramp centered on `midpoint` with a half-width set by `feather` turns `d` into a weight `t` (0 untouched, 1 full). Negative amount darkens, `p' = p (1 - k|a|t)`; positive lightens, `p' = p (1 - k a t) + 255 k a t`. No `GeoFrame` is needed because `renderWith` is handed the already-geometried picture.
+- **Grain** is a deterministic function of the pixel's (x, y) in the picture being rendered: an integer hash, with no random number generator, no state, and no dependence on render order, block size, thread or compiler. It is added equally to R, G and B (monochrome), scaled by a weight that is 1 at mid-gray and 0.4 at black and white. `size` sets the grain cell as a fraction of the long edge (at least 1 px), so the preview and the full picture look alike (not the same pixels: their grids differ); `roughness` blends smooth value noise (per cell) with crisp per-pixel noise.
+- Both are computed in float on the finished pixel and rounded once. Pixels with alpha 0 (the empty corners of a straightened picture) are left exactly as they are; alpha is never changed.
+- Order inside `apply()`: vignette, then grain.
+
+**Constants** (namespace `film_fx`)
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kVignetteStrength` | `float` | 0.9 | At |amount| = 1 and full weight a channel moves 90 % of the way to black (or white), never all the way |
+| `kMidpointSpan` | `float` | 0.45 | Midpoint ±100 moves the ramp center, in corner-distance units, around 0.5 by ±0.45 |
+| `kRampHalfMin`, `kRampHalfMax` | `float` | 0.05, 0.50 | Half-width of the ramp at Feather 0 / 100 (so the ramp is never empty) |
+| `kGrainLevels` | `float` | 48 | Grain 100 adds up to about this many levels |
+| `kCellFracMin`, `kCellFracSpan` | `float` | 0.0004, 0.0026 | Grain cell = long edge × (min + span × size), at least 1 px |
+| `kSmoothGainMax` | `float` | 1.5 | Gain on the smooth (value-noise) part for wide cells, so Size does not also mean "weaker" |
+| `kGrainEndWeight` | `float` | 0.4 | Grain weight at black and white (1 at mid-gray) |
+| `kSeedCrisp`, `kSeedSmooth` | `uint32_t` | `0x6C697465`, `0x726F6F6D` | Seeds of the two noise layers |
+
+**Types**
+- `struct Params`: `vignette` (-1..1), `midpoint` (0.05..0.95), `feather` (0..1), `grain` (0..1), `size` (0..1), `roughness` (0..1). `hasVignette()`, `hasGrain()`, `any()`, `operator==`. A default `Params` does nothing.
+- `struct Prepared`: a `Params` plus everything the per-pixel loop needs for one picture size (`W`, `H`, `vig`, `grain`, `invHalfW/H`, the ramp `inner` / `invRamp`, the grain `cell` / `invCell` / `smoothGain`). `any()`.
+
+**Functions**
+- **`inline Params paramsFromValues(float vignette, float midpoint, float feather, float grain, float size, float roughness)`**: from the six slider values (Vignette, Midpoint, Feather, Roughness -100..100; Grain, Size 0..100). Midpoint, Feather and Roughness are 0 at their default, so a file that only sets "Vignette" is a normal vignette. Every input is clamped, and NaN or infinity count as 0.
+- **`inline Prepared prepare(const Params &p, int W, int H)`**: resolves the params for one picture size. A non-positive size gives a `Prepared` that does nothing.
+- **`inline uint32_t hash2(uint32_t x, uint32_t y, uint32_t seed)`**: the 32-bit integer hash (unsigned arithmetic only, so identical on every compiler; a few values are pinned in the test). **`hashUnit`** turns it into a float in [-1, 1).
+- **`inline float valueNoise(float u, float v, uint32_t seed)`**: smooth value noise at grain-cell coordinates (`u`, `v` ≥ 0); at integer coordinates it is exactly the hash there.
+- **`inline float grainAt(const Prepared &f, int x, int y)`**: the grain value at a pixel (roughly -1.5..1.5, before Amount and the tone weight). Depends only on (x, y), size and roughness.
+- **`inline float vignetteWeight(const Prepared &f, int x, int y)`**: the vignette weight 0..1 of a pixel.
+- **`inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)`**: applies both to `count` consecutive RGBA8 pixels of a picture `W` wide, in place. `first` is the index (`y * W + x`) of the first pixel in the **whole** picture, so any split of the picture into blocks (even mid-row) gives the same bytes. Does nothing when `any()` is false. The loop uses raw pointers for Debug-build speed.
 
 ---
 
@@ -1288,19 +1335,20 @@ Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything
 ## Rendering
 
 ### `render.hpp`
-The pixel pass: tone tables → color pass → neighbor effects → masks, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
+The pixel pass: tone tables → color pass → neighbor effects → masks → Vignette and Grain, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
 
-**Depends on:** `adjustment_set.hpp`, `color_pass.hpp`, `detail_layer.hpp`, `liteui.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `pixel_math.hpp`, `render_params.hpp`. **Test:** `render_test`.
+**Depends on:** `adjustment_set.hpp`, `color_pass.hpp`, `detail_layer.hpp`, `film_fx.hpp`, `liteui.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `pixel_math.hpp`, `render_params.hpp`. **Test:** `render_test`.
 
 **Functions**
 
 **`inline std::shared_ptr<CanvasImage> renderWith(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
 - Inputs: the source picture (**never modified**), the frozen parameters, and the optional cancellation pair.
 - Returns: a new rendered picture, or **null if cancelled**. With no `latest` it always runs to completion (the synchronous path).
-- Order per pixel: tone tables → color pass → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy.
+- Order per pixel: tone tables → color pass → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy → Vignette and Grain on the finished pixel (`film_fx::apply`, global only).
 - How it works:
   - Masks are resolved against **this** image's size (`prepareComposite`), so preview and full-size renders agree.
   - Neighbor planes for the global effects **and every mask** are acquired once up front from `src`'s pixels (a cancelled build returns null). The detail layers come from whole-image planes, not halo rows, which is why `src` must stay untouched.
+  - Vignette and Grain are resolved against **this** image's size (`film_fx::prepare`) and run after the masks on each block, given the index of the block's first pixel (`off / 4`), so a block gives the same bytes as the whole picture in one go.
   - Rows are processed in blocks of 128; `latest` is re-read before every block. Each pixel is independent, so blocking doesn't change the result.
   - When all three channel tables are identical (no per-channel curves) a single-table fast path is used.
 
@@ -1361,6 +1409,53 @@ Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the 
   - Classic mode: red where any channel is 255, blue where any is 0.
   - Per-channel mode: colored by exactly which channels clip. Pixels clipped in all three are left untinted.
   - Where a block holds both kinds, highlights win. Fully transparent pixels never count. Marked blocks get alpha 255; others stay transparent.
+
+### `scopes.hpp`
+The two views that can replace the histogram in the pinned canvas above the panes: a **waveform** (every picture column drawn as a column of levels) and a **vectorscope** (every pixel's chroma drawn as a point on a Cb / Cr plane). Pure functions of an image: the editor's `state` is not touched. Each scope is built in two steps, counting and then drawing, so the counts can be tested without looking at pixels. Everything is in `namespace scopes`. See [architecture.md](architecture.md#waveform-and-vectorscope).
+
+**Depends on:** `histogram.hpp` (for `kHistMaxSamples`), `liteui.hpp` (`CanvasImage`). **Test:** `scopes_test` (links LiteUI). **In the app** (`main.cpp`, not this header): `computeHistogram()` calls `scopes::render` for the current view and stores the picture in `state.scopeImage`; a click on the pinned canvas calls `cycleScope()`; `paintScope` stretches the picture over the canvas and adds the graticule.
+
+**Constants** (namespace `scopes`)
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kWaveMaxCols` | `int` | 256 | Most scope columns of the waveform (fewer for a narrow picture) |
+| `kWaveLevels` | `int` | 256 | Height of the waveform, one row per level |
+| `kVecSize` | `int` | 128 | The vectorscope is `kVecSize x kVecSize` cells; Cb and Cr (0..255) are halved |
+| `kWaveSat` | `float` | 0.04 | A level holding this share of its column is drawn at full brightness |
+| `kVecSat` | `float` | 0.01 | A cell holding this share of all pixels is drawn at full brightness |
+| `kVecFloor` | `float` | 0.25 | A vectorscope cell with any pixel at all is at least this bright |
+| `kVecCellLuma` | `float` | 180 | The luma at which a vectorscope cell's own color is shown |
+| `kBgR`, `kBgG`, `kBgB` | `uint8_t` | 34, 34, 38 | The plot background (the histogram canvas's dark gray) |
+
+**Types**
+- `enum class Kind : int`: `Histogram, Waveform, Vectorscope, Count`. What the pinned canvas shows.
+- `struct Waveform`: `cols` (0 = nothing counted), `total` (samples counted), `r`, `g`, `b` (`std::vector<uint32_t>`, index `col * kWaveLevels + level`) and `colTotal` (samples counted per column).
+- `struct Vector`: `total` and `n` (`kVecSize * kVecSize` cells, index `y * kVecSize + x` with `x = Cb / 2` and `y = Cr / 2`; empty when `total == 0`).
+
+**Functions**
+
+**`inline const char *kindName(Kind k)`**: "Histogram", "Waveform" or "Vectorscope" (anything else gives "Histogram"). **`inline Kind nextKind(Kind k)`**: the next view in the order above, wrapping from `Vectorscope` to `Histogram`; a value out of range gives `Histogram`.
+
+**`inline int sampleStep(int w, int h)`**: the stride of the sample grid, `max(1, int(sqrt(w * h / kHistMaxSamples)))`: the same formula as `histogram::compute`, so a scope never visits more pixels than the histogram.
+
+**`inline float density(uint32_t count, uint32_t total, float saturation)`**: brightness 0..1 of a point holding `count` of `total` samples: `min(1, sqrt(share / saturation))` with `share = count / total`; 0 when either is 0. A share is used, not a count, so a small preview and the full picture look alike.
+
+**`inline uint8_t blendTo(uint8_t bg, float target, float v)`**: `bg` moved toward `target` (clamped to 0..255) by `v`, rounded.
+
+**`inline Waveform waveformCounts(const CanvasImage *img)`**
+- Counts the R, G and B levels of every picture column on the same sample grid as the histogram. Fully transparent pixels are skipped. A null or empty picture, or one with only transparent pixels, gives `cols == 0`.
+- The grid has `nx = ceil(width / step)` sample columns; they are folded into `cols = min(kWaveMaxCols, nx)` scope columns by sample index (`col = ix * cols / nx`), so every scope column gets at least one sample and a narrow picture never leaves gaps.
+
+**`inline std::shared_ptr<CanvasImage> waveformImage(const Waveform &wf)`**: the waveform as a picture, `cols` wide and `kWaveLevels` tall, level 255 at the top. Each channel lights only its own color component on the background, so where R, G and B coincide the point is white. Brightness is `density(count, colTotal, kWaveSat)`. Null if `cols == 0`.
+
+**`inline void rgbToCbCr(int r, int g, int b, int *cb, int *cr)`**: Rec. 601 full-range chroma in integer math, `Cb = 128 + ((-43 R - 85 G + 128 B) >> 8)` and `Cr = 128 + ((128 R - 107 G - 21 B) >> 8)`, clamped to 0..255. Any gray is exactly (128, 128); pure blue is (255, 107), pure red (85, 255), pure green (43, 21). The right shifts are of negative numbers, which C++20 defines as arithmetic shifts.
+
+**`inline Vector vectorCounts(const CanvasImage *img)`**: counts every sampled, non-transparent pixel into the cell of its Cb / Cr. An empty picture or one with only transparent pixels gives `total == 0`.
+
+**`inline std::shared_ptr<CanvasImage> vectorImage(const Vector &v)`**: the vectorscope as a `kVecSize x kVecSize` picture: Cb grows to the right and Cr upward, so red is at the top. A cell with pixels is drawn in its own hue (its Cb / Cr at luma `kVecCellLuma`) with brightness `max(kVecFloor, density(count, total, kVecSat))`; empty cells are the background. Null if `total == 0`.
+
+**`inline std::shared_ptr<CanvasImage> render(Kind kind, const CanvasImage *img)`**: the scope picture for `kind`: `waveformImage(waveformCounts(img))`, `vectorImage(vectorCounts(img))`, and null for `Histogram` (which is drawn from the counts, not from a picture) or for an empty picture.
 
 ---
 

@@ -1,5 +1,5 @@
-// render.hpp - The pixel pass: tone tables -> color pass -> neighbor effects -> masks,
-// in blocks of rows that a background render can abandon. Takes liteui's
+// render.hpp - The pixel pass: tone tables -> color pass -> neighbor effects -> masks
+// -> vignette and grain, in blocks of rows that a background render can abandon. Takes liteui's
 // CanvasImage, so this is the one header of the render chain that needs it.
 #pragma once
 #include <algorithm>
@@ -14,6 +14,7 @@
 #include "color/color_pass.hpp"
 #include "core/pixel_math.hpp"
 #include "detail/detail_layer.hpp"
+#include "detail/film_fx.hpp"
 #include "detail/neighbor_fx.hpp"
 #include "edit/adjustment_set.hpp"
 #include "edit/render_params.hpp"
@@ -103,7 +104,13 @@ inline void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev,
 //
 // Order per pixel: tone LUTs -> color pass -> neighbor effects (Dehaze,
 // Texture / Clarity / Sharpness, Noise Reduction, Blur) -> masks, each mask
-// doing the same three steps on its own copy.
+// doing the same three steps on its own copy -> Vignette and Grain (film_fx.hpp,
+// global only, on the finished pixel).
+// Vignette and Grain depend on the pixel's position in THIS picture, so they are
+// handed the index of the block's first pixel; a block of rows therefore gives the
+// same bytes as the whole picture at once, and the preview, the background render
+// and the batch export agree (the preview picture is smaller, so its grain is the
+// same kind but not the same pixels).
 // The detail layers need neighbors, which the 128-row blocks don't have, so
 // they come from whole-image blurred planes built once per picture (see
 // detail_layer.hpp) instead of from halo rows; `src` stays untouched, which
@@ -152,6 +159,9 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
                             fxNeed, latest, gen))
     return nullptr;
 
+  // Vignette and Grain are resolved against THIS picture's size, like the masks.
+  const film_fx::Prepared film = film_fx::prepare(rp.film, img->width, img->height);
+
   for (size_t off = 0; off < total; off += blockBytes)
   {
     if (latest && latest->load(std::memory_order_relaxed) != gen)
@@ -186,6 +196,8 @@ renderWith(const CanvasImage &src, const RenderParams &rp,
                        maskScratch.data(), maskWeights.data(),
                        maskWeights2.data(), src.pixels.data() + off,
                        fxPlanes);
+    if (film.any()) // last: after the masks, on whole rows (off / 4 = first pixel)
+      film_fx::apply(film, q, n / 4, off / 4);
   }
   return img;
 }

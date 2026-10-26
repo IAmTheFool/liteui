@@ -43,8 +43,8 @@ constexpr int kToneMax = kBipolarMax;
 // Adding a new one means adding an AdjId and one entry to that table (the
 // static_assert after the table fails the build if the two don't line up).
 // AdjustmentSet, the sidebar loop and the Tone-stage LUT pick it up
-// automatically; a Color or Detail slider also needs its pass (ColorPass,
-// detail_layer, ...) to read its value.
+// automatically; a Color, Detail or Effects slider also needs its pass
+// (ColorPass, detail_layer, film_fx, ...) to read its value.
 
 // Order must match kAdjustmentSpecs below (it is indexed by AdjId).
 enum class AdjId : int
@@ -88,6 +88,17 @@ enum class AdjId : int
   NoiseLuma,
   NoiseColor,
   Blur,
+  // Effects (Stage::Effects, see detail/film_fx.hpp): Vignette and Grain, the
+  // last step of the pipeline, global only (masks do not get them). Keep them
+  // last in the table. Midpoint, Feather and Roughness are 0 at their default
+  // look (the value is an offset from it), so every slider's neutral value is
+  // still 0 and a file that only sets "Vignette" is a normal vignette.
+  Vignette,
+  VignetteMidpoint,
+  VignetteFeather,
+  Grain,
+  GrainSize,
+  GrainRoughness,
   Count
 };
 
@@ -100,7 +111,7 @@ constexpr size_t adjIndex(AdjId id) { return static_cast<size_t>(id); }
 // means every Tone adjustment must be pointwise per-channel: it can't be
 // written this way if it needs neighbor-pixel access.
 //
-// Three stages:
+// Four stages:
 //   Stage::Tone   — pointwise per-channel; `apply` is composed into the shared
 //                   LUT (Exposure ... Blacks). Runs first.
 //   Stage::Color  — needs per-channel gains or cross-channel math
@@ -114,6 +125,11 @@ constexpr size_t adjIndex(AdjId id) { return static_cast<size_t>(id); }
 //                   here too: these are consumed by the neighbor-pixel passes
 //                   after the color pass (see detail_layer.hpp and
 //                   neighbor_fx.hpp).
+//   Stage::Effects — depends on the pixel's POSITION in the picture, not on
+//                   its neighbors or its color alone (Vignette, Grain).
+//                   `apply` is unused (null) here too: these are consumed by
+//                   film_fx.hpp, the very last step of renderWith (after the
+//                   masks). Global only: the mask sliders skip this stage.
 // The slider UI, undo/coalescing, and preview path treat all stages alike.
 //
 // `apply` is a plain function pointer (a captureless lambda converts to it) and
@@ -125,7 +141,8 @@ struct AdjustmentSpec
   {
     Tone,
     Color,
-    Detail
+    Detail,
+    Effects
   };
   AdjId id;
   std::string_view label;
@@ -137,7 +154,7 @@ struct AdjustmentSpec
 // Declaration order here is the sidebar's display order. It is also the
 // processing order within the Tone stage — each Tone spec's `apply` runs on the
 // previous one's output. Across stages the order is fixed: Tone (via the LUT),
-// then Color, then Detail. Exposure before Brightness mirrors Lightroom's own
+// then Color, then Detail, then (after the masks) Effects. Exposure before Brightness mirrors Lightroom's own
 // Basic panel ordering, and keeps exposure's multiplicative scale from being
 // thrown off by an offset that was meant to be applied after it.
 inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
@@ -291,6 +308,25 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
         // Blur: a color blur from none to very soft, 0..100 (mostly for masks).
         {AdjId::Blur, "Blur", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Detail},
+        // Effects stage (see film_fx.hpp). NOTE: these labels are sidecar keys;
+        // never rename them once released. Vignette: negative darkens the
+        // edges, positive lightens them. Midpoint (-100 = close to the center,
+        // +100 = far out) and Feather (-100 = narrow ramp, +100 = wide ramp)
+        // are offsets from their default look, so 0 is the default.
+        {AdjId::Vignette, "Vignette", static_cast<float>(kBipolarMin),
+         static_cast<float>(kBipolarMax), nullptr, AdjustmentSpec::Stage::Effects},
+        {AdjId::VignetteMidpoint, "Vignette Midpoint", static_cast<float>(kBipolarMin),
+         static_cast<float>(kBipolarMax), nullptr, AdjustmentSpec::Stage::Effects},
+        {AdjId::VignetteFeather, "Vignette Feather", static_cast<float>(kBipolarMin),
+         static_cast<float>(kBipolarMax), nullptr, AdjustmentSpec::Stage::Effects},
+        // Grain: Amount 0..100 (0 = off), Size 0..100 (0 = finest), Roughness
+        // -100..100 (-100 = smooth, +100 = crisp; 0 = the default blend).
+        {AdjId::Grain, "Grain", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Effects},
+        {AdjId::GrainSize, "Grain Size", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Effects},
+        {AdjId::GrainRoughness, "Grain Roughness", static_cast<float>(kBipolarMin),
+         static_cast<float>(kBipolarMax), nullptr, AdjustmentSpec::Stage::Effects},
     }};
 
 // Checks that the table lines up with AdjId (entry i has id i), every range is

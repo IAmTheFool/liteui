@@ -12,6 +12,7 @@
 #include "color/curves.hpp"
 #include "core/adjustments.hpp"
 #include "core/geometry.hpp"
+#include "detail/film_fx.hpp"
 #include "detail/neighbor_fx.hpp"
 #include "mask/mask.hpp"
 
@@ -31,6 +32,16 @@ inline FilterValues filterValuesFromAdj(const AdjValues &a)
   f.threshold = a[adjIndex(AdjId::Threshold)];
   f.crossProcess = a[adjIndex(AdjId::CrossProcess)];
   return f;
+}
+
+// The Vignette and Grain sliders of one AdjValues, in the form renderWith takes.
+// Global only: buildMaskPasses never reads them, so a mask cannot carry them.
+inline film_fx::Params filmFromAdj(const AdjValues &a)
+{
+  return film_fx::paramsFromValues(
+      a[adjIndex(AdjId::Vignette)], a[adjIndex(AdjId::VignetteMidpoint)],
+      a[adjIndex(AdjId::VignetteFeather)], a[adjIndex(AdjId::Grain)],
+      a[adjIndex(AdjId::GrainSize)], a[adjIndex(AdjId::GrainRoughness)]);
 }
 
 // A mask frozen for the render thread: its shape and everything its sliders
@@ -136,4 +147,5 @@ struct RenderParams
   ColorPass color;                                // float pass, after the LUTs
   neighbor_fx::Gains fx;                          // Texture / Clarity / Sharpness / Dehaze / Noise / Blur (neighbor_fx.hpp), after the color pass
   std::vector<MaskPass> masks;                    // local adjustments, applied after all of it
+  film_fx::Params film;                           // Vignette / Grain (film_fx.hpp): the very last step, after the masks
 };

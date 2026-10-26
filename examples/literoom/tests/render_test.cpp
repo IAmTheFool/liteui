@@ -278,8 +278,71 @@ static void testMasksSeeTheRowTheyAreGiven()
   }
 }
 
+// ------------------------------------------------------- vignette and grain
+static void testFilmEffects()
+{
+  // Vignette and Grain are the last step: the picture the other passes make,
+  // run through film_fx on the whole buffer.
+  for (int h : {1, 2, 127, 128, 129, 300})
+  {
+    const Img src = scene(61, h, static_cast<uint32_t>(h));
+    AdjustmentSet s = setFor(61, h);
+    s.set(AdjId::Vignette, -70.0f);
+    s.set(AdjId::Grain, 40.0f);
+    s.set(AdjId::GrainSize, 30.0f);
+    s.set(AdjId::GrainRoughness, 25.0f);
+    const RenderParams rp = s.buildRenderParams();
+    CHECK(rp.film.any() && !rp.color.active && !rp.fx.any() && rp.masks.empty());
+    const auto out = renderWith(src, rp);
+    std::vector<uint8_t> want = src.pixels; // identity tables: only the film is left
+    film_fx::apply(film_fx::prepare(rp.film, 61, h), want.data(), want.size() / 4, 0);
+    CHECK(out->pixels == want && out->width == 61 && out->height == h);
+    CHECK((h < 5) || out->pixels != src.pixels);
+    for (size_t i = 3; i < src.pixels.size(); i += 4)
+      CHECK(out->pixels[i] == src.pixels[i]); // alpha untouched
+    // Rendering again, or on the background path, gives the same bytes.
+    CHECK(renderWith(src, rp)->pixels == out->pixels);
+    std::atomic<uint64_t> latest{3};
+    CHECK(renderWith(src, rp, &latest, 3)->pixels == out->pixels);
+  }
+  // Applied AFTER the masks and the other passes, to what they made.
+  const Img src = scene(80, 140, 6);
+  auto edited = [](bool withFilm)
+  {
+    AdjustmentSet a = setFor(80, 140);
+    a.set(AdjId::Exposure, 20.0f);
+    a.set(AdjId::Saturation, -25.0f);
+    a.setMasks(MaskSet{radialExposure(50.0f)}, -1);
+    if (withFilm)
+    {
+      a.set(AdjId::Vignette, 60.0f);
+      a.set(AdjId::Grain, 25.0f);
+    }
+    return a.buildRenderParams();
+  };
+  const RenderParams rpBase = edited(false), rpBoth = edited(true);
+  CHECK(!rpBase.film.any() && rpBoth.film.any() && rpBoth.masks.size() == 1);
+  auto want = renderWith(src, rpBase)->pixels;
+  film_fx::apply(film_fx::prepare(rpBoth.film, 80, 140), want.data(), want.size() / 4, 0);
+  CHECK(renderWith(src, rpBoth)->pixels == want);
+  // A transparent pixel (the empty corner of a straightened picture) stays as it was.
+  Img clear = scene(30, 20);
+  for (size_t i = 0; i < 4 * 30; i += 4)
+    clear.pixels[i] = clear.pixels[i + 1] = clear.pixels[i + 2] = clear.pixels[i + 3] = 0;
+  AdjustmentSet f = setFor(30, 20);
+  f.set(AdjId::Vignette, -100.0f);
+  f.set(AdjId::Grain, 100.0f);
+  const auto fc = renderAdjusted(f, clear);
+  for (size_t i = 0; i < 4 * 30; ++i)
+    CHECK(fc->pixels[i] == 0);
+  // A superseded render still gives up first.
+  std::atomic<uint64_t> latest{9};
+  CHECK(renderWith(src, rpBoth, &latest, 8) == nullptr);
+}
+
 int main()
 {
+  testFilmEffects();
   testIdentity();
   testToneTablesAreExactLookups();
   testBlocksDoNotChangeTheResult();

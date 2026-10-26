@@ -44,7 +44,7 @@ This matters for masks. Masks are stored against the original picture (see below
 
 ## From sliders to pixels
 
-When you drag a slider, the edit state (`AdjustmentSet`) is **frozen** into a small value called `RenderParams`. It holds three 256-entry lookup tables, a color-pass description, the detail-effect gains, and a list of frozen masks. Building it takes O(256) work, no matter how big the picture is.
+When you drag a slider, the edit state (`AdjustmentSet`) is **frozen** into a small value called `RenderParams`. It holds three 256-entry lookup tables, a color-pass description, the detail-effect gains, a list of frozen masks, and the Vignette and Grain settings. Building it takes O(256) work, no matter how big the picture is.
 
 That value is then handed to `renderWith()` in `render.hpp`, which processes the picture in blocks of 128 rows. Per pixel, the order is always:
 
@@ -52,13 +52,17 @@ That value is then handed to `renderWith()` in `render.hpp`, which processes the
 2. **Color pass.** One float calculation per pixel, in this order: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. It rounds to 8 bits only **once, at the end**, so stacking several color sliders does not pile up rounding errors.
 3. **Neighbor effects.** Dehaze, then Texture / Clarity / Sharpness, then noise reduction, then Blur (last, so it wins).
 4. **Masks**, in list order. Each mask repeats steps 1 to 3 on its own copy of the pixels and blends the result back.
+5. **Vignette and Grain** (`film_fx.hpp`), on the finished pixel, after everything else. They are global only: masks do not get them.
 
 Some details that explain choices you will see in the code:
 
 - **Why lookup tables?** The tone sliders are pointwise (a pixel's result depends only on that pixel's own channel value), so all of them can be baked into 256 numbers. The table is rounded and clamped after *each* slider, so the result is bit-identical to running the sliders one after another.
 - **Why the Filters come last.** Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold and Cross Process are a "look" laid over your edits, so they run at the end of the color pass and see the finished color. Each is a blend, `lerp(pixel, filtered, strength)`, so a strength of 0 is exactly the identity. They stay in float, so they add no extra rounding. They are plain Color-stage sliders, so masks get them for free (a local black-and-white, for example).
+- **Why Vignette and Grain come last.** They are the finishing touch on the picture as it is shown, so they see the result of every slider and every mask, like a lens vignette or film grain on the print. They are also the only effects that depend on *where* a pixel is, which none of the other stages know: the tone tables see one value, the color pass one pixel, the detail layers a neighborhood of the source. That is why they are their own stage ("Effects") with their own pass, and why a mask has no Vignette or Grain sliders (the three renders in `main.cpp` that sample "the picture just before a mask" clear them, so a Color Range or Luminosity mask never sees a vignette).
+- **Why the vignette needs no `GeoFrame`.** `renderWith` is always handed the picture that is already oriented, straightened and cropped, and the vignette is measured against *that* frame: centered on it, following its aspect ratio, 0 at the center and 1 at the corners. A crop, a rotation or a flip therefore just gives the vignette of the new frame (Lightroom calls this post-crop vignetting). A vignette anchored to the original picture would have to go through the `GeoFrame` like a mask, and a crop could then leave it off-center.
+- **Why grain is a function of position.** Grain is an integer hash of the pixel's (x, y) in the picture being rendered: no random number generator, no state, nothing that depends on render order, block size, thread or compiler. The 128-row blocks, the background render and the batch export therefore give the same bytes for the same picture and sliders. Two things it does *not* promise: the fast preview renders a smaller picture, so its grain is the same kind (cell size is a fraction of the long edge) but not the same pixels; and a crop shifts the origin, so it changes the pattern. Every picture gets the same pattern for the same size and sliders, because there is no per-picture seed.
 - **Why a float color pass?** Cross-channel math (saturation, hue, the mixer) cannot be a per-channel table. Doing it in float and rounding once is both cheaper and more accurate than chaining 8-bit stages.
-- **Why the color pass shares its luma weights.** Several pieces of the color pass (Color Grading's tint, the white-balance normalization, vibrance, saturation) use the same Rec. 601 luma weights (`kGradeLumaR/G/B`). If the weights ever disagreed, a tint would shift brightness or read the wrong table row. Other parts of the program use their own luma, each consistent within itself: `detail_layer.hpp`, `neighbor_fx.hpp` and the Luminosity mask use integer 54/183/19 (about Rec. 709), Color Range uses float Rec. 709, and the histogram uses integer Rec. 601 (77/150/29).
+- **Why the color pass shares its luma weights.** Several pieces of the color pass (Color Grading's tint, the white-balance normalization, vibrance, saturation) use the same Rec. 601 luma weights (`kGradeLumaR/G/B`). If the weights ever disagreed, a tint would shift brightness or read the wrong table row. Other parts of the program use their own luma, each consistent within itself: `detail_layer.hpp`, `neighbor_fx.hpp` and the Luminosity mask use integer 54/183/19 (about Rec. 709), Color Range uses float Rec. 709, and the histogram uses integer Rec. 601 (77/150/29). The vectorscope's chroma (`scopes::rgbToCbCr`) is the matching integer Rec. 601 Cb / Cr, so a gray is exactly the center of the plot.
 - **Why 128-row blocks?** So a background render can check "have I been superseded?" between blocks and stop within a few milliseconds.
 - **Everything is sanitized.** Slider values are clamped and NaN/infinite values become 0 before they reach any formula, so a damaged sidecar or a UI bug can never produce an out-of-range table index.
 
@@ -80,7 +84,7 @@ Rendering a 24-megapixel photo on every mouse-move would be far too slow, so lar
 - **While dragging:** adjustments are applied to `previewBase`, a box-downsampled copy whose long side is at most 1024 px. This is quick enough to feel live. Pictures whose long side is under about 1536 px skip the preview entirely, because it would not be meaningfully cheaper.
 - **When you let go:** the full-resolution render is handed to a background worker (see [threading.md](threading.md)). The preview stays on screen until the finished image arrives, then replaces it.
 
-Masks are stored in normalized units (fractions of the picture), so the same mask renders identically on the small preview and on the full-size picture.
+Masks are stored in normalized units (fractions of the picture), so the same mask renders identically on the small preview and on the full-size picture. The vignette is normalized too (distance from the center in corner units), so it matches as well; only the grain differs in its exact pixels, as explained above.
 
 ## Masks
 
@@ -174,9 +178,28 @@ The UI side lives in `main.cpp` (`autoTone()`) and is small:
 - **Messages.** A flat picture or one with nothing to measure says so and changes nothing. If the slider ranges are not enough to reach the targets (a very dark or very washed-out picture), the edit is still applied and the status bar says the ranges are not enough.
 - **Not while the geometry worker is busy** (`source` still describes the previous geometry then; see [threading.md](threading.md#the-geometry-worker-rebuilds-everything)), and not mid-drag.
 
+## Waveform and vectorscope
+
+The pinned canvas above the panes (the one that holds the histogram) cycles through three views when you click it: **Histogram**, **Waveform** and **Vectorscope**. A click in either top corner still toggles the clipping overlays, in every view, and the clipping triangles are drawn in every view. The scopes add no new kind of data and are never saved: they are a different way of drawing the picture on screen.
+
+The engine does the work and stays UI-free:
+
+- **The math** is in `render/scopes.hpp`. The waveform keeps, for every column of the picture (folded into at most 256), how many pixels have each R, G and B level. The vectorscope keeps how many pixels have each Cb / Cr pair on a 128 x 128 grid. Both are then drawn into a small `CanvasImage`. See [headers.md](headers.md#scopeshpp).
+- **Same pixels as the histogram.** They use the same sample grid (about 300,000 pixels) and skip fully transparent pixels, so a scope costs no more than the histogram, and `computeHistogram()` builds them from the picture on screen: the mid-drag preview while a slider is held, the full-resolution result otherwise.
+- **Shares, not counts.** Brightness is a function of the share of a column (waveform) or of the picture (vectorscope) that sits on a point, so the small preview and the full picture look alike.
+- **A fixed size, stretched.** The scope picture is always the same size (the waveform is at most 256 x 256, the vectorscope 128 x 128) and the canvas stretches it, so nothing depends on how wide the sidebar is.
+
+The UI side lives in `main.cpp` and is small:
+
+- **State.** `state.scopeKind` (which view) and `state.scopeImage` (the waveform or vectorscope picture). `computeHistogram()` fills `scopeImage` for the current view with `scopes::render`; it is null while the histogram is showing, so the histogram view does no extra work and the golden histogram scenarios (which call `computeHistogram()` with the default view) are unchanged.
+- **The click.** `cycleScope()` moves to the next view, calls `computeHistogram()` (which rebuilds the picture and bumps `histVersion`, so the canvas repaints) and marks the canvas dirty. It does nothing without a picture.
+- **The height.** The canvas is 80 px tall for the histogram and 120 px for the scopes (`kHistHeightPx`, `kScopeHeightPx`); the height is a function of `scopeKind`, which LiteUI re-reads on every update. The vectorscope is drawn as a centered square.
+- **Painting.** `paintHistogram` fills the background, then calls `paintHistogramBars` or `paintScope`, then `paintClipTriangles`. `paintScope` draws the picture and a faint graticule: quarter lines for the waveform; two rings, the two axes and the skin-tone line for the vectorscope.
+- **The curve editor** reads `histR/G/B/L` behind the curve and is unaffected by the view.
+
 ## Where state lives
 
-All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). The white-balance picker's armed flag (`state.wbPicking`) is plain UI state and is never saved. Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
+All editor state is one global `state` (an `EditorState`) in `main.cpp`, touched only by the UI thread. The edit values live in `state.adjust` (an `AdjustmentSet`), which also owns the undo history. See [undo-and-history.md](undo-and-history.md). Edits are written to disk by [the sidecar](sidecar-format.md). Other UI-side state is the Presets pane's list of preset files (a cache of what is in the presets folder), the Copy Settings clipboard (one `Preset` held in memory) and the filmstrip's multi-selection (a flag on each `FilmEntry`, plus the anchor of a Shift-click range). The white-balance picker's armed flag (`state.wbPicking`) is plain UI state and is never saved, and so are the pinned canvas's view (`state.scopeKind`) and its scope picture (`state.scopeImage`). Presets themselves live in files, not in `state`; applying one, or pasting the clipboard, copies its values into `state.adjust`. Sync Settings never touches `state.adjust` for the pictures it writes to.
 
 ## The rule about threads
 

@@ -544,6 +544,7 @@ public:
                                          get(AdjId::Blur));
     if (!masks_.empty())
       rp.masks = buildMaskPasses(masks_, geoFrame());
+    rp.film = filmFromAdj(values_); // Vignette / Grain: global, after the masks
     return rp;
   }
 

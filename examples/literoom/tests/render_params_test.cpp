@@ -121,6 +121,30 @@ static void testFilters()
   CHECK(both.size() == 2 && both[0].tone && !both[0].color.filters.any && !both[1].tone && both[1].color.filters.any);
 }
 
+static void testFilm()
+{
+  // filmFromAdj picks the six Effects sliders out of an AdjValues, and nothing else.
+  CHECK(!filmFromAdj(AdjValues{}).any() && filmFromAdj(AdjValues{}) == film_fx::Params{});
+  AdjValues a{};
+  a[static_cast<size_t>(AdjId::Vignette)] = -30.0f;
+  a[static_cast<size_t>(AdjId::VignetteMidpoint)] = 20.0f;
+  a[static_cast<size_t>(AdjId::VignetteFeather)] = -10.0f;
+  a[static_cast<size_t>(AdjId::Grain)] = 50.0f;
+  a[static_cast<size_t>(AdjId::GrainSize)] = 40.0f;
+  a[static_cast<size_t>(AdjId::GrainRoughness)] = -60.0f;
+  a[static_cast<size_t>(AdjId::Saturation)] = 99.0f; // not an effect
+  CHECK(filmFromAdj(a) == film_fx::paramsFromValues(-30, 20, -10, 50, 40, -60));
+  // Vignette and Grain are global only: a mask that carries them (a hand-edited
+  // sidecar) is dropped as one with no adjustments, and they change nothing else.
+  for (AdjId id : {AdjId::Vignette, AdjId::VignetteMidpoint, AdjId::VignetteFeather, AdjId::Grain, AdjId::GrainSize, AdjId::GrainRoughness})
+    CHECK(buildMaskPasses({maskWith(id, 40.0f)}, kId).empty());
+  Mask m = maskWith(AdjId::Exposure, 30.0f);
+  m.adj[static_cast<size_t>(AdjId::Vignette)] = -50.0f;
+  m.adj[static_cast<size_t>(AdjId::Grain)] = 40.0f;
+  const auto with = buildMaskPasses({m}, kId), without = buildMaskPasses({maskWith(AdjId::Exposure, 30.0f)}, kId);
+  CHECK(with.size() == 1 && with[0].tone && !with[0].color.active && !with[0].fx.any() && with[0].luts == without[0].luts);
+}
+
 static void testShapesAreMappedThroughTheFrame()
 {
   // A mask stored in the top-left of the original ends up in the top-right of a
@@ -143,7 +167,7 @@ static void testRenderParamsDefaults()
   for (const auto &l : rp.luts)
     for (int i = 0; i < 256; ++i)
       CHECK(l[static_cast<size_t>(i)] == 0); // value-initialized: callers fill the tables
-  CHECK(!rp.color.active && !rp.fx.any() && rp.masks.empty());
+  CHECK(!rp.color.active && !rp.fx.any() && rp.masks.empty() && !rp.film.any());
   const MaskPass mp{};
   CHECK(mp.parts.empty() && !mp.invert && mp.amount == 1.0f && !mp.tone);
 }
@@ -153,6 +177,7 @@ int main()
   testWhichMasksAreKept();
   testWhatEachPassHolds();
   testFilters();
+  testFilm();
   testShapesAreMappedThroughTheFrame();
   testRenderParamsDefaults();
   return finish();

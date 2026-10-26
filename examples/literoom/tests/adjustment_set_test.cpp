@@ -792,6 +792,51 @@ static void testSnapshotRestore()
   CHECK(!z.restoreEdits(SidecarEdits{}, "neutral") && z.historySize() == 1); // already neutral
 }
 
+static void testEffectSliders()
+{
+  AdjustmentSet s;
+  fresh(s);
+  CHECK(!s.buildRenderParams().film.any());
+  s.set(AdjId::Vignette, -40.0f);
+  CHECK(lastLabel(s) == "Vignette -40");
+  RenderParams rp = s.buildRenderParams();
+  CHECK(rp.film.hasVignette() && !rp.film.hasGrain() && rp.film == film_fx::paramsFromValues(-40, 0, 0, 0, 0, 0));
+  // They are global: nothing else in the parameters moves.
+  CHECK(!rp.color.active && !rp.fx.any() && rp.masks.empty());
+  s.set(AdjId::Grain, 30.0f);
+  s.set(AdjId::GrainSize, 50.0f);
+  s.set(AdjId::GrainRoughness, -20.0f);
+  s.set(AdjId::VignetteMidpoint, 10.0f);
+  s.set(AdjId::VignetteFeather, -30.0f);
+  rp = s.buildRenderParams();
+  CHECK(rp.film == film_fx::paramsFromValues(-40, 10, -30, 30, 50, -20));
+  // Undo takes them back, one slider drag = one step.
+  const size_t n = s.historySize();
+  s.undo();
+  CHECK(s.historySize() == n && s.get(AdjId::VignetteFeather) == 0.0f && s.buildRenderParams().film.hasGrain());
+  // They are saved in the sidecar under their label, and zero ones are left out.
+  AdjustmentSet t;
+  fresh(t);
+  t.set(AdjId::Vignette, 25.0f);
+  t.set(AdjId::Grain, 15.0f);
+  const std::string text = t.toJson().dump();
+  CHECK(text.find("\"Vignette\"") != std::string::npos && text.find("\"Grain\"") != std::string::npos);
+  CHECK(text.find("Grain Size") == std::string::npos && text.find("Vignette Feather") == std::string::npos);
+  mj::Json j;
+  std::string err;
+  AdjustmentSet u;
+  fresh(u);
+  CHECK(mj::Json::parse(text, &j, &err) && u.loadJson(j));
+  CHECK(u.get(AdjId::Vignette) == 25.0f && u.get(AdjId::Grain) == 15.0f && u.buildRenderParams().film == t.buildRenderParams().film);
+  // A look (preset) carries them too, and applying it replaces the whole look.
+  const Preset p = t.currentPreset("Film");
+  AdjustmentSet v;
+  fresh(v);
+  v.set(AdjId::GrainSize, 70.0f);
+  CHECK(v.applyPreset(p));
+  CHECK(v.get(AdjId::Vignette) == 25.0f && v.get(AdjId::Grain) == 15.0f && v.get(AdjId::GrainSize) == 0.0f);
+}
+
 int main()
 {
   testFreshState();
@@ -812,5 +857,6 @@ int main()
   testWhiteBalancePick();
   testAutoTonePick();
   testSnapshotRestore();
+  testEffectSliders();
   return finish();
 }

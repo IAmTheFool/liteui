@@ -15,7 +15,7 @@ static void testTable()
   CHECK(kAdjustmentSpecs.size() == N);
   CHECK(AdjValues{}.size() == N);
   std::set<std::string> labels;
-  int stage = 0; // stages must come in the order Tone, Color, Detail
+  int stage = 0; // stages must come in the order Tone, Color, Detail, Effects
   for (size_t i = 0; i < N; ++i)
   {
     const AdjustmentSpec &s = kAdjustmentSpecs[i];
@@ -39,6 +39,8 @@ static void testTable()
   CHECK(spec(AdjId::Solarize).stage == AdjustmentSpec::Stage::Color);
   CHECK(spec(AdjId::Texture).stage == AdjustmentSpec::Stage::Detail);
   CHECK(spec(AdjId::Blur).stage == AdjustmentSpec::Stage::Detail);
+  CHECK(spec(AdjId::Vignette).stage == AdjustmentSpec::Stage::Effects);
+  CHECK(spec(AdjId::GrainRoughness).stage == AdjustmentSpec::Stage::Effects);
 }
 
 static void testRanges()
@@ -322,12 +324,42 @@ static void testToneLut()
     CHECK(toneLutFromValues(only(AdjId::Exposure, 30.0f), nullptr)[static_cast<size_t>(i)] >= id[static_cast<size_t>(i)]);
 }
 
+// The Effects block: Vignette and Grain, six Effects-stage sliders kept together
+// at the end of the table (main.cpp starts its "Effects" header at the first
+// one, and the mask sliders skip the whole stage).
+static void testEffectsBlock()
+{
+  const AdjId ids[] = {AdjId::Vignette, AdjId::VignetteMidpoint, AdjId::VignetteFeather,
+                       AdjId::Grain, AdjId::GrainSize, AdjId::GrainRoughness};
+  const char *labels[] = {"Vignette", "Vignette Midpoint", "Vignette Feather",
+                          "Grain", "Grain Size", "Grain Roughness"};
+  const float lo[] = {-100, -100, -100, 0, 0, -100};
+  for (size_t i = 0; i < 6; ++i)
+  {
+    const AdjustmentSpec &s = spec(ids[i]);
+    CHECK(s.stage == AdjustmentSpec::Stage::Effects && s.apply == nullptr);
+    CHECK(s.label == labels[i]); // sidecar keys: renaming one orphans saved values
+    CHECK(s.min == lo[i] && s.max == 100.0f);
+    CHECK(adjIndex(ids[i]) == adjIndex(AdjId::Blur) + 1 + i); // contiguous, right after Blur
+  }
+  CHECK(adjIndex(AdjId::GrainRoughness) + 1 == N); // the last entries of the table
+  // Only the Effects stage follows Detail; nothing sits between or after them.
+  for (size_t i = adjIndex(AdjId::Vignette); i < N; ++i)
+    CHECK(kAdjustmentSpecs[i].stage == AdjustmentSpec::Stage::Effects);
+  // Not part of the tone table, at any value.
+  for (AdjId id : ids)
+    CHECK(toneLutFromValues(only(id, spec(id).max), nullptr) == toneLutFromValues(AdjValues{}, nullptr));
+  CHECK(sanitizedValue(spec(AdjId::Grain), 250.0f) == 100.0f && sanitizedValue(spec(AdjId::Grain), -5.0f) == 0.0f);
+  CHECK(sanitizedValue(spec(AdjId::Vignette), -250.0f) == -100.0f && sanitizedValue(spec(AdjId::Vignette), std::nanf("")) == 0.0f);
+}
+
 int main()
 {
   testToneLut();
   testTable();
   testRanges();
   testFilterBlock();
+  testEffectsBlock();
   testLevels();
   testToneFunctions();
   testToneDirections();

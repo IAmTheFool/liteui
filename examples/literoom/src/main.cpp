@@ -64,6 +64,7 @@
 #include "edit/adjustment_set.hpp"
 #include "render/render.hpp"
 #include "render/histogram.hpp"
+#include "render/scopes.hpp"
 
 // background work
 #include "workers/latest_worker.hpp"
@@ -104,6 +105,9 @@ constexpr float kMixTabW = 46.0f; // Hue/Sat/Lum tab width (3 + gaps = 150)
 
 // Histogram canvas height (the counting constants live in histogram.hpp).
 constexpr float kHistHeightPx = 80.0f;
+// The same canvas is taller while it shows a waveform or a vectorscope (the
+// vectorscope is a square, so it needs the room). See scopes.hpp.
+constexpr float kScopeHeightPx = 120.0f;
 
 // Clipping warnings: corner triangles on the histogram (the canvas overlay's
 // constants live in histogram.hpp too).
@@ -575,6 +579,14 @@ struct EditorState
   std::array<uint32_t, 256> histR{}, histG{}, histB{}, histL{};
   bool histStale = true;
   uint32_t histVersion = 0;
+
+  // What the pinned canvas above the panes shows; a click on it cycles
+  // Histogram -> Waveform -> Vectorscope (cycleScope). scopeImage is the
+  // waveform or vectorscope picture, rebuilt by computeHistogram() together
+  // with the histogram; it is null while the histogram itself is showing (and
+  // for an empty picture), so the histogram mode costs nothing extra.
+  scopes::Kind scopeKind = scopes::Kind::Histogram;
+  std::shared_ptr<CanvasImage> scopeImage;
 
   // Clipping warnings. The flags say which overlays are on; histClipLo/Hi
   // are the channels (bit 0/1/2 = R/G/B) that have any clipped pixel in the
@@ -5611,6 +5623,7 @@ static std::optional<std::array<float, 3>> samplePreMaskColor(int sel,
   if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
     return std::nullopt;
   RenderParams rp = state.adjust.buildRenderParams();
+  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
   rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
                              state.adjust.geoFrame());
   const auto pre = renderWith(*base, rp);
@@ -6385,6 +6398,7 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
   if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
     return nullptr;
   RenderParams rp = state.adjust.buildRenderParams();
+  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
   rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
                              state.adjust.geoFrame());
   const auto pre = renderWith(*base, rp);
@@ -6470,6 +6484,7 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
     if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
       return nullptr;
     RenderParams rp = state.adjust.buildRenderParams();
+    rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
     rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel), frame);
     pre = renderWith(*base, rp);
     tw = pre->width;
@@ -7496,6 +7511,7 @@ static void computeHistogram()
   state.histClipHi = c.clipHi;
   state.clipOverlay = histogram::clipOverlay(
       img, {state.clipShadowsOn, state.clipHighlightsOn, state.clipPerChannel});
+  state.scopeImage = scopes::render(state.scopeKind, img);
   state.histStale = false;
   ++state.histVersion;
 }
@@ -7506,13 +7522,8 @@ static float gHistCanvasW = 0.0f;
 // Luma as gray bars, R/G/B as thin colored outlines on top. Bar heights use
 // sqrt scaling and are normalized to the tallest bin among 1..254, so a pile
 // of clipped pixels in bin 0/255 doesn't flatten the rest of the graph.
-static void paintHistogram(CanvasContext &ctx)
+static void paintHistogramBars(CanvasContext &ctx, float W, float H)
 {
-  const float W = ctx.width(), H = ctx.height();
-  gHistCanvasW = W;
-  ctx.setFillColor(Color{34, 34, 38, 255});
-  ctx.fillRect(0, 0, W, H);
-
   uint32_t peak = 1;
   for (int i = 1; i < 255; ++i)
     peak = std::max(
@@ -7552,7 +7563,13 @@ static void paintHistogram(CanvasContext &ctx)
   outline(state.histR, Color{235, 70, 70, 200});
   outline(state.histG, Color{70, 200, 90, 200});
   outline(state.histB, Color{80, 130, 255, 200});
+}
 
+// The two clipping triangles in the top corners of the pinned canvas. They
+// stay in every view (histogram, waveform, vectorscope): clipping is a
+// property of the picture, not of the way it is plotted.
+static void paintClipTriangles(CanvasContext &ctx, float W)
+{
   // Clipping triangles. Dark: nothing clipped. Otherwise colored by which
   // channels clip (white = all three). White outline: that overlay is on.
   auto triangle = [&](bool left, uint8_t mask, bool overlayOn)
@@ -7582,6 +7599,76 @@ static void paintHistogram(CanvasContext &ctx)
   };
   triangle(true, state.histClipLo, state.clipShadowsOn);
   triangle(false, state.histClipHi, state.clipHighlightsOn);
+}
+
+// Waveform or vectorscope: the picture scopes::render made, stretched over the
+// canvas (the waveform fills it, the vectorscope is a centered square), plus a
+// faint graticule and the view's name in the bottom-left corner.
+static void paintScope(CanvasContext &ctx, float W, float H)
+{
+  const bool wave = state.scopeKind == scopes::Kind::Waveform;
+  float x0 = 0.0f, y0 = 0.0f, w = W, h = H;
+  if (!wave)
+  {
+    const float side = std::min(W, H);
+    x0 = (W - side) / 2.0f;
+    y0 = (H - side) / 2.0f;
+    w = h = side;
+  }
+  if (state.scopeImage)
+    ctx.drawImage(*state.scopeImage, x0, y0, w, h);
+
+  ctx.setLineWidth(1.0f);
+  ctx.setStrokeColor(Color{255, 255, 255, 40});
+  ctx.beginPath();
+  if (wave)
+  {
+    // Quarter lines of the 0..255 level axis.
+    for (int q = 1; q <= 3; ++q)
+    {
+      const float y = std::floor(y0 + h * static_cast<float>(q) / 4.0f) + 0.5f;
+      ctx.moveTo(0.0f, y);
+      ctx.lineTo(W, y);
+    }
+  }
+  else
+  {
+    // Outer ring (full saturation), half ring, the two axes, and the skin-tone
+    // line (the I axis, 123 degrees from +Cb toward red).
+    const float cx = x0 + w / 2.0f, cy = y0 + h / 2.0f, r = w / 2.0f - 1.0f;
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0.0f, 6.2831853f);
+    ctx.moveTo(cx + r / 2.0f, cy);
+    ctx.arc(cx, cy, r / 2.0f, 0.0f, 6.2831853f);
+    ctx.moveTo(cx - r, cy);
+    ctx.lineTo(cx + r, cy);
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx, cy + r);
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx - 0.545f * r, cy - 0.839f * r);
+  }
+  ctx.stroke();
+
+  ctx.setFont("", 9.0f);
+  ctx.setTextAlign(TextAlign::Start);
+  ctx.setTextBaseline(TextBaseline::Top);
+  ctx.setFillColor(Color{255, 255, 255, 110});
+  ctx.fillText(scopes::kindName(state.scopeKind), 4.0f, H - 13.0f);
+}
+
+// The pinned canvas: the histogram, or the waveform / vectorscope picked with
+// a click (cycleScope), always with the clipping triangles on top.
+static void paintHistogram(CanvasContext &ctx)
+{
+  const float W = ctx.width(), H = ctx.height();
+  gHistCanvasW = W;
+  ctx.setFillColor(Color{34, 34, 38, 255});
+  ctx.fillRect(0, 0, W, H);
+  if (state.scopeKind == scopes::Kind::Histogram)
+    paintHistogramBars(ctx, W, H);
+  else
+    paintScope(ctx, W, H);
+  paintClipTriangles(ctx, W);
 }
 
 static void refreshHistogramIfStale()
@@ -7620,6 +7707,19 @@ static void toggleChannelClipping()
   if (!state.clipShadowsOn && !state.clipHighlightsOn)
     state.clipShadowsOn = state.clipHighlightsOn = true;
   computeHistogram(); // rebuild the overlay with the new coloring
+  state.markDirty();
+}
+
+// A click on the pinned canvas (outside the clipping corners): Histogram ->
+// Waveform -> Vectorscope -> Histogram. computeHistogram() rebuilds the scope
+// picture for the new view and bumps histVersion, so the canvas repaints; its
+// height follows scopeKind (see where the canvas is built).
+static void cycleScope()
+{
+  if (!state.image)
+    return;
+  state.scopeKind = scopes::nextKind(state.scopeKind);
+  computeHistogram();
   state.markDirty();
 }
 
@@ -8741,23 +8841,34 @@ int main()
   sidebarShell.addChild(std::move(sidebarTitle));
 
   // Histogram of the picture as currently shown (see computeHistogram).
-  // Pinned above every pane, like Lightroom.
+  // Pinned above every pane, like Lightroom. A click cycles it through the
+  // histogram, a waveform and a vectorscope (cycleScope).
   View histogram;
   histogram.isCanvas = true;
   histogram.style.width = Size::full();
-  histogram.style.height = Size::pixel(kHistHeightPx);
+  histogram.style.height = std::function<Size()>(
+      []
+      {
+        return Size::pixel(state.scopeKind == scopes::Kind::Histogram
+                               ? kHistHeightPx
+                               : kScopeHeightPx);
+      });
   histogram.style.flexShrink = 0;
   histogram.style.margin = EdgeInsets{0, 0, 12, 0};
   histogram.onPaint = [](CanvasContext &ctx)
   { paintHistogram(ctx); };
   histogram.onPressAt = [](float lx, float ly)
   {
-    if (!state.image || ly > kHistTriHitPx)
+    if (!state.image)
       return;
-    if (lx <= kHistTriHitPx)
+    // The top corners toggle the clipping overlays; anywhere else cycles the
+    // view (histogram / waveform / vectorscope).
+    if (ly <= kHistTriHitPx && lx <= kHistTriHitPx)
       setClipping(!state.clipShadowsOn, state.clipHighlightsOn);
-    else if (lx >= gHistCanvasW - kHistTriHitPx)
+    else if (ly <= kHistTriHitPx && lx >= gHistCanvasW - kHistTriHitPx)
       setClipping(state.clipShadowsOn, !state.clipHighlightsOn);
+    else
+      cycleScope();
   };
   histogram.canvasDirtySource = []
   {
@@ -8977,7 +9088,8 @@ int main()
     h.color = kColorTextMuted;
     return h;
   };
-  bool colorHeaderAdded = false, filtersHeaderAdded = false, detailHeaderAdded = false;
+  bool colorHeaderAdded = false, filtersHeaderAdded = false, detailHeaderAdded = false,
+       effectsHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
   adjustPane.addChild(sidebarButton(
       "Auto Tone (A)", [] { autoTone(); }, {}, false,
@@ -8999,6 +9111,13 @@ int main()
     {
       adjustPane.addChild(sectionLabel("Detail"));
       detailHeaderAdded = true;
+    }
+    // Vignette and Grain (Stage::Effects, the end of the table): the very last
+    // step of the render, after the masks.
+    if (!effectsHeaderAdded && spec.stage == AdjustmentSpec::Stage::Effects)
+    {
+      adjustPane.addChild(sectionLabel("Effects"));
+      effectsHeaderAdded = true;
     }
     // The white-balance picker sits at the top of the Color block, above
     // Temperature, the first slider it sets.
@@ -10061,7 +10180,10 @@ int main()
   fxBasic.addChild(sectionLabel("Tone"));
   for (const auto &spec : kAdjustmentSpecs)
   {
-
+    // Vignette and Grain are global only (renderWith applies them after the
+    // masks), so a mask gets no sliders for them.
+    if (spec.stage == AdjustmentSpec::Stage::Effects)
+      continue;
     if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
     {
       fxBasic.addChild(sectionLabel("Color"));

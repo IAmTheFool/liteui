@@ -32,6 +32,7 @@ set(LITEROOM_HEADERS
     # detail effects (need neighbor pixels)
     src/detail/detail_layer.hpp
     src/detail/neighbor_fx.hpp
+    src/detail/film_fx.hpp
 
     # masks and object selection
     src/mask/mask.hpp
@@ -52,6 +53,7 @@ set(LITEROOM_HEADERS
     # rendering and analysis
     src/render/render.hpp
     src/render/histogram.hpp
+    src/render/scopes.hpp
 
     # saving and files
     src/io/sidecar.hpp
@@ -182,7 +184,7 @@ if(LITEROOM_TESTS)
 
     # Pure header tests: no liteui, no threads.
     foreach(t minijson exif
-              pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves
+              pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves film_fx
               mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
               sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter)
         literoom_add_test(${t})
@@ -206,7 +208,7 @@ if(LITEROOM_TESTS)
     literoom_add_test(export_worker LITEUI THREADS)
 
     # These take liteui's CanvasImage, so their tests link liteui like the app.
-    foreach(t raster_ops seg_basic render image_codec histogram)
+    foreach(t raster_ops seg_basic render image_codec histogram scopes)
         literoom_add_test(${t} LITEUI)
     endforeach()
 

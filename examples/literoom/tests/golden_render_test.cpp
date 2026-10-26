@@ -364,7 +364,12 @@ namespace golden
   // than the "half of max, every other one negative" pattern. Levels at half of
   // max would clip a fifth of the tonal range at each end and hide what is
   // upstream. Setting them to 0 reproduces the pre-Levels fingerprints.
-  static bool isFixedSink(AdjId id) { return isFilter(id) || isLevels(id); }
+  // The Effects (Vignette ... Grain Roughness) are the last block of the table,
+  // so they shift no older slider's sinkPos. They get fixed, modest values too:
+  // at half range a vignette would black out the corners and grain would bury
+  // what the other sliders did.
+  static bool isEffects(AdjId id) { return id >= AdjId::Vignette && id <= AdjId::GrainRoughness; }
+  static bool isFixedSink(AdjId id) { return isFilter(id) || isLevels(id) || isEffects(id); }
   static float fixedSinkValue(AdjId id)
   {
     switch (id)
@@ -372,6 +377,12 @@ namespace golden
     case AdjId::BlackPoint: return 8.0f;
     case AdjId::WhitePoint: return 8.0f;
     case AdjId::Gamma: return 20.0f;
+    case AdjId::Vignette: return -35.0f;
+    case AdjId::VignetteMidpoint: return 10.0f;
+    case AdjId::VignetteFeather: return 15.0f;
+    case AdjId::Grain: return 22.0f;
+    case AdjId::GrainSize: return 30.0f;
+    case AdjId::GrainRoughness: return 20.0f;
     default: return kSinkFilterStrength;
     }
   }
@@ -1033,6 +1044,78 @@ namespace golden
       putImage(std::string(g.name) + "/source", *src);
       renderScenario(g.name, s, *src);
     }
+    // Vignette and Grain through the same three geometries: they follow the
+    // picture as it is shown (the crop, the rotation), with no masks involved.
+    for (const Geo &g : geos)
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      const int ow = (g.o.rot % 2) ? H : W, oh = (g.o.rot % 2) ? W : H;
+      const Dims d = rotatedDims(ow, oh, g.angle, g.expand);
+      CropRect crop;
+      if (g.crop)
+        crop = CropRect{d.w / 10, d.h / 8, d.w * 3 / 4, d.h * 3 / 4};
+      s.setExpand(g.expand);
+      s.setGeometry(g.o, g.angle, crop);
+      s.set(AdjId::Vignette, -60);
+      s.set(AdjId::Grain, 30);
+      s.set(AdjId::GrainSize, 20);
+      auto src = geometryPipeline(img, s);
+      if (!src)
+      {
+        fail(g.name, "geometry pipeline returned null");
+        continue;
+      }
+      renderScenario("geo_film/" + std::string(g.name).substr(10), s, *src);
+    }
+  }
+
+  // ------------------------------------------------------- vignette and grain
+  // Global, position-dependent, applied after the masks (film_fx.hpp).
+  static void film(const CanvasImage &img, int W, int H)
+  {
+    struct Case
+    {
+      const char *name;
+      float vig, mid, feather, grain, size, rough;
+    };
+    const Case cases[] = {
+        {"film/vignette_dark", -60, 0, 0, 0, 0, 0},
+        {"film/vignette_light", 60, 0, 0, 0, 0, 0},
+        {"film/vignette_tight_hard", -100, -60, -80, 0, 0, 0},
+        {"film/vignette_wide_soft", -100, 80, 80, 0, 0, 0},
+        {"film/grain", 0, 0, 0, 50, 0, 0},
+        {"film/grain_big_smooth", 0, 0, 0, 70, 100, -80},
+        {"film/grain_fine_crisp", 0, 0, 0, 70, 0, 80},
+        {"film/both", -40, 10, 10, 35, 30, 0},
+    };
+    for (const Case &c : cases)
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Vignette, c.vig);
+      s.set(AdjId::VignetteMidpoint, c.mid);
+      s.set(AdjId::VignetteFeather, c.feather);
+      s.set(AdjId::Grain, c.grain);
+      s.set(AdjId::GrainSize, c.size);
+      s.set(AdjId::GrainRoughness, c.rough);
+      renderScenario(c.name, s, img);
+    }
+    {
+      // After everything else, masks included.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Exposure, 25);
+      s.set(AdjId::Saturation, -20);
+      s.set(AdjId::Clarity, 30);
+      Mask m = makeMask(radial());
+      m.adj = AdjValues{};
+      stdEffect(m);
+      s.setMasks({m}, -1);
+      s.set(AdjId::Vignette, -50);
+      s.set(AdjId::Grain, 30);
+      renderScenario("film/after_edits_and_masks", s, img);
+    }
   }
 
   // --------------------------------------------------------------- kitchen sink
@@ -1329,6 +1412,7 @@ namespace golden
     curvesMixGrade(img, W, H);
     masks(img, W, H, blob, 11);
     geometry(img, W, H, blob);
+    film(img, W, H);
     sink(img, W, H, blob, "200x150", true);
     history(img, W, H);
     helpers();
