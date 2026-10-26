@@ -1,6 +1,6 @@
 # Threading
 
-Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails, syncing settings onto other pictures) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the six workers, and the rules that keep it safe.
+Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails, syncing settings onto other pictures, exporting a batch of pictures) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the seven workers, and the rules that keep it safe.
 
 ## The problem "latest wins" solves
 
@@ -39,7 +39,7 @@ One qualification: the segmentation job keeps per-image state (the loaded model,
 
 This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs.
 
-## The six workers
+## The seven workers
 
 | Worker | Job | Can it be cancelled? | Notes |
 |---|---|---|---|
@@ -49,8 +49,9 @@ This is also why the editor never edits images in place: a render job holds a po
 | **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Keeps per-image state in worker-only statics (see the rule above). |
 | **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
 | **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings), or apply one rating / flag / color label change to them (a batch rating). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
+| **Export** | Batch export: render each picked picture from its own saved edits and write it to one folder. | **Yes.** Stop Export drops the queue and abandons the picture in flight (checked between render blocks and every 64 rows of the straighten). | A FIFO like Thumbnail, with `cancel()`; see below. |
 
-The first four and Sync are `LatestWorker`s. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
+The first four and Sync are `LatestWorker`s; Thumbnail and Export are FIFO queues. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
 
 ### Virtual copies and the workers
 
@@ -91,9 +92,29 @@ It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not
 - **The same worker does batch ratings.** When pictures are selected, a rating / flag / color label command changes the open picture on the UI thread and submits a `metaOnly` job for the other selected pictures: `sidecarPatchMeta` instead of `sidecarSyncLook`, with the same refusals and the same one-batch-at-a-time rule. Its outcomes carry each picture's new meta, so `collectSyncJob()` updates the strip's entries (and sets no "has edits" dot).
 - `collectSyncJob()` runs once per frame from `flushPendingAdjust`. It sets the "has edits" dot on each synced picture and shows "Synced N" or "Synced N, skipped M (file: reason)" in the status bar.
 
+### The export worker is a cancellable FIFO of whole pipelines
+
+Batch export (File > Export Selected... / Export All Shown..., or the same buttons in the Export pane) writes many pictures to one folder with the Export pane's settings. The pictures are not open, so like Sync there is no `AdjustmentSet` to read. Unlike Sync, the job needs the *pixels* too, so `exportPicture()` (in `export_worker.hpp`) is the whole per-picture pipeline as a pure function of the path and the settings:
+
+1. Decode `vcImageOf(path)` and apply the EXIF rotation (what the decode worker does), so the picture is the same upright "original" the saved edits were made against.
+2. Read the picture's sidecar from disk into a **local** `AdjustmentSet` (`setOriginalSize`, then `loadJson`). The editor's set is never touched. A missing sidecar is normal (the picture exports unedited); one that exists but can't be used (damaged, newer, too big, written for a different size) **skips that picture with a reason**, where the editor would open it clean. Silently exporting an unedited picture in the middle of a batch would be worse.
+3. The geometry worker's chain from the original: `orientImage`, `rotateArbitrary`, `cropImage`, then `renderWith(source, buildRenderParams())`. Intermediate pictures are released before the render so the peak stays near one picture.
+4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile` / `encodePngFile`). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
+
+`ExportWorker` queues the pictures in strip order:
+
+- **A FIFO with no generations**, like `ThumbWorker`: you want all of them. `start()` is refused while a batch is running, so there is never more than one.
+- **`cancel()`** bumps an epoch counter that `renderWith` and `rotateArbitrary` poll (the same `latest` / `gen` pair as the other workers), drops the queue, and gives every dropped picture an outcome with `cancelled = true`. The picture in flight is abandoned at its next poll, so a 24 MP picture stops within a few rows. A cancelled picture writes nothing.
+- **Every picture gets exactly one `ExportOutcome`** (ok / cancelled / skipped with a reason), appended to the result list in the same locked step that counts it as done. A failure on one picture never stops the batch.
+- **The UI asks `busy()` *before* `collect()`.** `collectExportJob()` (once per frame from `flushPendingAdjust`) does it in that order: if the worker was already idle, the `collect()` that follows returns the last outcomes and nothing more can arrive, so the summary ("Exported N photo(s) to ...", "Exported N, skipped M (file: reason)", "Export stopped: ...") never misses one. Asking after could drop the final result.
+- **The open picture is exported from its sidecar like any other**, so `startExportBatch` calls `flushSidecar()` first (and refuses to start mid-drag, like Sync). Its in-memory edits and the file then agree.
+- **It does not block opening pictures or editing**, unlike Sync, because it only *reads* sidecars (a rewrite is temp-file-then-rename, so a read sees the old or the new file, never half of one). A picture is exported with the edits it has on disk when the batch reaches it.
+- **Shared caches.** `renderWith` goes through the same neighbor-plane caches as the UI. They are keyed by pixel pointer, size and a fingerprint, so there is no stale hit, but a batch of large pictures pushes the open picture's blur planes out of the cache and its next slider drag may rebuild them.
+- `shutdown()` abandons the picture in flight (so closing the app mid-batch is quick) and joins.
+
 ## How the UI picks results up
 
-The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()`, `collectSegmentJob()` and `collectSyncJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
+The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()`, `collectSegmentJob()`, `collectSyncJob()` and `collectExportJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
 
 Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 
@@ -103,7 +124,7 @@ Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 - **A drag cancels the full render.** `enterDrag()` invalidates the render worker, because the render in flight would be for values the drag is about to change.
 - **A result for something that no longer exists is dropped.** For example, a finished object segmentation for a mask you deleted in the meantime, or a thumbnail for a folder you have left.
 - **A new picture invalidates everything in flight.** When a decode lands, `adoptDecoded` invalidates the render, geometry and segmentation workers and bumps `imageSerial`, so nothing made for the old picture can be adopted over the new one.
-- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled, and the sync worker's finishes the batch it is writing.
+- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled, the sync worker's finishes the batch it is writing, and the export worker's abandons the picture it is rendering.
 - **Small photos skip all of this.** For small images the pass is faster than the hand-off, so the render is synchronous.
 
 ## When you add a worker

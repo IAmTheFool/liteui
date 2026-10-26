@@ -66,7 +66,8 @@ set(LITEROOM_HEADERS
 
     # background work
     src/workers/latest_worker.hpp
-    src/workers/thumb_worker.hpp)
+    src/workers/thumb_worker.hpp
+    src/workers/export_worker.hpp)
 
 add_executable(literoom src/main.cpp ${LITEROOM_HEADERS})
 target_include_directories(literoom PRIVATE ${LITEROOM_SRC})
@@ -197,6 +198,12 @@ if(LITEROOM_TESTS)
     # thumb_worker decodes real files (liteui's decoder, the app's encoders in
     # the test) on a std::jthread, so it needs both liteui and threads.
     literoom_add_test(thumb_worker LITEUI THREADS)
+
+    # export_worker renders and encodes real files on a std::jthread (the whole
+    # batch-export pipeline), so like thumb_worker it needs liteui and threads.
+    # Loop it to shake out timing flakiness:
+    #   ctest -C Release -R literoom_export_worker --repeat until-fail:50
+    literoom_add_test(export_worker LITEUI THREADS)
 
     # These take liteui's CanvasImage, so their tests link liteui like the app.
     foreach(t raster_ops seg_basic render image_codec histogram)

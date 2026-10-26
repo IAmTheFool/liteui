@@ -41,10 +41,10 @@ Every header sits under `src/`, which is the include root, so a header is always
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram` |
 | `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
-| `workers/` | `latest_worker`, `thumb_worker` |
+| `workers/` | `latest_worker`, `thumb_worker`, `export_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
-The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
+The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`; `export_worker` is the exception that also uses `edit` and `render`, because it runs the whole pipeline. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
 
 ---
 
@@ -1884,6 +1884,49 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 - **`std::vector<Result> collect()`**: returns everything made since the last call and empties the list. Thread-safe, non-blocking.
 - **`void shutdown()`**: clears the queue, requests stop and joins the thread.
 - Per file, the worker: decodes it (`liteui_image::decodeFile` on `vcImageOf(path)`; skipped for a virtual copy), applies the orientation from `orientOf` (also given the real file's path), makes the thumbnail, then reads the sidecar (`readSidecarForThumb` through `sidecarFileOf`, so a copy reads its own file; at most 64 MiB) and runs `sidecarScan` on it.
+
+---
+
+### `export_worker.hpp`
+Batch export: `exportPicture` renders one picture from its own saved edits and writes it, and `ExportWorker` runs a queue of them off the UI thread. A first-in-first-out queue with **no generations** (like `ThumbWorker`) that can be cancelled. (Needs LiteUI's decoder and encoders.)
+
+**Depends on:** `liteui.hpp`, `geometry.hpp`, `raster_ops.hpp`, `adjustment_set.hpp`, `render.hpp`, `file_utils.hpp`, `image_codec.hpp`, `image_meta.hpp`, `minijson.hpp`, `sidecar.hpp`, `virtual_copy.hpp`. **Test:** `export_worker_test` (links LiteUI and the thread library; loop it after changing the header).
+
+**Constants:** `kExportMaxSidecarBytes` = 64 MiB (the limit the editor puts on a sidecar).
+
+**Types**
+
+- `struct ExportSettings { bool jpeg = true; int quality = 92; bool keepMetadata = true; bool removeGps = false; bool resize = false; int longEdge = 2048; std::string folder; bool overwrite = false; }`: a copy of the Export pane's settings plus the destination folder. `overwrite` false means a taken name gets `-2`, `-3`, ...
+- `struct ExportOutcome { std::string path; bool ok; bool cancelled; std::string outFile; std::string error; int width, height; }`: one per picture. `path` is the picture's path (a copy's `|vc<n>` included). `cancelled` is **not** a failure: the picture was dropped or abandoned by `cancel()` and nothing was written. `error` says why a picture was skipped. `outFile`, `width` and `height` are set only when `ok`.
+
+**Functions**
+
+**`inline bool saveJpegFile(const std::string &path, const CanvasImage &img, int quality, bool keepMetadata, bool removeGps, const std::string &sourcePath, std::string *errorOut)`**
+- Encodes `img` as a JPEG (quality clamped to 1..100) with `encodeJpegMemory`, optionally splices in the EXIF block and ICC profile of `sourcePath` (`embedSourceMetadata`, with the GPS cut out when `removeGps`), and writes it with `writeFileAtomic`. Shared by the editor's single Export and the batch (it used to live in `main.cpp`).
+
+**`inline std::string exportStemOf(const std::string &path)`**
+- Returns: the picture's file name without its extension; `"export"` if that is empty; `-copy<n>` appended for a virtual copy's path (`photo.jpg|vc2` gives `photo-copy2`). A leading dot is kept (`.hidden`).
+
+**`inline std::string exportTargetPath(const std::string &folder, const std::string &stem, const std::string &ext, bool overwrite, std::set<std::string> &used)`**
+- Returns: `<folder>/<stem>-edit.<ext>`, or with `-2`, `-3`, ... up to 9999 when that name is in `used` (compared **without case**, so `a.jpg` and `A.png` can't collide on a case-insensitive disk) or, unless `overwrite`, already exists. The chosen name is added to `used`. `used` wins over `overwrite`: a name already taken in this batch is never reused. Empty string if every name is taken.
+
+**`inline bool exportLoadEdits(const std::string &path, int w, int h, AdjustmentSet *adj, std::string *err)`**
+- `adj` must already have `setOriginalSize(w, h)` (the upright size). No sidecar file: returns true and leaves `adj` neutral. A sidecar that exists but is empty or over 64 MiB, unreadable, not valid JSON, from a newer version, written for a different size, or whose `edits` can't be loaded: returns false with a reason in `*err`. **This is stricter than the editor**, which opens such a picture clean: a batch must not quietly export an unedited picture.
+
+**`inline ExportOutcome exportPicture(const std::string &path, const ExportSettings &s, std::set<std::string> &used, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
+- The whole pipeline for one picture, a pure function of its inputs (see [threading.md](threading.md#the-export-worker-is-a-cancellable-fifo-of-whole-pipelines)): decode `vcImageOf(path)`, apply the EXIF rotation, load the edits into a **local** `AdjustmentSet`, `orientImage` -> `rotateArbitrary` -> `cropImage` -> `renderWith`, then `fitLongEdge` / `resizeToLongEdge` (never enlarging), the JPEG size check, a free name from `exportTargetPath`, and the encode. The JPEG keeps the source's metadata from the **real** file behind a copy.
+- Cancellation: `latest` / `gen` are the usual pair (both may be null / 0 for a synchronous call). Once superseded the outcome is `cancelled` and **nothing is written**.
+- Failures (undecodable picture, unusable sidecar, JPEG too large, unwritable folder) come back as an outcome with `error` set; the function never throws for them.
+
+**`class ExportWorker`** (non-copyable)
+
+- **`~ExportWorker()`**: calls `shutdown()`.
+- **`void setNotify(std::function<void()> fn)`**: called **on the worker thread** after each result is stored. Set it before the first `start()`.
+- **`bool start(std::vector<std::string> paths, ExportSettings settings)`**: queues the batch (starting the thread on first use). False, with nothing changed, if `paths` is empty or a batch is still running.
+- **`void cancel()`**: drops what is still queued (each picture gets a `cancelled` outcome), bumps the epoch that `renderWith` and `rotateArbitrary` poll so the picture in flight is abandoned, and returns at once. A picture that had already been written stays written.
+- **`bool busy() const`**: true from `start()` until every picture has an outcome. `size_t total() const` and `size_t done() const` give the progress.
+- **`std::vector<ExportOutcome> collect()`**: every outcome made since the last call, in the order they finished, and empties the list. **Call `busy()` first**: if it was already false, these are the last outcomes. Asking after `collect()` could miss a result that lands in between.
+- **`void shutdown()`**: clears the queue, abandons the picture in flight, requests stop and joins. Safe to call twice.
 
 ---
 

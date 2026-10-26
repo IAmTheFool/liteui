@@ -17,7 +17,7 @@ ctest --test-dir build/release -C Release --output-on-failure
 
 `-C Release` (the configuration) is needed with Visual Studio's multi-configuration generator and is harmless with Ninja. To run just one test, filter by name: `ctest --test-dir build/release -C Release -R mask_brush`.
 
-Each test is a target named `literoom_<name>_test` and a CTest entry named `literoom_<name>`, so `-R mask_brush` still matches. There are **36** literoom tests (26 plain unit tests, 4 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`), 5 LiteUI tests and `golden_render`). A plain `ctest -N` from the liteui root lists more (178 at the time of writing, with `preset` and `virtual_copy` included), because it also includes liteui's own Catch2 cases and the `counter` example. To list only literoom's:
+Each test is a target named `literoom_<name>_test` and a CTest entry named `literoom_<name>`, so `-R mask_brush` still matches. There are **37** literoom tests (26 plain unit tests, 5 thread tests (`detail_layer`, `neighbor_fx`, `latest_worker`, `thumb_worker`, `export_worker`), 5 LiteUI tests and `golden_render`). A plain `ctest -N` from the liteui root lists more (178 at the time of writing, with `preset` and `virtual_copy` included), because it also includes liteui's own Catch2 cases and the `counter` example. To list only literoom's:
 
 ```powershell
 ctest --test-dir build/release -N -R literoom_
@@ -41,7 +41,7 @@ A test file is just a `main()` that calls some functions, makes `CHECK`s, and en
 
 Things worth knowing:
 
-- **It is not thread-safe.** The failure counter (`tcheck::failures`) is a plain `int`. Tests that run threads (`latest_worker`, `thumb_worker`) therefore only call `CHECK` on the main thread; worker threads record into atomics or mutex-guarded state, and the main thread asserts afterwards.
+- **It is not thread-safe.** The failure counter (`tcheck::failures`) is a plain `int`. Tests that run threads (`latest_worker`, `thumb_worker`, `export_worker`) therefore only call `CHECK` on the main thread; worker threads record into atomics or mutex-guarded state, and the main thread asserts afterwards.
 - **The counter is readable.** `sidecar_test` uses `tcheck::failures` to stop its fuzz loop at the first failure instead of printing thousands of lines.
 - **Four test files do not use it.** `minijson_test`, `exif_test`, `detail_layer_test` and `neighbor_fx_test` define their own small `CHECK` macro and print their own summary (`all ok`, `all passed` or `N FAILED`). They still return a non-zero exit code on failure, so `ctest` treats them the same. New tests should use `check.hpp`.
 
@@ -67,6 +67,7 @@ Some headers take LiteUI's `CanvasImage` or decoders, or run a real thread, so t
 | `detail_layer`, `neighbor_fx` | The platform thread library | Their cache tests start a few `std::thread`s to check that concurrent requests for the same plane give the same result. No LiteUI. |
 | `latest_worker` | The platform thread library | It runs a `std::jthread`. No LiteUI; it is tested with plain integers and move-only types. |
 | `thumb_worker` | LiteUI **and** threads | It decodes real files on a thread. The test writes those files with the app's own encoders (`image_codec.hpp`). |
+| `export_worker` | LiteUI **and** threads | It decodes, renders and encodes real files on a thread. Same file setup as `thumb_worker`; the exported files are read back with the real decoder. |
 
 **A test that uses LiteUI must define `LITEUI_IMPLEMENTATION`.** LiteUI is one header, and its implementation (the Win32 / WIC includes, `toWide`, the decoders, ...) is only compiled when the macro is defined. Each test executable must define it in **exactly one** `.cpp`, before the first include that reaches `liteui.hpp`:
 
@@ -88,7 +89,7 @@ ctest --test-dir build/release -C Release -R thumb_worker --repeat until-fail:50
 
 This repeats the test up to 50 times and stops at the first failure. `--timeout 60` makes a hung run fail instead of stalling ctest; use it for `detail_layer` and `neighbor_fx`, which have no timeouts of their own.
 
-How `latest_worker` and `thumb_worker` are written so they stay reliable:
+How `latest_worker`, `thumb_worker` and `export_worker` are written so they stay reliable:
 
 - They use **gates and latches instead of sleeps**, and every wait has a timeout (5 to 10 s), so a broken worker fails the test instead of hanging it.
 - A short `grace()` sleep (100 ms) is used only where a *negative* check has no signal to wait for (for example "nothing was notified after the job returned nothing"). Too short a grace can hide a bug (a false pass) but can never fail a correct worker.
@@ -235,6 +236,7 @@ To prove that the only change in the kitchen-sink scenarios is the new slider, g
 | `histogram` | Counts and luma, alpha skipped, clip bits, strided sampling, the clipping overlay in classic and per-channel mode, block reduction past 2048 px. |
 | `latest_worker` | See [kind 2](#2-tests-that-need-liteui-or-threads) above. |
 | `thumb_worker` | `makeThumb` sizes and rounding, FIFO order, queue replacement, failed decodes, the `edited` flag, EXIF orientation, shutdown. The sidecar scan: a file holding only a rating is not "edited" and still delivers its rating, flag and label; a file with real edits is edited and delivers them too; no sidecar, unreadable JSON and a file from before `meta` give the default; a picture that can't be decoded still delivers its `meta`. Virtual copies (`testVirtualCopy`): a copy's path is read for its own sidecar only, so it delivers `thumbSkipped`, no thumbnail, its own `edited` and `meta`, even when its picture does not exist, while the picture itself is decoded as before. |
+| `export_worker` | Batch export, with real files and the real decoder. Names: `exportStemOf` (extension dropped, `-copy2` for a virtual copy), `exportTargetPath` (`-edit`, then `-2`, `-3`; an existing file is skipped unless overwriting; a name used in this batch always wins; names compare without case). `exportPicture`: an unedited picture comes back **pixel-identical**; crop plus Exposure plus Saturation, and orient plus straighten, are compared pixel for pixel against `cropImage` / `rotateArbitrary` / `renderWith` run directly, so the worker's chain cannot drift from the editor's; Resize shrinks and never enlarges; JPEG with the metadata options; a virtual copy exports its own sidecar and its own name while the picture itself is unaffected; an unusable sidecar (wrong size, garbage), an undecodable picture and an unwritable folder each give a skipped outcome with a reason; a superseded call is `cancelled` and writes nothing. `ExportWorker`: order, one outcome per picture, the notify per result, a second `start()` refused while busy, a fresh name on the next batch (and the same name when overwriting), a failure not stopping the batch, `cancel()` (the picture in flight finishes, the rest come back `cancelled`, the worker is reusable), shutdown with work queued. |
 | `photo_meta` | `PhotoMeta` JSON: defaults are left out, every rating / flag / label combination round-trips, hostile input is clamped (an out-of-range or non-number rating, unknown flag or color names, a non-object), a hand-built value is sanitized. `MetaPatch`: only the named fields change, a set-to-zero is a change, out-of-range values are forced into range. `MetaFilter`: off matches everything, "at least N stars", OR within flags and within colors, AND across the three, toggles (the value already set switches off, out-of-range ignored). |
 | `golden_render` | See [the golden render test](#3-the-golden-render-test). |
 
@@ -360,9 +362,24 @@ The filmstrip code, the menu items and the pixel reuse have no automated test (s
 11. **Folder reopen.** Open another folder and come back (File > Open Folder): the copies are listed after their pictures.
 12. Delete `a.jpg`'s sidecar by hand but leave `a.jpg.vc1.literoom.json`: the copy still lists and opens.
 
+## Manual checks: batch export
+
+Open a folder with a few pictures: `a` edited (crop, a slider, a mask), `b` untouched, `c` a portrait phone photo, and a virtual copy of `a` with a different look.
+
+1. **Selection.** Ctrl+click `a`, `b` and the copy, then File > Export Selected... (or Ctrl+Shift+E). Pick a folder. The status bar counts up and ends with "Exported 3 photo(s) to <folder>". With nothing selected it says to select pictures first.
+2. **Each picture has its own look.** `a-edit.jpg` has `a`'s crop and edits, `a-copy1-edit.jpg` has the copy's, `b-edit.jpg` looks like `b`. All three match what the editor shows (and what single Export gives).
+3. **The open picture.** Make an edit on the open picture and export without waiting: the file has that edit (the batch flushes the sidecar first). Starting a batch in the middle of a slider drag is refused.
+4. **Metadata and size.** With "Keep EXIF" on, the JPEGs have the real picture's EXIF (a copy gets its picture's); with Remove location on, no GPS. With Resize on, long edges are the chosen size, and a smaller picture is not enlarged.
+5. **Names.** Export the same selection again: the files get `-2`. Turn on "Overwrite existing files" and export again: the original names are rewritten, and no extra files appear. Two pictures that would get the same name (`x.jpg` and `x.png`) never overwrite each other.
+6. **Export All Shown.** Filter the strip to five stars: only those are exported, in strip order.
+7. **Stop.** Export about 20 large pictures and press Stop Export (File menu or Export pane): the status says "Export stopped: N exported, M not exported", the picture being rendered writes no file, and the app stays responsive throughout. A new batch can start afterwards.
+8. **Skips.** Damage one picture's sidecar (or edit it for a different size): that picture is skipped with a reason in the summary ("Exported 2, skipped 1 (...)") and the others are exported. A read-only destination gives a skipped count, not a crash.
+9. **The portrait phone photo.** Its export is upright, and its crop and masks land where they do in the editor.
+10. **Not blocking.** While a batch runs you can open pictures and edit (export only reads sidecars). Starting a second batch is refused with "Wait for the export to finish". Closing the app mid-batch is quick.
+
 ## Sanitizers
 
-Several test files say they are meant to be run under the sanitizers (`adjustments`, `latest_worker`, `thumb_worker`, `detail_layer`, `neighbor_fx`, and the fuzz tests in `exif` and `sidecar`). `CMakeLists.txt` has no switch for this, so build the test by hand. Each test's first line gives its command; add the flags:
+Several test files say they are meant to be run under the sanitizers (`adjustments`, `latest_worker`, `thumb_worker`, `export_worker`, `detail_layer`, `neighbor_fx`, and the fuzz tests in `exif` and `sidecar`). `CMakeLists.txt` has no switch for this, so build the test by hand. Each test's first line gives its command; add the flags:
 
 ```bash
 # from the tests/ folder; -I../src is the include root (check.hpp is found next to the test)
@@ -399,7 +416,7 @@ Tests that need LiteUI also need `-I<folder with liteui.hpp>` and LiteUI's libra
 - **Virtual copies are covered below the UI only.** `virtual_copy_test` pins the path marker and the file names, `testVirtualCopyNames` the sidecar name and `testVirtualCopy` (thumb worker) the skip of decoding. Not covered: the filmstrip bookkeeping (`filmInsertEntry`, `filmRemoveEntry`, `filmPushWithCopies`, which keep `current`, `target`, `anchor` and `byName` right when cells appear and disappear; the part most likely to break), `createVirtualCopy` and `deleteVirtualCopy` and their messages and double-press guard, the no-decode switch in `filmOpenIndex`, handing the original's thumbnail to its copies, the badge, and the real-file translations in the decode job, the Sync job and export (a missed `vcImageOf` would try to open a path ending in `|vc2`). The golden test compiles this code but does not run it.
 - **The `src/main.cpp` UI itself is not under test.** The golden test reaches the render and geometry pipeline, undo history, sidecar, histogram state and a few helpers, but not widgets, shortcuts, menus or the event loop.
 - **`render_test`'s second mask check** compares a gray channel value against 0.4 where it means luma. This is fine for the gray ramp it uses, but would be wrong for a colored picture.
-- **Timing.** The `latest_worker` and `thumb_worker` tests are timeout-guarded, but run them in a loop after touching `latest_worker.hpp` or `thumb_worker.hpp`. The `detail_layer` and `neighbor_fx` thread tests have no timeouts (see above).
+- **Timing.** The `latest_worker`, `thumb_worker` and `export_worker` tests are timeout-guarded, but run them in a loop after touching `latest_worker.hpp`, `thumb_worker.hpp` or `export_worker.hpp`. The `detail_layer` and `neighbor_fx` thread tests have no timeouts (see above).
 - **Input handling and guards in the neighbor effects are mostly untested.** `gainsFromValues` clamping and NaN/inf handling (in both `detail_layer` and `neighbor_fx`), `toU8`'s NaN and infinity rules, invalid arguments to `blurLuma`, `Cache::get` and the two `acquire` functions (null pixels, non-positive size, unknown kind), `apply` with `W <= 0`, and the "plane too small, skip it" guards in `addPixels`, `nrLumaPass` and `nrColorPass`.
 - **Cache limits and mid-build cancellation.** Only the entry cap of `detail_layer`'s cache (9) is checked. Its 384 MB byte cap, which entry the LRU drops, and the eviction of `chromaStore` (256 MB, 6 entries) and `mapStore` (64 MB, 40 entries) are not tested. Every cancellation test sets the generation before the build starts, so only the first cancellation check fires; none cancels part-way through a blur.
 - **Effect internals and interactions.** `kClarityLimit` soft limiting, the veil's airlight clamp (180 to 255) and transmission floor (0.25), `sampleMap` clamping, the order of effects inside `apply` (dehaze, detail, noise reduction, blur last) and interactions between effects (each is tested alone, or all at once on tiny pictures that check only size and alpha, never pairwise).
