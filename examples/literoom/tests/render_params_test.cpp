@@ -145,6 +145,20 @@ static void testFilm()
   CHECK(with.size() == 1 && with[0].tone && !with[0].color.active && !with[0].fx.any() && with[0].luts == without[0].luts);
 }
 
+static void testLutIsGlobalOnly()
+{
+  // The 3D LUT belongs to the picture, not to a mask: a mask that carries LUT Amount (a hand-edited
+  // sidecar) is dropped as one with no adjustments, and the value changes nothing else about it.
+  CHECK(buildMaskPasses({maskWith(AdjId::LutAmount, 80.0f)}, kId).empty());
+  Mask m = maskWith(AdjId::Exposure, 30.0f);
+  m.adj[static_cast<size_t>(AdjId::LutAmount)] = 100.0f;
+  const auto with = buildMaskPasses({m}, kId), without = buildMaskPasses({maskWith(AdjId::Exposure, 30.0f)}, kId);
+  CHECK(with.size() == 1 && with[0].tone && !with[0].color.active && !with[0].color.lut.any() && !with[0].fx.any());
+  CHECK(with[0].luts == without[0].luts);
+  // Nothing in a fresh RenderParams / MaskPass holds a table.
+  CHECK(!RenderParams{}.color.lut.any() && !MaskPass{}.color.lut.any());
+}
+
 static void testShapesAreMappedThroughTheFrame()
 {
   // A mask stored in the top-left of the original ends up in the top-right of a
@@ -178,6 +192,7 @@ int main()
   testWhatEachPassHolds();
   testFilters();
   testFilm();
+  testLutIsGlobalOnly();
   testShapesAreMappedThroughTheFrame();
   testRenderParamsDefaults();
   return finish();

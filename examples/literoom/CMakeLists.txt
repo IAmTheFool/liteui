@@ -28,6 +28,7 @@ set(LITEROOM_HEADERS
     src/color/color_grade.hpp
     src/color/color_pass.hpp
     src/color/curves.hpp
+    src/color/lut3d.hpp
 
     # detail effects (need neighbor pixels)
     src/detail/detail_layer.hpp
@@ -64,12 +65,15 @@ set(LITEROOM_HEADERS
     src/io/exif.hpp
     src/io/image_meta.hpp
     src/io/preset.hpp
+    src/io/lut_cube.hpp
+    src/io/lut_library.hpp
     src/io/photo_meta.hpp
 
     # background work
     src/workers/latest_worker.hpp
     src/workers/thumb_worker.hpp
-    src/workers/export_worker.hpp)
+    src/workers/export_worker.hpp
+    src/workers/lut_preview_worker.hpp)
 
 add_executable(literoom src/main.cpp ${LITEROOM_HEADERS})
 target_include_directories(literoom PRIVATE ${LITEROOM_SRC})
@@ -186,14 +190,16 @@ if(LITEROOM_TESTS)
     foreach(t minijson exif
               pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves film_fx
               mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
-              sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter)
+              sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter
+              lut3d lut_cube)
         literoom_add_test(${t})
     endforeach()
 
     # detail_layer and neighbor_fx start std::threads (shared-cache race tests);
     # latest_worker runs a std::jthread. Loop it to shake out timing flakiness:
     #   ctest -C Release -R literoom_latest_worker --repeat until-fail:50
-    foreach(t detail_layer neighbor_fx latest_worker)
+    # lut_library starts std::threads (several threads resolving one LUT at once).
+    foreach(t detail_layer neighbor_fx latest_worker lut_library)
         literoom_add_test(${t} THREADS)
     endforeach()
 
@@ -207,8 +213,19 @@ if(LITEROOM_TESTS)
     #   ctest -C Release -R literoom_export_worker --repeat until-fail:50
     literoom_add_test(export_worker LITEUI THREADS)
 
+    # lut_preview_worker renders LUT previews on a std::jthread (the LUTs pane's list), so like
+    # thumb_worker it needs liteui (CanvasImage) and threads. Loop it to shake out timing flakiness:
+    #   ctest -C Release -R literoom_lut_preview_worker --repeat until-fail:50
+    literoom_add_test(lut_preview_worker LITEUI THREADS)
+
+    # lut_pane compiles src/main.cpp into the test (like golden_render, below) and drives the LUTs pane's
+    # logic without a window: refresh, previews, apply / remove, import, status texts.
+    # Loop it to shake out timing flakiness:
+    #   ctest -C Release -R literoom_lut_pane --repeat until-fail:50
+    literoom_add_test(lut_pane LITEUI THREADS)
+
     # These take liteui's CanvasImage, so their tests link liteui like the app.
-    foreach(t raster_ops seg_basic render image_codec histogram scopes)
+    foreach(t raster_ops seg_basic render image_codec histogram scopes lut_render)
         literoom_add_test(${t} LITEUI)
     endforeach()
 

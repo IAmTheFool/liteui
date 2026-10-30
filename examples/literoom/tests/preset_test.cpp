@@ -17,6 +17,8 @@ static Preset sample()
   p.grade.wheel[0].hue = 220.0f;
   p.grade.wheel[0].sat = 30.0f;
   p.grade.blending = 60.0f;
+  p.lut = LutRef{"Teal Orange", 0xfedcba9876543210ull};
+  p.values[adjIndex(AdjId::LutAmount)] = 65.0f;
   return p;
 }
 
@@ -163,12 +165,66 @@ static void testFiles()
   fs::remove_all(root, ec);
 }
 
+static void testLut()
+{
+  // The LUT is stored by name and hash, only when the look has one, and the amount is an ordinary value.
+  Preset p = sample();
+  const mj::Json j = presetToJson(p);
+  const mj::Json *l = j.find("lut");
+  CHECK(l && l->isObject() && l->get("name").asStr() == "Teal Orange" && l->get("hash").asStr() == "fedcba9876543210");
+  CHECK(j.get("adjust").get("LUT Amount").asNum(0) == 65.0);
+  Preset q;
+  CHECK(presetFromJson(j, &q) && q == p && q.lut == p.lut);
+  // The default look has none, and the key stays out of the file.
+  Preset none;
+  none.name = "Neutral";
+  CHECK(presetToJson(none).find("lut") == nullptr);
+  Preset n2;
+  CHECK(presetFromJson(presetToJson(none), &n2) && n2.lut.empty() && n2 == none);
+  // It makes a difference: two looks that differ only in the LUT are different presets.
+  Preset other = p;
+  other.lut.hash += 1;
+  CHECK(!(other == p));
+  other = p;
+  other.lut = LutRef{};
+  CHECK(!(other == p));
+
+  // Hostile files: a bad "lut" is dropped (the rest of the preset still loads), names are made safe.
+  Preset out;
+  for (const mj::Json &bad : {mj::Json::str("x"), mj::Json::array(), mj::Json::object(),
+                              mj::Json::object().set("name", mj::Json::num(1)),
+                              mj::Json::object().set("name", mj::Json::str("   "))})
+  {
+    mj::Json jj = presetToJson(p);
+    jj.set("lut", bad);
+    CHECK(presetFromJson(jj, &out) && out.lut.empty() && out.name == "Warm Film");
+  }
+  mj::Json jj = presetToJson(p);
+  jj.set("lut", mj::Json::object().set("name", mj::Json::str("../../x\\y")).set("hash", mj::Json::str("nothex")));
+  CHECK(presetFromJson(jj, &out) && out.lut == (LutRef{".._.._x_y", 0}));
+  CHECK(out.lut.name.find('/') == std::string::npos && out.lut.name.find('\\') == std::string::npos);
+
+  // Through a file: still tiny (a LUT table is never stored in a preset), and it comes back whole.
+  namespace fs = std::filesystem;
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  const fs::path root = fs::temp_directory_path() / ("literoom_preset_lut_" + std::to_string(stamp));
+  const std::string dir = u8ToString(root / "presets");
+  std::string err, path;
+  CHECK(savePresetFile(dir, p, &err, &path));
+  CHECK(fs::file_size(fsPath(path)) < 8192);
+  Preset back;
+  CHECK(loadPresetFile(path, &back, &err) && back == p);
+  std::error_code ec;
+  fs::remove_all(root, ec);
+}
+
 int main()
 {
   testNames();
   testJsonRoundTrip();
   testRejectsAndClamps();
   testFiles();
+  testLut();
   CHECK(!presetDir().empty());
   return finish();
 }

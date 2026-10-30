@@ -143,7 +143,8 @@ static void testFilterBlock()
   }
   CHECK(adjIndex(AdjId::Greyscale) == adjIndex(AdjId::ColorizeAmount) + 1);
   CHECK(adjIndex(AdjId::Solarize) + 1 == adjIndex(AdjId::BleachBypass)); // the newer three follow Solarize
-  CHECK(adjIndex(AdjId::Texture) == adjIndex(AdjId::CrossProcess) + 1);
+  CHECK(adjIndex(AdjId::LutAmount) == adjIndex(AdjId::CrossProcess) + 1); // the LUT strength closes the Color stage
+  CHECK(adjIndex(AdjId::Texture) == adjIndex(AdjId::LutAmount) + 1);
   // Values are sanitized into 0..100 like every other slider.
   CHECK(sanitizedValue(spec(AdjId::Greyscale), 250.0f) == 100.0f);
   CHECK(sanitizedValue(spec(AdjId::Greyscale), -5.0f) == 0.0f);
@@ -152,6 +153,24 @@ static void testFilterBlock()
   AdjValues f{};
   for (AdjId id : filters)
     f[static_cast<size_t>(id)] = 100.0f;
+  const auto lut = toneLutFromValues(f, nullptr);
+  for (int i = 0; i < 256; ++i)
+    CHECK(lut[static_cast<size_t>(i)] == i);
+}
+
+// LUT Amount: the strength of the 3D LUT (the LUT itself is the edit's LutRef).
+static void testLutAmount()
+{
+  const AdjustmentSpec &s = spec(AdjId::LutAmount);
+  CHECK(s.label == "LUT Amount"); // a sidecar key: renaming it orphans saved values
+  CHECK(s.stage == AdjustmentSpec::Stage::Color && s.apply == nullptr);
+  CHECK(s.min == 0.0f && s.max == 100.0f); // 0 = off, like every other neutral value
+  CHECK(sanitizedValue(s, 250.0f) == 100.0f);
+  CHECK(sanitizedValue(s, -5.0f) == 0.0f);
+  CHECK(sanitizedValue(s, std::nanf("")) == 0.0f);
+  // Not part of the tone table, at any strength.
+  AdjValues f{};
+  f[adjIndex(AdjId::LutAmount)] = 100.0f;
   const auto lut = toneLutFromValues(f, nullptr);
   for (int i = 0; i < 256; ++i)
     CHECK(lut[static_cast<size_t>(i)] == i);
@@ -359,6 +378,7 @@ int main()
   testTable();
   testRanges();
   testFilterBlock();
+  testLutAmount();
   testEffectsBlock();
   testLevels();
   testToneFunctions();

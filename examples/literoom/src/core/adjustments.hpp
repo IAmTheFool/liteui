@@ -81,6 +81,12 @@ enum class AdjId : int
   BleachBypass,
   Threshold,
   CrossProcess,
+  // How much of the 3D LUT is used (0..100, 0 = off). The LUT itself is not a
+  // slider: it is the edit's LutRef (color/lut3d.hpp), chosen in the LUTs pane.
+  // Runs last in the color pass, after the Filters. Global only: the Adjust pane
+  // and the mask lists skip it (the LUTs pane carries this slider), and a mask
+  // that holds a value here is ignored.
+  LutAmount,
   Texture,
   Clarity,
   Sharpness,
@@ -288,6 +294,8 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
         {AdjId::Threshold, "Threshold", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         {AdjId::CrossProcess, "Cross Process", 0.0f, 100.0f, nullptr,
+         AdjustmentSpec::Stage::Color},
+        {AdjId::LutAmount, "LUT Amount", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         // Detail stage (see detail_layer.hpp). Texture and Clarity soften when
         // negative; Sharpness only sharpens.

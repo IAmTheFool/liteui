@@ -1,5 +1,5 @@
 // preset.hpp - Presets: a saved "look" (sliders, curves, Color Mixer, Color
-// Grading) that can be applied to any picture. Geometry (crop, rotation,
+// Grading, 3D LUT) that can be applied to any picture. Geometry (crop, rotation,
 // straighten) and masks are NOT part of a preset: they belong to one picture.
 // Pure functions on plain values plus small file helpers; no UI, no editor
 // state. Loading reuses the sidecar readers, so every value is validated and
@@ -7,7 +7,11 @@
 //
 // File: <presetDir()>/<name>.literoom-preset.json
 //   { "app": "literoom", "kind": "preset", "version": 1, "name": "...",
-//     "adjust": {...}, "curves": {...}, "colorMix": {...}, "colorGrading": {...} }
+//     "adjust": {...}, "curves": {...}, "colorMix": {...}, "colorGrading": {...},
+//     "lut": {"name": "...", "hash": "..."} }   ("lut" only when the look has one)
+// The LUT is stored by name and hash, never as a table (see io/lut_library.hpp), so a
+// preset stays tiny. Applying a preset replaces the picture's whole look: one
+// without a "lut" clears the picture's LUT.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -24,6 +28,7 @@
 #include "color/color_grade.hpp"
 #include "color/color_mix.hpp"
 #include "color/curves.hpp"
+#include "color/lut3d.hpp"
 #include "core/adjustments.hpp"
 #include "io/file_utils.hpp"
 #include "io/minijson.hpp"
@@ -42,6 +47,7 @@ struct Preset
   CurveSet curves = identityCurves();
   MixValues mix{};
   ColorGrade grade;
+  LutRef lut; // empty = no LUT (its amount is in `values`)
   bool operator==(const Preset &) const = default;
 };
 
@@ -106,6 +112,8 @@ inline mj::Json presetToJson(const Preset &p)
   o.set("curves", sidecarCurvesToJson(p.curves));
   o.set("colorMix", sidecarMixToJson(p.mix));
   o.set("colorGrading", sidecarGradeToJson(p.grade));
+  if (!p.lut.empty())
+    o.set("lut", sidecarLutToJson(p.lut));
   return o;
 }
 
@@ -131,6 +139,7 @@ inline bool presetFromJson(const mj::Json &o, Preset *out)
         p.curves[c] = sidecarCurveFromJson(*a);
   p.mix = sidecarMixFromJson(o.find("colorMix"));
   p.grade = sidecarGradeFromJson(o.find("colorGrading"));
+  p.lut = sidecarLutFromJson(o.find("lut"));
   *out = std::move(p);
   return true;
 }

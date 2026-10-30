@@ -356,6 +356,121 @@ static void testBatch()
   CHECK(again.size() == 2 && again[0].ok && again[1].ok && again[0].outFile != again[1].outFile);
 }
 
+// A LUT in the library folder (a real .cube file) for the duration of one test.
+struct LutLibrary
+{
+  TempDir dir;
+  LutLibrary()
+  {
+    lutDirOverride() = dir.root();
+    clearLutCache();
+  }
+  ~LutLibrary()
+  {
+    lutDirOverride().clear();
+    clearLutCache();
+  }
+  // An inverting 2-point cube; returns the hash of its bytes.
+  uint64_t writeInvert(const std::string &name)
+  {
+    const std::string text = "LUT_3D_SIZE 2\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n";
+    writeText(lutPath(dir.root(), name), text);
+    return lutHashBytes(reinterpret_cast<const uint8_t *>(text.data()), text.size());
+  }
+};
+
+static void testLutExport()
+{
+  LutLibrary lib;
+  const uint64_t hash = lib.writeInvert("Inv");
+  TempDir in, out;
+  const std::string src = in.path("l.png");
+  CHECK(writePng(src, 48, 36));
+  AdjustmentSet adj;
+  adj.setOriginalSize(48, 36);
+  adj.setCrop(CropRect{4, 3, 30, 20});
+  adj.set(AdjId::Saturation, 20.0f);
+  CHECK(adj.setLut(LutRef{"Inv", hash}));
+  writeSidecar(src, 48, 36, adj);
+
+  std::set<std::string> used;
+  const ExportOutcome o = exportPicture(src, pngSettings(out), used);
+  CHECK(o.ok && o.width == 30 && o.height == 20);
+  // The batch renders exactly what the editor would: crop, then the render with the LUT.
+  auto cropped = cropImage(makeImage(48, 36), CropRect{4, 3, 30, 20});
+  auto want = renderWith(*cropped, adj.buildRenderParams());
+  auto back = readBack(o.outFile);
+  CHECK(back.has_value() && want != nullptr);
+  if (back && want)
+  {
+    CHECK(back->pixels == want->pixels);
+    AdjustmentSet noLut = adj;
+    noLut.setLut(LutRef{});
+    CHECK(back->pixels != renderWith(*cropped, noLut.buildRenderParams())->pixels); // the LUT really did something
+  }
+
+  // A LUT file that has changed since it was chosen (a different hash) is used as it is.
+  const ExportOutcome changed = [&]
+  {
+    AdjustmentSet a2 = adj;
+    a2.setLut(LutRef{"Inv", hash + 1});
+    writeSidecar(src, 48, 36, a2);
+    std::set<std::string> u2;
+    return exportPicture(src, pngSettings(out), u2);
+  }();
+  CHECK(changed.ok);
+}
+
+static void testMissingLutIsReported()
+{
+  LutLibrary lib; // an empty library
+  TempDir in, out;
+  std::set<std::string> used;
+  const std::string a = in.path("m.png");
+  CHECK(writePng(a, 32, 24));
+  AdjustmentSet adj;
+  adj.setOriginalSize(32, 24);
+  adj.setLut(LutRef{"Gone", 5});
+  writeSidecar(a, 32, 24, adj);
+  // In use (amount above 0) but not in the library: skipped with a reason, like any unusable sidecar.
+  const ExportOutcome o = exportPicture(a, pngSettings(out), used);
+  CHECK(!o.ok && !o.cancelled && o.error.find("LUT") != std::string::npos && o.error.find("Gone") != std::string::npos);
+  CHECK(!std::filesystem::exists(fsPath(out.path("m-edit.png"))));
+
+  // A LUT file that exists but is damaged: also skipped.
+  writeText(lutPath(lib.dir.root(), "Gone"), "LUT_3D_SIZE 2\n1 2 3\n");
+  clearLutCache();
+  const ExportOutcome bad = exportPicture(a, pngSettings(out), used);
+  CHECK(!bad.ok && !bad.cancelled && bad.error.find("can't be read") != std::string::npos);
+
+  // With the amount at 0 the LUT does nothing, so a missing one is no reason to skip the picture.
+  const std::string b = in.path("n.png");
+  CHECK(writePng(b, 32, 24));
+  AdjustmentSet off;
+  off.setOriginalSize(32, 24);
+  off.setLut(LutRef{"Absent", 5});
+  off.set(AdjId::LutAmount, 0.0f);
+  writeSidecar(b, 32, 24, off);
+  const ExportOutcome fine = exportPicture(b, pngSettings(out), used);
+  CHECK(fine.ok);
+  auto back = readBack(fine.outFile);
+  CHECK(back.has_value() && back->pixels == makeImage(32, 24).pixels);
+
+  // In a batch, the picture with the missing LUT is skipped and the rest go on.
+  const std::string good = in.path("g.png");
+  CHECK(writePng(good, 16, 16));
+  ExportWorker w;
+  CHECK(w.start({a, good}, pngSettings(out)));
+  CHECK(waitIdle(w));
+  auto got = w.collect();
+  CHECK(got.size() == 2);
+  if (got.size() == 2)
+  {
+    CHECK(!got[0].ok && !got[0].cancelled && got[0].error.find("LUT") != std::string::npos);
+    CHECK(got[1].ok);
+  }
+}
+
 static void testFailureDoesNotStopTheBatch()
 {
   TempDir in, out;
@@ -448,6 +563,8 @@ int main()
   testResizeAndJpeg();
   testVirtualCopy();
   testUnusableSidecarIsReported();
+  testLutExport();
+  testMissingLutIsReported();
   testCancelledPicture();
   testBatch();
   testFailureDoesNotStopTheBatch();

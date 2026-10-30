@@ -35,16 +35,16 @@ Every header sits under `src/`, which is the include root, so a header is always
 | Folder | Headers |
 |---|---|
 | `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops` |
-| `color/` | `color_mix`, `color_grade`, `color_pass`, `curves` |
+| `color/` | `color_mix`, `color_grade`, `color_pass`, `curves`, `lut3d` |
 | `detail/` | `detail_layer`, `neighbor_fx`, `film_fx` |
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_rect`, `mask_polygon`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
 | `render/` | `render`, `histogram`, `scopes` |
-| `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta` |
-| `workers/` | `latest_worker`, `thumb_worker`, `export_worker` |
+| `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta`, `lut_cube`, `lut_library` |
+| `workers/` | `latest_worker`, `thumb_worker`, `export_worker`, `lut_preview_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
-The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`; `export_worker` is the exception that also uses `edit` and `render`, because it runs the whole pipeline. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
+The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`; `export_worker` and `lut_preview_worker` are the exceptions that also use `edit` and `render`, because they run the pixel pipeline. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
 
 ---
 
@@ -86,7 +86,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 
 **Four stages**
 - **Tone**: pointwise per channel (0..255 in, float out). Composed into one lookup table by `toneLutFromValues`. Runs first.
-- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process): 0..100 strengths that run as the last block of the color pass.
+- **Color**: needs cross-channel math. `apply` is `nullptr`; read by `makeColorPass` / `applyColorPass` (`color_pass.hpp`). This stage also holds the **Filters** (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process): 0..100 strengths that run as the last block of the color pass. **LUT Amount** follows them: the strength of the picture's 3D LUT (0 = off; the LUT itself is the edit's `LutRef`, see `lut3d.hpp`), the very last step of the color pass. It is global only: the Adjust pane and the mask lists skip it by id, and `buildMaskPasses` never reads it.
 - **Detail**: needs neighbor pixels. `apply` is `nullptr`; read by `detail_layer.hpp` and `neighbor_fx.hpp`.
 - **Effects**: needs the pixel's *position* (Vignette, Grain). `apply` is `nullptr`; read by `film_fx.hpp`, the very last step of `renderWith` (after the masks). Global only: the mask slider lists skip this stage. Last in the table.
 
@@ -102,7 +102,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | `kGammaOctaves` | `float` | 2 | Gamma's exponent is `2^(-v / 100 * kGammaOctaves)`, so the exponent runs from 0.25 (+100) to 4 (-100) |
 
 **Types**
-- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, BlackPoint, WhitePoint, Gamma, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Vignette, VignetteMidpoint, VignetteFeather, Grain, GrainSize, GrainRoughness, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
+- `enum class AdjId : int`: `Exposure, Brightness, Contrast, Highlights, Shadows, Whites, Blacks, BlackPoint, WhitePoint, Gamma, Temperature, Tint, Vibrance, Saturation, Hue, ColorizeHue, ColorizeAmount, Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, BleachBypass, Threshold, CrossProcess, LutAmount, Texture, Clarity, Sharpness, Dehaze, NoiseLuma, NoiseColor, Blur, Vignette, VignetteMidpoint, VignetteFeather, Grain, GrainSize, GrainRoughness, Count`. The order **must** match `kAdjustmentSpecs` (it is the index).
 - `struct AdjustmentSpec`
 
   | Field | Type | Meaning |
@@ -112,9 +112,9 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
   | `min`, `max` | `float` | Slider range; `min < max` is enforced at compile time |
   | `apply` | `float (*)(float channelValue, float value)` | Tone only: one channel 0..255 and the slider value in, **unclamped, unrounded** float out. `nullptr` for Color, Detail and Effects |
   | `stage` | `Stage` (`Tone`, `Color`, `Detail`, `Effects`) | Which pass consumes it. Defaults to `Tone` |
-- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 40 floats, indexed by `adjIndex(id)`.
+- `using AdjValues = std::array<float, adjIndex(AdjId::Count)>`: 41 floats, indexed by `adjIndex(id)`.
 
-**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 40>`). Declaration order is the sidebar order and, within Tone, the processing order.
+**The table `kAdjustmentSpecs`** (`inline constexpr std::array<AdjustmentSpec, 41>`). Declaration order is the sidebar order and, within Tone, the processing order.
 
 | Slider | Range | Stage | Per-channel function (x = channel 0..255, v = value) |
 |---|---|---|---|
@@ -132,6 +132,7 @@ The Adjust sliders. `AdjId` names every slider, `kAdjustmentSpecs` is the table 
 | ColorizeHue | 0..360 (degrees) | Color | none |
 | ColorizeAmount | 0..100 | Color | none |
 | Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process | 0..100 | Color | none (the Filters block of `color_pass.hpp`; 0 = off). Their labels are sidecar keys, so never rename them |
+| LUT Amount | 0..100 | Color | none (the strength of the 3D LUT, last step of the color pass; 0 = off. Global only. Its label is a sidecar key, so never rename it) |
 | Texture, Clarity, Dehaze | -100..100 | Detail | none |
 | Sharpness, NoiseLuma ("Noise Reduction"), NoiseColor ("Color Noise"), Blur | 0..100 | Detail | none |
 | Vignette | -100..100 | Effects | none (`film_fx.hpp`; negative darkens the edges, positive lightens them, 0 = off) |
@@ -214,7 +215,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 ### `adjustment_set.hpp`
 `AdjustmentSet`: the live value of every edit, the undo/redo history, the History labels, the sidecar JSON and the `RenderParams`. No UI, no pixels. See [undo-and-history.md](undo-and-history.md).
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `preset.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `lut3d.hpp`, `lut_library.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `preset.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
 
 **Constants:** `kMaxUndoSteps` (`size_t`, 200): the history holds the baseline plus at most this many steps (so `historySize()` is at most 201); older steps are dropped as new edits come in.
 
@@ -224,7 +225,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - The "current drag" is tracked by `lastEdited_`. Besides the real sliders (`AdjId`) it uses pseudo-ids just above `AdjId::Count`: `Count` itself means "no drag in progress", then `Count + 1` angle, `+ 2` curve, `+ 3` Color Mixer, `+ 4` Color Grading, `+ 5` mask.
 - Controls that need to say *which* one is being dragged keep an extra key: the curve channel, the Mixer slot index, and an integer `key` for grading and masks.
 
-**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade and the whole mask list. A snapshot also has a `std::string label`. It is **empty for every step except a preset step, a white-balance pick, an Auto Tone and a snapshot restore**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
+**What one undo step restores** (the private `Snapshot`): slider values, crop, orientation, straighten angle, corner mode, the four curves, the 24 Mixer values, the grade, the whole mask list and the LUT reference (`LutRef`). A snapshot also has a `std::string label`. It is **empty for every step except a preset step, a white-balance pick, an Auto Tone, a snapshot restore and a LUT choice or removal**, and it is not part of the edit state (it is never compared and never restored); see "How a step is labelled" below.
 
 **Read access**
 
@@ -239,6 +240,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 | `float mix(MixChan c, size_t band) const`, `const MixValues &mixValues() const` | Color Mixer values |
 | `const ColorGrade &grade() const` | Color Grading |
 | `const MaskSet &masks() const` | The masks |
+| `const LutRef &lut() const` | The picture's 3D LUT (empty = none). How much of it is used is the `LUT Amount` slider |
 | `GeoFrame geoFrame() const` | `makeGeoFrame(origW_, origH_, orient_, angle_, expand_, crop_)`: the identity frame until `setOriginalSize` has been called |
 | `uint64_t version() const` | Bumped by **every** change to the edit state (edit, undo, redo, jump, reset, load). The app compares it with its value at the last save/load to know whether the sidecar is stale. Not part of the undo history |
 
@@ -273,13 +275,24 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`void setMasks(const MaskSet &m, int key)`**
 - Commits a new mask list (add, delete, move, edit a slider...). `key` works as in `setGrade`; callers pack the mask index into it so two masks never share a step. No-op if equal (mask equality is cheap: object bitmaps compare by id). **`void endMaskEdit()`** closes the drag.
 
+**3D LUT** (see [`lut3d.hpp`](#lut3dhpp) and [`lut_library.hpp`](#lut_libraryhpp); the reference is look data, the strength is the ordinary `LUT Amount` slider)
+
+**`bool setLut(const LutRef &ref)`**
+- Chooses the LUT, or removes it (an empty `ref`, or a name with nothing left after `sanitizeLutName`), as **one undo step**. The name is cleaned on the way in, so no caller can store an unsafe file-name stem.
+- The amount follows the choice so the result is visible at once and a LUT-less picture stays untouched: choosing a LUT while `LUT Amount` is 0 sets it to 100; choosing another one while an amount is set keeps that amount; removing the LUT sets the amount back to 0. Both changes are in the same step, so one undo brings back both.
+- Returns false, adding **no step** and not bumping `version()`, if neither the reference nor the amount would change.
+- Like `applyPreset` it goes through `pushStep()`, so it ends any slider drag in progress. Its label is stored in the step: `"LUT: <name>"`, or `"Remove LUT"`.
+- Does not look at the library: a reference to a file that does not exist is accepted (see `lutStatus`).
+
+**`LutStatus lutStatus() const`**: where the LUT stands in the library right now: `None` (no LUT), `Ok`, `HashChanged` (the file's bytes differ from when it was chosen, still used), `Missing` or `Unreadable` (no effect). Resolves through `acquireLut`, so it may parse the file on the first call (the UI thread, about 150 ms for the largest tables) and is cheap after that.
+
 **Presets** (see [`preset.hpp`](#presethpp); a preset is the *look* only, so crop, orientation, straighten angle and masks are never part of it)
 
 **`Preset currentPreset(const std::string &name) const`**
-- Returns the current slider values, the four curves, the 24 Mixer values and the grade as a `Preset`. `name` goes through `sanitizePresetName`, so it may come back shorter, trimmed or empty. Does not touch the history or `version()`.
+- Returns the current slider values, the four curves, the 24 Mixer values, the grade and the LUT as a `Preset`. `name` goes through `sanitizePresetName`, so it may come back shorter, trimmed or empty. Does not touch the history or `version()`.
 
 **`bool applyPreset(const Preset &p)`**
-- **Replaces the whole look** with `p` as **one undo step**. A slider the preset does not set (its value is 0) is reset to 0, not left alone; this is "replace", not "merge". Crop, orientation, angle, corner mode and masks are not touched.
+- **Replaces the whole look** with `p` as **one undo step**. A slider the preset does not set (its value is 0) is reset to 0, not left alone; this is "replace", not "merge". Crop, orientation, angle, corner mode and masks are not touched. The LUT is part of the look: a preset **without** one clears the picture's LUT (its `LUT Amount` comes from the preset's slider values like any other slider). The preset's LUT name is cleaned again; a preset that differs from the picture only in its LUT is a change.
 - Each slider value is run through `sanitizedValue` (clamped to its range, NaN/infinity become 0), so a hand-built `Preset` cannot put an out-of-range slider in. The curves, Mixer values and grade are taken **as given**: a `Preset` that came from `presetFromJson` already satisfies the editor's rules (see `sidecarCurveFromJson`), but a hand-built one must keep them itself.
 - Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders, the curves, the Mixer values and the grade all equal the current ones. Otherwise returns true.
 - The step is always its own: it goes through `pushStep()`, which ends any slider/curve/Mixer/grade/mask drag, so the next slider touch starts a fresh step rather than overwriting the preset step. Its label is `"Preset: <name>"` (the name sanitized again), or just `"Preset"` if the name is blank. The label is stored in the new snapshot, so it survives undo, redo and History jumps, and it stays even if the preset *file* is later deleted: history holds a full copy of the look, never a link to the file.
@@ -305,11 +318,11 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **Named snapshots** (a saved copy of the *whole* edit state; the list lives in `main.cpp`, see [undo-and-history.md](undo-and-history.md#named-snapshots) and [`sidecar.hpp`](#sidecarhpp))
 
 **`SidecarEdits currentEdits() const`**
-- The whole edit state as a plain value: sliders, crop, orientation, angle, corner mode, curves, Mixer, grade and masks. This is what `toJson()` writes and what *Save snapshot* stores. Does not touch the history or `version()`. It builds the struct field by field, so a new field of `SidecarEdits` must be added here.
+- The whole edit state as a plain value: sliders, crop, orientation, angle, corner mode, curves, Mixer, grade, masks and the LUT. This is what `toJson()` writes and what *Save snapshot* stores. Does not touch the history or `version()`. It builds the struct field by field, so a new field of `SidecarEdits` must be added here.
 
 **`bool restoreEdits(const SidecarEdits &e, const std::string &name)`**
 - Puts the picture back exactly as `e` describes it as **one undo step**. Unlike `applyPreset` it replaces the geometry (crop, orientation, angle, corner mode) and the masks too, so the caller must refresh the picture the way it does after an undo.
-- Slider values go through `sanitizedValue` (clamped, NaN/infinity become 0). Everything else is taken **as given**, so `e` must come from `currentEdits()` or `sidecarSnapshotsFromJson` (which checks the crop against the picture's size).
+- Slider values go through `sanitizedValue` (clamped, NaN/infinity become 0). Everything else is taken **as given** (the LUT's name is made safe like any other name), so `e` must come from `currentEdits()` or `sidecarSnapshotsFromJson` (which checks the crop against the picture's size).
 - Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders and every other field already equal the current ones. Otherwise returns true.
 - Like `applyPreset` it goes through `pushStep()`, so it ends any drag in progress. Its label is `"Snapshot: <name>"` (the name sanitized again with `sanitizeSnapshotName`), or `"Snapshot"` for a blank name; it is stored in the history step, so it survives undo, redo and History jumps, and it is not saved.
 
@@ -317,7 +330,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 
 **`void setOriginalSize(int w, int h)`**: the untouched picture's size, which masks are stored against and `geoFrame()` and the sidecar loader need. Call it once per opened file, **after `reset()`**.
 
-**`void reset()`**: a fresh baseline for a newly opened image: every slider, Mixer value, grade, mask, crop, orientation and angle back to neutral, curves to identity, history reduced to that one baseline step.
+**`void reset()`**: a fresh baseline for a newly opened image: every slider, Mixer value, grade, mask, the LUT, crop, orientation and angle back to neutral, curves to identity, history reduced to that one baseline step.
 
 **`mj::Json toJson() const`**: everything the user has done, as the sidecar JSON (the undo history is not included). Calls `sidecarEditsToJson(currentEdits())`.
 
@@ -330,7 +343,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - **`const std::string &historyLabel(size_t i) const`**: what step `i` changed compared with step `i − 1` (`"Original"` for step 0; an empty string for an out-of-range `i`). Labels are cached per `version()`, so polling every frame is cheap. The reference is only valid until the next change.
 - **`void goToHistory(size_t i)`**: jumps to step `i` (the same as pressing Undo/Redo until you get there). No-op if `i` is out of range or already current.
 
-**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset`, `setWhiteBalance`, `setAutoTone` and `restoreEdits` set one) is described by that label, with no diffing. Otherwise the **first** difference found wins, checked in this order:
+**How a step is labelled** (`describeStep` diffs a step against the one before it, so the setters don't know about labels and a coalesced drag can never leave a stale one). One exception comes first: a step whose snapshot carries a non-empty `label` (only `applyPreset`, `setWhiteBalance`, `setAutoTone`, `restoreEdits` and `setLut` set one) is described by that label, with no diffing. Next, before any slider is looked at, a changed LUT reference is described as `LUT: <name>` (or `Remove LUT`); that is a safety net, because `setLut` always stores a label. Otherwise the **first** difference found wins, checked in this order:
 1. A global slider: `"<label> <signed value>"` in `kAdjustmentSpecs` order (e.g. `Exposure +20`). Values within 0.05 of a whole number print as `%+d`, others as `%+.1f`.
 2. `Rotate / Flip`, then `Straighten ±x.x°`, then `Straighten: Keep Canvas` / `Straighten: Auto-Crop`, then `Crop` / `Remove Crop`.
 3. `Tone Curve: RGB / Red / Green / Blue`.
@@ -347,7 +360,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const`**
 - Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what `renderWith`'s fast path checks).
 
-**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade and the ten Filters (via `filterValuesFromAdj(values_)`).
+**`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade, the ten Filters (via `filterValuesFromAdj(values_)`) and the 3D LUT: `makeLutPass(acquireLut(lut_).lut, LUT Amount)`, so the pass holds a shared pointer to the cached table and an unavailable LUT is simply inactive.
 
 **`RenderParams buildRenderParams() const`**
 - Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks), and `film` from `filmFromAdj(values_)` (Vignette and Grain: global, applied after the masks).
@@ -371,7 +384,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 | `color` | `ColorPass` | inactive | The mask's own color pass |
 | `fx` | `neighbor_fx::Gains` | all 0 | The mask's Texture, Clarity, Sharpness, Dehaze, Noise and Blur gains |
 
-`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it), `film` (`film_fx::Params`: Vignette and Grain, the very last step, after the masks).
+`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables; it holds the picture's 3D LUT as a shared pointer, so copying a `RenderParams` never copies a table), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it), `film` (`film_fx::Params`: Vignette and Grain, the very last step, after the masks).
 
 **Functions**
 
@@ -388,16 +401,16 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
   - Tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
   - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount, and the Filters through `filterValuesFromAdj`). A mask with only a Filter slider set counts as having an active color pass, so it is kept.
   - `fx` comes from `neighbor_fx::gainsFromValues` with the seven detail sliders.
-  - The Effects sliders (Vignette, Grain) are **not read**: a mask that carries one has no adjustment from it, and one with nothing else is dropped.
+  - The Effects sliders (Vignette, Grain) and **LUT Amount** are **not read**: a mask that carries one has no adjustment from it, and one with nothing else is dropped. A mask's color pass never gets a LUT.
 
 ---
 
 ## Color
 
 ### `color_pass.hpp`
-The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization). Also holds `solveWhiteBalance`, the inverse of the white-balance gains, used by the app's eyedropper.
+The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters → 3D LUT. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization). Also holds `solveWhiteBalance`, the inverse of the white-balance gains, used by the app's eyedropper.
 
-**Depends on:** `color_grade.hpp`, `color_mix.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test`.
+**Depends on:** `color_grade.hpp`, `color_mix.hpp`, `lut3d.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test` (the order of the LUT among the stages is also checked through the real renderer in `lut_render_test`).
 
 **Constants**
 
@@ -427,6 +440,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 | `grade` | `bool` | false | Color Grading on; `gradeLut` is valid |
 | `gradeLut` | `GradeLut` | zeros | Only filled when `grade` |
 | `filters` | `FilterPass` | all off | The Filters block; `filters.any` = on. Counts toward `active` |
+| `lut` | `LutPass` | none | The 3D LUT (shared pointer to an immutable table, plus the 0..1 amount); `lut.any()` = on. Counts toward `active`. Only the global color pass ever has one: masks do not |
 
 `struct FilterValues`: the ten Filter slider values as given by the UI (0..100 each, default 0): `greyscale`, `sepia`, `vintage`, `fade`, `negative`, `posterize`, `solarize`, `bleachBypass`, `threshold`, `crossProcess`.
 
@@ -441,7 +455,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 
 **Functions**
 
-**`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f, const FilterValues &filters = FilterValues{})`**
+**`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f, const FilterValues &filters = FilterValues{}, const LutPass &lut = LutPass{})`**
 - Inputs (all UI slider values):
   - `temperature`, `tint`, `vibrance`, `saturation`, `hueShift`: -100..100, 0 = untouched.
   - `mix`: the 8 × 3 Color Mixer sliders (`MixValues`).
@@ -449,6 +463,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   - `colorizeHue`: degrees; only checked for finiteness (it wraps, so any value works).
   - `colorizeAmount`: 0..100.
   - `filters`: the ten Filter strengths, 0..100 (default: all off). Sanitized by `makeFilterPass` (NaN/infinity → 0, clamped).
+  - `lut`: the picture's LUT, already vetted and frozen by `makeLutPass` (default: none). Only the global call site (`AdjustmentSet::buildColorPass`) passes one; `buildMaskPasses` does not.
 - Returns: a `ColorPass`. If nothing is non-neutral, `active` is false and the rest is left at defaults.
 - Sanitizing: each slider is clamped to its range and NaN/infinity become 0, so the loop only ever sees finite values and its table indexes are in range. `grade` is sanitized inside `buildGradeLut`.
 - Details:
@@ -458,6 +473,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   - `tintVec` = (hue color − its own luma) × `colorizeAmount/100 × 0.6 × 255`.
   - The Mixer and Grade tables are built here (`buildMixLut`, `buildGradeLut`) only when those stages are on.
   - `cp.filters = makeFilterPass(filters)` is built before `active` is computed, and `filters.any` is part of `active`; without that the fast path would skip a lone Filter.
+  - `cp.lut` is stored (only when `lut.any()`) before `active` is computed, and `lut.any()` is part of `active`; without that the fast path would skip a lone LUT. A LUT alone also computes the (neutral) white-balance gains: they are within a float rounding of 1, so a LUT-only pass need not be bit-exact with a default pass, which is why `colorPassWithLut` below rebuilds through `makeColorPass` in that case.
 
 **`inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)`**
 - Inputs:
@@ -474,8 +490,14 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   6. **Colorize**: adds `tintVec × 4·l·(1 − l)` where `l` is luma 0..1 (strongest in midtones, zero at black and white).
   7. **Grading**: clamp to 0..255, `yi = int(luma + 0.5)`, add `gradeLut[c][yi]`.
   8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Bleach Bypass (half-desaturate, then overlay the luma: more contrast, less color, black and white fixed) → Cross Process (S-curve on R at 0.9, on G at 0.5, B lifted from 0 to 32 and lowered from 255 to 225) → Threshold (luma at or above `kThresholdLevel` = 128 goes white, below goes black; the slider is the blend strength) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
-  9. Write back with `toU8Clamped`, once.
+  9. **3D LUT** (only if `lut.any()`): clamp R, G and B to 0..255 (NaN to 0), then `applyLutPixel`: the table's tetrahedral lookup, blended with the pixel by the amount, `lerp(pixel, lut(pixel), amount)`. Last, so the LUT sees the finished color; before the neighbor effects, the masks and Vignette / Grain (see `renderWith`).
+  10. Write back with `toU8Clamped`, once.
 - Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
+
+**`inline ColorPass colorPassWithLut(const ColorPass &cp, const LutPass &lut)`**
+- Returns a copy of `cp` whose LUT is `lut`; an inactive `lut` (a default `LutPass{}`) removes it. Everything else in the pass is kept exactly. This is how the LUT previews swap one LUT for another on the picture's own `RenderParams` without the sliders that made the pass (`lutPreviewParams`).
+- Equivalence: when nothing else is in play (no Mixer, grade, hue, colorize, Filters, gains, vibrance or saturation change) and a LUT is given, the result is **`makeColorPass`'s own pass for a LUT alone**, so a preview matches a real render byte for byte. Otherwise it is `cp` with `lut` replaced and `active` recomputed (`cp.active` is false only when no stage is on, so removing the only active stage turns the pass off).
+- Does not change `cp`.
 
 
 **White-balance picker types**
@@ -639,6 +661,45 @@ Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 2
 
 **`inline bool curveRemove(CurvePoints &pts, int idx)`**
 - Removes an interior point and returns true. Returns false (nothing removed) for either end point or an out-of-range index.
+
+### `lut3d.hpp`
+3D color LUTs as plain values: the table (`Lut3D`), the name that points at one in the library (`LutRef`), the per-pixel lookup (tetrahedral interpolation) and the frozen form the render loop holds (`LutPass`). No files, no UI, no editor state. See [3D LUTs](architecture.md#3d-luts).
+
+**Depends on:** standard library only. **Test:** `lut3d_test`. **Thread model:** no shared state. A `Lut3D` is built once and then only read, so a `std::shared_ptr<const Lut3D>` is shared freely between threads.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kLutMinSize` / `kLutMaxSize` | `int` | 2 / 65 | Grid points per axis a table may have |
+| `kLutNameMax` | `size_t` | 48 | Longest LUT name kept |
+
+**Types**
+
+- **`struct LutRef { std::string name; uint64_t hash = 0; }`** with `empty()` (no name) and a defaulted `==`. What an edit stores to say "this picture uses that LUT": the library name and the hash of the file's bytes when it was chosen. Hash 0 means unknown (accept any file by that name).
+- **`struct Lut3D`**: `int size`; `domainMin` / `domainMax` (`std::array<float, 3>`, the input range of the file, default 0..1 per channel); `std::vector<float> rgb`, `size³` RGB triples in the picture's own **0..255 units**, the red index varying fastest, then green, then blue (the order of a `.cube` file); and `scale` / `offset` (derived) so that a pixel value maps to a grid position as `pos = value · scale + offset`. `void finalize()` computes `scale` / `offset` (call it after `size` and the domain are set; the parser and `identityLut` do). `bool valid() const`: size in range, exactly `size³ · 3` entries, a finite domain with max above min, finite positive `scale`. Nothing else in the program looks up a table that is not `valid()`.
+- **`struct LutPass { std::shared_ptr<const Lut3D> lut; float amount = 0; }`** with `any()` (a table and an amount above 0). The LUT frozen for the render thread: shared and immutable, so copying a `ColorPass` or a `RenderParams` copies a pointer, however big the table is.
+
+**Functions**
+
+**`inline std::string sanitizeLutName(const std::string &s)`**
+- Returns: `s` reduced to printable ASCII (the `TextInput` widget is ASCII), with each of `< > : " / \ | ? *` replaced by `_`, trimmed, cut to `kLutNameMax` and stripped of trailing dots and spaces. May be empty. The result is always safe as a file-name stem, so a name read from a hand-edited sidecar can never point outside the library folder (`"../x"` becomes `".._x"`).
+
+**`inline std::string lutFileStem(const std::string &name)`**: the stem a LUT is stored under: `sanitizeLutName(name)`, `"lut"` if that is empty, and the Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, any case) prefixed with `_`.
+
+**`inline std::string lutHashToHex(uint64_t h)`** / **`inline bool lutHashFromHex(std::string_view s, uint64_t *out)`**: 16 lowercase hex digits and back. `FromHex` accepts upper case and **only exactly 16 digits**; anything else returns false and leaves `*out` untouched.
+
+**`inline Lut3D identityLut(int n)`**: a table that changes nothing (up to float rounding), `n` clamped to `kLutMinSize..kLutMaxSize`. Used by tests and previews.
+
+**`inline void lutEval(const Lut3D &L, float r, float g, float b, float *out)`**
+- Inputs: a **valid** table, and a pixel in 0..255 units (values outside that, and NaN, are clamped first: NaN becomes 0). `out` receives three floats in the same units (not clamped: a table may hold values outside 0..255).
+- Method: the pixel is mapped to a grid position through the domain (`scale` / `offset`), clamped to the grid, and the cell it falls in is cut into **six tetrahedra** along its main diagonal. The output is linear inside the tetrahedron the fractional parts select: the path from the cell's origin to its far corner visits the axes in order of decreasing fractional part. Compared with trilinear this keeps the gray axis exactly gray (no color cast between grid points) and reproduces any table that is affine inside a cell exactly (`lut3d_test` checks both, with every one of the six cases exercised).
+- Raw pointers and no `std::` helpers, for Debug-build speed, like `applyColorPass`.
+
+**`inline LutPass makeLutPass(std::shared_ptr<const Lut3D> lut, float slider)`**
+- `slider` is LUT Amount, 0..100. Returns the **inactive** pass (no table, amount 0) for a null table, an invalid table, a NaN/infinite slider, or a slider that clamps to 0; otherwise the table and `clamp(slider, 0, 100) / 100`.
+
+**`inline void applyLutPixel(const LutPass &p, float &r, float &g, float &b)`**: one pixel in place, `lerp(pixel, lut(pixel), p.amount)`. Requires `p.any()`. The caller clamps to 0..255 first (the color pass does), because the blend starts from the pixel as given.
 
 ---
 
@@ -1335,7 +1396,7 @@ Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything
 ## Rendering
 
 ### `render.hpp`
-The pixel pass: tone tables → color pass → neighbor effects → masks → Vignette and Grain, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
+The pixel pass: tone tables → color pass (whose last step is the 3D LUT) → neighbor effects → masks → Vignette and Grain, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
 
 **Depends on:** `adjustment_set.hpp`, `color_pass.hpp`, `detail_layer.hpp`, `film_fx.hpp`, `liteui.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `pixel_math.hpp`, `render_params.hpp`. **Test:** `render_test`.
 
@@ -1344,7 +1405,7 @@ The pixel pass: tone tables → color pass → neighbor effects → masks → Vi
 **`inline std::shared_ptr<CanvasImage> renderWith(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
 - Inputs: the source picture (**never modified**), the frozen parameters, and the optional cancellation pair.
 - Returns: a new rendered picture, or **null if cancelled**. With no `latest` it always runs to completion (the synchronous path).
-- Order per pixel: tone tables → color pass → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy → Vignette and Grain on the finished pixel (`film_fx::apply`, global only).
+- Order per pixel: tone tables → color pass (ending with the Filters and then the 3D LUT: nothing in this header knows about LUTs, the pass does it) → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy → Vignette and Grain on the finished pixel (`film_fx::apply`, global only).
 - How it works:
   - Masks are resolved against **this** image's size (`prepareComposite`), so preview and full-size renders agree.
   - Neighbor planes for the global effects **and every mask** are acquired once up front from `src`'s pixels (a cancelled build returns null). The detail layers come from whole-image planes, not halo rows, which is why `src` must stay untouched.
@@ -1464,7 +1525,7 @@ The two views that can replace the histogram in the pinned canvas above the pane
 ### `sidecar.hpp`
 The saved edits as JSON. Pure functions on plain values; **loading validates and clamps everything**, so a hand-edited or damaged file can never put the editor in a state its own UI couldn't reach. The undo history is not saved. See [sidecar-format.md](sidecar-format.md). `AdjustmentSet::toJson` / `loadJson` call these functions; the file handling lives next to `openImage`. `preset.hpp` reuses the per-group functions (`sidecarAdjToJson` / `FromJson`, the curve, Mixer and grade ones), so a preset is validated and clamped exactly like a saved edit. `sidecarSyncLook` (last entry below) is how Sync Settings puts a look into another picture's sidecar. The wrapper also carries the picture's **named snapshots** (see below), and `sidecarFileOf` understands a virtual copy's path.
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `mask.hpp`, `minijson.hpp`, `photo_meta.hpp`, `virtual_copy.hpp`. No UI. **Test:** `sidecar_test`.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `geometry.hpp`, `lut3d.hpp`, `mask.hpp`, `minijson.hpp`, `photo_meta.hpp`, `virtual_copy.hpp`. No UI. **Test:** `sidecar_test`.
 
 **Constants**
 
@@ -1478,7 +1539,7 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 | `kSidecarMaxPrompts` | `size_t` | 256 | Object prompts kept per mask part |
 | `kSidecarMaxMapPixels` | `int64_t` | 2^26 | Largest object bitmap (8192 × 8192) |
 
-**Types:** `struct SidecarEdits { AdjValues values{}; CropRect crop; Orient orient; float angle = 0; bool expand = false; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; MaskSet masks; }`: everything the user did to a picture.
+**Types:** `struct SidecarEdits { AdjValues values{}; CropRect crop; Orient orient; float angle = 0; bool expand = false; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; MaskSet masks; LutRef lut; }`: everything the user did to a picture.
 
 **`struct NamedSnapshot { std::string name; SidecarEdits edits; }`** and **`using SnapshotList = std::vector<NamedSnapshot>`**: a saved, named copy of the whole edit state.
 
@@ -1487,6 +1548,7 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 - `curves`: keys `rgb`, `r`, `g`, `b`, each an array of `[x, y]` pairs; identity curves left out.
 - `colorMix`: keys `hue`, `sat`, `lum`, each an array of 8 numbers; `{}` if all zero.
 - `colorGrading`: `wheels` (4 objects with `hue`, `sat`, `lum`, `visible`), `blending`, `balance`; `{}` if default.
+- `lut`: `{ "name": "...", "hash": "0123456789abcdef" }`, **only when the picture has a LUT** (the key is absent otherwise, so a picture without one writes the same file as before). The strength is the `LUT Amount` entry of `adjust`. `hash` is 16 hex digits and left out when unknown. The table itself is never stored (see `lut_library.hpp`).
 - `geometry`: `flip`, `rotate` (quarter turns), `angle`, `keepFullCanvas`, and `crop` as `[x, y, w, h]` (only if there is a crop).
 - `masks`: array of masks. Each has `enabled`, `invert`, `adjust`, `parts`, and only when non-default: `name`, `amount`, `colorMix`, `colorGrading`, `curves`. Each part is the shape object plus `op` (`"add"`, `"subtract"`, `"intersect"`).
 - Shape objects by `type`: `radial` (`cx, cy, rx, ry, angle, feather`); `linear` (`cx, cy, len, angle`); `brush` (`strokes` of `erase, size, feather, density, flow` (only if not 1), and `pts` as a flat `x0, y0, x1, y1, …` list); `luminosity` (`lo, hi, feather`); `colorRange` (`set, r, g, b, range, feather`); `object` (`feather, grow, prompts` as `[x, y, fg]`, and `map` = `{w, h, rle}` where `rle` is base64 of the run-length-coded bytes).
@@ -1510,6 +1572,8 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 **`inline mj::Json sidecarMixToJson(const MixValues &m)`** / **`inline MixValues sidecarMixFromJson(const mj::Json *j)`**: read clamps each value to -100..100; missing rows or entries stay 0.
 
 **`inline mj::Json sidecarGradeToJson(const ColorGrade &g)`** / **`inline ColorGrade sidecarGradeFromJson(const mj::Json *j)`**: read clamps `hue` to 0..359, `sat` to 0..100, `lum` to -100..100, `blending` to 0..100, `balance` to -100..100.
+
+**`inline mj::Json sidecarLutToJson(const LutRef &r)`** / **`inline LutRef sidecarLutFromJson(const mj::Json *j)`**: the `lut` object above (also used by `preset.hpp`). Write: the name goes through `sanitizeLutName`, `hash` only if non-zero. Read: not an object, no string `name`, or a name with nothing left after cleaning gives **no LUT** (never an error: a bad `lut` cannot make the file unreadable); the name is cleaned (printable ASCII, `<>:"/\|?*` become `_`, at most 48 characters, no trailing dot or space), so a hand-edited name can never point outside the library folder; a `hash` that is not exactly 16 hex digits is dropped (read as unknown).
 
 **`inline const char *sidecarOpKey(MaskOp op)`**: `"subtract"`, `"intersect"`, otherwise `"add"`.
 
@@ -1544,10 +1608,10 @@ The saved edits as JSON. Pure functions on plain values; **loading validates and
 - Returns: false (and leaves `*out` untouched) only if `o` isn't an object or `origW`/`origH` aren't positive. Anything wrong inside is dropped or clamped instead.
 - Details: `rotate` is rounded into 0..3; `angle` clamped to ±`kAngleMax`. The crop is kept only if it has four numbers, positive `w`/`h`, and fits inside the oriented, straightened size (a quarter turn swaps width and height first, then `rotatedDims` with the angle and `keepFullCanvas`). At most `kMaxMasks` masks are loaded.
 
-**`inline bool sidecarSyncLook(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const AdjValues &values, const CurveSet &curves, const MixValues &mix, const ColorGrade &grade, std::string *outText, std::string *err)`**: puts a look into **another picture's** sidecar text without opening it (Image > Sync Settings to Selected). See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
-- Inputs: `oldText` is the picture's current sidecar file (`""` if it has none). `imageName` is written to `image.name` (informational). `imgW` / `imgH` are the picture's upright size: **required only when `oldText` is empty** (a new file must record it); otherwise the size recorded in the file is used, and if `imgW` and `imgH` are both positive they must match it. The look is the four groups a preset holds. `outText` receives the whole new file (wrapper plus edits); `err` receives a short reason.
+**`inline bool sidecarSyncLook(const std::string &oldText, const std::string &imageName, int imgW, int imgH, const AdjValues &values, const CurveSet &curves, const MixValues &mix, const ColorGrade &grade, const LutRef &lut, std::string *outText, std::string *err)`**: puts a look into **another picture's** sidecar text without opening it (Image > Sync Settings to Selected). See [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures).
+- Inputs: `oldText` is the picture's current sidecar file (`""` if it has none). `imageName` is written to `image.name` (informational). `imgW` / `imgH` are the picture's upright size: **required only when `oldText` is empty** (a new file must record it); otherwise the size recorded in the file is used, and if `imgW` and `imgH` are both positive they must match it. The look is the four groups a preset holds plus the LUT (`lut` is **required**, not defaulted, so a caller must say what a synced look does to the target's LUT: an empty one clears it). `outText` receives the whole new file (wrapper plus edits); `err` receives a short reason.
 - Returns: true with `*outText` set. False, with a reason in `*err` and `*outText` untouched, when the old file can't be trusted: not valid JSON or not an object, a missing, non-numeric or higher `version`, no `image.width` / `image.height`, a different size than the one given, or an `edits` part that `sidecarEditsFromJson` refuses. Or when there is no old file and `imgW` / `imgH` aren't both positive. The caller skips that picture rather than overwrite edits it can't read.
-- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix` and `grade` are replaced, and the result is written by `sidecarEditsToJson`. The picture's own rating, flag and color label (`meta`) are read from the old file and written back as they were. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. The picture's named snapshots are read from the old file and written back as they were (each keeps the look it captured). Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
+- Details: the old `edits` go through `sidecarEditsFromJson` (so they are validated and clamped as on open), **only** `values`, `curves`, `mix`, `grade` and `lut` are replaced, and the result is written by `sidecarEditsToJson`. The picture's own rating, flag and color label (`meta`) are read from the old file and written back as they were. Crop, orientation, angle, `keepFullCanvas` and masks therefore survive (a crop that no longer fits is dropped by the loader, as on open). The values passed in are written as given, so they should come from `AdjustmentSet::currentPreset` or `presetFromJson`. The output always has `app: "literoom"` and the current `kSidecarVersion`. Syncing the same look twice gives the same text. The picture's named snapshots are read from the old file and written back as they were (each keeps the look it captured). Pure: no file access, safe from any thread; the app calls it from the sync worker (`runSyncJob` in `main.cpp`), which does the reading and the temp-file-and-rename write.
 
 **Rating, flag and color label** (the wrapper's `meta` object; see [sidecar-format.md](sidecar-format.md)). `sidecar.hpp` includes `photo_meta.hpp`.
 
@@ -1585,9 +1649,9 @@ A picture's **rating, flag and color label**, their JSON form, and the filmstrip
 **`struct MetaFilter { int minRating; unsigned flags; unsigned labels; }`**: what the filmstrip shows. `minRating` is "at least this many stars" (0 = off); `flags` has a bit `1 << PhotoFlag value` per accepted flag and `labels` a bit `1 << label` per accepted color (0 = off for each). `active()` is true when anything is on. `matches(m)`: every switched-on criterion must hold (AND), and within `flags` or `labels` any chosen value matches (OR). A picture with no label doesn't match a color filter. `toggleRating(n)` (n is clamped; the value already set switches it off), `toggleFlag(f)`, `toggleLabel(c)` (1..5; anything else is ignored).
 
 ### `preset.hpp`
-Presets: a saved **look** (slider values, the four tone curves, the Color Mixer and Color Grading) that can be applied to any picture. Crop, orientation, straighten angle and masks are **not** part of a preset, because they belong to one picture. Pure functions on plain values plus small file helpers; no UI, no editor state. Loading goes through the sidecar readers, so a hand-edited or damaged preset can never put the editor in a state its own UI couldn't reach. `AdjustmentSet::currentPreset` / `applyPreset` are the bridge to the edit state; the Presets pane in `main.cpp` is the UI. See [undo-and-history.md](undo-and-history.md) for how applying one appears in History.
+Presets: a saved **look** (slider values, the four tone curves, the Color Mixer, Color Grading and the 3D LUT, by name) that can be applied to any picture. Crop, orientation, straighten angle and masks are **not** part of a preset, because they belong to one picture. Pure functions on plain values plus small file helpers; no UI, no editor state. Loading goes through the sidecar readers, so a hand-edited or damaged preset can never put the editor in a state its own UI couldn't reach. `AdjustmentSet::currentPreset` / `applyPreset` are the bridge to the edit state; the Presets pane in `main.cpp` is the UI. See [undo-and-history.md](undo-and-history.md) for how applying one appears in History.
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `file_utils.hpp`, `minijson.hpp`, `sidecar.hpp` (all at or below `io/`). No UI. **Test:** `preset_test`; the undo behavior is covered in `adjustment_set_test` (`testPresets`). **Thread model:** no shared state, so every function is safe from any thread; the app calls them from the UI thread only.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `curves.hpp`, `file_utils.hpp`, `lut3d.hpp`, `minijson.hpp`, `sidecar.hpp` (all at or below `io/`). No UI. **Test:** `preset_test`; the undo behavior is covered in `adjustment_set_test` (`testPresets`). **Thread model:** no shared state, so every function is safe from any thread; the app calls them from the UI thread only.
 
 **Constants**
 
@@ -1599,9 +1663,9 @@ Presets: a saved **look** (slider values, the four tone curves, the Color Mixer 
 | `kPresetMaxFileBytes` | `size_t` | 2^20 (1 MiB) | Larger files are refused (a real preset is a few hundred bytes) |
 | `kPresetMaxFiles` | `size_t` | 500 | Most files `listPresetFiles` returns |
 
-**Types:** `struct Preset { std::string name; AdjValues values{}; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; }` with a defaulted `operator==` (all five fields). A default `Preset` is the neutral look with no name.
+**Types:** `struct Preset { std::string name; AdjValues values{}; CurveSet curves = identityCurves(); MixValues mix{}; ColorGrade grade; LutRef lut; }` with a defaulted `operator==` (all six fields: two looks that differ only in the LUT are different presets). A default `Preset` is the neutral look with no name and no LUT.
 
-**File layout** (written by `presetToJson`): `{ "app": "literoom", "kind": "preset", "version": 1, "name": "...", "adjust": {...}, "curves": {...}, "colorMix": {...}, "colorGrading": {...} }`. The last four use exactly the sidecar's forms (see `sidecar.hpp`): sliders keyed by **label** with zero sliders left out, identity curves left out, and so on. A neutral look therefore has four empty groups. Because `adjust` is keyed by slider label, **renaming a slider label orphans it in saved presets** just as it does in sidecars.
+**File layout** (written by `presetToJson`): `{ "app": "literoom", "kind": "preset", "version": 1, "name": "...", "adjust": {...}, "curves": {...}, "colorMix": {...}, "colorGrading": {...}, "lut": {"name": "...", "hash": "..."} }`. The four groups use exactly the sidecar's forms (see `sidecar.hpp`): sliders keyed by **label** with zero sliders left out (so `LUT Amount` is in `adjust`), identity curves left out, and so on; `lut` is `sidecarLutToJson`'s object and is **only written when the look has a LUT**. A neutral look therefore has four empty groups and no `lut`. The LUT is a name and a hash, never a table, so a preset stays a few hundred bytes (the 1 MiB limit is not touched). Because `adjust` is keyed by slider label, **renaming a slider label orphans it in saved presets** just as it does in sidecars.
 
 **Functions**
 
@@ -1619,7 +1683,7 @@ Presets: a saved **look** (slider values, the four tone curves, the Color Mixer 
 **`inline bool presetFromJson(const mj::Json &o, Preset *out)`**
 - Inputs: a parsed JSON value and the output.
 - Returns: false (and leaves `*out` untouched) if `o` isn't an object, `kind` is missing or not the string `"preset"`, or `version` is not a number from 1 to `kPresetVersion` (a string `"1"` is refused). The `app` key is not checked. Otherwise true.
-- Details: nothing inside is trusted. Sliders are clamped to their ranges, a non-number becomes 0, a curve that breaks the editor's rules becomes the identity curve, Mixer and grade values are clamped (all by the `sidecar*FromJson` functions). A missing or invalid `name` gives an empty name; `loadPresetFile` fills it from the file name.
+- Details: nothing inside is trusted. Sliders are clamped to their ranges, a non-number becomes 0, a curve that breaks the editor's rules becomes the identity curve, Mixer and grade values are clamped, and a bad `lut` object becomes no LUT (all by the `sidecar*FromJson` functions). A missing or invalid `name` gives an empty name; `loadPresetFile` fills it from the file name.
 
 **`inline std::string presetDir()`**
 - Returns: where presets are kept: `%APPDATA%\Literoom\presets` on Windows; `$XDG_CONFIG_HOME/literoom/presets` or `~/.config/literoom/presets` elsewhere; the relative folder `presets` if no home can be found. Does not create the folder.
@@ -1643,6 +1707,70 @@ Presets: a saved **look** (slider values, the four tone curves, the Color Mixer 
 **`inline bool deletePresetFile(const std::string &path)`**: true if the file was removed; false if it did not exist or couldn't be removed.
 
 **In the app** (`main.cpp`, not this header): the Presets activity keeps a cache of the folder's presets, re-read when the pane is opened and after each save or delete (never per frame). Clicking a row calls `AdjustmentSet::applyPreset`; "Save current look" calls `savePresetFile` with `currentPreset(name)`; unreadable files are skipped silently. While the name field has focus, `typingInTextField()` is true so plain-key shortcuts stand down.
+
+### `lut_cube.hpp`
+Reads a 3D LUT in the Adobe / DaVinci Resolve **`.cube`** format, and says whether a LUT looks made for another kind of picture. Pure text in, `Lut3D` out: no files, no UI. See [3D LUTs](architecture.md#3d-luts).
+
+**Depends on:** `lut3d.hpp`. **Test:** `lut_cube_test` (including parse time for a 65³ file, which it prints). **Thread model:** no shared state; safe from any thread.
+
+**Types:** `struct LutCubeInfo { std::string title; bool domainDefault = true; bool videoRange = false; }`: what a file said besides its table. `title` is the `TITLE` line (printable ASCII, at most 100 characters); `domainDefault` is false when the input domain is not 0..1 on every channel; `videoRange` is set by `LUT_IN_VIDEO_RANGE` / `LUT_OUT_VIDEO_RANGE`.
+
+**`inline bool parseCube(std::string_view text, Lut3D *out, LutCubeInfo *info, std::string *err)`**
+- Returns: true and fills `*out` (and `*info`, which may be null). On failure returns false with a reason in `*err` (which may be null) and **leaves both outputs untouched**. Errors name the line: `"line 12: expected three finite numbers"`.
+- Accepted: `LUT_3D_SIZE n` (2..65), `DOMAIN_MIN` / `DOMAIN_MAX` (three numbers each, max above min on every channel), `LUT_3D_INPUT_RANGE lo hi` (the Resolve spelling), `TITLE`, `LUT_IN_VIDEO_RANGE`, `LUT_OUT_VIDEO_RANGE`, `#` comments (also after a data line), blank lines, CRLF or LF, keywords in any case, a leading `+`, exponents. Table lines are exactly three numbers, the red index changing fastest.
+- Refused: a 1D LUT (`LUT_1D_SIZE`), a size outside 2..65 or given twice, an unknown keyword, **any keyword after the table data has begun**, table data before the size, a line with fewer or more than three numbers, a non-finite number (`nan`, `inf`, `1e999`), a value with magnitude above 16, a number that is not a plain decimal (a decimal comma is never read), and a table with fewer or more than `size³` entries.
+- Numbers are read with `std::from_chars`, **independent of the system locale**: a German or French locale cannot change what a file means.
+- Values are stored scaled to 0..255 (`Lut3D::rgb`); the domain is kept as given and `finalize()` is called.
+
+**`inline bool lutNameLooksLog(std::string_view s)`**: true if a word of `s` (split at anything that is not a letter or digit, lower-cased, trailing digits dropped) is a camera-log curve name: `log`, `slog`, `vlog`, `clog`, `logc`, `flog`, `nlog`, `dlog`, `dlogm`, `redlog`, `log3g`, `acescct`, `acescc`. So `"SLog3 to 709"`, `"V-Log_to_709"`, `"ARRI LogC3"` and `"RED Log3G10"` match, and `"Analog Film"`, `"Catalog"` and `"Dialog"` do not.
+
+**`inline std::string lutExpectationWarning(const std::string &label, const Lut3D &L, const LutCubeInfo &info)`**
+- Returns `""` when nothing looks off, otherwise one sentence: *"<label> may expect camera-log input (<reasons>). Literoom applies LUTs to sRGB / Rec.709 pictures, so it may look wrong."* The reasons: the name or the title is log-like, the input range is not 0 to 1, and/or the LUT moves mid-gray (127.5) by more than a quarter of the range. Any one is enough. It only **suggests**: nothing in a `.cube` file says for certain, and the app never blocks a LUT because of it.
+
+### `lut_library.hpp`
+The LUT library: `.cube` files kept in one folder, found by name, with a small cache of the ones in use. Standard library plus `file_utils` / `lut_cube` / `lut3d`: no UI, no editor state, so everything here is tested against a temp folder. See [3D LUTs](architecture.md#3d-luts).
+
+**Depends on:** `lut3d.hpp`, `lut_cube.hpp`, `file_utils.hpp`. **Test:** `lut_library_test` (links the thread library: several threads resolve one LUT at once). **Thread model:** the cache is a mutex-guarded global (`acquireLut`, `clearLutCache`, `lutCachePut` are safe from any thread; the UI thread and the export worker both resolve LUTs). `lutDirOverride()` is a plain global meant to be set by tests before any thread uses the library. Everything else is a pure function. **This is the only place a render-side LUT is ever read from a file**; the render loop and the previews' renders see frozen tables.
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kLutExt` | `const char *` | `".cube"` | Extension of a library file |
+| `kLutMaxFileBytes` | `size_t` | 16 MiB | Larger files are refused (a 65³ cube is about 7 MB) |
+| `kLutMaxFiles` | `size_t` | 100 | Most files listed or kept (the pane builds this many rows) |
+| `kLutCacheEntries` | `size_t` | 4 | Tables (and remembered failures) the cache holds; the oldest is dropped |
+
+**Types**
+
+- **`struct LutEntry { std::string name; std::string path; uint64_t hash = 0; int size = 0; }`**: a library file. `hash` and `size` are 0 until the file has been read.
+- **`enum class LutStatus { None, Ok, HashChanged, Missing, Unreadable }`**: `None` = the edit has no LUT; `Ok` = found, same bytes as when it was chosen; `HashChanged` = found and **used**, but not the file that was chosen; `Missing` = no such file; `Unreadable` = there, but unreadable or not a valid cube. Only `Ok` and `HashChanged` give a table.
+- **`struct LutResolved { std::shared_ptr<const Lut3D> lut; LutStatus status; uint64_t hash; }`**: the answer of `acquireLut`. `hash` is the hash of the file's bytes **as it is now** (what a new `LutRef` should store), whatever the reference asked for; 0 when there is no table.
+
+**Functions**
+
+**`inline uint64_t lutHashBytes(const uint8_t *p, size_t n)`**: FNV-1a, 64 bit. Never returns 0 (0 means "unknown" in a `LutRef`).
+
+**`inline std::string lutDir()`** / **`inline std::string &lutDirOverride()`**: where the library lives: `%APPDATA%\Literoom\luts` on Windows; `$XDG_CONFIG_HOME/literoom/luts` or `~/.config/literoom/luts` elsewhere; the relative folder `luts` if no home can be found. Does not create it. A non-empty `lutDirOverride()` wins (tests). On Windows the same non-UTF-8 `%APPDATA%` gotcha as `presetDir` applies.
+
+**`inline std::string lutPath(const std::string &dir, const std::string &name)`**: `dir + "/" + lutFileStem(name) + ".cube"`. **`inline std::string lutNameOfFile(const std::string &fileName)`**: a file name without its `.cube` (any case), cleaned by `sanitizeLutName`.
+
+**`inline bool readLutBytes(const std::string &path, std::vector<uint8_t> *out, std::string *err)`**: all bytes of a file. False with *"couldn't read <file>"*, *"<file> is empty"* or *"<file> is too large for a LUT (16 MiB at most)"* (checked before reading). **`parseLutBytes`**: the same bytes through `parseCube`, error prefixed with the file name. **`inline bool loadLutFile(const std::string &path, Lut3D *out, LutCubeInfo *info, uint64_t *hash, std::string *err)`**: both, bypassing the cache; `*hash` (optional) is the hash of the bytes. The LUT previews use this.
+
+**`inline std::vector<std::string> listLutFiles(const std::string &dir)`**: names (UTF-8, no directory) of the regular files in `dir` ending in `.cube` (any case), natural order; sub-folders and other files skipped; a missing folder gives `{}`. At most `kLutMaxFiles` are collected **before** sorting (the same rule as `listPresetFiles`).
+
+**`inline std::vector<LutEntry> listLutEntries(const std::string &dir)`**: `listLutFiles` as entries (name and path only), **leaving out files an edit could not point at again**: a file whose name has a character a LUT name cannot hold (non-ASCII, a trailing dot) would not be found by `lutPath(name)`, so it is not offered.
+
+**`inline bool importLutFile(const std::string &src, const std::string &dir, LutEntry *out, std::string *warning, std::string *err)`**
+- Copies the `.cube` at `src` into the library after checking that it parses. The name is the file's name, cleaned; a taken name gets `-2`, `-3`, ... (the name is cut so the suffix fits `kLutNameMax`); **a taken file with the very same bytes is reused** and nothing is written. The bytes are copied unchanged (`writeFileAtomic`), so the hash of the library file is the hash of the source.
+- `*warning` (optional) is `lutExpectationWarning`'s sentence or `""`. Failure (nothing written, `*err` says why): not a `.cube`, unreadable, empty, too large, not a valid cube (with the line), the library already holds `kLutMaxFiles`, or no free name up to `-99`.
+
+**`inline bool deleteLutFile(const std::string &path)`**: true if the file was removed. (The app has no Delete button; this is for tests and tools.)
+
+**`inline LutResolved acquireLut(const LutRef &ref)`**
+- Turns a reference into a shared table. An empty `ref` returns `{}` (status `None`) without touching the cache. Otherwise: the cache is consulted by library folder and file stem (compared without case); on a miss the file is read and parsed **outside the lock, on the calling thread** (so the first use of a big table costs its parse time), and the result, **success or failure**, is cached. Two threads that miss at once both parse; the first to finish wins.
+- `status`: `Ok` if `ref.hash` is 0 or equals the file's hash, `HashChanged` if not, `Missing` if there is no file, `Unreadable` if it does not parse. A failure is remembered, so a missing file costs one check, not one per slider frame.
+- **`inline void clearLutCache()`**: empties the cache. Call it whenever the folder's content may have changed: after an import, when a picture is opened (a file may have been edited since). **`inline void lutCachePut(const std::string &name, std::shared_ptr<const Lut3D> lut, uint64_t hash)`**: puts a table in the cache by hand, so tests need no file.
 
 ### `minijson.hpp`
 A tiny JSON value, writer and parser (UTF-8, no dependencies), plus base64 and byte run-length helpers. Everything is in `namespace mj`. Used for the edit sidecar.
@@ -1985,7 +2113,7 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 ### `export_worker.hpp`
 Batch export: `exportPicture` renders one picture from its own saved edits and writes it, and `ExportWorker` runs a queue of them off the UI thread. A first-in-first-out queue with **no generations** (like `ThumbWorker`) that can be cancelled. (Needs LiteUI's decoder and encoders.)
 
-**Depends on:** `liteui.hpp`, `geometry.hpp`, `raster_ops.hpp`, `adjustment_set.hpp`, `render.hpp`, `file_utils.hpp`, `image_codec.hpp`, `image_meta.hpp`, `minijson.hpp`, `sidecar.hpp`, `virtual_copy.hpp`. **Test:** `export_worker_test` (links LiteUI and the thread library; loop it after changing the header).
+**Depends on:** `liteui.hpp`, `geometry.hpp`, `raster_ops.hpp`, `adjustment_set.hpp`, `render.hpp`, `file_utils.hpp`, `image_codec.hpp`, `image_meta.hpp`, `minijson.hpp`, `sidecar.hpp`, `virtual_copy.hpp`, and through `adjustment_set.hpp` the LUT library. **Test:** `export_worker_test` (links LiteUI and the thread library; loop it after changing the header).
 
 **Constants:** `kExportMaxSidecarBytes` = 64 MiB (the limit the editor puts on a sidecar).
 
@@ -2006,7 +2134,7 @@ Batch export: `exportPicture` renders one picture from its own saved edits and w
 - Returns: `<folder>/<stem>-edit.<ext>`, or with `-2`, `-3`, ... up to 9999 when that name is in `used` (compared **without case**, so `a.jpg` and `A.png` can't collide on a case-insensitive disk) or, unless `overwrite`, already exists. The chosen name is added to `used`. `used` wins over `overwrite`: a name already taken in this batch is never reused. Empty string if every name is taken.
 
 **`inline bool exportLoadEdits(const std::string &path, int w, int h, AdjustmentSet *adj, std::string *err)`**
-- `adj` must already have `setOriginalSize(w, h)` (the upright size). No sidecar file: returns true and leaves `adj` neutral. A sidecar that exists but is empty or over 64 MiB, unreadable, not valid JSON, from a newer version, written for a different size, or whose `edits` can't be loaded: returns false with a reason in `*err`. **This is stricter than the editor**, which opens such a picture clean: a batch must not quietly export an unedited picture.
+- `adj` must already have `setOriginalSize(w, h)` (the upright size). No sidecar file: returns true and leaves `adj` neutral. A sidecar that exists but is empty or over 64 MiB, unreadable, not valid JSON, from a newer version, written for a different size, or whose `edits` can't be loaded: returns false with a reason in `*err`. **This is stricter than the editor**, which opens such a picture clean: a batch must not quietly export an unedited picture. The same goes for a LUT: if the picture's LUT is in use (`LUT Amount` above 0) and the library reports it `Missing` (*"its LUT \"<name>\" is not in the LUT library"*) or `Unreadable` (*"... can't be read"*), the picture is skipped with that reason rather than exported without its look. A LUT whose file has changed (`HashChanged`) is used as it is, and a LUT at amount 0 never blocks a picture. The table is resolved here, on the worker thread, through `acquireLut`.
 
 **`inline ExportOutcome exportPicture(const std::string &path, const ExportSettings &s, std::set<std::string> &used, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
 - The whole pipeline for one picture, a pure function of its inputs (see [threading.md](threading.md#the-export-worker-is-a-cancellable-fifo-of-whole-pipelines)): decode `vcImageOf(path)`, apply the EXIF rotation, load the edits into a **local** `AdjustmentSet`, `orientImage` -> `rotateArbitrary` -> `cropImage` -> `renderWith`, then `fitLongEdge` / `resizeToLongEdge` (never enlarging), the JPEG size check, a free name from `exportTargetPath`, and the encode. The JPEG keeps the source's metadata from the **real** file behind a copy.
@@ -2022,6 +2150,25 @@ Batch export: `exportPicture` renders one picture from its own saved edits and w
 - **`bool busy() const`**: true from `start()` until every picture has an outcome. `size_t total() const` and `size_t done() const` give the progress.
 - **`std::vector<ExportOutcome> collect()`**: every outcome made since the last call, in the order they finished, and empties the list. **Call `busy()` first**: if it was already false, these are the last outcomes. Asking after `collect()` could miss a result that lands in between.
 - **`void shutdown()`**: clears the queue, abandons the picture in flight, requests stop and joins. Safe to call twice.
+
+### `lut_preview_worker.hpp`
+The LUTs pane's previews, made off the UI thread: each LUT of the library applied to the open picture. One job is the picture, its current look and a list of LUT files; the worker posts one result per file. See [threading.md](threading.md#the-lut-preview-worker-streams-results-for-the-newest-job).
+
+**Depends on:** `liteui.hpp` (`CanvasImage`), `color_pass.hpp`, `lut3d.hpp`, `render_params.hpp`, `lut_cube.hpp`, `lut_library.hpp`, `render.hpp`, `thumb_worker.hpp` (`makeThumb`, `kFilmThumbW` / `kFilmThumbH`). **Test:** `lut_preview_worker_test` (links LiteUI and the thread library; loop it after changing the header). **Thread model:** `submit()`, `cancel()`, `busy()`, `collect()` and `shutdown()` from the UI thread only; `setNotify()` before the first `submit()`. The worker thread starts at the first `submit()`.
+
+**Types**
+
+- **`struct LutPreviewJob { uint64_t serial; std::shared_ptr<const CanvasImage> base; RenderParams params; std::vector<LutEntry> items; }`**: `base` is the picture to preview on (null: no thumbnails, the files are still read); `params` its current look (its own LUT, if any, is replaced); `items` the files (name and path; truncated to `kLutMaxFiles`).
+- **`struct LutPreviewResult { uint64_t serial; std::string name, path; std::shared_ptr<const CanvasImage> thumb; uint64_t hash; int size; std::string warning, error; }`**: `thumb` is null when there is no picture or the file is unusable; `hash` and `size` are 0 and `error` is set (the loader's message, which names the file) when it could not be read; `warning` is `lutExpectationWarning`'s sentence or `""`.
+
+**`inline RenderParams lutPreviewParams(const RenderParams &in, const LutPass &lut)`**: the look a preview is rendered with: `in` with `color` replaced by `colorPassWithLut(in.color, lut)` and **without the neighbor effects** (`fx` and every mask's `fx` emptied). They are invisible at thumbnail size, and leaving them out means a preview never touches the shared detail-plane cache the main render uses. Everything else is kept: tone, curves, color, Mixer, grading, Filters, masks, Vignette and Grain. A function of its own so the tests build the same reference.
+
+**`class LutPreviewWorker`**
+- **`void submit(LutPreviewJob job)`**: replaces whatever is waiting or running. The picture in flight is abandoned (`renderWith` polls the generation, so a thumbnail stops within a few rows) and results of the replaced job that were not collected are dropped: **nothing of an earlier job is delivered once `submit` has returned**.
+- **`void cancel()`**: forgets the job and every uncollected result. **`bool busy() const`**: from `submit()` until the last result of the job was made (or it was replaced or cancelled and the worker has let go of it).
+- **`std::vector<LutPreviewResult> collect()`**: every result made since the last call, in the order made, which is the order of `items`.
+- **`void shutdown()`**: stops and joins; safe to call twice. The destructor calls it.
+- Per job the worker box-averages the picture **once** to the filmstrip's thumbnail size (`makeThumb`), then for each file: `loadLutFile` (**never the cache**, so a hundred previews cannot push out the table in use), `lutPreviewParams` with the table at 100 %, `renderWith`. The notify callback runs after each result and when the job ends.
 
 ---
 

@@ -350,6 +350,8 @@ namespace golden
       pos -= levelsCount;
     if (i > idx(AdjId::CrossProcess))
       pos -= count;
+    if (i > idx(AdjId::LutAmount)) // the LUT's strength sits right after the Filters
+      pos -= 1;
     return pos;
   }
   // The Levels sliders (Black Point ... Gamma) are one contiguous block too.
@@ -369,7 +371,10 @@ namespace golden
   // at half range a vignette would black out the corners and grain would bury
   // what the other sliders did.
   static bool isEffects(AdjId id) { return id >= AdjId::Vignette && id <= AdjId::GrainRoughness; }
-  static bool isFixedSink(AdjId id) { return isFilter(id) || isLevels(id) || isEffects(id); }
+  // LUT Amount scales a LUT, and the kitchen-sink scenarios have none (the lut/ scenarios do), so
+  // it gets a fixed value and shifts no other slider's sinkPos.
+  static bool isLut(AdjId id) { return id == AdjId::LutAmount; }
+  static bool isFixedSink(AdjId id) { return isFilter(id) || isLevels(id) || isEffects(id) || isLut(id); }
   static float fixedSinkValue(AdjId id)
   {
     switch (id)
@@ -383,6 +388,7 @@ namespace golden
     case AdjId::Grain: return 22.0f;
     case AdjId::GrainSize: return 30.0f;
     case AdjId::GrainRoughness: return 20.0f;
+    case AdjId::LutAmount: return 0.0f;
     default: return kSinkFilterStrength;
     }
   }
@@ -570,6 +576,8 @@ namespace golden
     for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
     {
       const AdjustmentSpec &sp = kAdjustmentSpecs[i];
+      if (sp.id == AdjId::LutAmount)
+        continue; // only scales a LUT: with none chosen it does nothing (see lut/ below)
       std::string label(sp.label);
       std::replace(label.begin(), label.end(), ' ', '_');
       // dir 0: up, 1: down, 2: barely moved, 3: full range both ends. Small
@@ -1118,6 +1126,141 @@ namespace golden
     }
   }
 
+  // ------------------------------------------------------------------- 3D LUT
+  // A fixed, non-trivial 17-point LUT built in code (plain float arithmetic: no file, no pow), put in
+  // the library's cache under a name so AdjustmentSet resolves it like a real one. The first
+  // three keep the table out of the picture's other stages: a LUT is the last step of the color pass,
+  // before the neighbor effects, the masks and the film effects.
+  static Lut3D goldenLutTable()
+  {
+    Lut3D L = identityLut(17);
+    size_t i = 0;
+    for (int b = 0; b < 17; ++b)
+      for (int g = 0; g < 17; ++g)
+        for (int r = 0; r < 17; ++r)
+        {
+          const float x = static_cast<float>(r) / 16.0f, y = static_cast<float>(g) / 16.0f, z = static_cast<float>(b) / 16.0f;
+          const float o[3] = {x * 0.85f + 0.10f * y + 0.04f * x * x, y * 0.95f + 0.03f,
+                              z * 0.70f + 0.20f * (1.0f - x) * (1.0f - x) + 0.05f};
+          for (int k = 0; k < 3; ++k)
+            L.rgb[i++] = 255.0f * (o[k] < 0.0f ? 0.0f : (o[k] > 1.0f ? 1.0f : o[k]));
+        }
+    return L;
+  }
+  static void lutScenarios(const CanvasImage &img, int W, int H)
+  {
+    lutDirOverride() = (std::filesystem::temp_directory_path() / "literoom_golden_no_such_lut_folder").string();
+    clearLutCache();
+    lutCachePut("golden lut", std::make_shared<const Lut3D>(goldenLutTable()), 1);
+    lutCachePut("golden identity", std::make_shared<const Lut3D>(identityLut(33)), 2);
+    const LutRef ref{"golden lut", 1};
+
+    const auto withLut = [&](AdjustmentSet &s, float amount)
+    {
+      s.setLut(ref);
+      s.set(AdjId::LutAmount, amount);
+    };
+    const char *names[] = {"lut/full", "lut/half", "lut/low"};
+    const float amounts[] = {100.0f, 50.0f, 12.0f};
+    for (int k = 0; k < 3; ++k)
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      withLut(s, amounts[k]);
+      renderScenario(names[k], s, img);
+    }
+    { // The LUT sees the finished color pass: Filters, color, tone, curves, mixer and grading first.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Exposure, 25);
+      s.set(AdjId::Saturation, 40);
+      s.set(AdjId::Temperature, 25);
+      s.set(AdjId::Sepia, 40);
+      s.set(AdjId::Negative, 20);
+      withLut(s, 80);
+      renderScenario("lut/after_color_and_filters", s, img);
+    }
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      s.setCurve(CurveChannel::Master, CurvePoints{{0, 0}, {64, 40}, {128, 150}, {200, 230}, {255, 255}}, false);
+      s.setMix(MixChan::Hue, 2, 30.0f);
+      ColorGrade g;
+      g.wheel[1].hue = 200;
+      g.wheel[1].sat = 40;
+      s.setGrade(g, -1);
+      s.set(AdjId::Contrast, 20);
+      withLut(s, 100);
+      renderScenario("lut/after_curves_mix_grade", s, img);
+    }
+    { // ...and before the neighbor effects, the masks and Vignette / Grain.
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Clarity, 40);
+      s.set(AdjId::Sharpness, 40);
+      withLut(s, 100);
+      renderScenario("lut/before_detail", s, img);
+    }
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      Mask m = makeMask(radial());
+      m.adj = AdjValues{};
+      stdEffect(m);
+      s.setMasks({m}, -1);
+      withLut(s, 100);
+      renderScenario("lut/before_masks", s, img);
+    }
+    {
+      AdjustmentSet s;
+      init(s, W, H);
+      s.set(AdjId::Vignette, -50);
+      s.set(AdjId::Grain, 30);
+      withLut(s, 100);
+      renderScenario("lut/before_film", s, img);
+    }
+
+    // Things that must leave the picture exactly alone.
+    {
+      AdjustmentSet plain;
+      init(plain, W, H);
+      const auto base = renderScenario("lut/none_reference", plain, img, false);
+      AdjustmentSet zero; // a LUT chosen, amount 0
+      init(zero, W, H);
+      withLut(zero, 0);
+      const auto a = renderScenario("lut/amount_zero", zero, img, false);
+      if (a && base && a->pixels != base->pixels)
+        fail("lut/amount_zero", "a LUT at amount 0 changed the picture");
+      AdjustmentSet missing; // a LUT the library doesn't have
+      init(missing, W, H);
+      missing.setLut(LutRef{"not in the library", 3});
+      const auto m = renderScenario("lut/missing", missing, img, false);
+      if (m && base && m->pixels != base->pixels)
+        fail("lut/missing", "a missing LUT changed the picture");
+      AdjustmentSet noRef; // an amount without a LUT
+      init(noRef, W, H);
+      noRef.set(AdjId::LutAmount, 100);
+      const auto n = renderScenario("lut/amount_without_lut", noRef, img, false);
+      if (n && base && n->pixels != base->pixels)
+        fail("lut/amount_without_lut", "LUT Amount without a LUT changed the picture");
+      AdjustmentSet idl; // an identity table: within one level of the picture
+      init(idl, W, H);
+      idl.setLut(LutRef{"golden identity", 2});
+      const auto id = renderScenario("lut/identity", idl, img, false);
+      if (id && base)
+      {
+        int worst = 0;
+        for (size_t i = 0; i < id->pixels.size(); ++i)
+          worst = std::max(worst, std::abs(int(id->pixels[i]) - int(base->pixels[i])));
+        if (worst > 1)
+          fail("lut/identity", "an identity LUT moved a value by " + std::to_string(worst));
+      }
+    }
+
+    lutDirOverride().clear();
+    clearLutCache();
+  }
+
   // --------------------------------------------------------------- kitchen sink
   static void buildSink(AdjustmentSet &s, const std::shared_ptr<const ObjectMap> &blob)
   {
@@ -1413,6 +1556,7 @@ namespace golden
     masks(img, W, H, blob, 11);
     geometry(img, W, H, blob);
     film(img, W, H);
+    lutScenarios(img, W, H);
     sink(img, W, H, blob, "200x150", true);
     history(img, W, H);
     helpers();

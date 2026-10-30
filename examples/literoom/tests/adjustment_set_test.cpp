@@ -837,6 +837,160 @@ static void testEffectSliders()
   CHECK(v.get(AdjId::Vignette) == 25.0f && v.get(AdjId::Grain) == 15.0f && v.get(AdjId::GrainSize) == 0.0f);
 }
 
+// ------------------------------------------------------------------- 3D LUT
+// Points the LUT library at a folder that does not exist (so nothing is ever read from disk) and
+// puts tables in the cache by hand; restores everything when it goes out of scope.
+struct LutEnv
+{
+  LutEnv()
+  {
+    lutDirOverride() = (std::filesystem::temp_directory_path() / "literoom_adjset_lut_nonexistent").string();
+    clearLutCache();
+  }
+  ~LutEnv()
+  {
+    lutDirOverride().clear();
+    clearLutCache();
+  }
+  static std::shared_ptr<const Lut3D> inverting()
+  {
+    Lut3D L = identityLut(2);
+    for (float &v : L.rgb)
+      v = 255.0f - v;
+    return std::make_shared<const Lut3D>(std::move(L));
+  }
+};
+
+static void testLut()
+{
+  LutEnv env;
+  AdjustmentSet s;
+  fresh(s);
+  const size_t kAmount = adjIndex(AdjId::LutAmount);
+  CHECK(s.lut().empty() && s.lutStatus() == LutStatus::None && s.get(AdjId::LutAmount) == 0.0f);
+  CHECK(!s.buildColorPass().lut.any() && !s.buildColorPass().active);
+  CHECK(s.toJson().find("lut") == nullptr); // a picture without a LUT writes no "lut" key
+  const size_t base = s.historySize();
+  CHECK(!s.setLut(LutRef{}) && s.historySize() == base); // nothing to remove: no step
+
+  // Choosing a LUT is one undo step; with the amount at 0 it switches the amount to 100.
+  const auto inv = LutEnv::inverting();
+  lutCachePut("Warm", inv, 7);
+  CHECK(s.setLut(LutRef{"Warm", 7}));
+  CHECK(s.historySize() == base + 1 && lastLabel(s) == "LUT: Warm");
+  CHECK(s.lut() == LutRef{"Warm", 7} && s.get(AdjId::LutAmount) == 100.0f && s.lutStatus() == LutStatus::Ok);
+  const uint64_t v1 = s.version();
+  CHECK(!s.setLut(LutRef{"Warm", 7}) && s.version() == v1 && s.historySize() == base + 1); // same again: nothing
+
+  // It reaches the color pass (and so every render, preview and export) as the shared table.
+  {
+    const ColorPass cp = s.buildColorPass();
+    CHECK(cp.active && cp.lut.any() && cp.lut.lut == inv && cp.lut.amount == 1.0f);
+    const RenderParams rp = s.buildRenderParams();
+    CHECK(rp.color.lut.lut == inv && rp.masks.empty());
+  }
+
+  // The amount is an ordinary slider: it drags as one coalesced step, then labels like the others.
+  s.set(AdjId::LutAmount, 20.0f);
+  s.set(AdjId::LutAmount, 40.0f);
+  s.set(AdjId::LutAmount, 60.0f);
+  CHECK(s.historySize() == base + 2 && lastLabel(s) == "LUT Amount +60");
+  CHECK(s.buildColorPass().lut.amount == 0.6f);
+  s.set(AdjId::LutAmount, 0.0f); // amount 0: the LUT stays chosen but does nothing
+  CHECK(s.lut() == LutRef{"Warm", 7} && !s.buildColorPass().lut.any() && !s.buildColorPass().active);
+  s.set(AdjId::LutAmount, 60.0f);
+
+  // Another LUT while an amount is set keeps the amount.
+  lutCachePut("Cool", inv, 9);
+  CHECK(s.setLut(LutRef{"Cool", 9}) && lastLabel(s) == "LUT: Cool" && s.get(AdjId::LutAmount) == 60.0f);
+  s.set(AdjId::LutAmount, 50.0f); // a slider move right after a LUT pick is its own step
+  CHECK(lastLabel(s) == "LUT Amount +50");
+
+  // Removing it resets the amount, so the picture is untouched again.
+  const size_t n = s.historySize();
+  CHECK(s.setLut(LutRef{}));
+  CHECK(s.historySize() == n + 1 && lastLabel(s) == "Remove LUT");
+  CHECK(s.lut().empty() && s.get(AdjId::LutAmount) == 0.0f && s.lutStatus() == LutStatus::None);
+  CHECK(!s.buildColorPass().active && s.toJson().find("lut") == nullptr);
+  s.undo(); // ...and undo brings both back
+  CHECK(s.lut() == LutRef{"Cool", 9} && s.get(AdjId::LutAmount) == 50.0f && s.buildColorPass().lut.any());
+  s.redo();
+  CHECK(s.lut().empty() && s.get(AdjId::LutAmount) == 0.0f);
+  s.undo();
+  s.undo(); // "LUT Amount +50"
+  s.undo(); // "LUT: Cool"
+  CHECK(s.lut() == LutRef{"Warm", 7} && s.get(AdjId::LutAmount) == 60.0f);
+
+  // Names are cleaned to a safe file-name stem on the way in; nothing left of one removes the LUT.
+  AdjustmentSet c;
+  fresh(c);
+  CHECK(c.setLut(LutRef{"../../etc/x", 5}));
+  CHECK(c.lut().name.find('/') == std::string::npos && c.lut().name.find('\\') == std::string::npos && c.lut().hash == 5);
+  CHECK(c.setLut(LutRef{"   ", 5}) && c.lut().empty() && c.get(AdjId::LutAmount) == 0.0f);
+  CHECK(!c.setLut(LutRef{"   ", 5})); // already none
+
+  // A LUT the library can't supply: Missing (no effect, picture still opens), or a changed file (used).
+  AdjustmentSet m;
+  fresh(m);
+  CHECK(m.setLut(LutRef{"Gone", 1}) && m.lutStatus() == LutStatus::Missing);
+  CHECK(!m.buildColorPass().lut.any() && !m.buildColorPass().active);
+  CHECK(m.lut() == LutRef{"Gone", 1} && m.get(AdjId::LutAmount) == 100.0f); // the reference is kept
+  lutCachePut("Warm", inv, 7);
+  CHECK(m.setLut(LutRef{"Warm", 8}) && m.lutStatus() == LutStatus::HashChanged && m.buildColorPass().lut.any());
+  CHECK(m.setLut(LutRef{"Warm", 0}) && m.lutStatus() == LutStatus::Ok); // hash 0 = unknown: accepts the file
+
+  // Save + load: the reference and the amount come back, history starts from them.
+  const mj::Json j = s.toJson();
+  const mj::Json *lj = j.find("lut");
+  CHECK(lj && lj->isObject() && lj->get("name").asStr() == "Warm" && lj->get("hash").asStr() == lutHashToHex(7));
+  AdjustmentSet r;
+  fresh(r);
+  CHECK(r.loadJson(j) && r.lut() == LutRef{"Warm", 7} && r.get(AdjId::LutAmount) == 60.0f);
+  CHECK(r.historySize() == 1 && r.toJson().dump() == j.dump());
+  CHECK(r.currentEdits().lut == LutRef{"Warm", 7});
+  r.reset();
+  CHECK(r.lut().empty() && r.get(AdjId::LutAmount) == 0.0f);
+
+  // Presets carry the LUT; applying one without a LUT clears it.
+  AdjustmentSet p;
+  fresh(p);
+  p.set(AdjId::Exposure, 5.0f);
+  Preset withLut;
+  withLut.name = "Teal Look";
+  withLut.values[kAmount] = 70.0f;
+  withLut.lut = LutRef{"Warm", 7};
+  const size_t pb = p.historySize();
+  CHECK(p.applyPreset(withLut) && p.historySize() == pb + 1 && lastLabel(p) == "Preset: Teal Look");
+  CHECK(p.lut() == LutRef{"Warm", 7} && p.get(AdjId::LutAmount) == 70.0f && p.get(AdjId::Exposure) == 0.0f);
+  CHECK(p.currentPreset("x").lut == LutRef{"Warm", 7} && p.currentPreset("x").values[kAmount] == 70.0f);
+  CHECK(!p.applyPreset(withLut) && p.historySize() == pb + 1); // identical: no step
+  Preset other = withLut; // only the LUT differs
+  other.lut = LutRef{"Cool", 9};
+  CHECK(p.applyPreset(other) && p.lut() == LutRef{"Cool", 9});
+  Preset plain;
+  plain.name = "Plain";
+  plain.values[adjIndex(AdjId::Contrast)] = 10.0f;
+  CHECK(p.applyPreset(plain) && p.lut().empty() && p.get(AdjId::LutAmount) == 0.0f); // cleared
+  p.undo();
+  CHECK(p.lut() == LutRef{"Cool", 9} && p.get(AdjId::LutAmount) == 70.0f);
+  Preset hostile = withLut; // a hand-built preset with an unsafe name
+  hostile.lut.name = "a/b\\c";
+  CHECK(p.applyPreset(hostile) && p.lut().name == "a_b_c");
+
+  // Snapshots restore it too.
+  AdjustmentSet q;
+  fresh(q);
+  q.setLut(LutRef{"Warm", 7});
+  const SidecarEdits saved = q.currentEdits();
+  q.setLut(LutRef{});
+  q.set(AdjId::Exposure, 9.0f);
+  CHECK(q.restoreEdits(saved, "A") && q.lut() == LutRef{"Warm", 7} && q.get(AdjId::LutAmount) == 100.0f && q.get(AdjId::Exposure) == 0.0f);
+  CHECK(!q.restoreEdits(saved, "A")); // already exactly that
+  SidecarEdits onlyLut = q.currentEdits();
+  onlyLut.lut = LutRef{"Cool", 9}; // the LUT alone differs: that is a change
+  CHECK(q.restoreEdits(onlyLut, "B") && q.lut() == LutRef{"Cool", 9});
+}
+
 int main()
 {
   testFreshState();
@@ -858,5 +1012,6 @@ int main()
   testAutoTonePick();
   testSnapshotRestore();
   testEffectSliders();
+  testLut();
   return finish();
 }

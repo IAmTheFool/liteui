@@ -134,8 +134,8 @@ inline std::string exportTargetPath(const std::string &folder,
 // Loads the saved edits of `path` into `adj` (which must already have
 // setOriginalSize(w, h)). No sidecar at all is normal: the picture exports
 // unedited. A sidecar that exists but can't be used (damaged, newer, too big,
-// written for a different size) is an ERROR here, unlike in the editor, which
-// opens such a picture clean: silently exporting an unedited picture in the
+// written for a different size, or using a LUT the library no longer has) is an
+// ERROR here, unlike in the editor, which opens such a picture clean: silently exporting an unedited picture in the
 // middle of a batch would be worse than skipping it with a reason.
 inline bool exportLoadEdits(const std::string &path, int w, int h,
                             AdjustmentSet *adj, std::string *err)
@@ -189,6 +189,23 @@ inline bool exportLoadEdits(const std::string &path, int w, int h,
   {
     *err = "its saved edits are unreadable";
     return false;
+  }
+  // The same strictness for its LUT: a LUT that is in use (amount above 0) but
+  // gone from the library (or damaged) would export the picture without its look.
+  // A file that has changed since the LUT was chosen is used as it is.
+  if (!adj->lut().empty() && adj->get(AdjId::LutAmount) > 0.0f)
+  {
+    const LutStatus st = adj->lutStatus();
+    if (st == LutStatus::Missing)
+    {
+      *err = "its LUT \"" + adj->lut().name + "\" is not in the LUT library";
+      return false;
+    }
+    if (st == LutStatus::Unreadable)
+    {
+      *err = "its LUT \"" + adj->lut().name + "\" can't be read";
+      return false;
+    }
   }
   return true;
 }

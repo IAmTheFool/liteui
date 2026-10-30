@@ -17,6 +17,7 @@ This page describes what is in that file, when it is written and read, and how l
 | **Virtual copies** (more sidecars for one picture, see [below](#virtual-copies)) | `virtual_copy.hpp` (the path marker, the file-name rules, the folder scan); `sidecarFileOf` in `sidecar.hpp`; `createVirtualCopy`, `deleteVirtualCopy` and the filmstrip code in `main.cpp` |
 | The separate **preset** file (a saved look, see [Presets](#presets-a-related-file) below) | `preset.hpp`, which reuses the readers and writers in `sidecar.hpp` |
 | Putting a look into **another picture's** sidecar without opening it (Sync Settings, see [below](#syncing-a-look-onto-other-pictures)) | `sidecarSyncLook` in `sidecar.hpp`; the file reading, atomic write and worker are in `main.cpp` (`readSidecarText`, `writeTextAtomic`, `runSyncJob`) |
+| The **3D LUT** (the `lut` object, and `LUT Amount` in `adjust`; see [below](#the-3d-lut)) | `LutRef` and the name / hash helpers in `lut3d.hpp`; `sidecarLutToJson` / `sidecarLutFromJson` in `sidecar.hpp`; the table files, the folder and the cache in `lut_library.hpp` |
 
 ## What the file contains
 
@@ -43,10 +44,11 @@ Inside `edits`:
 
 | Key | Content |
 |---|---|
-| `adjust` | The slider values, keyed by each slider's **label** (for example `"Exposure"`, `"Noise Reduction"`). Sliders at 0 are left out. |
+| `adjust` | The slider values, keyed by each slider's **label** (for example `"Exposure"`, `"Noise Reduction"`, `"LUT Amount"`). Sliders at 0 are left out. |
 | `curves` | Four tone curves under the keys `rgb`, `r`, `g`, `b`, each a list of control points. |
 | `colorMix` | The 24 Color Mixer values, as three lists of 8 numbers (one per color band) under the keys `hue`, `sat` and `lum`. |
 | `colorGrading` | The four wheels, plus blending and balance. |
+| `lut` | Optional: the picture's 3D LUT as `{ "name", "hash" }` (see [The 3D LUT](#the-3d-lut)). **Absent when the picture has none**, like `meta`, so a picture that never had a LUT keeps exactly the file it had before LUTs existed. |
 | `geometry` | `flip`, `rotate` (clockwise quarter turns, 0 to 3), `angle` (degrees), `keepFullCanvas`, and, only if there is one, `crop` as `[x, y, w, h]` measured on the turned and straightened picture. |
 | `masks` | A list of masks (see below). |
 
@@ -74,6 +76,20 @@ Shape positions are **fractions of the original picture** (centers as a fraction
 
 Brush strokes and object-selection bitmaps are saved too. A photo with many strokes or object masks therefore has a larger sidecar.
 
+## The 3D LUT
+
+A picture's LUT is stored as a **reference**, never as a table:
+
+```json
+"lut": { "name": "Warm Film", "hash": "0123456789abcdef" }
+```
+
+- `name` is the LUT's name in the LUT library (the file `<name>.cube` in the library folder, see `lut_library.hpp`). It is cleaned on load like every name: printable ASCII only, the characters Windows does not allow in file names (`< > : " / \ | ? *`) become `_`, at most 48 characters, no trailing dot or space. A name can therefore never point outside the library folder, whatever a hand-edited file says.
+- `hash` is the hash (FNV-1a, 64 bit) of the file's bytes **when the LUT was chosen**, as exactly 16 hex digits. It is optional; a missing or malformed one is read as "unknown", which accepts any file by that name. It exists so that replacing a `.cube` under the same name is noticed (the picture still uses the new file, and says so when it is opened).
+- **How strongly** the LUT is used is the ordinary slider `LUT Amount` (0 to 100) in `adjust`, like every other slider. A picture can hold a LUT at amount 0 (chosen, but off); removing a LUT sets the amount back to 0.
+- The table is **never** stored: a 65³ table is about 7 MB of numbers, and a sidecar's snapshots, undo steps (in memory) and presets would each repeat it. A name and a hash are about 60 bytes. The price is that the file must still be in the library when the picture is opened: if it is missing or unreadable, the picture opens **without** the look (the reference and the amount are kept, so putting the file back restores it), the status bar says so, and a batch export skips the picture with a reason. See [3D LUTs in architecture.md](architecture.md#3d-luts).
+- The `lut` object is part of the *look*: presets, Copy / Paste Settings and Sync Settings carry it, and a look without a LUT **clears** the target's LUT (the look is replaced, not merged).
+
 ## When it is written and read
 
 - **Written** after any change (once no mouse drag is in progress; applying a preset counts as a change, and so does changing the rating, flag or color label, or adding or deleting a snapshot), when another picture replaces this one, and when the app closes.
@@ -92,10 +108,11 @@ A sidecar can be damaged, hand-edited, written by a newer version, or written fo
 - Inside a valid file, nothing is trusted. Slider values are clamped to their ranges, and non-numbers become the neutral value.
 - A tone curve must keep the editor's own rules (2 to 16 points, end points at x = 0 and 255, the rest at least a minimum gap apart). Anything else becomes a straight line.
 - The crop is checked against the size of the turned and straightened picture, and dropped if it does not fit.
-- At most 8 masks are read (`kMaxMasks`) and at most 6 parts per mask (`kMaxMaskParts`). Further ones are ignored. A mask with no valid part is dropped.
+- At most 16 masks are read (`kMaxMasks`) and at most 6 parts per mask (`kMaxMaskParts`). Further ones are ignored. A mask with no valid part is dropped.
 - Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped.
+- **A bad `lut` never makes a file bad.** If it is not an object, has no string `name`, or has a name with nothing left after cleaning, the picture simply has no LUT (the rest of the file loads normally). A `hash` that is not exactly 16 hex digits is dropped. Whether the named file exists is not checked at load time: that is the library's business, reported when the LUT is first used.
 - Object masks are limited: at most 256 prompts per selection, and a stored bitmap must be 1 to 16,384 pixels on each side, no more than about 67 million pixels in total (`kSidecarMaxMapPixels`), and decode to exactly `w × h` bytes.
-- **Snapshots never make a file bad.** `snapshots` that isn't an array gives none. Each entry is skipped if it isn't an object or its `edits` can't be loaded, and each one that is kept goes through `sidecarEditsFromJson` like the live edits (sliders clamped, the crop checked against the picture's size, at most 8 masks, and so on). At most `kMaxSnapshots` (20) are kept, and the name is cleaned (printable ASCII, trimmed, at most 32 characters; a blank one becomes `Snapshot`).
+- **Snapshots never make a file bad.** `snapshots` that isn't an array gives none. Each entry is skipped if it isn't an object or its `edits` can't be loaded, and each one that is kept goes through `sidecarEditsFromJson` like the live edits (sliders clamped, the crop checked against the picture's size, at most 16 masks, and so on). At most `kMaxSnapshots` (20) are kept, and the name is cleaned (printable ASCII, trimmed, at most 32 characters; a blank one becomes `Snapshot`).
 
 ## Details of the JSON code
 
@@ -112,7 +129,7 @@ A **preset** is a saved look that can be applied to any picture. It is a differe
 | Belongs to | One picture | No picture: any picture |
 | Where | Next to the picture: `photo.jpg.literoom.json` | In the presets folder: `<name>.literoom-preset.json` |
 | Wrapper | `app`, `version`, `image`, `edits` | Flat: `app`, `kind`, `version`, `name`, then the groups |
-| Contains | Sliders, curves, Color Mixer, Color Grading, **geometry and masks** | Sliders, curves, Color Mixer, Color Grading only |
+| Contains | Sliders, curves, Color Mixer, Color Grading, the 3D LUT, **geometry and masks** | Sliders, curves, Color Mixer, Color Grading and the 3D LUT only |
 | Written when | After every change, on switching pictures, on close | Only when you press "Save current look" |
 | Size limit on load | 64 MiB | 1 MiB |
 
@@ -127,13 +144,14 @@ The presets folder is `%APPDATA%\Literoom\presets` on Windows, and `$XDG_CONFIG_
   "adjust": { "Exposure": 12.5, "Temperature": 30 },
   "curves": { ... },
   "colorMix": { ... },
-  "colorGrading": { ... }
+  "colorGrading": { ... },
+  "lut": { "name": "Warm Film", "hash": "0123456789abcdef" }
 }
 ```
 
-The `adjust`, `curves`, `colorMix` and `colorGrading` groups are **exactly** the sidecar's forms: sliders keyed by label with zero ones left out, curves as `[x, y]` lists with identity curves left out, and so on. A neutral look has four empty groups.
+The `adjust`, `curves`, `colorMix` and `colorGrading` groups are **exactly** the sidecar's forms: sliders keyed by label with zero ones left out (so `LUT Amount` is in `adjust`), curves as `[x, y]` lists with identity curves left out, and so on. `lut` is the sidecar's `lut` object and is **only written when the look has a LUT**, so a neutral look has four empty groups and no `lut`. The LUT is a name and a hash, never a table, so a preset stays a few hundred bytes.
 
-**Loading is as strict as for a sidecar.** The preset is read with the same functions, so nothing in the file is trusted: slider values are clamped, non-numbers become 0, a tone curve that breaks the editor's rules becomes a straight line, and Mixer and grading values are clamped. A file is **refused** (the picture is not changed, and the pane simply leaves it out of the list) when it is empty, larger than 1 MiB, not valid JSON, not an object, has a `kind` other than `"preset"`, or has a missing, zero or higher-than-supported `version`. The preset's `version` is its own number (`kPresetVersion`) and is not tied to `kSidecarVersion`.
+**Loading is as strict as for a sidecar.** The preset is read with the same functions, so nothing in the file is trusted: slider values are clamped, non-numbers become 0, a tone curve that breaks the editor's rules becomes a straight line, Mixer and grading values are clamped, and a bad `lut` object becomes no LUT. A file is **refused** (the picture is not changed, and the pane simply leaves it out of the list) when it is empty, larger than 1 MiB, not valid JSON, not an object, has a `kind` other than `"preset"`, or has a missing, zero or higher-than-supported `version`. The preset's `version` is its own number (`kPresetVersion`) and is not tied to `kSidecarVersion`.
 
 Things that differ from a sidecar:
 - There is no picture size to check, because a preset has no geometry and no masks.
@@ -142,10 +160,10 @@ Things that differ from a sidecar:
 
 ## Syncing a look onto other pictures
 
-**Image > Sync Settings to Selected** (Ctrl+Shift+S) copies the open picture's look (sliders, curves, Color Mixer, Color Grading: the same four groups a preset holds) onto the pictures selected in the filmstrip. Those pictures are not open, so nothing goes through `AdjustmentSet`: their sidecar files are rewritten directly by `sidecarSyncLook`, a pure function in `sidecar.hpp`. It takes the picture's current sidecar text and returns the new text. How it decides:
+**Image > Sync Settings to Selected** (Ctrl+Shift+S) copies the open picture's look (sliders, curves, Color Mixer, Color Grading and the 3D LUT: what a preset holds) onto the pictures selected in the filmstrip. Those pictures are not open, so nothing goes through `AdjustmentSet`: their sidecar files are rewritten directly by `sidecarSyncLook`, a pure function in `sidecar.hpp`. It takes the picture's current sidecar text and returns the new text. How it decides:
 
 - **No sidecar yet:** a new file is made. It must record the picture's size, so the background job decodes the picture once and uses its upright size (a camera's quarter turn swaps width and height).
-- **A sidecar exists:** its recorded `image.width` and `image.height` are used, so no decode is needed. The file is read through `sidecarEditsFromJson`, **only the four look groups are replaced**, and the whole thing is written back through `sidecarEditsToJson`. The picture's own crop, rotation, straighten angle and masks are kept, so a crop that suits one photo is never pushed onto another.
+- **A sidecar exists:** its recorded `image.width` and `image.height` are used, so no decode is needed. The file is read through `sidecarEditsFromJson`, **only the look is replaced** (the four groups, and the `lut`: a look without a LUT clears the picture's LUT, like any other part of the look), and the whole thing is written back through `sidecarEditsToJson`. The picture's own crop, rotation, straighten angle and masks are kept, so a crop that suits one photo is never pushed onto another.
 - **A file that can't be trusted is never overwritten.** The picture is *skipped*, and the status bar says why, when the file is not valid JSON or not an object, is from a newer version (or has none), has no picture size, was written for a different size than the one given, or has an `edits` part that can't be loaded. The edits in such a file might still be recoverable by hand, so syncing leaves it alone.
 - The picture's own `meta` (rating, flag, color label) is read from the old file and written back unchanged: syncing a look never changes how a picture is rated. A picture with no `meta` stays without one.
 - The picture's own **snapshots** are read and written back as well, each keeping the look it captured: syncing a look changes the picture's current edits, never its saved snapshots. A picture with none stays without any.
@@ -223,6 +241,7 @@ How the UI treats them (`main.cpp`):
 - `kSidecarVersion` (currently 1) is written to every file by `saveSidecar` and checked by `loadSidecar`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
 - The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values in sidecars **and in saved presets** (see [extending.md](extending.md)).
 - Adding a field is safe if the loader gives it a default and clamps it.
+- **The 3D LUT was added without a version bump**: `lut` is a new optional key and `LUT Amount` a new `adjust` key. An older build ignores both (it opens the picture without the LUT) and its next save drops them, which is the usual cost of an additive change; a newer build reads every older file unchanged.
 - **Every code path that rewrites a whole sidecar must go through `sidecarFileText`** (the app's own save, `sidecarSyncLook` and `sidecarPatchMeta` do). It writes the wrapper, `meta` and `snapshots` included, in one place, so a new top-level key added there can't be dropped by one writer and kept by another. A rewriter of *another* picture's file must also read the new key back in `sidecarReadForRewrite` and pass it to `sidecarFileText`, as it does for `meta` and `snapshots`.
 - **Every field must be written by `sidecarEditsToJson` and read by `sidecarEditsFromJson`.** Sync Settings reloads a picture's sidecar and writes it back, so a field that only the app's own code kept (and the loader dropped) would be lost from every picture it syncs onto.
 - A new mask type must be added to both `sidecarShapeToJson` and `sidecarShapeFromJson`. Presets do not store masks, so they need no change. Snapshots store whole edits, masks included, so they pick the new type up from those two functions.

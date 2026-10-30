@@ -19,6 +19,7 @@
 #include "color/color_grade.hpp"
 #include "color/color_mix.hpp"
 #include "color/curves.hpp"
+#include "color/lut3d.hpp"
 #include "core/geometry.hpp"
 #include "mask/mask.hpp"
 #include "io/minijson.hpp"
@@ -57,6 +58,7 @@ struct SidecarEdits
   MixValues mix{};
   ColorGrade grade;
   MaskSet masks;
+  LutRef lut; // the 3D LUT (empty = none); part of the look, with its amount in `values`
 };
 
 inline float sidecarNum(const mj::Json &o, const char *key, float def,
@@ -582,6 +584,41 @@ inline bool sidecarMaskFromJson(const mj::Json &o, Mask *out)
   return true;
 }
 
+// ---- the 3D LUT ----
+// {"name": "Warm Film", "hash": "0123456789abcdef"}: which library file the
+// picture uses and what its bytes were when it was chosen (hash left out when
+// unknown). The table itself is never stored (see io/lut_library.hpp). Loading is
+// as strict as everything here: a name is cleaned to a safe file-name stem, a
+// hash that isn't 16 hex digits is dropped, and anything else gives "no LUT".
+inline mj::Json sidecarLutToJson(const LutRef &r)
+{
+  using mj::Json;
+  Json o = Json::object();
+  o.set("name", Json::str(sanitizeLutName(r.name)));
+  if (r.hash != 0)
+    o.set("hash", Json::str(lutHashToHex(r.hash)));
+  return o;
+}
+inline LutRef sidecarLutFromJson(const mj::Json *j)
+{
+  LutRef r;
+  if (!j || !j->isObject())
+    return r;
+  const mj::Json *n = j->find("name");
+  if (!n || !n->isString())
+    return r;
+  r.name = sanitizeLutName(n->asStr());
+  if (r.name.empty())
+    return LutRef{};
+  if (const mj::Json *h = j->find("hash"); h && h->isString())
+  {
+    uint64_t v = 0;
+    if (lutHashFromHex(h->asStr(), &v))
+      r.hash = v;
+  }
+  return r;
+}
+
 // ---- the whole edit state ----
 inline mj::Json sidecarEditsToJson(const SidecarEdits &e)
 {
@@ -591,6 +628,8 @@ inline mj::Json sidecarEditsToJson(const SidecarEdits &e)
   o.set("curves", sidecarCurvesToJson(e.curves));
   o.set("colorMix", sidecarMixToJson(e.mix));
   o.set("colorGrading", sidecarGradeToJson(e.grade));
+  if (!e.lut.empty())
+    o.set("lut", sidecarLutToJson(e.lut));
   Json g = Json::object();
   g.set("flip", Json::flag(e.orient.flip));
   g.set("rotate", Json::num(e.orient.rot)); // clockwise quarter turns
@@ -627,6 +666,7 @@ inline bool sidecarEditsFromJson(const mj::Json &o, int origW, int origH,
         e.curves[c] = sidecarCurveFromJson(*a);
   e.mix = sidecarMixFromJson(o.find("colorMix"));
   e.grade = sidecarGradeFromJson(o.find("colorGrading"));
+  e.lut = sidecarLutFromJson(o.find("lut"));
 
   if (const mj::Json *g = o.find("geometry"); g && g->isObject())
   {
@@ -910,7 +950,8 @@ inline bool sidecarSyncLook(const std::string &oldText,
                             const std::string &imageName, int imgW, int imgH,
                             const AdjValues &values, const CurveSet &curves,
                             const MixValues &mix, const ColorGrade &grade,
-                            std::string *outText, std::string *err)
+                            const LutRef &lut, std::string *outText,
+                            std::string *err)
 {
   SidecarEdits e;
   PhotoMeta meta; // the picture's own rating / flag / label: kept as it is
@@ -923,6 +964,7 @@ inline bool sidecarSyncLook(const std::string &oldText,
   e.curves = curves;
   e.mix = mix;
   e.grade = grade;
+  e.lut = lut; // a look without a LUT clears the picture's LUT, like any other part of it
 
   if (outText)
     *outText = sidecarFileText(imageName, W, H, sidecarEditsToJson(e), meta, snaps);

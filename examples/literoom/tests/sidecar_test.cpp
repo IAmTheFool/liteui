@@ -113,6 +113,7 @@ static SidecarEdits rich()
   cr.feather = 0.6f;
   obj.parts.push_back({cr, MaskOp::Add});
   e.masks.push_back(obj);
+  e.lut = LutRef{"Warm Film", 0x0123456789abcdefull};
   return e;
 }
 
@@ -658,9 +659,9 @@ static void testSyncLook()
   std::string out, err;
 
   // A picture with no sidecar yet: the size must be given.
-  CHECK(!sidecarSyncLook("", "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+  CHECK(!sidecarSyncLook("", "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &out, &err));
   CHECK(!err.empty());
-  CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
   SidecarEdits fresh;
   CHECK(loadFile(out, &fresh, 400, 300));
   CHECK(fresh.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
@@ -673,7 +674,7 @@ static void testSyncLook()
   // A picture with edits: the look is replaced, geometry and masks stay.
   const SidecarEdits old = rich();
   const std::string oldText = fileText(old, 400, 300);
-  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err)); // size from the file
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &out, &err)); // size from the file
   SidecarEdits e;
   CHECK(loadFile(out, &e, 400, 300));
   CHECK(e.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
@@ -687,23 +688,23 @@ static void testSyncLook()
   CHECK(!e.masks.empty());
 
   // Same size given and recorded: fine. A different size: refused.
-  CHECK(sidecarSyncLook(oldText, "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
   out = "untouched";
-  CHECK(!sidecarSyncLook(oldText, "a.jpg", 500, 300, v, cs, mix, grade, &out, &err));
+  CHECK(!sidecarSyncLook(oldText, "a.jpg", 500, 300, v, cs, mix, grade, LutRef{}, &out, &err));
   CHECK(out == "untouched");
   CHECK(!err.empty());
 
   // Files that can't be trusted are refused, never overwritten.
-  CHECK(!sidecarSyncLook("not json", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
-  CHECK(!sidecarSyncLook("[1,2]", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
-  CHECK(!sidecarSyncLook(fileText(old, 400, 300, kSidecarVersion + 1), "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
-  CHECK(!sidecarSyncLook("{\"version\":1,\"edits\":{}}", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err)); // no image size
+  CHECK(!sidecarSyncLook("not json", "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
+  CHECK(!sidecarSyncLook("[1,2]", "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
+  CHECK(!sidecarSyncLook(fileText(old, 400, 300, kSidecarVersion + 1), "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
+  CHECK(!sidecarSyncLook("{\"version\":1,\"edits\":{}}", "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err)); // no image size
   CHECK(out == "untouched");
 
   // Syncing twice with the same look gives the same file.
   std::string again;
-  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
-  CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, &again, &err));
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &out, &err));
+  CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &again, &err));
   CHECK(again == out);
 }
 
@@ -782,7 +783,7 @@ static void testMeta()
     std::string out, err;
     SidecarEdits old = rich();
     const std::string oldText = metaFile(old, rated);
-    CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+    CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &out, &err));
     Json root;
     CHECK(Json::parse(out, &root, &err));
     CHECK(sidecarMetaFromRoot(root) == rated);
@@ -792,13 +793,13 @@ static void testMeta()
     CHECK(now.crop == old.crop); // geometry kept, as before
     // twice gives the same text, with the meta
     std::string again;
-    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, &again, &err));
+    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &again, &err));
     CHECK(again == out);
     // a file without meta stays without
-    CHECK(sidecarSyncLook(fileText(old, 400, 300), "a.jpg", 0, 0, v, cs, mix, grade, &out, &err));
+    CHECK(sidecarSyncLook(fileText(old, 400, 300), "a.jpg", 0, 0, v, cs, mix, grade, LutRef{}, &out, &err));
     CHECK(out.find("\"meta\"") == std::string::npos);
     // a new file has none
-    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, &out, &err));
+    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, cs, mix, grade, LutRef{}, &out, &err));
     CHECK(out.find("\"meta\"") == std::string::npos);
   }
 }
@@ -878,7 +879,7 @@ static void testPatchMeta()
     MetaPatch p;
     p.label = 2;
     std::string synced;
-    CHECK(sidecarSyncLook(metaFile(rich(), rated), "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &synced, &err));
+    CHECK(sidecarSyncLook(metaFile(rich(), rated), "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &synced, &err));
     CHECK(sidecarPatchMeta(synced, "a.jpg", 0, 0, p, &out, &got, &err));
     CHECK(got == PhotoMeta({4, PhotoFlag::Pick, 2}));
     SidecarEdits back;
@@ -1033,11 +1034,11 @@ static void testSnapshots()
     AdjValues v{};
     v[static_cast<size_t>(AdjId::Exposure)] = 25.0f;
     std::string out, err, again;
-    CHECK(sidecarSyncLook(old, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(sidecarSyncLook(old, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &out, &err));
     CHECK(sameSnapshots(snapsOf(out), l));
     SidecarEdits back;
     CHECK(loadFile(out, &back, 400, 300) && back.values[static_cast<size_t>(AdjId::Exposure)] == 25.0f);
-    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, &again, &err));
+    CHECK(sidecarSyncLook(out, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &again, &err));
     CHECK(again == out);
 
     MetaPatch p;
@@ -1046,12 +1047,12 @@ static void testSnapshots()
     CHECK(sidecarPatchMeta(old, "a.jpg", 0, 0, p, &out, &got, &err));
     CHECK(got.rating == 2 && sameSnapshots(snapsOf(out), l));
 
-    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(sidecarSyncLook("", "a.jpg", 400, 300, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &out, &err));
     CHECK(out.find("snapshots") == std::string::npos);
 
     // a file that can't be trusted is still refused, snapshots or not
     out = "untouched";
-    CHECK(!sidecarSyncLook(old, "a.jpg", 500, 300, v, identityCurves(), MixValues{}, ColorGrade{}, &out, &err));
+    CHECK(!sidecarSyncLook(old, "a.jpg", 500, 300, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &out, &err));
     CHECK(out == "untouched" && !err.empty());
   }
 
@@ -1096,6 +1097,82 @@ static void testVirtualCopyNames()
   CHECK(sidecarFileOf("x/a|vcX.jpg") == std::string("x/a|vcX.jpg") + kSidecarExt); // not a marker
 }
 
+static void testLut()
+{
+  // Written only when there is one, as {"name", "hash"}; the hash is 16 hex digits.
+  SidecarEdits e;
+  CHECK(sidecarEditsToJson(e).find("lut") == nullptr);
+  e.lut = LutRef{"Warm Film", 0x0123456789abcdefull};
+  const Json j = sidecarEditsToJson(e);
+  const Json *l = j.find("lut");
+  CHECK(l && l->isObject() && l->get("name").asStr() == "Warm Film" && l->get("hash").asStr() == "0123456789abcdef");
+  SidecarEdits back;
+  CHECK(sidecarEditsFromJson(j, 400, 300, &back) && back.lut == e.lut);
+  // Through text, too, and an unknown hash (0) is left out and comes back as 0.
+  e.lut.hash = 0;
+  const Json j0 = sidecarEditsToJson(e);
+  CHECK(j0.find("lut")->find("hash") == nullptr);
+  Json parsed;
+  std::string perr;
+  CHECK(Json::parse(j0.dump(), &parsed, &perr) && sidecarEditsFromJson(parsed, 400, 300, &back) && back.lut == LutRef{"Warm Film", 0});
+  CHECK(sidecarLutToJson(LutRef{"a/b", 5}).get("name").asStr() == "a_b"); // never writes an unsafe name
+
+  // What a hand-edited file can say is cleaned or dropped, never trusted.
+  const auto load = [&](const Json &lut) -> LutRef
+  {
+    Json edits = sidecarEditsToJson(SidecarEdits{});
+    edits.set("lut", lut);
+    SidecarEdits o;
+    o.lut = LutRef{"untouched", 1};
+    CHECK(sidecarEditsFromJson(edits, 400, 300, &o)); // a bad "lut" never fails the whole file
+    return o.lut;
+  };
+  CHECK(load(Json::str("Warm")) == LutRef{});                       // not an object
+  CHECK(load(Json::array()) == LutRef{});
+  CHECK(load(Json::object()) == LutRef{});                          // no name
+  CHECK(load(Json::object().set("name", Json::num(3))) == LutRef{}); // name is not a string
+  CHECK(load(Json::object().set("name", Json::str("   "))) == LutRef{});
+  CHECK(load(Json::object().set("name", Json::str("\x01\x7F"))) == LutRef{});
+  CHECK(load(Json::object().set("name", Json::str("../../etc/passwd"))).name.find('/') == std::string::npos);
+  CHECK(load(Json::object().set("name", Json::str("a\\b:c"))) == (LutRef{"a_b_c", 0}));
+  CHECK(load(Json::object().set("name", Json::str(std::string(200, 'x')))).name.size() == kLutNameMax);
+  CHECK(load(Json::object().set("name", Json::str("X")).set("hash", Json::str("123"))) == (LutRef{"X", 0}));       // not 16 digits
+  CHECK(load(Json::object().set("name", Json::str("X")).set("hash", Json::str("zzzzzzzzzzzzzzzz"))) == (LutRef{"X", 0}));
+  CHECK(load(Json::object().set("name", Json::str("X")).set("hash", Json::num(5))) == (LutRef{"X", 0}));
+  CHECK(load(Json::object().set("name", Json::str("X")).set("hash", Json::str("00000000000000FF"))) == (LutRef{"X", 255}));
+  // A file with no "lut" at all gives no LUT (and replaces whatever the target held).
+  {
+    SidecarEdits o;
+    o.lut = LutRef{"untouched", 1};
+    CHECK(sidecarEditsFromJson(sidecarEditsToJson(SidecarEdits{}), 400, 300, &o) && o.lut.empty());
+  }
+
+  // A picture with a LUT counts as edited, even with the amount at 0 (it holds a choice).
+  {
+    SidecarEdits e2;
+    CHECK(!sidecarScan(fileText(e2, 400, 300)).edited);
+    e2.lut = LutRef{"Warm", 0};
+    CHECK(sidecarScan(fileText(e2, 400, 300)).edited);
+  }
+
+  // Sync Settings carries the LUT: the look is replaced as a whole, so none clears it.
+  AdjValues v{};
+  v[static_cast<size_t>(AdjId::LutAmount)] = 80.0f;
+  const SidecarEdits old = rich();
+  const std::string oldText = fileText(old, 400, 300);
+  std::string out, err;
+  SidecarEdits s;
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{"Teal", 9}, &out, &err));
+  CHECK(loadFile(out, &s, 400, 300) && s.lut == LutRef{"Teal", 9} && s.values[static_cast<size_t>(AdjId::LutAmount)] == 80.0f);
+  CHECK(s.crop == old.crop && s.masks.size() == old.masks.size()); // geometry and masks stay
+  CHECK(sidecarSyncLook(oldText, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{}, &out, &err));
+  CHECK(loadFile(out, &s, 400, 300) && s.lut.empty()); // the old picture's LUT is gone
+  // A picture that had none gets one.
+  const std::string plain = fileText(SidecarEdits{}, 400, 300);
+  CHECK(sidecarSyncLook(plain, "a.jpg", 0, 0, v, identityCurves(), MixValues{}, ColorGrade{}, LutRef{"Teal", 9}, &out, &err));
+  CHECK(loadFile(out, &s, 400, 300) && s.lut == LutRef{"Teal", 9});
+}
+
 int main()
 {
   testRoundTrip();
@@ -1109,6 +1186,7 @@ int main()
   testObjectMaps();
   testFuzz();
   testSyncLook();
+  testLut();
   testMeta();
   testPatchMeta();
   testSnapshots();

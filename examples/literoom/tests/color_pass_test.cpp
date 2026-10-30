@@ -19,9 +19,9 @@ static Px run(const ColorPass &cp, Px p)
 static ColorPass pass(float temperature = 0, float tint = 0, float vibrance = 0, float saturation = 0,
                       const MixValues &mix = MixValues{}, const ColorGrade &grade = ColorGrade{},
                       float hue = 0, float colorizeHue = 0, float colorizeAmount = 0,
-                      const FilterValues &filters = FilterValues{})
+                      const FilterValues &filters = FilterValues{}, const LutPass &lut = LutPass{})
 {
-  return makeColorPass(temperature, tint, vibrance, saturation, mix, grade, hue, colorizeHue, colorizeAmount, filters);
+  return makeColorPass(temperature, tint, vibrance, saturation, mix, grade, hue, colorizeHue, colorizeAmount, filters, lut);
 }
 // A pass with only the given Filters set.
 static ColorPass filterPass(const FilterValues &f) { return pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, f); }
@@ -610,6 +610,150 @@ static void testWhiteBalancePicker()
   CHECK(solveWhiteBalance(kWbMaxLevel - 1, kWbMaxLevel - 1, kWbMaxLevel - 1).usable());
 }
 
+// ------------------------------------------------------------------- 3D LUT
+// A 2-point LUT that inverts every channel (an exact table for tetrahedral lookups).
+static std::shared_ptr<const Lut3D> invertLut()
+{
+  Lut3D L = identityLut(2);
+  for (float &v : L.rgb)
+    v = 255.0f - v;
+  return std::make_shared<const Lut3D>(std::move(L));
+}
+static LutPass lutPass(std::shared_ptr<const Lut3D> t, float amount) { return makeLutPass(std::move(t), amount); }
+static ColorPass lutOnly(std::shared_ptr<const Lut3D> t, float amount)
+{
+  return pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, FilterValues{}, lutPass(std::move(t), amount));
+}
+
+static void testLutActiveFlag()
+{
+  const auto inv = invertLut();
+  CHECK(lutOnly(inv, 100.0f).active && lutOnly(inv, 100.0f).lut.any());
+  CHECK(lutOnly(inv, 1.0f).active);
+  // Nothing in play: no table, amount 0, a table that isn't valid. The pass stays off, so the fast path skips it.
+  CHECK(!lutOnly(nullptr, 100.0f).active && !lutOnly(inv, 0.0f).active && !lutOnly(inv, -5.0f).active);
+  CHECK(!lutOnly(std::make_shared<const Lut3D>(Lut3D{}), 100.0f).active);
+  CHECK(!pass().lut.any() && pass().lut.lut == nullptr);
+  // The other stages' flags are untouched by a LUT.
+  const ColorPass cp = lutOnly(inv, 100.0f);
+  CHECK(!cp.mix && !cp.grade && !cp.hue && !cp.colorize && !cp.filters.any);
+  // Copying a pass shares the table (a RenderParams copy per slider frame stays cheap).
+  const ColorPass copy = cp;
+  CHECK(copy.lut.lut == cp.lut.lut && copy.lut.amount == 1.0f);
+}
+
+static void testLutIdentityChangesNothing()
+{
+  const ColorPass cp = lutOnly(std::make_shared<const Lut3D>(identityLut(33)), 100.0f);
+  std::mt19937 rng(7);
+  Px img(4 * 4000);
+  for (auto &v : img)
+    v = static_cast<uint8_t>(rng() & 255);
+  Px want = img;
+  const Px got = run(cp, img);
+  for (size_t i = 0; i < got.size(); ++i)
+  {
+    if (i % 4 == 3)
+      CHECK(got[i] == want[i]); // alpha is never touched
+    else
+      CHECK(std::abs(int(got[i]) - int(want[i])) <= 1);
+  }
+}
+
+static void testLutAppliesAndBlends()
+{
+  const auto inv = invertLut();
+  CHECK(run(lutOnly(inv, 100.0f), one(10, 128, 250, 77)) == one(245, 127, 5, 77));
+  CHECK(run(lutOnly(inv, 100.0f), one(0, 0, 0)) == one(255, 255, 255));
+  CHECK(run(lutOnly(inv, 100.0f), one(255, 255, 255)) == one(0, 0, 0));
+  // Amount blends between the picture and the table's answer.
+  {
+    const Px h = run(lutOnly(inv, 50.0f), one(0, 100, 200)); // every channel lands on 127.5: 127 or 128 after float rounding
+    for (int k = 0; k < 3; ++k)
+      CHECK(h[static_cast<size_t>(k)] == 127 || h[static_cast<size_t>(k)] == 128);
+  }
+  const Px a = run(lutOnly(inv, 25.0f), one(0, 0, 0)), b = run(lutOnly(inv, 75.0f), one(0, 0, 0));
+  CHECK(a[0] == 64 && b[0] == 191 && a[0] < b[0]);
+  // Amount 0 is the untouched picture, byte for byte.
+  CHECK(run(lutOnly(inv, 0.0f), one(12, 34, 56, 78)) == one(12, 34, 56, 78));
+  // A transparent pixel keeps its alpha (the empty corners of a straightened picture).
+  CHECK(run(lutOnly(inv, 100.0f), one(10, 20, 30, 0))[3] == 0);
+  // Many pixels, one call: each is looked up on its own.
+  Px two = {0, 0, 0, 255, 255, 255, 255, 255};
+  applyColorPass(lutOnly(inv, 100.0f), two.data(), two.size());
+  CHECK(two == (Px{255, 255, 255, 255, 0, 0, 0, 255}));
+}
+
+static void testLutRunsLast()
+{
+  const auto inv = invertLut();
+  // After the Filters: Negative followed by an inverting LUT is the original picture.
+  FilterValues neg;
+  neg.negative = 100.0f;
+  const ColorPass both = pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, neg, lutPass(inv, 100.0f));
+  for (int v : {0, 30, 128, 200, 255})
+  {
+    const Px got = run(both, one(v, 255 - v, v / 2));
+    CHECK(std::abs(int(got[0]) - v) <= 1 && std::abs(int(got[1]) - (255 - v)) <= 1 && std::abs(int(got[2]) - v / 2) <= 1);
+  }
+  // Greyscale, then the LUT: the LUT sees the grey picture.
+  FilterValues grey;
+  grey.greyscale = 100.0f;
+  const ColorPass gl = pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, grey, lutPass(inv, 100.0f));
+  const Px g = run(filterPass(grey), one(200, 40, 90));
+  const Px o = run(gl, one(200, 40, 90));
+  for (int k = 0; k < 3; ++k)
+    CHECK(std::abs(int(o[static_cast<size_t>(k)]) - (255 - int(g[static_cast<size_t>(k)]))) <= 1);
+  // After the other stages too: a warm white balance pushes red to the ceiling (255), and that is
+  // what the LUT is handed, never a value above it.
+  const Px warm = run(pass(100), one(250, 200, 100));
+  CHECK(warm[0] == 255);
+  const ColorPass wl = pass(100, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, FilterValues{}, lutPass(inv, 100.0f));
+  CHECK(run(wl, one(250, 200, 100))[0] == 0);
+}
+
+static void testColorPassWithLut()
+{
+  const auto inv = invertLut();
+  const LutPass on = lutPass(inv, 100.0f);
+  // On a pass with nothing else in it, it is exactly the pass makeColorPass makes for a LUT alone.
+  const ColorPass viaHelper = colorPassWithLut(pass(), on);
+  const ColorPass direct = lutOnly(inv, 100.0f);
+  CHECK(viaHelper.active && viaHelper.lut.lut == inv && viaHelper.lut.amount == 1.0f);
+  Px a = {10, 130, 250, 255, 77, 77, 77, 9}, b = a;
+  applyColorPass(viaHelper, a.data(), a.size());
+  applyColorPass(direct, b.data(), b.size());
+  CHECK(a == b);
+  // On a pass that has other stages, those are untouched and the LUT is added (or swapped).
+  const ColorPass busy = pass(20, -10, 30, 25);
+  const ColorPass withIt = colorPassWithLut(busy, on);
+  CHECK(withIt.active && withIt.lut.any() && withIt.gain[0] == busy.gain[0] && withIt.saturation == busy.saturation &&
+        withIt.vibrance == busy.vibrance);
+  const ColorPass made = pass(20, -10, 30, 25, MixValues{}, ColorGrade{}, 0, 0, 0, FilterValues{}, on);
+  Px c = {200, 100, 50, 255, 33, 99, 240, 255}, d = c;
+  applyColorPass(withIt, c.data(), c.size());
+  applyColorPass(made, d.data(), d.size());
+  CHECK(c == d); // the same bytes as a pass built with the LUT from the start
+  // Swapping one LUT for another replaces it (never stacks), and the amount is the new pass's.
+  const auto other = std::make_shared<const Lut3D>(identityLut(5));
+  const ColorPass swapped = colorPassWithLut(withIt, lutPass(other, 40.0f));
+  CHECK(swapped.lut.lut == other && swapped.lut.amount == 0.4f && swapped.active);
+  // Removing it (an inactive LutPass): a pass that was only the LUT becomes inactive again;
+  // one with other stages stays active.
+  CHECK(!colorPassWithLut(pass(), LutPass{}).active);
+  const ColorPass onlyLut = lutOnly(inv, 100.0f);
+  const ColorPass removed = colorPassWithLut(onlyLut, LutPass{});
+  CHECK(!removed.lut.any());
+  CHECK(colorPassWithLut(withIt, LutPass{}).active && !colorPassWithLut(withIt, LutPass{}).lut.any());
+  // Stages other than the LUT keep their own flags: filters, mix, grade, hue, colorize.
+  FilterValues f;
+  f.sepia = 50.0f;
+  CHECK(colorPassWithLut(pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, f), on).filters.any);
+  CHECK(colorPassWithLut(pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 30), on).hue);
+  // The source pass is never changed.
+  CHECK(!busy.lut.any() && !pass().lut.any());
+}
+
 int main()
 {
   testActiveFlags();
@@ -633,6 +777,11 @@ int main()
   testThresholdFilter();
   testCrossProcessFilter();
   testFilterOrderAndPlacement();
+  testLutActiveFlag();
+  testLutIdentityChangesNothing();
+  testLutAppliesAndBlends();
+  testLutRunsLast();
+  testColorPassWithLut();
   testFilterBufferHandling();
   testBufferHandling();
   testWhiteBalancePicker();

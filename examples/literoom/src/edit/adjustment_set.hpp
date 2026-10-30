@@ -15,10 +15,12 @@
 #include "color/color_mix.hpp"
 #include "color/color_pass.hpp"
 #include "color/curves.hpp"
+#include "color/lut3d.hpp"
 #include "core/adjustments.hpp"
 #include "core/geometry.hpp"
 #include "detail/neighbor_fx.hpp"
 #include "edit/render_params.hpp"
+#include "io/lut_library.hpp"
 #include "io/minijson.hpp"
 #include "io/preset.hpp"
 #include "io/sidecar.hpp"
@@ -258,7 +260,7 @@ public:
   SidecarEdits currentEdits() const
   {
     return SidecarEdits{values_, crop_, orient_, angle_, expand_,
-                        curves_, mix_, grade_, masks_};
+                        curves_, mix_, grade_, masks_, lut_};
   }
   // Replaces every edit with the saved ones in `j` (call after reset() and
   // setOriginalSize()); undo history restarts from them. False, with nothing
@@ -277,6 +279,7 @@ public:
     mix_ = e.mix;
     grade_ = e.grade;
     masks_ = std::move(e.masks);
+    lut_ = std::move(e.lut);
     history_ = {snapshot()};
     historyIndex_ = 0;
     lastEdited_ = AdjId::Count;
@@ -323,6 +326,7 @@ public:
     p.curves = curves_;
     p.mix = mix_;
     p.grade = grade_;
+    p.lut = lut_;
     return p;
   }
   // Replaces the whole look with `p` as ONE undo step labelled "Preset: <name>".
@@ -337,17 +341,51 @@ public:
       const size_t k = static_cast<size_t>(spec.id);
       v[k] = sanitizedValue(spec, v[k]);
     }
-    if (v == values_ && p.curves == curves_ && p.mix == mix_ && p.grade == grade_)
+    const LutRef lut = cleanLut(p.lut);
+    if (v == values_ && p.curves == curves_ && p.mix == mix_ && p.grade == grade_ &&
+        lut == lut_)
       return false;
     values_ = v;
     curves_ = p.curves;
     mix_ = p.mix;
     grade_ = p.grade;
+    lut_ = lut; // a preset without a LUT clears the picture's LUT
     pushStep();
     const std::string n = sanitizePresetName(p.name);
     history_.back().label = n.empty() ? std::string("Preset") : "Preset: " + n;
     return true;
   }
+
+  // ---- 3D LUT ----
+  // The picture's LUT: a name (and the hash of the file's bytes when it was
+  // chosen) that the LUT library resolves to a table (io/lut_library.hpp). How
+  // much of it is used is the LUT Amount slider (AdjId::LutAmount). Part of the
+  // look: presets, Copy / Paste and Sync Settings carry both.
+  const LutRef &lut() const { return lut_; }
+  // Chooses the LUT (an empty ref, or a name with nothing left after cleaning,
+  // removes it) as ONE undo step labelled "LUT: <name>" / "Remove LUT". Choosing
+  // one while LUT Amount is 0 sets the amount to 100, so the pick is visible at
+  // once; removing it sets the amount back to 0, so a picture without a LUT is
+  // untouched again. Returns false, adding no step, if nothing would change.
+  bool setLut(const LutRef &ref)
+  {
+    const LutRef r = cleanLut(ref);
+    const size_t k = static_cast<size_t>(AdjId::LutAmount);
+    float amount = values_[k];
+    if (r.empty())
+      amount = 0.0f;
+    else if (amount <= 0.0f)
+      amount = 100.0f;
+    if (r == lut_ && amount == values_[k])
+      return false;
+    lut_ = r;
+    values_[k] = amount;
+    pushStep();
+    history_.back().label = r.empty() ? std::string("Remove LUT") : "LUT: " + r.name;
+    return true;
+  }
+  // Where the LUT stands in the library right now (None when there is no LUT).
+  LutStatus lutStatus() const { return acquireLut(lut_).status; }
 
   // ---- Named snapshots ----
   // Puts the picture back exactly as `e` describes it (every slider, curve, the
@@ -368,9 +406,10 @@ public:
       const size_t k = static_cast<size_t>(spec.id);
       v[k] = sanitizedValue(spec, v[k]);
     }
+    const LutRef lut = cleanLut(e.lut);
     if (v == values_ && e.crop == crop_ && e.orient == orient_ &&
         e.angle == angle_ && e.expand == expand_ && e.curves == curves_ &&
-        e.mix == mix_ && e.grade == grade_ && e.masks == masks_)
+        e.mix == mix_ && e.grade == grade_ && e.masks == masks_ && lut == lut_)
       return false;
     values_ = v;
     crop_ = e.crop;
@@ -381,6 +420,7 @@ public:
     mix_ = e.mix;
     grade_ = e.grade;
     masks_ = e.masks;
+    lut_ = lut;
     pushStep();
     const std::string n = sanitizeSnapshotName(name);
     history_.back().label = n.empty() ? std::string("Snapshot") : "Snapshot: " + n;
@@ -442,6 +482,7 @@ public:
     mix_.fill(0.0f);
     grade_ = ColorGrade{};
     masks_.clear();
+    lut_ = LutRef{};
     crop_ = CropRect{};
     orient_ = Orient{};
     angle_ = 0.0f;
@@ -554,7 +595,8 @@ public:
                          get(AdjId::Vibrance), get(AdjId::Saturation), mix_,
                          grade_, get(AdjId::Hue), get(AdjId::ColorizeHue),
                          get(AdjId::ColorizeAmount),
-                         filterValuesFromAdj(values_));
+                         filterValuesFromAdj(values_),
+                         makeLutPass(acquireLut(lut_).lut, get(AdjId::LutAmount)));
   }
 
 private:
@@ -571,6 +613,7 @@ private:
     MixValues mix{};
     ColorGrade grade;
     MaskSet masks;
+    LutRef lut;
     // Non-empty only for steps that carry their own History label (a preset,
     // a white-balance pick, an Auto Tone, a snapshot restore);
     // every other step is labelled by diffing it against the one before.
@@ -580,7 +623,7 @@ private:
   {
     ++version_; // every state change passes through here (or restore)
     return {values_, crop_, orient_, angle_, expand_,
-            curves_, mix_, grade_, masks_};
+            curves_, mix_, grade_, masks_, lut_};
   }
   void restore(const Snapshot &s)
   {
@@ -594,6 +637,15 @@ private:
     mix_ = s.mix;
     grade_ = s.grade;
     masks_ = s.masks;
+    lut_ = s.lut;
+  }
+
+  // A LutRef as the edit stores it: the name cleaned to a safe file-name stem
+  // (see sanitizeLutName), no LUT at all when nothing is left of it.
+  static LutRef cleanLut(const LutRef &r)
+  {
+    LutRef o{sanitizeLutName(r.name), r.hash};
+    return o.name.empty() ? LutRef{} : o;
   }
 
   // ---- History panel labels ----
@@ -613,6 +665,8 @@ private:
   {
     if (!b.label.empty())
       return b.label;
+    if (!(a.lut == b.lut))
+      return b.lut.empty() ? std::string("Remove LUT") : "LUT: " + b.lut.name;
     for (const auto &s : kAdjustmentSpecs)
     {
       const size_t k = static_cast<size_t>(s.id);
@@ -780,6 +834,7 @@ private:
   ColorGrade grade_;
   int lastGradeKey_ = -1; // control of the open Color Grading drag
   MaskSet masks_;
+  LutRef lut_; // the 3D LUT (empty = none)
   int lastMaskKey_ = -1;      // control of the open mask drag
   int origW_ = 0, origH_ = 0; // see setOriginalSize
   std::vector<Snapshot> history_{Snapshot{}};

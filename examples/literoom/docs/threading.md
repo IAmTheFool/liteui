@@ -1,6 +1,6 @@
 # Threading
 
-Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails, syncing settings onto other pictures, exporting a batch of pictures) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the seven workers, and the rules that keep it safe.
+Slow work (rendering a big photo, rotating it, decoding a file, running the AI model, making thumbnails, syncing settings onto other pictures, exporting a batch of pictures, previewing 3D LUTs) happens on background threads so the window never freezes. This page explains the one pattern almost all of it uses, the eight workers, and the rules that keep it safe.
 
 ## The problem "latest wins" solves
 
@@ -39,7 +39,7 @@ One qualification: the segmentation job keeps per-image state (the loaded model,
 
 This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs.
 
-## The seven workers
+## The eight workers
 
 | Worker | Job | Can it be cancelled? | Notes |
 |---|---|---|---|
@@ -50,8 +50,9 @@ This is also why the editor never edits images in place: a render job holds a po
 | **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
 | **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings), or apply one rating / flag / color label change to them (a batch rating). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
 | **Export** | Batch export: render each picked picture from its own saved edits and write it to one folder. | **Yes.** Stop Export drops the queue and abandons the picture in flight (checked between render blocks and every 64 rows of the straighten). | A FIFO like Thumbnail, with `cancel()`; see below. |
+| **LUT previews** | For each LUT file of the library: parse it and render the open picture, at thumbnail size, with that LUT. | **Yes.** A new job drops the old one and abandons the picture in flight (checked between render blocks). | A FIFO with generations: several results per job, only the newest job counts; see below. |
 
-The first four and Sync are `LatestWorker`s; Thumbnail and Export are FIFO queues. Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
+The first four and Sync are `LatestWorker`s; Thumbnail and Export are FIFO queues, and so is LUT previews (with a generation counter added, see below). Jobs that cannot be cancelled simply always return a value (a failure value, if need be).
 
 ### Virtual copies and the workers
 
@@ -97,7 +98,7 @@ It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not
 Batch export (File > Export Selected... / Export All Shown..., or the same buttons in the Export pane) writes many pictures to one folder with the Export pane's settings. The pictures are not open, so like Sync there is no `AdjustmentSet` to read. Unlike Sync, the job needs the *pixels* too, so `exportPicture()` (in `export_worker.hpp`) is the whole per-picture pipeline as a pure function of the path and the settings:
 
 1. Decode `vcImageOf(path)` and apply the EXIF rotation (what the decode worker does), so the picture is the same upright "original" the saved edits were made against.
-2. Read the picture's sidecar from disk into a **local** `AdjustmentSet` (`setOriginalSize`, then `loadJson`). The editor's set is never touched. A missing sidecar is normal (the picture exports unedited); one that exists but can't be used (damaged, newer, too big, written for a different size) **skips that picture with a reason**, where the editor would open it clean. Silently exporting an unedited picture in the middle of a batch would be worse.
+2. Read the picture's sidecar from disk into a **local** `AdjustmentSet` (`setOriginalSize`, then `loadJson`). The editor's set is never touched. A missing sidecar is normal (the picture exports unedited); one that exists but can't be used (damaged, newer, too big, written for a different size, or using a LUT that the LUT library no longer has) **skips that picture with a reason**, where the editor would open it clean. Silently exporting an unedited picture in the middle of a batch would be worse.
 3. The geometry worker's chain from the original: `orientImage`, `rotateArbitrary`, `cropImage`, then `renderWith(source, buildRenderParams())`. Intermediate pictures are released before the render so the peak stays near one picture.
 4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile` / `encodePngFile`). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
 
@@ -110,12 +111,27 @@ Batch export (File > Export Selected... / Export All Shown..., or the same butto
 - **The open picture is exported from its sidecar like any other**, so `startExportBatch` calls `flushSidecar()` first (and refuses to start mid-drag, like Sync). Its in-memory edits and the file then agree.
 - **It does not block opening pictures or editing**, unlike Sync, because it only *reads* sidecars (a rewrite is temp-file-then-rename, so a read sees the old or the new file, never half of one). A picture is exported with the edits it has on disk when the batch reaches it.
 - **Vignette and Grain need no cache and no lock.** `film_fx` keeps no state: the grain is a hash of the pixel position and the vignette a formula of it, both computed from the `RenderParams` copy the worker already holds. So the render worker, the batch export and the UI's fast preview can all run them at once, and they give the same bytes for the same picture (the preview renders a smaller picture, so its grain is the same kind but not the same pixels).
-- **Shared caches.** `renderWith` goes through the same neighbor-plane caches as the UI. They are keyed by pixel pointer, size and a fingerprint, so there is no stale hit, but a batch of large pictures pushes the open picture's blur planes out of the cache and its next slider drag may rebuild them.
+- **Shared caches.** `renderWith` goes through the same neighbor-plane caches as the UI. They are keyed by pixel pointer, size and a fingerprint, so there is no stale hit, but a batch of large pictures pushes the open picture's blur planes out of the cache and its next slider drag may rebuild them. The picture's 3D LUT is resolved on this thread through the LUT library's mutex-guarded cache (see [below](#the-lut-cache-is-the-one-shared-global)): a table the open picture already uses is usually cached, and a `clearLutCache()` on the UI thread while a batch runs only makes the worker read a table again.
 - `shutdown()` abandons the picture in flight (so closing the app mid-batch is quick) and joins.
+
+### The LUT preview worker streams results for the newest job
+
+The LUTs pane shows each LUT of the library applied to the open picture. That means reading and parsing up to 100 `.cube` files (a 65³ one takes on the order of 150 ms) and rendering a small picture for each, so it cannot run on the UI thread. `LutPreviewWorker` (`workers/lut_preview_worker.hpp`) is a FIFO like the thumbnail worker with the generation counter of `LatestWorker`, because the UI wants both *several results per request* and *only the newest request*:
+
+- **One job, many results.** A job is the picture, its look (a `RenderParams` copy) and the list of files. The worker posts one `LutPreviewResult` per file, in the order given, and `collect()` drains what has arrived. Each result carries the job's serial, so the UI can also drop a late one.
+- **A new job replaces the old one.** `submit()` bumps a generation, drops the waiting job and every uncollected result, and the picture in flight stops within a few rows (`renderWith` polls the generation like every other cancellable render). A result is pushed under the lock after re-checking the generation, so **nothing from a replaced job is delivered once `submit()` has returned**.
+- **Work is shared where it can be.** The picture is box-averaged to thumbnail size once per job, not once per LUT. Neighbor effects are left out of previews (invisible at that size), so the worker never builds or touches the shared detail-plane caches.
+- **Previews never use the LUT cache.** They call `loadLutFile`, which parses without caching: a hundred previews would otherwise push out the table the open picture is using. The worker only reads the job's own copies; it never touches `state` or the `AdjustmentSet`.
+- **Who polls, and when.** `pollLutPreviews()` (in `main.cpp`, once per frame from `flushPendingAdjust`) collects results at any time, and starts a new job only while the LUTs pane is open, a picture is open, nothing is being dragged, and the previews are stale: the folder's list changed, the picture changed, or its look changed. The pane's own changes (choosing a LUT, moving LUT Amount) do not make them stale.
+- `busy()` is true from `submit()` until the last result of the job was made. `cancel()` forgets the job. `shutdown()` abandons the picture in flight and joins.
+
+#### The LUT cache is the one shared global
+
+Besides the mask and detail-plane caches, one more global is shared between threads: the LUT library's table cache (`io/lut_library.hpp`). `acquireLut()` is called by `buildRenderParams()` on the UI thread and by the export worker (through `exportLoadEdits` and its own `buildRenderParams()`). A mutex guards the four-entry list; a miss is parsed *outside* the lock on the calling thread, and if two threads miss together both parse and the first to finish wins. Failures are cached too, so a missing file costs one check, not one per slider frame. The first use of a big table on the UI thread is the one place where a LUT costs noticeable time there; the render workers never read files, because `RenderParams` holds the finished table (a `shared_ptr` to an immutable `Lut3D`).
 
 ## How the UI picks results up
 
-The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()`, `collectSegmentJob()`, `collectSyncJob()` and `collectExportJob()`. Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
+The event loop sleeps until the OS gives it an event, and a worker finishing is not an OS event. So each worker's `notify` is wired in `main()` to `ui.wake()`. When the loop wakes, it polls and adopts any finished result. Once per frame, `flushPendingAdjust` calls `collectFullRender()`, `collectGeometryJob()`, `collectDecodeJob()`, `collectSegmentJob()`, `collectSyncJob()`, `collectExportJob()` and `pollLutPreviews()` (which also starts the next LUT preview batch when one is due). Thumbnails are collected separately: `collectThumbJobs()` runs from the filmstrip canvas's `canvasDirtySource`.
 
 Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 
@@ -125,7 +141,7 @@ Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 - **A drag cancels the full render.** `enterDrag()` invalidates the render worker, because the render in flight would be for values the drag is about to change.
 - **A result for something that no longer exists is dropped.** For example, a finished object segmentation for a mask you deleted in the meantime, or a thumbnail for a folder you have left.
 - **A new picture invalidates everything in flight.** When a decode lands, `adoptDecoded` invalidates the render, geometry and segmentation workers and bumps `imageSerial`, so nothing made for the old picture can be adopted over the new one.
-- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled, the sync worker's finishes the batch it is writing, and the export worker's abandons the picture it is rendering.
+- **Shutdown order matters.** `LiteUI::wake()` may only be called while the `LiteUI` object exists, so `main()` calls every worker's `shutdown()` right after `ui.run()` returns, before `ui` goes out of scope. The decode worker's `shutdown()` waits out a decode that is still running, because decodes can't be cancelled, the sync worker's finishes the batch it is writing, the export worker's abandons the picture it is rendering, and the LUT preview worker's does the same.
 - **Small photos skip all of this.** For small images the pass is faster than the hand-off, so the render is synchronous.
 
 ## When you add a worker

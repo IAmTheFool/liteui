@@ -8,6 +8,7 @@
 
 #include "color/color_grade.hpp"
 #include "color/color_mix.hpp"
+#include "color/lut3d.hpp"
 #include "core/pixel_math.hpp"
 
 constexpr float kHueShiftDegrees = 90.0f; // Hue slider +/-100 = +/- this many degrees
@@ -231,7 +232,8 @@ struct ColorPass
   MixLut mixLut;                               // only filled when `mix` is true
   bool grade = false;                          // Color Grading stage enabled (gradeLut is valid)
   GradeLut gradeLut{};                         // only filled when `grade` is true
-  FilterPass filters;                          // Filters block (filters.any = enabled), runs last
+  FilterPass filters;                          // Filters block (filters.any = enabled)
+  LutPass lut;                                 // 3D LUT (lut.any() = enabled), runs very last, after the filters
 };
 
 // UI values are the -100..+100 slider values (Colorize Hue is 0..360 degrees,
@@ -241,7 +243,8 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
                                const ColorGrade &grade,
                                float hueShift = 0.0f, float colorizeHue = 0.0f,
                                float colorizeAmount = 0.0f,
-                               const FilterValues &filters = FilterValues{})
+                               const FilterValues &filters = FilterValues{},
+                               const LutPass &lut = LutPass{})
 {
   // Sanitize first: NaN/inf -> 0, everything else clamped to its range. A NaN
   // here would otherwise reach static_cast<int> and then a table index.
@@ -265,7 +268,10 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   cp.hue = hueShift != 0.0f;
   cp.colorize = colorizeAmount > 0.0f;
   cp.filters = makeFilterPass(filters); // sanitizes its own values
+  if (lut.any())                         // makeLutPass already vetted the table and the amount
+    cp.lut = lut;
   cp.active = cp.mix || cp.grade || cp.hue || cp.colorize || cp.filters.any ||
+              cp.lut.any() ||
               temperature != 0.0f || tint != 0.0f || vibrance != 0.0f ||
               saturation != 0.0f;
   if (!cp.active)
@@ -394,6 +400,27 @@ inline WbPick solveWhiteBalance(float r, float g, float b)
   return out;
 }
 
+// A copy of `cp` whose 3D LUT is `lut` (an inactive `lut`, e.g. a default LutPass{}, removes
+// it). Everything else in the pass is kept exactly as it is, and the result is what
+// makeColorPass would have made had it been given this LUT in the first place: the LUT
+// previews (workers/lut_preview_worker.hpp) swap one LUT for another on the picture's own
+// RenderParams this way, without the sliders that made the pass. When nothing else is in
+// play, it is makeColorPass's own pass for a LUT alone, so previews match real renders to
+// the byte.
+inline ColorPass colorPassWithLut(const ColorPass &cp, const LutPass &lut)
+{
+  ColorPass o = cp;
+  o.lut = lut.any() ? lut : LutPass{};
+  const bool others = o.mix || o.grade || o.hue || o.colorize || o.filters.any ||
+                      o.gain[0] != 1.0f || o.gain[1] != 1.0f || o.gain[2] != 1.0f ||
+                      o.vibrance != 0.0f || o.saturation != 1.0f;
+  if (!others && o.lut.any())
+    return makeColorPass(0.0f, 0.0f, 0.0f, 0.0f, MixValues{}, ColorGrade{}, 0.0f, 0.0f,
+                         0.0f, FilterValues{}, o.lut);
+  o.active = others || o.lut.any();
+  return o;
+}
+
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched). Raw pointers
 // and no std::clamp/min/max calls in the loop, for the same Debug-build
 // reason as AdjustmentSet::applyTo.
@@ -412,6 +439,8 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
   const bool doGrade = cp.grade;
   const bool doFilt = cp.filters.any;
   const FilterPass &fp = cp.filters;
+  const bool doLut = cp.lut.any();
+  const LutPass &lp = cp.lut;
   const float *gdR = cp.gradeLut[0].data();
   const float *gdG = cp.gradeLut[1].data();
   const float *gdB = cp.gradeLut[2].data();
@@ -580,6 +609,13 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
     }
     if (doFilt)
       applyFilterPixel(fp, r, g, b); // the "look" block, still float
+    if (doLut)
+    { // last: the LUT sees the finished picture. Clamp first (it maps 0..255).
+      r = r > 0.0f ? (r < 255.0f ? r : 255.0f) : 0.0f;
+      g = g > 0.0f ? (g < 255.0f ? g : 255.0f) : 0.0f;
+      b = b > 0.0f ? (b < 255.0f ? b : 255.0f) : 0.0f;
+      applyLutPixel(lp, r, g, b);
+    }
     p[i] = toU8Clamped(r);
     p[i + 1] = toU8Clamped(g);
     p[i + 2] = toU8Clamped(b);

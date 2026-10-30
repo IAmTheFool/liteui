@@ -70,6 +70,7 @@
 #include "workers/latest_worker.hpp"
 #include "workers/thumb_worker.hpp"
 #include "workers/export_worker.hpp"
+#include "workers/lut_preview_worker.hpp"
 
 constexpr float kSamSoftness = 2.0f; // logit -> coverage steepness (edge softness)
 
@@ -137,6 +138,13 @@ constexpr size_t kPresetRows = 24;
 // Activity id of the Snapshots panel. It has kMaxSnapshots rows (sidecar.hpp);
 // the view tree is built once, like the preset and history lists.
 constexpr int kSnapshotsActivity = 11;
+
+// Activity id of the LUTs panel. Like the preset list, its view tree is built once, with a row
+// for every LUT the library can hold (kLutMaxFiles).
+constexpr int kLutsActivity = 12;
+constexpr size_t kLutRows = kLutMaxFiles;
+constexpr float kLutRowH = kFilmThumbH + 12.0f; // a row with its preview of the picture
+constexpr float kLutRowNamesH = 28.0f;          // a row with no picture open: just the name
 
 // Masks, UI side: tint-bitmap sizes and overlay handle sizes. The engine
 // constants live next to their algorithms: mask_geom.hpp (radii), mask_brush.hpp,
@@ -1770,6 +1778,323 @@ static void autosaveSidecar()
   saveSidecar();
 }
 
+// ---------------- 3D LUTs ----------------
+// The LUTs pane (see "LUTs" in main): the library's .cube files as a list, each with a preview of
+// the open picture under that LUT. The picture's own LUT is part of its edits
+// (AdjustmentSet::lut(), with LUT Amount as its strength); everything here is the UI around it.
+// The library and its cache are io/lut_library.hpp, the previews are
+// workers/lut_preview_worker.hpp.
+struct LutRow
+{
+  LutEntry entry;                           // name + path (hash and size arrive with the preview)
+  std::shared_ptr<const CanvasImage> thumb; // null until made, or with no picture open
+  std::string error;                        // why the file can't be used; "" if it can
+  std::string warning;                      // "may expect camera-log input"; "" if not
+  uint64_t paintVersion = 0;                // changes whenever what the row shows changes
+};
+static std::vector<LutRow> gLuts;
+static bool gLutsLoaded = false; // the folder was listed since the pane was last opened
+static uint64_t gLutPaintCounter = 0;
+static LutPreviewWorker lutPreviewWorker;
+static uint64_t gLutSerial = 0; // the job whose results are taken in
+
+// What the previews were made for: the picture's pixels and the edit state. A change of either
+// makes them stale. The LUTs pane's own changes (choosing a LUT, its amount) do not, because a
+// preview shows every LUT on the picture WITHOUT the one it has now (see lutPreviewsFollow).
+struct LutBuilt
+{
+  bool valid = false;
+  const CanvasImage *source = nullptr;
+  uint64_t version = 0;
+};
+static LutBuilt gLutBuilt;
+static uint64_t gLutCacheEpoch = 1; // bumped when the LUT cache is emptied (see currentLutStatus)
+
+// Empties the library's cache: a LUT file may have changed (an import, another picture).
+static void dropLutCache()
+{
+  clearLutCache();
+  ++gLutCacheEpoch;
+}
+
+// Lists the library folder afresh. Rows keep what is known about a file that is still there (its
+// preview, size, warning), and the previews are only made again when the list itself changed.
+static void refreshLuts()
+{
+  std::vector<std::string> oldPaths; // taken before the rows are moved from below
+  for (const LutRow &o : gLuts)
+    oldPaths.push_back(o.entry.path);
+  std::vector<LutRow> old = std::move(gLuts);
+  gLuts.clear();
+  for (LutEntry &e : listLutEntries(lutDir()))
+  {
+    if (gLuts.size() >= kLutRows)
+      break;
+    LutRow r;
+    r.entry = std::move(e);
+    r.paintVersion = ++gLutPaintCounter;
+    for (LutRow &o : old)
+      if (o.entry.path == r.entry.path)
+      {
+        r = std::move(o); // same file: keep its preview, hash and size (and its paint version)
+        break;
+      }
+    gLuts.push_back(std::move(r));
+  }
+  bool same = oldPaths.size() == gLuts.size();
+  for (size_t i = 0; same && i < gLuts.size(); ++i)
+    same = gLuts[i].entry.path == oldPaths[i];
+  gLutsLoaded = true;
+  if (!same)
+  { // a file came or went (an import, or one removed by hand): make the previews again
+    lutPreviewWorker.cancel();
+    gLutBuilt.valid = false;
+  }
+  state.markDirty();
+}
+
+// Where the open picture's LUT stands in the library. Looked up again only when the edit state or
+// the cache changed (the pane's text asks every frame).
+static LutStatus currentLutStatus()
+{
+  static uint64_t forVersion = 0, forEpoch = 0;
+  static LutStatus cached = LutStatus::None;
+  if (forVersion != state.adjust.version() || forEpoch != gLutCacheEpoch)
+  {
+    cached = state.adjust.lutStatus();
+    forVersion = state.adjust.version();
+    forEpoch = gLutCacheEpoch;
+  }
+  return cached;
+}
+
+// Says so in the status bar when the picture's LUT can't be used as it was chosen: gone from the
+// library, damaged, or a file that has changed since. True if it said something.
+static bool noteLutProblem()
+{
+  const std::string name = "\"" + state.adjust.lut().name + "\"";
+  switch (currentLutStatus())
+  {
+  case LutStatus::Missing:
+    setStatus("LUT " + name + " is not in the LUT library: the picture shows without it", true);
+    return true;
+  case LutStatus::Unreadable:
+    setStatus("LUT " + name + " can't be read: the picture shows without it", true);
+    return true;
+  case LutStatus::HashChanged:
+    setStatus("LUT " + name + " has changed since it was chosen", false);
+    return true;
+  default:
+    return false;
+  }
+}
+
+// "line 3: ..." out of "file.cube: line 3: ..." (the row already names the file).
+static std::string lutReason(const std::string &error)
+{
+  const size_t k = error.find(": ");
+  return k == std::string::npos ? error : error.substr(k + 2);
+}
+
+// The previews match the picture and its edits as they are right now.
+static bool lutPreviewsCurrent()
+{
+  return gLutBuilt.valid && gLutBuilt.source == state.source.get() &&
+         gLutBuilt.version == state.adjust.version();
+}
+// Call after a change made by the LUTs pane itself (`wasCurrent` = lutPreviewsCurrent() just before
+// it): the previews do not depend on it, so they stay current. An unrelated edit made in between
+// keeps them stale.
+static void lutPreviewsFollow(bool wasCurrent)
+{
+  if (wasCurrent)
+    gLutBuilt.version = state.adjust.version();
+}
+
+// The LUT Amount slider's setter. The previews show every LUT at 100 %, whatever the amount is, so
+// moving it keeps them current.
+static void setLutAmount(float v)
+{
+  const bool current = lutPreviewsCurrent();
+  state.adjust.set(AdjId::LutAmount, v);
+  lutPreviewsFollow(current);
+}
+
+// Once per frame (flushPendingAdjust): takes in the previews the worker has made, and, with the
+// pane open, starts a new batch when the list or the picture's look has changed since the last.
+static void pollLutPreviews()
+{
+  for (LutPreviewResult &r : lutPreviewWorker.collect())
+  {
+    if (r.serial != gLutSerial)
+      continue; // a batch that was replaced
+    for (LutRow &row : gLuts)
+      if (row.entry.path == r.path)
+      {
+        row.entry.hash = r.hash;
+        row.entry.size = r.size;
+        row.thumb = std::move(r.thumb);
+        row.error = std::move(r.error);
+        row.warning = std::move(r.warning);
+        row.paintVersion = ++gLutPaintCounter;
+        state.markDirty();
+        break;
+      }
+  }
+  if (state.activeActivity != kLutsActivity)
+    return;
+  if (!gLutsLoaded)
+    refreshLuts();
+  if (!state.original || !state.source || state.dragging || gLuts.empty())
+    return; // no picture: the list is just names
+  if (lutPreviewsCurrent())
+    return;
+  if (gLutBuilt.valid && gLutBuilt.source != state.source.get())
+    for (LutRow &row : gLuts)
+    { // another picture: what is shown is wrong until the new previews arrive
+      row.thumb.reset();
+      row.paintVersion = ++gLutPaintCounter;
+    }
+  LutPreviewJob job;
+  job.serial = ++gLutSerial;
+  job.base = state.previewBase ? state.previewBase : state.source;
+  job.params = state.adjust.buildRenderParams();
+  for (const LutRow &row : gLuts)
+    job.items.push_back(row.entry);
+  lutPreviewWorker.submit(std::move(job));
+  gLutBuilt = LutBuilt{true, state.source.get(), state.adjust.version()};
+  state.markDirty();
+}
+
+// Gives the picture the LUT of list row i: one undo step, "LUT: <name>" in History.
+static void applyLutRow(size_t i)
+{
+  if (state.dragging || !state.original || i >= gLuts.size())
+    return;
+  const LutRow &row = gLuts[i];
+  if (!row.error.empty())
+  {
+    setStatus("Can't use " + row.entry.name + ": " + lutReason(row.error), true);
+    return;
+  }
+  // The hash that goes into the edit is the file's own, as the library reads it now.
+  const LutResolved res = acquireLut(LutRef{row.entry.name, 0});
+  if (!res.lut)
+  {
+    setStatus("Couldn't read the LUT " + row.entry.name, true);
+    return;
+  }
+  const bool current = lutPreviewsCurrent();
+  if (!state.adjust.setLut(LutRef{row.entry.name, res.hash}))
+  {
+    setStatus("Already using the LUT " + row.entry.name, false);
+    return;
+  }
+  lutPreviewsFollow(current);
+  state.markAdjustDirty(); // re-render through the normal (drag-safe) path
+  state.markDirty();
+  setStatus("Applied LUT: " + row.entry.name, false);
+}
+
+// Takes the LUT off the picture (and its amount back to 0): one undo step, "Remove LUT".
+static void removeLut()
+{
+  if (state.dragging || !state.original)
+    return;
+  const bool current = lutPreviewsCurrent();
+  if (!state.adjust.setLut(LutRef{}))
+    return;
+  lutPreviewsFollow(current);
+  state.markAdjustDirty();
+  state.markDirty();
+  setStatus("Removed the LUT", false);
+}
+
+// Copies .cube files into the library (see importLutFile) and re-lists it; says what happened in
+// the status bar.
+static void importLutPaths(const std::vector<std::string> &files)
+{
+  if (files.empty())
+    return;
+  size_t ok = 0, bad = 0;
+  std::string lastName, firstError, logName;
+  for (const std::string &f : files)
+  {
+    LutEntry e;
+    std::string warning, err;
+    if (importLutFile(f, lutDir(), &e, &warning, &err))
+    {
+      ++ok;
+      lastName = e.name;
+      if (!warning.empty() && logName.empty())
+        logName = e.name;
+    }
+    else
+    {
+      ++bad;
+      if (firstError.empty())
+        firstError = err;
+    }
+  }
+  dropLutCache();
+  refreshLuts();
+  if (ok == 0)
+  {
+    setStatus("Couldn't import: " + firstError, true);
+    return;
+  }
+  if (!logName.empty()) // not a refusal: it is imported, it may just look wrong on this kind of picture
+  {
+    setStatus(logName + " may expect camera-log input and look wrong on this picture", true);
+    return;
+  }
+  std::string msg = ok == 1 ? "Imported LUT: " + lastName : "Imported " + std::to_string(ok) + " LUTs";
+  if (bad > 0)
+    msg += " (" + std::to_string(bad) + " skipped: " + firstError + ")";
+  setStatus(msg, bad > 0);
+}
+
+static void importLuts()
+{
+  importLutPaths(openFilesPicker("Import LUTs", {{"3D LUTs", "*.cube"}, {"All Files", "*.*"}}));
+}
+
+// The line under a row's name: the table size, or why the file can't be used.
+static std::string lutRowDetail(size_t i)
+{
+  if (i >= gLuts.size())
+    return std::string();
+  const LutRow &r = gLuts[i];
+  if (!r.error.empty())
+    return "Can't be read: " + lutReason(r.error);
+  std::string s;
+  if (r.entry.size > 0)
+    s = std::to_string(r.entry.size) + "\u00B3 points";
+  if (!r.warning.empty())
+    s += std::string(s.empty() ? "" : "  \u2022  ") + "may expect camera-log input";
+  return s;
+}
+
+// What the pane says about the picture's own LUT.
+static std::string lutCurrentText()
+{
+  const LutRef &r = state.adjust.lut();
+  if (r.empty())
+    return "No LUT on this picture";
+  switch (currentLutStatus())
+  {
+  case LutStatus::Missing:
+    return "LUT \"" + r.name + "\" is not in the library, so it has no effect";
+  case LutStatus::Unreadable:
+    return "LUT \"" + r.name + "\" can't be read, so it has no effect";
+  case LutStatus::HashChanged:
+    return "LUT: " + r.name + " (the file has changed since it was chosen)";
+  default:
+    return "LUT: " + r.name;
+  }
+}
+
+
 // Applies the picture's saved edits, if it has any. Call right after
 // adjust.reset() + setOriginalSize() and BEFORE syncSource(), so the saved
 // crop / rotation is what gets built.
@@ -1780,6 +2105,7 @@ static void loadSidecar()
   state.metaDirty = false;
   state.snapshots.clear(); // none unless the file has some
   state.snapshotsDirty = false;
+  dropLutCache(); // a LUT file may have changed since the last picture was open
   std::ifstream f(sidecarPath(state.imagePath),
                   std::ios::binary | std::ios::ate);
   if (!f)
@@ -1833,6 +2159,7 @@ static void loadSidecar()
                                              state.original->height);
   if (edits->dump() != sidecarNeutralEditsDump()) // a rating alone isn't "edits"
     setStatus("Restored saved edits", false);
+  noteLutProblem(); // a LUT the library no longer has (or has changed) is worth a word
 }
 
 // ---------------- Sync Settings: one look onto other pictures ----------------
@@ -1855,7 +2182,7 @@ static void loadSidecar()
 struct SyncJob
 {
   std::vector<std::string> paths;
-  Preset look; // only its values, curves, mix and grade are used
+  Preset look; // only its values, curves, mix, grade and LUT are used
   bool metaOnly = false; // rate / flag / label the pictures instead
   MetaPatch patch;       // ... with this
 };
@@ -1961,7 +2288,7 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
                                    &o.meta, &o.error)
                 : sidecarSyncLook(old, baseName(vcImageOf(path)), w, h, job.look.values,
                                   job.look.curves, job.look.mix, job.look.grade,
-                                  &text, &o.error);
+                                  job.look.lut, &text, &o.error);
         if (built)
           o.ok = writeTextAtomic(sidecarPath(path), text, &o.error);
       }
@@ -6772,6 +7099,104 @@ static View buildPresetRow(size_t i)
   return b;
 }
 
+ 
+// One row of the LUTs list: the open picture under that LUT, the LUT's name and a line about the
+// file. Click applies it (undoable). With no picture open a row is just the name.
+static View buildLutRow(size_t i)
+{
+  const auto withPicture = []
+  { return state.original != nullptr; };
+  const auto isCur = [i]
+  {
+    const LutRef &r = state.adjust.lut();
+    return i < gLuts.size() && !r.empty() && filmLower(r.name) == filmLower(gLuts[i].entry.name);
+  };
+
+  View b;
+  b.style.width = Size::full();
+  b.style.height = std::function<Size()>([withPicture]
+                                         { return Size::pixel(withPicture() ? kLutRowH : kLutRowNamesH); });
+  b.style.flexShrink = 0;
+  b.style.borderRadius = 4.0f;
+  b.style.direction = FlexDirection::Row;
+  b.style.alignItems = Align::Center;
+  b.style.gap = 10.0f;
+  b.style.padding = EdgeInsets{0, 10, 0, 6};
+  b.style.overflowX = Overflow::Hidden;
+  b.style.hoverColor = kColorActivityHover;
+  b.style.display = std::function<Display()>([i]
+                                             { return state.activeActivity == kLutsActivity &&
+                                                              i < gLuts.size()
+                                                          ? Display::Flex
+                                                          : Display::None; });
+  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color
+                                                   { return isCur() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.borderWidth = std::function<float()>([isCur]
+                                               { return isCur() ? 1.0f : 0.0f; });
+  b.style.borderColor = kColorDividerHover;
+  b.onClick = [i]
+  { applyLutRow(i); };
+
+  // The preview. A click on it bubbles up to the row.
+  View thumb;
+  thumb.isCanvas = true;
+  thumb.style.width = Size::pixel(kFilmThumbW);
+  thumb.style.height = Size::pixel(kFilmThumbH);
+  thumb.style.flexShrink = 0;
+  thumb.style.display = std::function<Display()>([withPicture]
+                                                 { return withPicture() ? Display::Flex : Display::None; });
+  thumb.onPaint = [i](CanvasContext &ctx)
+  {
+    ctx.setFillColor(kColorTrack);
+    ctx.fillRect(0, 0, kFilmThumbW, kFilmThumbH);
+    if (i < gLuts.size() && gLuts[i].thumb)
+    {
+      const CanvasImage &img = *gLuts[i].thumb;
+      ctx.drawImage(img, std::floor((kFilmThumbW - img.width) / 2.0f),
+                    std::floor((kFilmThumbH - img.height) / 2.0f));
+    }
+  };
+  // Repaint when this row's picture changed, or when the canvas has just been shown again.
+  auto last = std::make_shared<std::array<uint64_t, 3>>(std::array<uint64_t, 3>{~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}});
+  thumb.canvasDirtySource = [i, last, withPicture]() -> bool
+  {
+    const std::array<uint64_t, 3> now{i < gLuts.size() ? gLuts[i].paintVersion : 0,
+                                      withPicture() ? 1u : 0u,
+                                      state.activeActivity == kLutsActivity ? 1u : 0u};
+    if (now == *last)
+      return false;
+    *last = now;
+    return true;
+  };
+  b.addChild(std::move(thumb));
+
+  View col;
+  col.style.direction = FlexDirection::Column;
+  col.style.flexGrow = 1;
+  col.style.gap = 2.0f;
+  col.style.overflowX = Overflow::Hidden;
+
+  Text name;
+  name.label = std::function<std::string()>([i]() -> std::string
+                                            { return i < gLuts.size() ? gLuts[i].entry.name : std::string(); });
+  name.fontSize = 13.0f;
+  name.wrap = TextWrap::NoWrap;
+  name.color = kColorTextDark;
+  col.addChild(std::move(name));
+
+  Text detail;
+  detail.label = std::function<std::string()>([i]() -> std::string
+                                              { return lutRowDetail(i); });
+  detail.fontSize = 11.0f;
+  detail.wrap = TextWrap::NoWrap;
+  detail.color = kColorTextMuted;
+  col.addChild(std::move(detail));
+
+  b.addChild(std::move(col));
+  return b;
+}
+
+
 // One row of the Snapshots list. Click restores the snapshot (undoable).
 static View buildSnapshotRow(size_t i)
 {
@@ -7476,6 +7901,7 @@ static void flushPendingAdjust()
   collectSegmentJob();
   collectSyncJob();  // a finished Sync Settings batch, if any
   collectExportJob(); // progress / the end of a batch export, if any
+  pollLutPreviews();  // LUT previews: results in, a new batch when the picture or its look changed
   autosaveSidecar(); // a finished change, once the mouse is released
   if (!state.adjustDirty)
     return;
@@ -8476,6 +8902,8 @@ int main()
                        { ui.wake(); });
   exportWorker.setNotify([&ui]
                          { ui.wake(); });
+  lutPreviewWorker.setNotify([&ui]
+                             { ui.wake(); });
 
   // ---- Keyboard shortcuts ----
   // LiteUI's addShortcut is global: it fires whatever has focus, so these work
@@ -8598,6 +9026,7 @@ int main()
       {kSnapshotsActivity, "Snapshots", "S"},
       {1, "Adjust", "A"},
       {kPresetsActivity, "Presets", "P"},
+      {kLutsActivity, "LUTs", "L"},
       {4, "Curve", "~"},
       {5, "Color Mix", "M"},
       {6, "Color Grading", "G"},
@@ -9096,6 +9525,9 @@ int main()
       [] { return state.source != nullptr && !state.dragging; }));
   for (const auto &spec : kAdjustmentSpecs)
   {
+    // LUT Amount is the LUTs pane's slider (it only scales the chosen LUT).
+    if (spec.id == AdjId::LutAmount)
+      continue;
     if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
     {
       adjustPane.addChild(sectionLabel("Color"));
@@ -9151,7 +9583,7 @@ int main()
 
   Text presetsHint;
   presetsHint.label = std::string(
-      "A preset is a look: sliders, curves, Color Mix and Color Grading. "
+      "A preset is a look: sliders, curves, Color Mix, Color Grading and the LUT. "
       "Crop, rotation and masks are not included. Applying one replaces the "
       "current look and can be undone.");
   presetsHint.fontSize = 12.0f;
@@ -9212,6 +9644,92 @@ int main()
   presetsPane.addChild(std::move(presetsFolder));
 
   sidebar.addChild(std::move(presetsPane));
+
+  // -- "LUTs" pane: 3D color lookup tables (.cube files made for ordinary sRGB / Rec.709
+  // pictures). Click one to apply it (one undo step); LUT Amount sets its strength. Import copies
+  // files into the library folder. Each row previews the open picture under that LUT (made on a
+  // background worker; see pollLutPreviews). The list is re-read each time the pane is opened.
+  View lutsPane;
+  lutsPane.style.width = Size::full();
+  lutsPane.style.direction = FlexDirection::Column;
+  lutsPane.style.gap = 6.0f;
+  lutsPane.style.display = std::function<Display()>(
+      []
+      {
+        static bool wasShown = false;
+        const bool shown = state.activeActivity == kLutsActivity;
+        if (shown && !wasShown)
+          refreshLuts();
+        wasShown = shown;
+        return shown ? Display::Flex : Display::None;
+      });
+
+  Text lutsHint;
+  lutsHint.label = std::string(
+      "A LUT remaps colors. Click one to apply it to this picture; it can be undone. LUT Amount "
+      "sets how much of it is used. Presets, Copy / Paste Settings and Sync Settings carry the LUT "
+      "too. Made for camera-log footage? It may look wrong here.");
+  lutsHint.fontSize = 12.0f;
+  lutsHint.color = kColorTextMuted;
+  lutsHint.style.margin = EdgeInsets{0, 0, 6, 0};
+  lutsPane.addChild(std::move(lutsHint));
+
+  lutsPane.addChild(sidebarButton("Import LUT...", importLuts, {}, true));
+
+  Text lutsCurrent;
+  lutsCurrent.label = std::function<std::string()>([]() -> std::string
+                                                   { return lutCurrentText(); });
+  lutsCurrent.fontSize = 13.0f;
+  lutsCurrent.color = kColorTextDark;
+  lutsCurrent.style.margin = EdgeInsets{6, 0, 0, 0};
+  lutsPane.addChild(std::move(lutsCurrent));
+
+  {
+    SliderSpec s;
+    s.name = "LUT Amount";
+    s.lo = 0.0f;
+    s.hi = 100.0f;
+    s.get = []
+    { return state.adjust.get(AdjId::LutAmount); };
+    s.set = [](float v)
+    { setLutAmount(v); };
+    s.format = [](float v)
+    { return std::to_string(static_cast<int>(std::lround(v))); };
+    View amountBox;
+    amountBox.style.width = Size::full();
+    amountBox.style.direction = FlexDirection::Column;
+    amountBox.style.display = std::function<Display()>([]
+                                                       { return state.adjust.lut().empty() ? Display::None : Display::Flex; });
+    amountBox.addChild(buildSliderRow(s));
+    lutsPane.addChild(std::move(amountBox));
+  }
+  lutsPane.addChild(sidebarButton(
+      "Remove LUT", removeLut, {}, false,
+      []
+      { return !state.adjust.lut().empty() && !state.dragging; }));
+
+  Text lutsEmpty;
+  lutsEmpty.label = std::string("No LUTs yet. Import a .cube file.");
+  lutsEmpty.fontSize = 12.0f;
+  lutsEmpty.color = kColorTextMuted;
+  lutsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
+  lutsEmpty.style.display = std::function<Display()>(
+      []
+      { return gLuts.empty() ? Display::Flex : Display::None; });
+  lutsPane.addChild(std::move(lutsEmpty));
+
+  for (size_t i = 0; i < kLutRows; ++i)
+    lutsPane.addChild(buildLutRow(i));
+
+  Text lutsFolder;
+  lutsFolder.label = "LUT library: " + lutDir();
+  lutsFolder.fontSize = 11.0f;
+  lutsFolder.color = kColorTextMuted;
+  lutsFolder.style.margin = EdgeInsets{8, 0, 0, 0};
+  lutsPane.addChild(std::move(lutsFolder));
+
+  sidebar.addChild(std::move(lutsPane));
+
 
   // -- "Curve" pane: tone curves — RGB (master) plus per-channel R, G, B, one
   // tab each. Click the plot to add a point, drag to move it, right-click a
@@ -10181,8 +10699,8 @@ int main()
   for (const auto &spec : kAdjustmentSpecs)
   {
     // Vignette and Grain are global only (renderWith applies them after the
-    // masks), so a mask gets no sliders for them.
-    if (spec.stage == AdjustmentSpec::Stage::Effects)
+    // masks), and so is the 3D LUT: a mask gets no sliders for them.
+    if (spec.stage == AdjustmentSpec::Stage::Effects || spec.id == AdjId::LutAmount)
       continue;
     if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
     {
@@ -11190,5 +11708,6 @@ int main()
   segmentWorker.shutdown();
   syncWorker.shutdown(); // ditto (finishes the batch it is writing)
   exportWorker.shutdown(); // ditto (abandons the picture it is rendering)
+  lutPreviewWorker.shutdown(); // ditto
   return 0;
 }

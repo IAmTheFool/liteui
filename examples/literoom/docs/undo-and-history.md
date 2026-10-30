@@ -10,6 +10,7 @@ The edit state is everything needed to reproduce the picture from the original:
 - the four tone curves (RGB, R, G, B)
 - the Color Mixer values (24 sliders)
 - the Color Grading wheels, blending and balance
+- the 3D LUT (a reference: a library name and a hash of the file; how strongly it is used is the `LUT Amount` slider, one of the slider values above)
 - the committed crop, the 90° orientation (turns and flip), the straighten angle and the corner mode
 - the list of masks (shapes, brush strokes, object bitmaps, and each mask's own sliders)
 
@@ -17,7 +18,7 @@ A picture's **rating, flag and color label** are not edits either. They are kept
 
 **Named snapshots** are not edits either: they are kept beside the edit state, saved in the sidecar, and adding or deleting one has no undo step. Restoring one *is* an edit (see [Named snapshots](#named-snapshots)).
 
-A **preset** is not another kind of edit. It is a way of setting the first four groups (sliders, curves, Color Mixer, Color Grading) in one go; see [Presets](#presets) below.
+A **preset** is not another kind of edit. It is a way of setting the look (sliders, curves, Color Mixer, Color Grading and the LUT) in one go; see [Presets](#presets) below.
 
 ## Snapshots
 
@@ -25,7 +26,7 @@ The history is a list of **snapshots**, each a complete copy of the edit state a
 
 Why whole copies rather than "deltas"? It is simple and robust: restoring a step is a plain assignment, and nothing can drift out of sync. Object bitmaps, the largest items, are immutable and shared by pointer (and compared by an id), so copying a mask list does not copy them.
 
-- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)), a white-balance pick (see [White balance picker](#white-balance-picker)), an Auto Tone (see [Auto Tone](#auto-tone)) and a snapshot restore (see [Named snapshots](#named-snapshots)). It is not part of the edit state: it is never compared with another snapshot and never restored.
+- A snapshot also carries an optional text `label`. It is empty for every step except a preset step (see [Presets](#presets)), a white-balance pick (see [White balance picker](#white-balance-picker)), an Auto Tone (see [Auto Tone](#auto-tone)), a snapshot restore (see [Named snapshots](#named-snapshots)) and a LUT choice or removal (see [3D LUT](#3d-lut)). It is not part of the edit state: it is never compared with another snapshot and never restored.
 - Up to **200** steps can be undone (`kMaxUndoSteps`). Older ones are dropped as new edits arrive.
 - A new edit after an undo **discards the redo tail**, like most editors.
 - Opening a picture (`reset()`) or loading saved edits (`loadJson()`) starts a fresh history containing only the starting state. **The history itself is not saved to disk.**
@@ -73,8 +74,9 @@ Where the UI *does* know a gesture ended, it says so: `endCurveEdit()`, `endGrad
 | `setMasks(masks, key)` | See keys above. |
 | `setWhiteBalance(temp, tint)` | Always its own step, and it ends any drag in progress. Sets Temperature and Tint together; see [White balance picker](#white-balance-picker). |
 | `setAutoTone(exp, contrast, whites, blacks)` | Always its own step, and it ends any drag in progress. Sets Exposure, Contrast, Whites and Blacks together; see [Auto Tone](#auto-tone). |
-| `applyPreset(preset)` | Always its own step, and it ends any drag in progress. Replaces the sliders, curves, Color Mixer and Color Grading together; see [Presets](#presets). |
-| `restoreEdits(edits, name)` | Always its own step, and it ends any drag in progress. Replaces **everything** (sliders, curves, Mixer, grading, crop, orientation, angle, corner mode and masks); see [Named snapshots](#named-snapshots). |
+| `setLut(ref)` | Always its own step, and it ends any drag in progress. Chooses or removes the 3D LUT, and moves `LUT Amount` with it, in the same step; see [3D LUT](#3d-lut). |
+| `applyPreset(preset)` | Always its own step, and it ends any drag in progress. Replaces the sliders, curves, Color Mixer, Color Grading and the LUT together; see [Presets](#presets). |
+| `restoreEdits(edits, name)` | Always its own step, and it ends any drag in progress. Replaces **everything** (sliders, curves, Mixer, grading, the LUT, crop, orientation, angle, corner mode and masks); see [Named snapshots](#named-snapshots). |
 
 All of them except `set` skip the step if nothing actually changed (the new value compares equal to the old), so no-op edits never clutter the history. `set(id, value)` has no such check: a call with an unchanged value still overwrites the current step (same slider) or appends a new one (a different control), and it still bumps `version()`.
 
@@ -82,7 +84,7 @@ All of them except `set` skip the step if nothing actually changed (the new valu
 
 Labels are not stored with the steps. Instead, each step is **described by comparing it with the step before it** (`describeStep`). This has two benefits: the setters need to know nothing about labels, and a coalesced drag that overwrites a step can never leave a stale label behind.
 
-`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step, a white-balance pick, an Auto Tone and a snapshot restore have one), that text is the label and nothing is diffed. Otherwise it checks, in order: global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
+`describeStep` first looks at the step's own `label`: if it is not empty (only a preset step, a white-balance pick, an Auto Tone, a snapshot restore and a LUT choice or removal have one), that text is the label and nothing is diffed. Otherwise it checks, in order: a changed LUT reference ("LUT: Warm" or "Remove LUT"; a safety net, because `setLut` always stores a label), global sliders ("Exposure +20"), orientation ("Rotate / Flip"), straighten angle, corner mode, crop, tone curves, Color Mixer ("Color Mix: Blue Hue +10", or "Color Mix: Reset" if several changed), Color Grading, then masks (add, delete, reorder, and per-mask changes). The first difference found names the step. Step 0 is always "Original".
 
 The per-mask labels are `Mask <n>: ` followed by `Rename`, a slider and its value ("Mask 2: Exposure +30"), `Amount <n>`, `Color Mix`, `Color Grading`, `Curve`, `On` / `Off`, `Invert`, `Parts` (a part was added or removed), or `Edit`. A change to a shape itself (feather, radius, a brush stroke, an object selection) has no label of its own and shows as `Mask <n>: Edit`.
 
@@ -92,12 +94,12 @@ Labels are cached and rebuilt only when the version changes, so polling them eve
 
 ## Presets
 
-A preset is a saved look: the slider values, the four tone curves, the Color Mixer values and Color Grading. Crop, orientation, straighten angle and masks are **not** part of it. The file format and helpers are in `preset.hpp` (see [headers.md](headers.md#presethpp)).
+A preset is a saved look: the slider values, the four tone curves, the Color Mixer values, Color Grading and the 3D LUT (by name and hash). Crop, orientation, straighten angle and masks are **not** part of it. The file format and helpers are in `preset.hpp` (see [headers.md](headers.md#presethpp)).
 
 `AdjustmentSet` has two calls for them:
 
 - `currentPreset(name)` copies the current look into a `Preset`. It does not change the history or `version()`.
-- `applyPreset(preset)` **replaces** the whole look with the preset's. A slider the preset leaves at 0 is reset to 0; it is not left as it was. Crop, orientation, angle and masks stay as they are. Slider values are clamped again on the way in.
+- `applyPreset(preset)` **replaces** the whole look with the preset's. A slider the preset leaves at 0 is reset to 0; it is not left as it was. Crop, orientation, angle and masks stay as they are. The LUT is replaced too: a preset **without** one clears the picture's LUT (its amount is one of the slider values the preset sets, so it goes back to the preset's value, 0 if the preset has none). Slider values are clamped again on the way in.
 
 How it fits the history:
 
@@ -147,7 +149,7 @@ It is a normal edit afterwards: it bumps `version()`, is autosaved to the sideca
 
 ## Named snapshots
 
-A **named snapshot** is a saved, named copy of the whole edit state (a `SidecarEdits`: sliders, curves, Color Mixer, Color Grading, crop, orientation, straighten angle, corner mode **and masks**). It is the user-facing cousin of the history's internal snapshots, and it is stored differently: not in the undo history but in the picture's sidecar (see [sidecar-format.md](sidecar-format.md#named-snapshots)), so it survives closing the picture. The list itself lives in `main.cpp` (`state.snapshots`), not in `AdjustmentSet`, for the same reason a rating does: it is not an edit.
+A **named snapshot** is a saved, named copy of the whole edit state (a `SidecarEdits`: sliders, curves, Color Mixer, Color Grading, crop, orientation, straighten angle, corner mode, masks **and the 3D LUT**). It is the user-facing cousin of the history's internal snapshots, and it is stored differently: not in the undo history but in the picture's sidecar (see [sidecar-format.md](sidecar-format.md#named-snapshots)), so it survives closing the picture. The list itself lives in `main.cpp` (`state.snapshots`), not in `AdjustmentSet`, for the same reason a rating does: it is not an edit.
 
 `AdjustmentSet` has two calls for them:
 
@@ -164,6 +166,17 @@ How `restoreEdits` fits the history:
 - **The picture must be refreshed.** Because geometry can change, the caller does what it does after an undo: `applySnapshotEntry` calls `updateImageFromAdjustments()`, which also hands a crop or rotation change to the geometry worker, and sets its status message afterwards (that function clears the status).
 
 Adding or deleting a snapshot only changes `state.snapshots` and sets `state.snapshotsDirty`, so autosave writes the sidecar. It adds no step, no History label and no `version()` bump. The snapshot list is replaced when another picture (or another virtual copy) is opened.
+
+## 3D LUT
+
+The picture's LUT is look data that is not a slider: a `LutRef` (a library name and a hash of the file's bytes) held by `AdjustmentSet` next to the masks, in every history snapshot, in presets and in named snapshots. How strongly it is used is the ordinary `LUT Amount` slider, which coalesces like any other slider. `setLut(ref)` is the one call that changes the reference:
+
+- **One step, always its own.** It goes through `pushStep()`, so it ends any drag in progress, and its label is stored in the step: `LUT: <name>` or `Remove LUT`. A drag of the amount slider right after it is a new step (`LUT Amount +60`), never folded into the choice.
+- **The amount moves with the choice, in the same step.** Choosing a LUT while the amount is 0 sets it to 100; choosing another one while an amount is set keeps that amount; removing the LUT sets it back to 0. One undo of a choice therefore brings back the old LUT *and* the old amount, and a picture without a LUT is always untouched.
+- **No-op calls add nothing.** The same LUT at the same amount returns false, adds no step and does not bump `version()`.
+- **Names are cleaned on the way in** (`sanitizeLutName`) by `setLut`, `applyPreset` and `restoreEdits` alike, so an unsafe name cannot reach a history step, a sidecar or a preset by any path.
+- **Undo never touches the library.** A step stores only the reference. If the file is missing when you undo to a step that uses it, the picture shows without the look and the LUTs pane says why. The library's answer (`lutStatus()`) is not part of the edit state and is never saved.
+- **The LUTs pane's previews are not edit state either.** They are rebuilt when the picture or its look changes, but not for a LUT choice or an amount change made by the pane itself, because a preview shows every LUT on the picture *without* the one it has now (see [threading.md](threading.md#the-lut-preview-worker-streams-results-for-the-newest-job)).
 
 ## The version counter
 
