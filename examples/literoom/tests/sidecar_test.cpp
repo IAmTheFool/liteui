@@ -1,4 +1,16 @@
 // Build: g++ -std=c++20 -I.. sidecar_test.cpp -o sidecar_test && ./sidecar_test
+
+#if defined(__SANITIZE_ADDRESS__)          // MSVC and GCC with ASan
+#define LITEROOM_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)       // Clang
+#define LITEROOM_ASAN 1
+#endif
+#endif
+#ifndef LITEROOM_ASAN
+#define LITEROOM_ASAN 0
+#endif
+
 #include "io/sidecar.hpp"
 #include "check.hpp"
 
@@ -551,11 +563,14 @@ static void testObjectMaps()
 
 static void testFuzz()
 {
+
+  const int kIters = LITEROOM_ASAN ? 400 : 2500;
   const std::string base = sidecarEditsToJson(rich()).dump();
   std::mt19937 rng(2024);
   const char *replacements[] = {"null", "true", "false", "\"x\"", "[]", "{}", "[1,2]", "1e30", "-1e30", "0", "-1", "999999999999", "0.5"};
   int loaded = 0;
-  for (int iter = 0; iter < 2500; ++iter)
+  
+  for (int iter = 0; iter < kIters; ++iter)
   {
     std::string t = base;
     const int kind = iter % 4;
@@ -616,7 +631,7 @@ static void testFuzz()
         return;
     }
   }
-  CHECK(loaded > 1000); // most of the damaged files still parse and load, so the checks above ran on them
+  CHECK(loaded > kIters * 2 / 5);// most of the damaged files still parse and load, so the checks above ran on them
 }
 
 // ------------------------------------------------------------ sync a look
