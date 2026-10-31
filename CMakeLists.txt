@@ -94,7 +94,9 @@ else()
 
     # ------------------------------------------------------------------
     # Register `regen-protocols` FIRST, before the existence check below,
-    # so a fresh checkout can configure far enough to run it.
+    # so a fresh checkout can configure far enough to run it. The output
+    # directory is created by the target itself, so configuring never
+    # writes into the source tree.
     # ------------------------------------------------------------------
     find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
     pkg_get_variable(_liteui_wp_dir wayland-protocols pkgdatadir)
@@ -102,8 +104,8 @@ else()
     if(WAYLAND_SCANNER_EXECUTABLE AND _liteui_wp_dir)
         set(_xdg_shell_xml      "${_liteui_wp_dir}/stable/xdg-shell/xdg-shell.xml")
         set(_xdg_decoration_xml "${_liteui_wp_dir}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml")
-        file(MAKE_DIRECTORY ${LITEUI_PROTO_DIR})
         add_custom_target(regen-protocols
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${LITEUI_PROTO_DIR}
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_xdg_shell_xml}      ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_xdg_shell_xml}      ${LITEUI_PROTO_DIR}/xdg-shell-client-protocol.h
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_xdg_decoration_xml} ${LITEUI_PROTO_DIR}/xdg-decoration-protocol.c
@@ -177,21 +179,59 @@ else()
         PkgConfig::XKBCOMMON
         PkgConfig::PNG
         PkgConfig::JPEG
-        util  #TODO :: used in codeeditor for terminal needs to move there
     )
 endif()
 
+# ------------------------------------------------------------------------
+# Everything below is TOP-LEVEL ONLY: projects that pull liteui in via
+# add_subdirectory/FetchContent never download Catch2, build tests or build
+# examples.
+# ------------------------------------------------------------------------
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    # Tests are configured BEFORE examples so that Catch2 and enable_testing()
-    # exist when an example registers its own tests. Examples are optional
-    # about this: one without a tests/ folder simply registers none.
-    option(LITEUI_BUILD_TESTS "Build the liteui unit tests (Catch2)" ON)
+    option(LITEUI_BUILD_TESTS    "Build the liteui unit tests (Catch2)" ON)
+    option(LITEUI_SANITIZE       "Build the tests with AddressSanitizer (UBSan on GCC/Clang)" OFF)
+    option(LITEUI_BUILD_EXAMPLES "Build the liteui example programs" ON)
+
+    # Tests are configured BEFORE examples so that Catch2, enable_testing()
+    # and liteui_add_test() exist when an example registers its own tests.
+    # Examples are optional about this: one without a tests/ folder simply
+    # registers none.
     if(LITEUI_BUILD_TESTS)
         include(CTest)   # also generates DartConfiguration.tcl for IDE/`ctest -T` runs
+        include(FetchContent)
+
+        # Catch2 is looked up HERE, in the root, so every subdirectory added
+        # below (tests/ and the examples) sees the same Catch2::Catch2WithMain.
+        # An imported target from find_package is only visible in the directory
+        # that found it and its children, so finding it in tests/ would hide it
+        # from examples/.
+        #
+        # 1) Prefer an installed Catch2 v3 (apt install catch2, vcpkg, conan, ...).
+        find_package(Catch2 3 QUIET)
+
+        # 2) Otherwise download a pinned release.
+        if(NOT Catch2_FOUND)
+            message(STATUS "liteui tests: Catch2 not installed, fetching v3.8.1")
+            FetchContent_Declare(
+                Catch2
+                GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+                GIT_TAG        v3.8.1
+            )
+            FetchContent_MakeAvailable(Catch2)
+            # Provides catch_discover_tests() when Catch2 is built from source.
+            list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+        endif()
+        include(Catch)
+
+        # liteui_add_test() and the sanitizer helpers, shared by tests/ and
+        # every example (see cmake/LiteuiTests.cmake).
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+        include(LiteuiTests)
+        liteui_prepare_sanitizers()
+
         add_subdirectory(tests)
     endif()
 
-    option(LITEUI_BUILD_EXAMPLES "Build the liteui example programs" ON)
     if(LITEUI_BUILD_EXAMPLES)
         add_subdirectory(examples)
     endif()

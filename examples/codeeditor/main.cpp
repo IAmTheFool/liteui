@@ -1,3 +1,4 @@
+#define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
 
 #include <algorithm>

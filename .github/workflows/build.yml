@@ -1,32 +1,70 @@
-name: Build examples
+name: Build and test
+
+# Builds every example and the tests through the CMake presets (the same ones
+# you use locally), then runs ctest. Also callable from other workflows
+# (release.yml uses it as its gate).
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'screenshots/**'
+      - 'todo.txt'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'screenshots/**'
+      - 'todo.txt'
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A new push to the same branch/PR cancels the run still in progress.
+# The group name is literal (not github.workflow) so that, when release.yml
+# calls this workflow next to single-header-check.yml, the two don't share a
+# group and cancel each other.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    # Legs marked experimental can fail without failing the workflow. Remove the
+    # flag from a leg once it has been green for a while.
+    continue-on-error: ${{ matrix.experimental == true }}
+
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
+        include:
+          - { name: "Linux / GCC Debug",           os: ubuntu-latest,  preset: gcc-debug }
+          - { name: "Linux / GCC Release",         os: ubuntu-latest,  preset: gcc-release }
+          - { name: "Linux / GCC Debug + ASan",    os: ubuntu-latest,  preset: gcc-debug-asan,  experimental: true }
+          - { name: "Windows / MSVC Debug",        os: windows-latest, preset: msvc-debug }
+          - { name: "Windows / MSVC Release",      os: windows-latest, preset: msvc-release }
+          - { name: "Windows / MSVC Debug + ASan", os: windows-latest, preset: msvc-debug-asan, experimental: true }
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # liteui's CMakeLists.txt vendors the Wayland protocol bindings
-      # under platform/wayland-protocols/, so no wayland-scanner /
-      # wayland-protocols package is needed here -- only the runtime
-      # dev packages the header itself #includes.
+      # liteui's CMakeLists.txt vendors the Wayland protocol bindings under
+      # platform/wayland-protocols/, so no wayland-scanner / wayland-protocols
+      # package is needed here -- only the runtime dev packages the header
+      # itself #includes. ninja-build: the presets use the Ninja generator.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ninja-build \
             pkg-config \
             libwayland-dev \
             libcairo2-dev \
@@ -37,17 +75,20 @@ jobs:
             libpng-dev \
             libjpeg-dev
 
+      # The Windows presets name cl.exe, so the compiler must be on PATH.
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        run: cmake --preset ${{ matrix.preset }}
 
-      # windows-latest's default generator is a multi-config Visual
-      # Studio generator, hence --config here; on Linux this flag is a
-      # harmless no-op for the single-config Unix Makefiles generator.
-      - name: Build every example
-        run: cmake --build build --config Release --parallel
+      - name: Build everything (examples and tests)
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
 
-      - name: List built binaries (sanity check)
-        shell: bash
-        run: |
-          find build -type f \( -iname "*.exe" -o -perm -u+x \) 2>/dev/null \
-            | grep -v -E "CMakeFiles|\.(a|lib|o|obj)$" || true
+      # The golden render test compares float fingerprints recorded with one
+      # specific compiler + configuration (tests/golden/render_<compiler>_<config>.txt).
+      # A runner's compiler version differs from yours, so it is left out here
+      # until CI-specific goldens are recorded.
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} -LE golden

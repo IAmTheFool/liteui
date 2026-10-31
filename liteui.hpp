@@ -23,6 +23,9 @@
 #ifndef LITEUI_HPP_INCLUDED
 #define LITEUI_HPP_INCLUDED
 
+#define LITEAUDIO_VERSION_MAJOR 0
+#define LITEAUDIO_VERSION_MINOR 6
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -6512,15 +6515,15 @@ private:
 // ---------------- Layout algorithm (flexbox subset) ----------------
 //
 // Two passes per subtree:
-//  1. measureNatural() — bottom-up. Resolves a node's own border-box size:
+//  Pass 1. measureNatural() — bottom-up. Resolves a node's own border-box size:
 //     Fixed/Percentage/Full resolve directly against the parent's available
 //     space; Fit sums/maxes its children's own natural sizes.
-//  2. placeNode() — top-down. Given a node's already-decided final box (from
-//     step 1 at the root, or from the parent's flex distribution below it),
+//  Pass 2. placeNode() — top-down. Given a node's already-decided final box (from
+//     pass 1 at the root, or from the parent's flex distribution below it),
 //     computes each child's basis size, distributes leftover space via
 //     flexGrow/flexShrink, positions via justifyContent/alignItems, and
 //     recurses.
-//
+
 
 // Known limitations (fine for v1, revisit if needed): percentages resolve to
 // 0 when an ancestor's size is itself Fit (indefinite). flex-wrap only
@@ -9816,12 +9819,11 @@ private:
       intervalHandleToFd_; // handle -> fd, for removeInterval
 
   // Key-repeat: Wayland does NOT auto-repeat key events for you (unlike
-  // Win32) — repeat_info tells you the rate/delay and you're expected to
-  // drive your own timer. Implemented with a POSIX timerfd folded into
-  // the event loop (see run()'s poll() rewrite in step 7). Until step 7
-  // is applied, holding a key down will fire onKeyDown once and then
-  // nothing until release — everything else in this step works fine
-  // without it.
+  // Win32). The compositor's repeat_info event gives the rate and delay,
+  // and the client drives its own timer. Here that is a POSIX timerfd,
+  // armed on key press (armRepeatTimer) and polled in run() alongside
+  // the Wayland display fd; each expiry calls fireRepeatIfDue(), which
+  // re-dispatches the held key.
   int repeatTimerFd_ = -1;
   uint32_t repeatKeycode_ = 0;
   int32_t repeatRateHz_ = 0; // 0 = repeat disabled by compositor

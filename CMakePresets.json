@@ -59,6 +59,15 @@
       }
     },
     {
+      "name": "msvc-debug-asan",
+      "displayName": "MSVC Debug + AddressSanitizer",
+      "inherits": "msvc-debug",
+      "binaryDir": "${sourceDir}/build/debug-asan",
+      "cacheVariables": {
+        "LITEUI_SANITIZE": "ON"
+      }
+    },
+    {
       "name": "linux-base",
       "hidden": true,
       "generator": "Ninja",
@@ -107,70 +116,46 @@
       "cacheVariables": {
         "LITEUI_PROFILE": "ON"
       }
+    },
+    {
+      "name": "gcc-debug-asan",
+      "displayName": "GCC Debug + AddressSanitizer / UBSan",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/debug-asan",
+      "cacheVariables": {
+        "LITEUI_SANITIZE": "ON"
+      }
     }
   ],
   "buildPresets": [
-    {
-      "name": "debug",
-      "configurePreset": "msvc-debug"
-    },
-    {
-      "name": "release",
-      "configurePreset": "msvc-release"
-    },
-    {
-      "name": "release-profile",
-      "configurePreset": "msvc-release-profile"
-    },
-    {
-      "name": "debug-profile",
-      "configurePreset": "msvc-debug-profile"
-    },
-    {
-      "name": "gcc-debug-build",
-      "configurePreset": "gcc-debug"
-    },
-    {
-      "name": "gcc-release-build",
-      "configurePreset": "gcc-release"
-    },
-    {
-      "name": "gcc-debug-profile-build",
-      "configurePreset": "gcc-debug-profile"
-    },
-    {
-      "name": "gcc-release-profile-build",
-      "configurePreset": "gcc-release-profile"
-    }
+    { "name": "msvc-debug",           "configurePreset": "msvc-debug" },
+    { "name": "msvc-release",         "configurePreset": "msvc-release" },
+    { "name": "msvc-release-profile", "configurePreset": "msvc-release-profile" },
+    { "name": "msvc-debug-profile",   "configurePreset": "msvc-debug-profile" },
+    { "name": "msvc-debug-asan",      "configurePreset": "msvc-debug-asan" },
+    { "name": "gcc-debug",            "configurePreset": "gcc-debug" },
+    { "name": "gcc-release",          "configurePreset": "gcc-release" },
+    { "name": "gcc-debug-profile",    "configurePreset": "gcc-debug-profile" },
+    { "name": "gcc-release-profile",  "configurePreset": "gcc-release-profile" },
+    { "name": "gcc-debug-asan",       "configurePreset": "gcc-debug-asan" }
   ],
   "testPresets": [
     {
-      "name": "debug",
-      "configurePreset": "msvc-debug",
+      "name": "test-base",
+      "hidden": true,
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 120,
+        "noTestsAction": "error"
       }
     },
-    {
-      "name": "release",
-      "configurePreset": "msvc-release",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "gcc-debug-test",
-      "configurePreset": "gcc-debug",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "gcc-release-test",
-      "configurePreset": "gcc-release",
-      "output": {
-        "outputOnFailure": true
-      }
-    }
+    { "name": "msvc-debug",      "inherits": "test-base", "configurePreset": "msvc-debug" },
+    { "name": "msvc-release",    "inherits": "test-base", "configurePreset": "msvc-release" },
+    { "name": "msvc-debug-asan", "inherits": "test-base", "configurePreset": "msvc-debug-asan" },
+    { "name": "gcc-debug",       "inherits": "test-base", "configurePreset": "gcc-debug" },
+    { "name": "gcc-release",     "inherits": "test-base", "configurePreset": "gcc-release" },
+    { "name": "gcc-debug-asan",  "inherits": "test-base", "configurePreset": "gcc-debug-asan" }
   ]
 }

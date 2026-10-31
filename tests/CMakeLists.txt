@@ -1,5 +1,9 @@
 # ------------------------------------------------------------------------
-# liteui_tests — Catch2 unit tests for liteui.hpp
+# liteui_core_test — Catch2 unit tests for liteui.hpp
+#
+# Included from the top-level CMakeLists when LITEUI_BUILD_TESTS is ON, after
+# Catch2 has been found / fetched (in the root) and cmake/LiteuiTests.cmake is
+# loaded (it provides liteui_add_test and the sanitizer setup).
 #
 # liteui::liteui is a header-only INTERFACE library: the implementation
 # (XML parser, SVG parser, layout engine, ...) is compiled inside whichever
@@ -13,41 +17,16 @@
 #     on Linux)
 #   - liteui_wayland_protocols, which carries the include directory for
 #     the vendored xdg-shell / xdg-decoration client headers
+#
+# CTest names: liteui_core.<Catch2 test case>
 # ------------------------------------------------------------------------
 
-include(FetchContent)
+# The .inc case files and the helper are listed only so they show up in the
+# IDE project tree; the compiler finds them through #include and tracks them
+# as dependencies either way.
+file(GLOB LITEUI_TEST_CASES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cases/*.inc)
 
-# 1) Prefer an installed Catch2 v3 (apt install catch2, vcpkg, conan, ...).
-find_package(Catch2 3 QUIET)
-
-# 2) Otherwise download a pinned release.
-if(NOT Catch2_FOUND)
-    message(STATUS "liteui tests: Catch2 not installed, fetching v3.8.1")
-    FetchContent_Declare(
-        Catch2
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG        v3.8.1
-    )
-    FetchContent_MakeAvailable(Catch2)
-    # Provides catch_discover_tests() when Catch2 is built from source.
-    list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
-endif()
-
-include(Catch)
-
-add_executable(liteui_tests liteui_tests.cpp)
-target_include_directories(liteui_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
-)
-if(MSVC)
-    target_compile_options(liteui_tests PRIVATE /utf-8)  # sources are UTF-8
-endif()
-
-target_link_libraries(liteui_tests PRIVATE
-    Catch2::Catch2WithMain
-    liteui::liteui
-)
-
-# PRE_TEST = discover test names when `ctest` runs, not as a post-build step,
-# so building never depends on being able to execute the binary.
-catch_discover_tests(liteui_tests DISCOVERY_MODE PRE_TEST)
+liteui_add_test(core
+    SOURCES  liteui_tests.cpp test_helpers.hpp ${LITEUI_TEST_CASES}
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
+    LITEUI)

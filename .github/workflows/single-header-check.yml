@@ -1,30 +1,61 @@
 name: Single-header check
 
-# Proves the "single header" claim: liteui.hpp, copied into an empty
-# scratch directory with nothing but a trivial main(), still compiles
-# on both platforms. This is a compile-only check (no linking, no
-# example code, no CMake) -- it exists purely to catch a header that
-# has quietly started depending on some other file in the repo.
+# Proves the "single header" claim: liteui.hpp, copied into an empty scratch
+# directory with a few trivial .cpp files, still compiles AND LINKS on both
+# platforms. No CMake and no example code are involved, so a header that has
+# quietly started depending on another file in the repo is caught here.
+#
+# Three translation units, linked together:
+#   impl.cpp    defines LITEUI_IMPLEMENTATION (compiles the implementation half)
+#   user_a.cpp  includes the header only
+#   user_b.cpp  includes the header only
+# Linking all three also catches a non-inline definition in the declaration
+# half of the header (it would be defined twice: "multiple definition").
+#
+# The binary is never run (it would try to open a window); linking is the test.
+# Warnings (-Wall -Wextra / /W4) are printed but do not fail the job yet. Add
+# -Werror (/WX on MSVC) once the header is warning-free.
+#
+# Also callable from other workflows (release.yml uses it as a gate).
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'liteui.hpp'
+      - 'platform/**'
+      - '.github/workflows/single-header-check.yml'
   pull_request:
+    paths:
+      - 'liteui.hpp'
+      - 'platform/**'
+      - '.github/workflows/single-header-check.yml'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: single-header-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  standalone-compile:
+  standalone:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
 
-    runs-on: ${{ matrix.os }}
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Linux headers
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -45,46 +76,55 @@ jobs:
           mkdir -p scratch
           cp liteui.hpp scratch/
 
-          # liteui.hpp #include's "xdg-shell-client-protocol.h" and
-          # "xdg-decoration-client-protocol.h" by relative name (quoted,
-          # not angle-bracketed) on Linux -- these are the vendored,
-          # generated headers under platform/wayland-protocols/, not
-          # system headers a package manager provides. Only the .h
-          # files are needed here since this check never links.
+          # On Linux liteui.hpp #include's "xdg-shell-client-protocol.h" and
+          # "xdg-decoration-client-protocol.h" by relative name, and linking
+          # needs the generated .c files: the four vendored files under
+          # platform/wayland-protocols/ are the only extras a drop-in user needs.
           if [ "$RUNNER_OS" = "Linux" ]; then
-            cp platform/wayland-protocols/*.h scratch/
+            cp platform/wayland-protocols/* scratch/
           fi
 
-          cat > scratch/standalone_check.cpp <<'EOF'
-          // Deliberately does nothing but include the header and define
-          // main(). The point is "does liteui.hpp parse and compile on
-          // its own", not "does a real app link" -- build.yml already
-          // covers real linking via the full example programs.
+          cat > scratch/impl.cpp <<'EOF'
+          // The one translation unit that compiles the implementation.
+          #define LITEUI_IMPLEMENTATION
           #include "liteui.hpp"
-          int main() { return 0; }
+          int unit_a();
+          int unit_b();
+          int main() { return unit_a() + unit_b() == 3 ? 0 : 1; }
           EOF
 
-      # libjpeg is intentionally left out of this pkg-config call: it
-      # doesn't reliably ship a .pc file, and libjpeg-dev on Ubuntu
-      # installs jpeglib.h to a default system include path anyway.
-      - name: Compile (Linux)
+          cat > scratch/user_a.cpp <<'EOF'
+          #include "liteui.hpp"
+          int unit_a() { return 1; }
+          EOF
+
+          cat > scratch/user_b.cpp <<'EOF'
+          #include "liteui.hpp"
+          int unit_b() { return 2; }
+          EOF
+
+      # libjpeg is left out of the pkg-config calls: it doesn't reliably ship a
+      # .pc file for every distro, and libjpeg-dev installs jpeglib.h to a
+      # default system include path anyway (it is linked with -ljpeg below).
+      - name: Compile and link (Linux)
         if: runner.os == 'Linux'
         working-directory: scratch
         run: |
-          g++ -std=c++23 -c standalone_check.cpp \
-            $(pkg-config --cflags wayland-client wayland-cursor wayland-egl \
-                                  cairo pangocairo egl glesv2 xkbcommon libpng)
+          PKGS="wayland-client wayland-cursor wayland-egl cairo pangocairo egl glesv2 xkbcommon libpng"
+          gcc -c xdg-shell-protocol.c xdg-decoration-protocol.c
+          g++ -std=c++23 -Wall -Wextra -c impl.cpp user_a.cpp user_b.cpp $(pkg-config --cflags $PKGS)
+          g++ impl.o user_a.o user_b.o xdg-shell-protocol.o xdg-decoration-protocol.o \
+              -o check $(pkg-config --libs $PKGS) -ljpeg
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
-      # The header's Windows branch pulls in d2d1/dwrite via
-      # #pragma comment(lib, ...), so no explicit /link flags are
-      # needed even for a full build -- here we don't even link, just
-      # compile with /c.
-      - name: Compile (Windows)
+      # The header's Windows branch pulls in d2d1/dwrite/... via
+      # #pragma comment(lib, ...), so no explicit libraries are needed. No
+      # /utf-8 on purpose: a drop-in user compiles with their own flags.
+      - name: Compile and link (Windows)
         if: runner.os == 'Windows'
         working-directory: scratch
         shell: cmd
-        run: cl /std:c++latest /EHsc /c standalone_check.cpp
+        run: cl /std:c++latest /EHsc /W4 /Fe:check.exe impl.cpp user_a.cpp user_b.cpp

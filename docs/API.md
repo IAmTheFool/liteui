@@ -1,41 +1,96 @@
 # API reference
 
-Field-by-field, method-by-method reference for `liteui.hpp`. Read
-[`GETTING_STARTED.md`](GETTING_STARTED.md) first if you haven't built a
-window yet — this doc assumes you know the `View` tree / `Dynamic<T>` /
-`addChild` model already. See [`PLATFORM_NOTES.md`](PLATFORM_NOTES.md)
-for anything that behaves differently between Windows and Linux, or is a
-deliberate v1 limitation.
+Everything LiteUI exposes lives in `liteui.hpp`, in the **global namespace** (plus four helper namespaces: `liteui_clipboard`, `liteui_image`, `liteui_text` and, internally, `liteui_layout`/`liteui_svg`). This page is the reference for the public types and functions. For concepts and behavior, see the guides: [LAYOUT.md](LAYOUT.md), [CANVAS.md](CANVAS.md) and [BUILDING.md](BUILDING.md).
 
-Everything below is declared in the part of `liteui.hpp` you get from a
-plain `#include`. The implementation is compiled in the one `.cpp` that
-defines `LITEUI_IMPLEMENTATION` (the `liteui::liteui` CMake target
-supplies the include path and platform libraries, but you still define
-the macro yourself) — see the [README](../README.md#how-the-single-header-works).
-
-## Contents
-
+- [Conventions](#conventions)
+- [Value types](#value-types)
+- [Enumerations](#enumerations)
 - [`Dynamic<T>`](#dynamict)
-- [`Size`](#size)
-- [`EdgeInsets`](#edgeinsets)
-- [Layout enums](#layout-enums)
+- [Input types](#input-types)
 - [`Style`](#style)
-- [`Text` / `TextStyle`](#text--textstyle)
+- [Leaf nodes](#leaf-nodes): `Text`, `TextInput`, `Image`, `Svg`, `Canvas`
 - [`View`](#view)
-- [`Canvas`](#canvas)
-- [`CanvasContext`](#canvascontext)
-- [`CanvasGradient`](#canvasgradient)
-- [`CanvasImage`](#canvasimage)
-- [`Image`](#image)
-- [`Svg`](#svg)
-- [`TextInput`](#textinput)
-- [`Color`](#color)
-- [Input types](#input-types) (`Key`, `KeyEvent`, `KeyModifiers`, `MouseButton`)
-- [File & folder pickers](#file--folder-pickers)
-- [Clipboard](#clipboard-liteui_clipboard)
-- [Image decoding](#image-decoding-liteui_image)
-- [`LiteUI`](#liteui)
-- [`TooltipStyle`](#tooltipstyle)
+- [`LiteUI` (the window)](#liteui-the-window)
+- [Dialogs, clipboard and image helpers](#dialogs-clipboard-and-image-helpers)
+- [Compile-time switches](#compile-time-switches)
+- [Errors, threading and lifetime](#errors-threading-and-lifetime)
+
+## Conventions
+
+- **One implementation per program.** Include `liteui.hpp` anywhere; define `LITEUI_IMPLEMENTATION` before including it in **exactly one** `.cpp` of each executable (see [BUILDING.md](BUILDING.md#rule-1-one-implementation-per-program)).
+- **C++23.** The CMake target sets `cxx_std_23`.
+- **Trees are copied.** `View::addChild` and `LiteUI::setRoot` take their argument **by value**. Build children completely first; later changes to your local `View` do not affect the copy that was added. Keep any state your callbacks capture alive while the window runs.
+- **UI thread only**, except `LiteUI::wake()`, which is safe from any thread.
+- **Units** are pixels, angles are radians, and colors are 8-bit per channel.
+
+---
+
+## Value types
+
+### `Color`
+
+```cpp
+struct Color { uint8_t r = 0, g = 0, b = 0, a = 255; };   // has operator==
+```
+
+Straight (non-premultiplied) RGBA. `Color{255, 128, 0}` is opaque orange; `Color{0, 0, 0, 0}` is fully transparent.
+
+### `EdgeInsets`
+
+```cpp
+struct EdgeInsets {
+    float top = 0, right = 0, bottom = 0, left = 0;       // CSS order
+    static EdgeInsets all(float v);
+};                                                         // has operator==
+```
+
+Used for `margin` and `padding`. Aggregate initialization follows the field order: `EdgeInsets{8, 12, 8, 12}` is top 8, right 12, bottom 8, left 12.
+
+### `Size`
+
+```cpp
+struct Size {
+    enum class Kind { Fixed, Percentage, Fit, Full };
+    Kind kind = Kind::Fit;
+    float value = 0;
+
+    static Size pixel(float v);        // Fixed, in pixels (border box)
+    static Size percentage(float v);   // 0-100, of the space offered by the parent
+    static Size fit();                 // size to content (the default)
+    static Size full();                // all the space the parent offers on that axis
+};
+```
+
+How each kind resolves is described in [LAYOUT.md](LAYOUT.md#sizing).
+
+### `kScrollbarThickness`
+
+`constexpr float kScrollbarThickness = 12.0f;` The width of a vertical scrollbar and the height of a horizontal one. Layout and painting share this constant.
+
+---
+
+## Enumerations
+
+| Enum | Values |
+|---|---|
+| `FlexDirection` | `Row`, `Column` |
+| `Justify` | `Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly` |
+| `Align` | `Start`, `End`, `Center`, `Stretch` |
+| `FlexWrap` | `NoWrap`, `Wrap` |
+| `AlignContent` | `Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`, `Stretch` |
+| `Position` | `Static`, `Absolute` |
+| `Display` | `Flex`, `None` |
+| `Visibility` | `Visible`, `Hidden` |
+| `Overflow` | `Visible`, `Hidden`, `Scroll`, `Auto` |
+| `FontWeight` (`int`) | `Thin` 100, `ExtraLight` 200, `Light` 300, `Regular` 400, `Medium` 500, `SemiBold` 600, `Bold` 700, `ExtraBold` 800, `Black` 900 |
+| `FontStyle` | `Normal`, `Italic` |
+| `TextAlign` | `Start`, `Center`, `End`, `Justify` |
+| `TextOverflow` | `Clip`, `Ellipsis` |
+| `TextWrap` | `Wrap`, `NoWrap` |
+| `ObjectFit` | `Fill`, `Contain`, `Cover`, `None`, `ScaleDown` |
+| `MouseButton` | `Left`, `Middle`, `Right` |
+
+Canvas-specific enums (`LineCap`, `LineJoin`, `TextBaseline`, `FillRule`, `CompositeOp`) are listed in [CANVAS.md](CANVAS.md).
 
 ---
 
@@ -45,157 +100,240 @@ the macro yourself) — see the [README](../README.md#how-the-single-header-work
 template <class T> using Dynamic = std::variant<T, std::function<T()>>;
 ```
 
-Almost every meaningful `Style`/`Text`/`TextStyle` field is a
-`Dynamic<T>`. Assign either a plain `T` or a `std::function<T()>`
-directly (`x = 5;` or `x = [&]{ return count; };`) — no wrapper syntax
-needed. A callback is re-polled once per dispatched event (click, key,
-scroll, timer tick), and the field only shows up as changed (triggering
-a repaint/relayout) if the returned value actually differs from last
-time.
+A field that holds either a value or a callback that returns one. Assign either form:
+
+```cpp
+label.label = std::string("fixed");
+label.label = [&] { return "Count: " + std::to_string(count); };
+```
+
+LiteUI polls callbacks after every dispatched event and once in `setRoot`; when a polled value changes it relays out and repaints. Callbacks should be cheap and free of side effects.
+
+| Helper | Purpose |
+|---|---|
+| `resolveDynamic(field, cache)` | Library-internal read helper (value if static, else the last polled value). |
+| `resolveStatic(field)` | Returns the stored value, and throws `std::bad_variant_access` if the field holds a callback. |
+
+> A `Dynamic<float>` assigned from an `int` does not compile (narrowing in `std::variant` conversion). Use `8.0f`, not `8`.
 
 ---
 
-## `Size`
+## Input types
 
-One axis's sizing rule.
+### `Key`
 
-```cpp
-enum class Kind { Fixed, Percentage, Fit, Full };
-```
+`Unknown`, `A`–`Z`, `N0`–`N9`, `F1`–`F12`, `Enter`, `Escape`, `Backspace`, `Tab`, `Space`, `Delete`, `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown`, `Shift`, `Control`, `Alt`, `Super`, `Minus`, `Equal`, `LeftBracket`, `RightBracket`, `Backslash`, `Semicolon`, `Quote`, `Comma`, `Period`, `Slash`, `Grave`.
 
-| Factory | Meaning |
-|---|---|
-| `Size::pixel(v)` | Fixed `v` px |
-| `Size::percentage(v)` | `v`% (0–100) of the parent's resolved size |
-| `Size::fit()` | Shrink to content — **the default** |
-| `Size::full()` | Fill available space along that axis |
+Keys are logical and independent of platform scan codes. There are no keypad, Insert, or lock keys.
 
-Percentages resolve to `0` when the ancestor's own size is itself `Fit`
-(indefinite) — see PLATFORM_NOTES.
-
-## `EdgeInsets`
+### `KeyModifiers`
 
 ```cpp
-struct EdgeInsets {
-  float top = 0, right = 0, bottom = 0, left = 0;
-  static EdgeInsets all(float v);   // all four sides equal
-};
+struct KeyModifiers { bool shift = false, ctrl = false, alt = false, super = false; };   // operator==
 ```
 
-Used by `Style::margin` and `Style::padding` (both `Dynamic<EdgeInsets>`).
+### `KeyEvent`
 
-## Layout enums
+```cpp
+struct KeyEvent { Key key = Key::Unknown; KeyModifiers mods; };
+```
 
-| Enum | Values | Used by |
-|---|---|---|
-| `FlexDirection` | `Row`, `Column` | `Style::direction` |
-| `Justify` | `Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly` | `Style::justifyContent` (main axis) |
-| `Align` | `Start`, `End`, `Center`, `Stretch` | `Style::alignItems` (cross axis, single line) |
-| `FlexWrap` | `NoWrap`, `Wrap` | `Style::flexWrap` |
-| `AlignContent` | `Start`, `End`, `Center`, `SpaceBetween`, `SpaceAround`, `SpaceEvenly`, `Stretch` | `Style::alignContent` (distributes multiple wrapped lines) |
-| `Position` | `Static`, `Absolute` | `Style::position` |
-| `Display` | `Flex`, `None` | `Style::display` — `None` skips layout/paint/hit-test entirely, space **not** reserved |
-| `Visibility` | `Visible`, `Hidden` | `Style::visibility` — `Hidden` still reserves space, only paint/hit-test/hover are skipped |
-| `Overflow` | `Visible`, `Hidden`, `Scroll`, `Auto` | `Style::overflowX` / `overflowY` |
+Delivered to `onKeyDown` / `onKeyUp`. Key repeat produces repeated `onKeyDown` events. For typed characters use `onTextInput`, which delivers an already-composed UTF-32 code point and is the right input for text fields.
 
-`Overflow` semantics: `Visible` (default) never clips or scrolls.
-`Hidden` clips but has no scrollbar/interaction. `Scroll` always clips
-and always shows that axis's scrollbar. `Auto` clips and shows the
-scrollbar only once content actually exceeds the viewport.
+---
 
 ## `Style`
 
-Every `View` and `Text`/`Canvas` (via their own `.style`) carries one of
-these.
+Layout, box painting and scrolling behavior. Every `View` and every leaf node has one. Fields marked **D** are `Dynamic<>` (value or callback); the rest are plain fields that are read when layout runs.
 
-| Field | Type | Default | Notes |
+| Field | Type | Default | |
 |---|---|---|---|
-| `width`, `height` | `Dynamic<Size>` | `Size::fit()` | |
-| `minWidth`, `maxWidth`, `minHeight`, `maxHeight` | `float` | `0` / `∞` | Clamp applied **after** `width`/`height` resolve. `maxWidth < minWidth` is treated as `maxWidth == minWidth`. |
-| `margin`, `padding` | `Dynamic<EdgeInsets>` | `{0,0,0,0}` | |
-| `direction` | `FlexDirection` | `Row` | Not `Dynamic` — plain field |
+| `width`, `height` | `Dynamic<Size>` | `Size::fit()` | **D** |
+| `minWidth`, `minHeight` | `float` | `0` | |
+| `maxWidth`, `maxHeight` | `float` | `+infinity` | |
+| `margin`, `padding` | `Dynamic<EdgeInsets>` | all `0` | **D** |
+| `direction` | `FlexDirection` | `Row` | |
 | `justifyContent` | `Justify` | `Start` | |
 | `alignItems` | `Align` | `Stretch` | |
-| `gap` | `float` | `0` | Space between flex children (and between wrapped lines) |
+| `gap` | `float` | `0` | |
 | `flexWrap` | `FlexWrap` | `NoWrap` | |
-| `alignContent` | `AlignContent` | `Stretch` | Only matters with >1 wrapped line |
+| `alignContent` | `AlignContent` | `Stretch` | |
 | `flexGrow` | `float` | `0` | |
 | `flexShrink` | `float` | `1` | |
-| `backgroundColor` | `Dynamic<Color>` | `{0,0,0,0}` | |
-| `borderWidth` | `Dynamic<float>` | `0` | Uniform on all sides |
-| `borderColor` | `Dynamic<Color>` | `{0,0,0}` | |
-| `borderRadius` | `Dynamic<float>` | `0` | |
-| `hoverColor` | `std::optional<Color>` | unset | Replaces `backgroundColor` while the pointer is over this view. `isHovered` itself is computed by the library from pointer position — never app-sourced. |
+| `backgroundColor` | `Dynamic<Color>` | transparent | **D** |
+| `borderWidth` | `Dynamic<float>` | `0` | **D** |
+| `borderColor` | `Dynamic<Color>` | black | **D** |
+| `borderRadius` | `Dynamic<float>` | `0` | **D** |
+| `hoverColor` | `std::optional<Color>` | unset | Replaces `backgroundColor` while the pointer is over the view. |
 | `position` | `Position` | `Static` | |
-| `left`, `top`, `right`, `bottom` | `Dynamic<float>` | `NaN` (unset) | Only meaningful when `position == Absolute`. See [Absolute positioning](#absolute-positioning) below. |
-| `zIndex` | `Dynamic<int>` | `0` | Stacking order among **all** absolute nodes tree-wide, ties broken by document order |
-| `overflowX`, `overflowY` | `Overflow` | `Visible` | Setting either to non-`Visible` makes this view a scroll container |
-| `contentPanEnabled` | `bool` | `true` | Whether click-and-drag inside the content area pans/scrolls it |
-| `wheelScrollEnabled` | `bool` | `true` | Whether the mouse wheel moves this view's scroll position. `onScrollUp`/`onScrollDown` still fire regardless of this flag. |
-| `display` | `Dynamic<Display>` | `Flex` | |
-| `visibility` | `Dynamic<Visibility>` | `Visible` | |
+| `left`, `top`, `right`, `bottom` | `Dynamic<float>` | `NaN` (unset) | **D** |
+| `zIndex` | `Dynamic<int>` | `0` | **D**. Absolute views only. |
+| `overflowX`, `overflowY` | `Overflow` | `Visible` | |
+| `contentPanEnabled` | `bool` | `true` | Drag inside a scroll container to pan. |
+| `wheelScrollEnabled` | `bool` | `true` | Wheel moves a scroll container. |
+| `scrollTrackColor`, `scrollThumbColor` | `Dynamic<std::optional<Color>>` | unset | **D**. Overrides the window default. |
+| `scrollbarAutoHide` | `bool` | `false` | Show bars only while hovered or dragging. |
+| `display` | `Dynamic<Display>` | `Flex` | **D** |
+| `visibility` | `Dynamic<Visibility>` | `Visible` | **D** |
+| `escapeClip` | `bool` | `false` | Absolute views: ignore ancestors' scroll clips. |
 
-### Absolute positioning
+Because `gap`, `direction`, `flexGrow`, `flexShrink`, the min/max sizes and the other plain fields are not polled, changing them after the tree is built has no effect on screen. See [LAYOUT.md](LAYOUT.md) for the full semantics of each.
 
-A `Position::Absolute` child is pulled out of flex distribution and
-placed against its parent's content box using `left`/`top`/`right`/
-`bottom` (each `NaN` = unset). If `width`/`height` is `Fit` and **both**
-opposing edges are set (`left` **and** `right`, or `top` **and**
-`bottom`), the size is derived from them (`contentW - left - right`);
-otherwise size resolves normally (`Fixed`/`Percentage`/`Fit`/`Full`)
-against the containing block, same as an in-flow child.
+---
 
-Absolute nodes are collected and painted/hit-tested in one **global**
-pass on top of the whole flow tree, stacked by `zIndex` (ties by
-document/discovery order) — this ordering is identical between painting
-and hit-testing. They are **not** threaded through scroll-aware
-clipping/hit-testing (a v1 trade-off, not a bug — see PLATFORM_NOTES).
+## Leaf nodes
 
-## `Text` / `TextStyle`
+`Text`, `TextInput`, `Image`, `Svg` and `Canvas` are **author-facing descriptions**. `View::addChild` flattens each into a plain `View`, so the retained tree only ever contains `View`s.
 
-`Text` is author-facing and leaf-only: `addChild(Text)` flattens it into
-a `View` (`isText = true`) — `Text` itself never appears in the retained
-tree afterward.
+### `Text`
 
 ```cpp
 struct Text {
-  Dynamic<std::string> label = std::string{};
-  Style style;                 // layout only: width/height/margin/position/etc
-  float fontSize = 16.0f;
-  FontWeight fontWeight = FontWeight::Regular;
-  FontStyle fontStyle = FontStyle::Normal;
-  std::string fontFamily;      // empty = platform default UI font
-  Dynamic<Color> color = Color{0,0,0};
-  TextAlign align = TextAlign::Start;
-  TextOverflow overflow = TextOverflow::Clip;
-  TextWrap wrap = TextWrap::Wrap;
-  float lineHeight = 0;        // 0 = auto from font metrics
-  float letterSpacing = 0;
-  int maxLines = 0;            // 0 = unlimited
-  bool underline = false;
-  bool strikethrough = false;
+    Dynamic<std::string> label;
+    Style style;                        // layout only
+    float fontSize = 16;
+    FontWeight fontWeight = FontWeight::Regular;
+    FontStyle fontStyle = FontStyle::Normal;
+    std::string fontFamily;             // empty = platform default UI font
+    Dynamic<Color> color = Color{0, 0, 0};
+    TextAlign align = TextAlign::Start;
+    TextOverflow overflow = TextOverflow::Clip;
+    TextWrap wrap = TextWrap::Wrap;
+    float lineHeight = 0;               // 0 = from font metrics
+    float letterSpacing = 0;
+    int maxLines = 0;                   // 0 = unlimited
+    bool underline = false, strikethrough = false;
 };
 ```
 
-| Enum | Values |
-|---|---|
-| `FontWeight` | `Thin`(100) … `Black`(900), including `Regular`(400), `Bold`(700), etc. — matches CSS numeric weights |
-| `FontStyle` | `Normal`, `Italic` |
-| `TextAlign` | `Start`, `Center`, `End`, `Justify` |
-| `TextOverflow` | `Clip`, `Ellipsis` |
-| `TextWrap` | `Wrap`, `NoWrap` |
+- Only `label` and `color` can be callbacks. `fontSize`, `fontWeight` and `fontStyle` are plain values.
+- `style` affects layout only. **A text node never paints its own background or border.** Wrap it in a styled `View` for that.
+- `Text` has no event handlers. To make text clickable, put a handler on a parent `View`; clicks on the text bubble up to it.
+- Give paragraphs a definite width so they wrap with a correct height (see [LAYOUT.md](LAYOUT.md#text)).
 
-`TextStyle` is the internal mirror of these fields stored on the `View`
-a `Text` flattens into (`View::textStyle`) — same fields, no `style`
-member (layout stays on `View::style`).
+### `TextInput`
+
+A single-line text field with caret, placeholder and basic editing wired up.
+
+```cpp
+struct TextInput {
+    Style style;
+    std::string text;                   // initial text, read once at addChild
+    std::string placeholder;
+    float fontSize = 16;
+    FontWeight fontWeight = FontWeight::Regular;
+    std::string fontFamily;
+    Color textColor{0,0,0};
+    Color placeholderColor{160,160,160};
+    Color caretColor{20,20,20};
+    Color borderColor{180,180,180};
+    Color focusedBorderColor{50,120,220};
+    float leftPadding = 6;
+    std::function<void(const std::string &)> onChange;   // after each edit or paste
+    std::function<void(const std::string &)> onSubmit;   // Enter
+    std::shared_ptr<TextInputState> state;               // live state, shared with the node
+};
+```
+
+- **Give it a size.** A `TextInput` is canvas-backed and has no intrinsic size; set `style.width` and `style.height`.
+- **Border:** the border color switches between `borderColor` and `focusedBorderColor` automatically (it overrides `style.borderColor`). Set `style.borderWidth` to make it visible.
+- **Reading the text:** keep a copy of the `state` pointer before `addChild`, and read `state->text` any time. `text` is only the initial value.
+- **Focusing from code:** set `state->requestFocus = true`; it takes focus at the next poll.
+
+```cpp
+TextInput name;
+name.style.width = Size::pixel(220);
+name.style.height = Size::pixel(32);
+name.style.borderWidth = 1.0f;
+name.placeholder = "Your name";
+auto nameState = name.state;                  // shared with the node after addChild
+name.onSubmit = [&](const std::string &s) { /* ... */ };
+root.addChild(name);
+// later: nameState->text
+```
+
+`TextInputState` fields: `text`, `cursor` (byte offset), `focused`, `blinkOn`, `dirty`, `scrollOffset`, `requestFocus` (plus an internal `blinkTimerHandle`).
+
+**Supported editing:** typing, Left/Right, Home/End, Backspace/Delete, Enter (`onSubmit`), click to place the caret, `Ctrl+V` paste (line breaks and non-ASCII bytes are stripped). **Not supported:** selection, copy/cut, select-all, undo, multi-line, and non-ASCII input (typed characters outside printable ASCII are ignored, and the caret moves by bytes). For richer fields, build your own on a `Canvas` using `liteui_text::caretIndexForX`.
+
+### `Image`
+
+```cpp
+struct Image {
+    Style style;
+    std::string path;                              // decoded when added
+    std::vector<uint8_t> memoryData;               // encoded bytes, decoded when added
+    Dynamic<std::shared_ptr<CanvasImage>> source;  // pixels you supply (fixed or callback)
+    ObjectFit fit = ObjectFit::Fill;
+    Color backgroundColor{0,0,0,0};                // shown in letterboxed margins
+    std::function<void(int w, int h)> onLoad;
+    std::function<void(const std::string &err)> onError;
+};
+```
+
+- **Source priority:** `source` (fixed or callback), then `path`, then `memoryData`.
+- **Decoding is synchronous**, inside `addChild`. `onLoad` / `onError` fire there, once.
+- **Natural size:** if `width`/`height` is `Fit`, the node takes the image's pixel size. With a callback `source` it follows whichever image is current.
+- **Dynamic source:** return a **different** `shared_ptr` when the picture changes. Comparison is by pointer, not by pixel content.
+- Linux decodes PNG and JPEG only; Windows uses WIC (more formats).
+
+### `Svg`
+
+```cpp
+struct Svg {
+    Style style;
+    std::string path;                     // file path, or...
+    std::string source;                   // ...inline SVG text (used if path is empty)
+    ObjectFit fit = ObjectFit::Contain;
+    Color backgroundColor{0,0,0,0};
+    std::function<void()> onLoad;
+    std::function<void(const std::string &err)> onError;
+};
+```
+
+Parsed when added (`onLoad` / `onError` fire there). A `Fit` size becomes the document's width/height. It re-renders at the node's pixel size, including after resizes, so it stays crisp. Supported: `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, groups, `<defs>`/`<use>`, transforms, presentation attributes, inline `style=""`, and `<style>` blocks with simple `.class` rules. Not supported: gradients, patterns, `clipPath`/`mask`, and text. Group opacity is approximated per shape.
+
+Behavior details confirmed by the SVG test suite:
+
+- **Size:** the document size comes from `viewBox` if present and valid, otherwise from `width`/`height`, otherwise **100 × 100**. A malformed `viewBox` is ignored. The `viewBox` origin shifts every shape.
+- **Precedence:** a presentation attribute loses to a `<style>` class rule, which loses to an inline `style=""`. `<style>` blocks (including inside CDATA, as Illustrator and Figma export them) support simple `.class` selectors only; tag and id selectors are ignored.
+- **Paints:** `none`, `#rgb`/`#rrggbb`, named colors, `rgb()` and `rgba()` are understood. Anything else, notably `url(#gradient)`, is **ignored and the inherited paint is kept**, so a gradient-filled shape falls back to its parent's fill (black by default), not to `none`.
+- **Shapes:** a shape with zero size (`width="0"`, `r="0"`, empty `points`, empty `d`) is dropped. Unknown elements such as `<text>` are skipped, but known shapes nested inside an unknown container are still drawn.
+- **`<use>`:** resolves `href` and `xlink:href`, supports `x`/`y` and `transform`, ignores missing targets, picks the first element when ids are duplicated, renders a `<symbol>` only through `<use>`, cuts reference cycles, and stops following chains beyond 32 levels.
+- **Errors:** `onError` receives a message such as `failed to open <path>` or `failed to parse <path>`. Input that is not an `<svg>` document (including an empty file) is a parse failure.
+
+### `Canvas`
+
+Custom drawing surface. Fields: `style`, `onPaint(CanvasContext &)`, the pointer, hover and wheel handlers, `canvasDirtySource`, and the focus and key handlers. The full model, the drawing API, and platform differences are in **[CANVAS.md](CANVAS.md)**.
+
+```cpp
+struct Canvas {
+    Style style;
+    std::function<void(CanvasContext &)> onPaint;
+    std::function<void()> onClick, onMiddleClick, onRightClick;
+    std::function<void(float x, float y)> onPressAt, onMiddlePressAt, onRightPressAt;
+    std::function<void(float x, float y)> onDragTo, onMiddleDragTo, onRightDragTo;
+    std::function<void()> onDragEnd;
+    std::function<bool(float x, float y)> onHoverAt;
+    std::function<bool()> onHoverEnd;
+    std::function<void()> onScrollUp, onScrollDown;
+    std::function<bool()> canvasDirtySource;
+    bool focusable = false;
+    std::function<void()> onFocus, onBlur;
+    std::function<void(KeyEvent)> onKeyDown;
+    std::function<void(uint32_t)> onTextInput;
+};
+```
+
+`CanvasImage`, `CanvasGradient`, and the `CanvasContext` methods are documented in [CANVAS.md](CANVAS.md).
+
+---
 
 ## `View`
 
-The retained tree node. You mostly build these implicitly via
-`addChild(Text{...})` / `addChild(Canvas{...})` / etc., but nothing
-stops you from filling a `View` directly for a plain container/box.
+A node in the retained tree. You normally create `View`s for containers and let `addChild` create the rest.
 
-### Adding children
+### Building the tree
 
 ```cpp
 void addChild(View child);
@@ -206,649 +344,197 @@ void addChild(Image img);
 void addChild(Svg s);
 ```
 
-Each non-`View` overload flattens the argument into a `View` and
-appends it. `Image`/`Svg` decode/parse **synchronously**, at `addChild`
-time.
+Each appends a child (flattening leaf descriptions into `View`s). The argument is taken **by value**.
 
-### Core fields
+### Members
 
-| Field | Type | Notes |
+| Member | Type | Notes |
 |---|---|---|
 | `style` | `Style` | |
-| `children` | `std::vector<View>` | Populated via `addChild`, or left empty in favor of `keysSource`/`itemBuilder` below |
-| `key` | `std::string` | Identity within a keyed sibling list; set automatically by the reconciler, empty = "not keyed" |
-| `isText` / `text` / `textStyle` | `bool` / `Dynamic<std::string>` / `TextStyle` | Set by `toView(Text)`; `isText` implies `children.empty()` always |
-| `isCanvas` / `onPaint` | `bool` / `std::function<void(CanvasContext&)>` | Set by `toView(Canvas/Image/Svg/TextInput)` |
-| `focusable` | `bool` | Default `false`. Click-to-focus is automatic for any focusable view. |
-| `tooltip` | `std::string` | Plain field (not `Dynamic`), looked up once when the tooltip shows |
-| `disabled` | `Dynamic<bool>` | A disabled view never receives click/press dispatch |
+| `children` | `std::vector<View>` | Filled by `addChild`. Fill either `children` or use a keyed list. |
+| `key` | `std::string` | Set automatically for keyed-list children. Empty means "not keyed". |
+| `keysSource` | `std::function<std::vector<std::string>()>` | Keyed list: the keys this view should hold. Polled after every event. |
+| `itemBuilder` | `std::function<View(const std::string &key)>` | Builds the child for a **new** key only. Surviving children are reused as they are. |
+| `disabled` | `Dynamic<bool>` | A disabled view ignores press/click handlers and shows no tooltip. |
+| `focusable` | `bool` | Click gives it keyboard focus. Default `false`. |
+| `wantsFocus` | `std::function<bool()>` | Polled; when it returns `true` this view takes focus. |
+| `tooltip` | `std::string` | Shown after hovering for `TooltipStyle::delayMs`. Plain field, read when the tooltip appears. |
+| `onLayout` | `std::function<void(float x, float y, float w, float h)>` | After each layout, with the final window-space box. |
+| `computed` | `View::Computed` | Layout results and caches. **Read-only for apps.** Contains `x`, `y`, `w`, `h` (border box in window coordinates), `contentW`, `contentH`, `scrollX`, `scrollY`, and `isHovered`. |
 
-### Keyed dynamic lists
-
-```cpp
-std::function<std::vector<std::string>()> keysSource;
-std::function<View(const std::string &key)> itemBuilder;
-```
-
-Set these instead of populating `children` directly for a list whose
-items change over time. `keysSource` is polled after every dispatched
-event; when the returned list differs from what's built, children are
-reconciled by `key` — survivors (matched key) are moved over untouched
-(cached text layout, canvas surface, scroll position, hover state all
-carry over); only new keys are built, only dropped keys are freed.
+`isText`, `text`, `textStyle`, `isCanvas` and `onPaint` are set by `addChild` when it flattens a leaf; do not set them by hand.
 
 ### Event handlers
 
-All are plain `std::function` members, empty by default.
+All are `std::function` members and may be left empty.
 
-| Handler | Signature | Fires when | Bubbles? |
-|---|---|---|---|
-| `onClick` / `onMiddleClick` / `onRightClick` | `void()` | Full press-and-release over the same view | Yes — to nearest ancestor with a handler |
-| `onPressAt` / `onMiddlePressAt` / `onRightPressAt` | `void(float localX, float localY)` | Instant a press lands; coordinates local to this view (0,0 = view's own top-left) | No |
-| `onDragTo` / `onMiddleDragTo` / `onRightDragTo` | `void(float localX, float localY)` | Continuously while a press that started on this view is held and moving | No |
-| `onScrollUp` / `onScrollDown` | `void()` | Per wheel notch, independent of pixel-based content scrolling | Yes |
-| `onLayout` | `void(float x, float y, float w, float h)` | Once per `relayout()`, right after this node's absolute on-screen box is finalized | — |
-| `onFocus` / `onBlur` | `void()` | Gains/loses keyboard focus | — |
-| `onKeyDown` / `onKeyUp` | `void(KeyEvent)` | Only while this view is the focused view; no bubbling. `onKeyDown` also fires on OS/library key-repeat. | No |
-| `onTextInput` | `void(uint32_t codepoint)` | Only while focused; an already-composed UTF-32 codepoint (this is what a text field should append, not `onKeyDown`) | No |
-| `canvasDirtySource` | `bool()` | `isCanvas` nodes only — polled like the sources above; return `true` once to force the next paint to re-invoke `onPaint`, then go back to `false` | — |
+| Member | Signature | When |
+|---|---|---|
+| `onClick`, `onMiddleClick`, `onRightClick` | `void()` | Press and release both land on this view. **Bubbles** to the nearest ancestor with a handler if the deepest view under the pointer has none. |
+| `onPressAt`, `onMiddlePressAt`, `onRightPressAt` | `void(float x, float y)` | Immediately on press, with coordinates local to the view's border box. |
+| `onDragTo`, `onMiddleDragTo`, `onRightDragTo` | `void(float x, float y)` | On every move while that button is held, after a press that started on this view. The view must also have a press handler (`onClick` or `onPressAt`) to be the press target. |
+| `onDragEnd` | `void()` | Once when a drag ends (release, or the platform aborts it). Not fired if the view is destroyed mid-drag. |
+| `onHoverAt` | `bool(float x, float y)` | On pointer movement over the view. Return `true` if app state changed so LiteUI re-polls and repaints. |
+| `onHoverEnd` | `bool()` | Once when the pointer leaves. Same return convention. |
+| `onScrollUp`, `onScrollDown` | `void()` | A wheel notch over the view. Bubbles. Independent of pixel scrolling. |
+| `onFocus`, `onBlur` | `void()` | Focus gained or lost. |
+| `onKeyDown`, `onKeyUp` | `void(KeyEvent)` | Only the focused view; no bubbling. `onKeyDown` repeats. |
+| `onTextInput` | `void(uint32_t codepoint)` | Only the focused view; composed UTF-32 text. |
+| `canvasDirtySource` | `bool()` | Canvas views: return `true` once to request a redraw. See [CANVAS.md](CANVAS.md#when-onpaint-runs). |
 
-### Canvas-node methods
+After any handler returns, LiteUI re-polls `Dynamic<>` values and keyed lists, and relays out and repaints if something changed. Handlers run on the UI thread.
 
-```cpp
-void requestCanvasRedraw();   // marks this canvas node's cached backing
-                               // surface stale; no-op on a non-canvas node
-```
+### Scrolling helpers
 
-### Scroll-related read accessors
-
-```cpp
-bool scrollsX() const;        // style.overflowX != Overflow::Visible
-bool scrollsY() const;
-float maxScrollX() const;     // max(0, contentW - w)
-float maxScrollY() const;     // max(0, contentH - h)
-```
-
-### `Computed` (read-only, filled by layout)
-
-`View::computed` holds everything the layout/paint passes derive.
-Renderers only ever read this — never re-derive it from `style`. The
-fields you'll actually want to read from app code:
-
-| Field | Meaning |
+| Member | Meaning |
 |---|---|
-| `x`, `y`, `w`, `h` | Border-box, absolute window pixel coordinates |
-| `isHovered` | Set by the library from pointer position every move event |
-| `contentW`, `contentH` | Only meaningful when scrolling on that axis — the content's natural (scrollable) size |
-| `scrollX`, `scrollY` | Current scroll offset, always clamped to `[0, maxScroll*]` |
-
-Everything else under `Computed` (cached text layouts, GL textures,
-resolved-dynamic caches) is renderer-internal.
-
-### Lifetime
-
-```cpp
-void freeTextResources();
-```
-
-Frees this node's cached text-/canvas-rendering resources and recurses
-into children. `View` frees nothing in a destructor (views get copied
-freely while building a tree), so this must be called explicitly before
-a tree is discarded — `LiteUI::setRoot()` and `~LiteUI()` are the only
-two places a live tree is normally retired; call it yourself only if
-you're managing a `View` tree outside those paths.
+| `bool scrollsX() const` / `scrollsY() const` | `true` if `overflowX` / `overflowY` is anything but `Visible`. |
+| `float maxScrollX() const` / `maxScrollY() const` | How far the content can currently scroll (`max(0, content - viewport)`). |
+| `void requestCanvasRedraw()` | Marks a canvas view's surface stale. Apps normally use `canvasDirtySource` instead, since handlers have no handle to the tree. |
 
 ---
 
-## `Canvas`
-
-Author-facing leaf node; `addChild(Canvas)` flattens it into an
-`isCanvas` `View`.
+## `LiteUI` (the window)
 
 ```cpp
-struct Canvas {
-  Style style;
-  std::function<void(CanvasContext &)> onPaint;
-  std::function<void()> onClick, onMiddleClick, onRightClick;
-  std::function<void(float, float)> onPressAt, onMiddlePressAt, onRightPressAt;
-  std::function<void(float, float)> onDragTo, onMiddleDragTo, onRightDragTo;
-  std::function<void()> onScrollUp, onScrollDown;
-  std::function<bool()> canvasDirtySource;
-  bool focusable = false;
-  std::function<void()> onFocus, onBlur;
-  std::function<void(KeyEvent)> onKeyDown;
-  std::function<void(uint32_t)> onTextInput;
+class LiteUI {
+public:
+    explicit LiteUI(const std::string &title = "Window",
+                    int width = -1, int height = -1, bool hideTitlebar = false);
+    ~LiteUI();                                  // not copyable
+    ...
 };
 ```
 
-`onPaint` is **not** a per-frame callback. It re-runs only when the
-canvas is actually dirty: first paint, a resize, or when
-`requestCanvasRedraw()` / `canvasDirtySource` reports true. Treat it as
-"rebuild my picture from whatever state I closed over," not "draw one
-frame of a game loop."
+- `width` / `height` are the initial size in pixels. If either is `<= 0` the window starts **maximized**.
+- `hideTitlebar = true` creates a window without the title bar (Linux: LiteUI's own bar is not drawn), so you can build your own and drive it with `requestMove` / `requestMinimize` / `requestMaximize` / `requestClose`.
+- The constructor **throws `std::runtime_error`** if the platform cannot be initialized (for example, no Wayland connection).
+- Create one window per process. `LiteUI::current()` returns the most recently created one.
 
-## `CanvasContext`
+### Methods
 
-Passed by reference into `onPaint`. HTML5-canvas-style 2D API, backed
-by Direct2D on Windows and Cairo on Linux — see PLATFORM_NOTES for the
-handful of places the two backends diverge (`clearRect` edge
-antialiasing, `globalCompositeOperation`, radial gradients, shadows,
-`strokeText`).
+| Method | Description |
+|---|---|
+| `void run()` | Blocks and pumps the platform event loop until the window closes. |
+| `void setRoot(View view)` | Sets or replaces the tree. Lays it out immediately (twice, polling `Dynamic<>` values in between) and repaints. The argument is copied or moved in. |
+| `void requestClose()` | Asks to close. On Windows this posts a close message, so it goes through `setOnCloseRequest` if one is set. **On Linux it currently closes the window immediately** (see the note below). |
+| `void forceClose()` | Closes immediately, bypassing the close-request handler. |
+| `void setOnCloseRequest(std::function<void()> fn)` | Intended to be called when the user asks to close (the window's close button, Alt+F4). **The handler must call `forceClose()` itself** to actually close. With no handler, close requests close immediately. **Currently honored on Windows only** (see the note below). |
 
-```cpp
-float width() const;
-float height() const;
-```
-
-### State stack
-
-```cpp
-void save();
-void restore();
-```
-
-### Transform
-
-```cpp
-void translate(float x, float y);
-void rotate(float radians);
-void scale(float sx, float sy);
-void transformBy(float a, float b, float c, float d, float e, float f); // pre-multiplies
-void setTransform(float a, float b, float c, float d, float e, float f); // replaces
-void resetTransform();
-```
-
-### Paint / style state
+> **Close-request handler on Linux.** In the current implementation, the Wayland backend never calls the handler: the title-bar close button, the compositor's close event, and `requestClose()` all end the event loop directly. A "save changes?" prompt installed with `setOnCloseRequest` therefore works on Windows but is skipped on Linux. If you need one on both, also confirm before calling `requestClose()` yourself from your own UI, and treat the handler as a Windows-only hook until the Linux path is wired up.
+| `void requestMinimize()` | Minimizes. |
+| `void requestMaximize()` | **Toggles** maximized and normal. |
+| `void requestMove()` | Starts an interactive window move (call it from a press handler on your own title bar). |
+| `KeyModifiers modifiers() const` | The modifier keys currently held. |
+| `int addInterval(int ms, std::function<void()> fn)` | Runs `fn` every `ms` milliseconds on the UI thread until removed. Each tick polls `Dynamic<>` sources and repaints. Returns a handle. |
+| `void removeInterval(int handle)` | Stops that interval. |
+| `void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn)` | Global shortcut, checked **before** the focused view's `onKeyDown`. A shortcut matches when the key **and the exact modifier set** are equal; the first match wins and consumes the event. |
+| `void setTooltipStyle(TooltipStyle s)` | Sets tooltip delay and appearance. |
+| `void setWindowBackground(Color c)` | Window background behind the root. |
+| `void setScrollbarColors(Color track, Color thumb)` | Window-wide default scrollbar colors (a view's own style overrides them). |
+| `void requestRepaint()` | Requests a repaint. |
+| `void wake()` | **Thread-safe.** Wakes the event loop from any thread; wakes coalesce. The woken loop runs the wake handler, then polls `Dynamic<>` sources and repaints. Join any thread that can call `wake()` before destroying the `LiteUI`. |
+| `void setWakeHandler(std::function<void()> fn)` | Runs on the UI thread once per coalesced wake, before the repaint. |
+| `static LiteUI *current()` | The active window, or `nullptr`. |
 
 ```cpp
-void setFillColor(Color c);
-void setFillGradient(const CanvasGradient &g);
-void setStrokeColor(Color c);
-void setStrokeGradient(const CanvasGradient &g);
-void setLineWidth(float w);
-void setLineCap(LineCap c);          // Butt | Round | Square
-void setLineJoin(LineJoin j);        // Miter | Round | Bevel
-void setMiterLimit(float m);
-void setLineDash(const std::vector<float> &dashes);
-void setLineDashOffset(float offset);
-void setGlobalAlpha(float a);        // 0..1
-void setGlobalCompositeOperation(CompositeOp op);
-void setShadow(Color color, float blurPx /* accepted, ignored — unblurred */,
-                float offsetX, float offsetY);
-void setFont(const std::string &family, float sizePx,
-             FontWeight weight = FontWeight::Regular,
-             FontStyle style = FontStyle::Normal);
-void setTextAlign(TextAlign a);
-void setTextBaseline(TextBaseline b); // Top | Middle | Alphabetic | Bottom
+LiteUI ui("Notes", 900, 600);
+ui.setWindowBackground(Color{24, 24, 28});
+ui.addShortcut(KeyModifiers{.ctrl = true}, Key::S, [&] { save(); });
+ui.setOnCloseRequest([&] { if (!dirty || confirmDiscard()) ui.forceClose(); });
+ui.setRoot(root);
+ui.run();
 ```
 
-`CompositeOp`: `SourceOver`, `SourceIn`, `SourceOut`, `SourceAtop`,
-`DestinationOver`, `DestinationIn`, `DestinationOut`, `DestinationAtop`,
-`Lighter`, `Copy`, `Xor`, `Multiply`, `Screen`. Full range honored on
-Linux; only `SourceOver`-equivalent behavior on Windows (see
-PLATFORM_NOTES).
-
-### Path building
-
-Same semantics as HTML canvas: `fill()`/`stroke()`/`clip()` do **not**
-clear the current path — only `beginPath()` does.
-
-```cpp
-void beginPath();
-void closePath();
-void moveTo(float x, float y);
-void lineTo(float x, float y);
-void quadraticCurveTo(float cpx, float cpy, float x, float y);
-void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x, float y);
-void arc(float cx, float cy, float r, float startAngle, float endAngle, bool ccw = false);
-void ellipse(float cx, float cy, float rx, float ry, float rotation,
-             float startAngle, float endAngle, bool ccw = false);
-void arcTo(float x1, float y1, float x2, float y2, float radius);
-void rect(float x, float y, float w, float h);
-void roundRect(float x, float y, float w, float h, float radius);
-```
-
-### Drawing
-
-```cpp
-void fill(FillRule rule = FillRule::NonZero);     // NonZero | EvenOdd
-void stroke();
-void clip(FillRule rule = FillRule::NonZero);
-void fillRect(float x, float y, float w, float h);
-void strokeRect(float x, float y, float w, float h);
-void clearRect(float x, float y, float w, float h);
-```
-
-### Text
-
-```cpp
-struct TextMetricsResult { float width; };
-TextMetricsResult measureText(const std::string &text);
-void fillText(const std::string &text, float x, float y, float maxWidth = -1);
-void strokeText(const std::string &text, float x, float y, float maxWidth = -1);
-```
-
-`maxWidth` is accepted for HTML-canvas API familiarity but currently
-does nothing (no squeeze-to-fit). `strokeText` approximates a stroked
-outline by nudging fill-text in a ring of directions — not a true
-glyph-contour stroke.
-
-### Images
-
-```cpp
-void drawImage(const CanvasImage &img, float dx, float dy);
-void drawImage(const CanvasImage &img, float dx, float dy, float dw, float dh);
-void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
-               float dx, float dy, float dw, float dh);
-```
-
-No image *decoding* happens here — `CanvasImage` just wraps raw,
-already-decoded RGBA8 pixels. Use the `Image`/`Svg` nodes, or
-`liteui_image::decodeFile`/`decodeMemory`, to get pixels from a
-PNG/JPEG file.
-
-### Pixel data
-
-```cpp
-std::optional<CanvasImage> getImageData(float x, float y, float w, float h);
-void putImageData(const CanvasImage &img, float dx, float dy);
-```
-
-`getImageData` is supported on both platforms: it reads raw device pixels
-straight from the canvas's own backing surface (a Cairo image surface on
-Linux, the WIC bitmap behind the render target on Windows), ignoring the
-current transform. It returns `std::nullopt` only if the canvas has no
-backing surface at all. `putImageData` ignores
-the current transform and paints directly at `(dx, dy)`, matching HTML
-canvas semantics.
-
-## `CanvasGradient`
-
-```cpp
-CanvasGradient g = CanvasGradient::linear(x0, y0, x1, y1);
-CanvasGradient g = CanvasGradient::radial(x0, y0, r0, x1, y1, r1);
-g.addColorStop(offset /* 0..1 */, color);
-```
-
-Copied by value into `setFillGradient`/`setStrokeGradient` — safe to
-build on the stack. Radial gradients are exact on Linux (Cairo's native
-two-circle model); Direct2D only models one circle plus a focal point,
-so the inner-radius stop is approximated there (see PLATFORM_NOTES).
-
-## `CanvasImage`
-
-```cpp
-struct CanvasImage {
-  int width = 0, height = 0;
-  std::vector<uint8_t> pixels; // width*height*4, row-major, RGBA8, straight alpha
-  CanvasImage() = default;
-  CanvasImage(int w, int h); // allocates + zero-fills pixels
-};
-```
-
----
-
-## `Image`
-
-Author-facing leaf node built on `Canvas`. `addChild(Image)` decodes
-synchronously (PNG/JPEG via libpng/libjpeg on Linux, WIC on Windows).
-
-```cpp
-struct Image {
-  Style style;
-  std::string path;                        // decoded at addChild time
-  std::vector<uint8_t> memoryData;          // decoded at addChild time
-  Dynamic<std::shared_ptr<CanvasImage>> source; // see below
-  ObjectFit fit = ObjectFit::Fill;
-  Color backgroundColor = Color{0,0,0,0};   // painted behind letterboxed margins
-  std::function<void(int width, int height)> onLoad;  // fires once, synchronously
-  std::function<void(const std::string &error)> onError;
-};
-```
-
-Set exactly one of `path` / `memoryData` / `source`. `source` can be a
-plain `std::shared_ptr<CanvasImage>` (fixed image) or a
-`std::function<std::shared_ptr<CanvasImage>()>` re-polled every
-dispatch cycle the same way `Text::label` is — return a *different*
-`shared_ptr` (comparison is by pointer, not pixel content) to swap the
-displayed image; the node repaints and reflows (if sized `Fit`)
-automatically.
-
-`ObjectFit`: `Fill`, `Contain`, `Cover`, `None`, `ScaleDown` — same
-semantics as CSS `object-fit`.
-
-## `Svg`
-
-Author-facing leaf node built on `Canvas`, parsed once at `addChild`
-time and replayed through `CanvasContext` on every paint — stays fully
-vector, re-rendering cleanly at any size including across a window
-resize (unlike `Image`, which is a fixed-resolution bitmap).
-
-```cpp
-struct Svg {
-  Style style;
-  std::string path;    // exactly one of path / source
-  std::string source;  // inline SVG XML text, used if path is empty
-  ObjectFit fit = ObjectFit::Contain; // SVG's "meet" == Contain
-  Color backgroundColor = Color{0,0,0,0};
-  std::function<void()> onLoad;
-  std::function<void(const std::string &error)> onError;
-};
-```
-
-Supported subset: `path`, `rect`, `circle`, `ellipse`, `line`,
-`polyline`, `polygon`, `<g>`/`<symbol>`/nested `<svg>`, `<use>` (both
-`href` and `xlink:href`, cycle/depth-guarded), presentation attributes,
-inline `style=""`, and a single-class subset of `<style>` block CSS
-(`.foo { fill: ...; }`, matched in file order — no specificity, no
-compound selectors). **Not supported:** gradients, patterns,
-`clipPath`/`mask`, `<text>` elements. See PLATFORM_NOTES for `<use>`/
-`<symbol>` sizing caveats and how group `opacity` is approximated.
-
-## `TextInput`
-
-Author-facing single-line text field built on `Canvas`, with caret,
-click-to-position, arrow-key navigation, and editing already wired up.
-
-```cpp
-struct TextInput {
-  Style style;
-  std::string text;
-  std::string placeholder;
-  float fontSize = 16.0f;
-  FontWeight fontWeight = FontWeight::Regular;
-  std::string fontFamily;
-  Color textColor = Color{0,0,0};
-  Color placeholderColor = Color{160,160,160};
-  Color caretColor = Color{20,20,20};
-  Color borderColor = Color{180,180,180};
-  Color focusedBorderColor = Color{50,120,220};
-  float leftPadding = 6.0f;
-  std::function<void(const std::string &)> onChange;
-  std::function<void(const std::string &)> onSubmit; // fires on Enter
-
-  std::shared_ptr<TextInputState> state = std::make_shared<TextInputState>();
-};
-```
-
-`state` is shared across copies of the flattened `View` — you normally
-never touch it directly, but it's there if you need to read/set
-`text`/`cursor`/`focused` from outside the widget's own handlers.
-
-`Ctrl+V` paste is wired up. **ASCII-only** (codepoints `0x20`–`0x7F`)
-for both typed and pasted text — see PLATFORM_NOTES; this does not
-affect plain `Text` rendering.
-
-For anything this widget doesn't cover, build a `Canvas` by hand and use
-`liteui_text::caretIndexForX` — the same helper this widget uses
-internally for click-to-position:
-
-```cpp
-namespace liteui_text {
-  // Byte index in `text` whose caret position is closest to `clickX`
-  // (measured from the text's own left edge). O(n) — fine for typical
-  // single-line field text.
-  size_t caretIndexForX(const std::string &text, const TextStyle &style,
-                        float fontSize, FontWeight fontWeight,
-                        FontStyle fontStyle, float clickX);
-}
-```
-
----
-
-## `Color`
-
-```cpp
-struct Color {
-  uint8_t r = 0, g = 0, b = 0, a = 255;
-  bool operator==(const Color &) const = default;
-};
-```
-
-Plain aggregate — `Color{255, 100, 100}` or `Color{0, 0, 0, 128}`.
-
----
-
-## Input types
-
-```cpp
-enum class MouseButton { Left, Middle, Right };
-
-struct KeyModifiers {
-  bool shift = false, ctrl = false, alt = false, super = false;
-  bool operator==(const KeyModifiers &) const = default;
-};
-
-struct KeyEvent {
-  Key key = Key::Unknown;
-  KeyModifiers mods;
-};
-```
-
-`Key` is a platform-independent enum covering `A`–`Z`, `N0`–`N9`,
-`F1`–`F12`, `Enter`, `Escape`, `Backspace`, `Tab`, `Space`, `Delete`,
-arrow keys, `Home`/`End`/`PageUp`/`PageDown`, `Shift`/`Control`/`Alt`/
-`Super`, and the common punctuation keys (`Minus`, `Equal`,
-`LeftBracket`, `RightBracket`, `Backslash`, `Semicolon`, `Quote`,
-`Comma`, `Period`, `Slash`, `Grave`).
-
----
-
-## File & folder pickers
-
-Blocking, synchronous, modal — safe to call from an `onClick` handler.
-On Linux these shell out to `zenity` or `kdialog` (in that order); if
-neither is installed, every picker call returns `std::nullopt` as if
-cancelled (no built-in fallback dialog).
-
-```cpp
-struct FileFilter { std::string name; std::string pattern; }; // ';'-separated globs, e.g. "*.png;*.jpg"
-
-std::optional<std::string>
-openFilePicker(const std::string &title = "Open File",
-               const std::vector<FileFilter> &filters = {});
-
-// Multi-select (Ctrl / Shift). Empty vector on cancel/failure.
-std::vector<std::string>
-openFilesPicker(const std::string &title = "Open Files",
-                const std::vector<FileFilter> &filters = {});
-
-std::optional<std::string>
-saveFilePicker(const std::string &title = "Save File",
-               const std::string &defaultName = "",
-               const std::vector<FileFilter> &filters = {},
-               const std::string &defaultExt = "");
-
-std::optional<std::string> openFolderPicker(const std::string &title = "Open Folder");
-std::optional<std::string> saveFolderPicker(const std::string &title = "Select Folder");
-```
-
-`saveFilePicker`'s `defaultExt` (no leading dot) is appended if the
-user's typed name doesn't already end in an extension covered by
-`filters`. The single-path pickers return the chosen absolute path, or
-`std::nullopt` on cancel/failure; `openFilesPicker` returns an empty
-vector in those cases.
-
-## Clipboard (`liteui_clipboard`)
-
-```cpp
-namespace liteui_clipboard {
-  bool setText(const std::string &utf8);
-  std::optional<std::string> getText(); // nullopt = no usable OS clipboard;
-                                        // "" = clipboard has no text
-
-  // What TextInput actually uses — always mirrors into an in-process
-  // fallback so copy/paste still round-trips within THIS app even with
-  // no OS clipboard tool available:
-  void setTextWithFallback(const std::string &s);
-  std::string getTextWithFallback();
-
-  // Line-ending helpers:
-  std::string toLF(const std::string &in);   // "\r\n" and lone "\r" -> "\n"
-  std::string toCRLF(const std::string &in); // "\n" -> "\r\n" (existing CRLF untouched)
-}
-```
-
-On Linux, `setText`/`getText` shell out to `wl-copy`/`wl-paste`
-(Wayland), `xclip`, or `xsel`, checked in that order and only counted
-as available if the matching display-server env var is also set. See
-PLATFORM_NOTES for the silent in-process fallback's caveats.
-
----
-
-## Image decoding (`liteui_image`)
-
-```cpp
-namespace liteui_image {
-  std::optional<CanvasImage> decodeFile(const std::string &path,
-                                        std::string *errorOut = nullptr);
-  std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
-                                          std::string *errorOut = nullptr);
-}
-```
-
-Synchronous decode into an RGBA8 `CanvasImage` (PNG/JPEG via
-libpng/libjpeg on Linux, WIC on Windows). Both return `std::nullopt` on
-failure; if `errorOut` is non-null it receives a short message (for
-example `"unrecognized image format (not PNG or JPEG)"`). This is what
-the `Image` node uses internally — call it directly when you want the
-pixels for `CanvasContext::drawImage` / `putImageData`.
-
----
-
-## `LiteUI`
-
-The window class.
-
-```cpp
-explicit LiteUI(const std::string &title = "Window",
-                int width = -1, int height = -1,
-                bool hideTitlebar = false);
-```
-
-`width`/`height` of `-1` (the default) starts the window maximized.
-`hideTitlebar` (Linux only) suppresses the custom client-side titlebar
-— on Windows this has no effect (native decorations are always used).
-
-### Running
-
-```cpp
-void run(); // blocks, pumps the platform event loop until the window closes
-```
-
-### Tree management
-
-```cpp
-void setRoot(View view);
-```
-
-Lays the tree out immediately and repaints. Safe to call more than
-once — replaces the previous tree (freeing its cached text/canvas
-resources first) and invalidates any stale click/focus/scroll-drag/
-tooltip pointers into the old tree.
-
-### Window control
-
-```cpp
-void requestClose();
-void requestMinimize();
-void requestMaximize(); // toggles: maximizes if normal, restores if maximized
-void requestMove();     // starts an interactive window-drag (call from onClick)
-
-void setOnCloseRequest(std::function<void()> fn);
-void forceClose();
-```
-
-`setOnCloseRequest` installs a handler that runs whenever the user asks
-to close the window — the system close button, the custom titlebar's
-close button via `requestClose()`, Alt+F4, or a window-manager "Close"
-action — instead of the window closing immediately. The handler decides
-what happens next: call `forceClose()` right away if there's nothing to
-lose, or show a confirmation UI first and call it once the user has
-answered. With no handler installed, a close request closes the window
-immediately. `forceClose()` closes unconditionally, bypassing the
-handler.
-
-### Timers
-
-```cpp
-int  addInterval(int ms, std::function<void()> fn);
-void removeInterval(int handle);
-```
-
-`fn` runs every `ms` milliseconds until removed. Each tick automatically
-triggers the same poll-dynamic-sources + relayout + repaint cycle as a
-click/key dispatch, so `fn` can freely mutate plain captured
-variables and have it show up on screen with no extra plumbing.
-
-### Background threads
-
-```cpp
-void wake();                                   // safe from ANY thread
-void setWakeHandler(std::function<void()> fn);
-```
-
-`wake()` is the one `LiteUI` call that is safe off the UI thread. The
-event loop normally sleeps until the OS hands it an event, so a worker
-thread that has finished something (a render, a decode, a download) has
-no other way to make the UI notice. `wake()` makes the UI thread run the
-wake handler (if one is set), then poll dynamic sources and repaint —
-exactly as after a click or timer tick.
-
-Wakes coalesce: several `wake()` calls before the UI thread gets to them
-produce **one** callback, so a chatty worker can't flood the loop. A wake
-is never lost — one issued while the UI thread is busy is delivered as
-soon as it next waits. The handler runs on the UI thread before the
-repaint and is optional; with none installed, a wake still polls and
-repaints, which is all a worker needs when the UI reads its results from
-a `canvasDirtySource`. Set it from the UI thread before the first
-`wake()`.
-
-**Lifetime:** join every thread that can still call `wake()` before the
-`LiteUI` is destroyed.
-
-### Global shortcuts
-
-```cpp
-void addShortcut(KeyModifiers mods, Key key, std::function<void()> fn);
-```
-
-Fires regardless of what (if anything) has keyboard focus — checked
-*before* the focused view's own `onKeyDown`. Use for things like
-Ctrl+S that should work even while, say, a plain button has focus.
-
-### Appearance
-
-```cpp
-void setTooltipStyle(TooltipStyle s);
-void setWindowBackground(Color c);
-void setScrollbarColors(Color track, Color thumb);
-```
-
-### Misc
-
-```cpp
-void requestRepaint();       // polls dynamic sources, relayouts, repaints
-static LiteUI *current();    // the active instance (used internally by
-                              // TextInput/Image for their own timers/polling)
-KeyModifiers modifiers() const; // Shift/Ctrl/Alt/Super state right now
-```
-
----
-
-## `TooltipStyle`
+### `TooltipStyle`
 
 ```cpp
 struct TooltipStyle {
-  int delayMs = 500;
-  Color background{50, 50, 50, 230};
-  Color textColor{255, 255, 255, 255};
-  float padding = 6.0f;
-  float fontSize = 13.0f;
-  std::string fontFamily; // empty = platform default
+    int delayMs = 500;
+    Color background{50, 50, 50, 230};
+    Color textColor{255, 255, 255, 255};
+    float padding = 6;
+    float fontSize = 13;
+    std::string fontFamily;         // empty = platform default
 };
 ```
 
-Applies to every `View::tooltip` in the window; set once via
-`LiteUI::setTooltipStyle`. `delayMs` is the hover time before a tooltip
-appears.
+---
+
+## Dialogs, clipboard and image helpers
+
+### File and folder pickers
+
+```cpp
+struct FileFilter { std::string name; std::string pattern; };   // pattern: ";"-separated globs, "*.png;*.jpg"
+
+std::optional<std::string>  openFilePicker  (const std::string &title = "Open File",
+                                             const std::vector<FileFilter> &filters = {});
+std::vector<std::string>    openFilesPicker (const std::string &title = "Open Files",
+                                             const std::vector<FileFilter> &filters = {});
+std::optional<std::string>  saveFilePicker  (const std::string &title = "Save File",
+                                             const std::string &defaultName = "",
+                                             const std::vector<FileFilter> &filters = {},
+                                             const std::string &defaultExt = "");
+std::optional<std::string>  openFolderPicker(const std::string &title = "Open Folder");
+std::optional<std::string>  saveFolderPicker(const std::string &title = "Select Folder");
+```
+
+All are **modal and synchronous**, so they are safe to call from an `onClick`. They return `std::nullopt` (or an empty vector) on cancel or failure. `defaultExt` has no leading dot and is appended if the typed name does not already end in an extension from the filters. `saveFolderPicker` differs from `openFolderPicker` only in default title and button wording. On Linux the dialogs are provided by `zenity` or `kdialog`; if neither is installed, the pickers return nothing.
+
+### `liteui_clipboard`
+
+```cpp
+bool                        liteui_clipboard::setText(const std::string &utf8);
+std::optional<std::string>  liteui_clipboard::getText();
+void                        liteui_clipboard::setTextWithFallback(const std::string &s);
+std::string                 liteui_clipboard::getTextWithFallback();
+std::string                 liteui_clipboard::toLF  (const std::string &in);   // CRLF / CR -> LF
+std::string                 liteui_clipboard::toCRLF(const std::string &in);   // LF -> CRLF
+```
+
+- `setText` / `getText` talk to the operating system clipboard. `getText` returns the raw text (possibly with `\r\n`), or `nullopt` if it cannot be read.
+- `setTextWithFallback` always keeps a copy in the process **and** tries the system clipboard. `getTextWithFallback` returns the system text normalized to `\n`, or the process copy if the system clipboard is unavailable. This makes copy and paste inside your app work even when no clipboard tool is installed on Linux.
+- On Linux, the system clipboard uses `wl-copy`/`wl-paste` under Wayland, or `xclip` / `xsel` when `DISPLAY` is set.
+
+### `liteui_image`
+
+```cpp
+std::optional<CanvasImage> liteui_image::decodeFile  (const std::string &path,
+                                                      std::string *errorOut = nullptr);
+std::optional<CanvasImage> liteui_image::decodeMemory(const uint8_t *data, size_t size,
+                                                      std::string *errorOut = nullptr);
+```
+
+Decode synchronously into straight-alpha RGBA8. `errorOut`, if given, receives a message on failure. Linux: PNG and JPEG (`decodeFile` picks the codec by extension, `decodeMemory` by magic bytes). Windows: any format WIC supports.
+
+### `liteui_text`
+
+```cpp
+size_t liteui_text::caretIndexForX(const std::string &text, const TextStyle &style,
+                                   float fontSize, FontWeight fontWeight,
+                                   FontStyle fontStyle, float clickX);
+```
+
+Returns the byte index in `text` whose caret position is closest to `clickX`, measured from the text's left edge. It is the helper `TextInput` uses, exposed for hand-built text widgets.
+
+---
+
+## Compile-time switches
+
+| Macro | Where | Effect |
+|---|---|---|
+| `LITEUI_IMPLEMENTATION` | Exactly one `.cpp` per executable, before `#include "liteui.hpp"` | Compiles the platform backend into that translation unit. |
+| `LITEUI_PROFILE` | Define for the implementation translation unit (CMake: `-DLITEUI_PROFILE=ON`) | Prints per-second frame timing to `stderr`. Compiles to nothing when undefined. |
+
+The backend is chosen by `#if defined(_WIN32)` (Direct2D) versus everything else (Wayland). See [BUILDING.md](BUILDING.md) for libraries and flags.
+
+---
+
+## Errors, threading and lifetime
+
+- **Exceptions.** The `LiteUI` constructor throws `std::runtime_error` on platform initialization failure. `resolveStatic` throws `std::bad_variant_access` if a field holds a callback. Everything else reports failure through return values (`std::optional`, empty vectors, `bool`) or `onError` callbacks.
+- **Threads.** All API calls belong to the UI thread, except `LiteUI::wake()`. Handlers, interval callbacks, `Dynamic<>` callbacks, `onPaint` and the wake handler all run on the UI thread.
+- **Copies.** `addChild` and `setRoot` copy their argument. State captured by callbacks must outlive the window (locals in `main` captured by reference are fine while `run()` is on the stack).
+- **Keyed lists.** `itemBuilder` runs only for new keys; reused rows keep what they were built with, so make anything that can change a `Dynamic<>` callback. See the [README](../README.md#keyed-dynamic-lists).
+- **Destruction.** Join every thread that may call `wake()` before the `LiteUI` is destroyed.
