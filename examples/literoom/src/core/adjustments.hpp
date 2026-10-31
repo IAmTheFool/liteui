@@ -40,8 +40,10 @@ constexpr int kToneMax = kBipolarMax;
 
 // ---------------- Adjustments ----------------
 // Every slider in the "Adjust" pane is one entry in kAdjustmentSpecs below.
-// Adding a new one means adding an AdjId and one entry to that table (the
-// static_assert after the table fails the build if the two don't line up).
+// Adding a new one means adding an AdjId and one entry to that table 
+// (That every Tone entry has an `apply` is checked at run time by
+// tests/adjustments_test.cpp, because GCC can't constant-evaluate the
+// null check under -fsanitize=address,undefined.)
 // AdjustmentSet, the sidebar loop and the Tone-stage LUT pick it up
 // automatically; a Color, Detail or Effects slider also needs its pass
 // (ColorPass, detail_layer, film_fx, ...) to read its value.
@@ -337,10 +339,9 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
          static_cast<float>(kBipolarMax), nullptr, AdjustmentSpec::Stage::Effects},
     }};
 
-// Checks that the table lines up with AdjId (entry i has id i), every range is
-// non-empty, and every Tone entry has an `apply`. Evaluated at compile time just
-// below, so adding an AdjId without a table entry (or vice versa) fails the
-// build instead of silently reading the wrong slider at run time.
+// Compile-time part: table lines up with AdjId and every range is non-empty.
+// (The `apply` null check can't live here: GCC refuses to constant-evaluate
+// a lambda->function-pointer comparison under -fsanitize=address,undefined.)
 constexpr bool adjustmentSpecsValid()
 {
   for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
@@ -348,14 +349,14 @@ constexpr bool adjustmentSpecsValid()
     const AdjustmentSpec &s = kAdjustmentSpecs[i];
     if (adjIndex(s.id) != i || !(s.min < s.max))
       return false;
-    if (s.stage == AdjustmentSpec::Stage::Tone && s.apply == nullptr)
-      return false;
   }
   return true;
 }
 static_assert(adjustmentSpecsValid(),
               "kAdjustmentSpecs must have one entry per AdjId, in AdjId order, "
-              "with min < max and an `apply` for every Tone entry");
+              "with min < max");
+
+
 
 using AdjValues = std::array<float, adjIndex(AdjId::Count)>;
 

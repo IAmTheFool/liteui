@@ -30,7 +30,8 @@ struct RectEval
   // The weight is non-zero exactly where |u| < 1 and |v| < 1, and with
   //   u = (dx c + dy s) / rx      v = (-dx s + dy c) / ry
   // each of those is a linear function of dx, so each gives an interval of dx
-  // and the row's span is their intersection. Exact (padded by a pixel).
+  // and the row's span is their intersection. Exact up to a tiny rounding
+  // tolerance (see `clip`), then padded by a pixel.
   bool rowSpan(int y, int W, int &x0, int &x1) const
   {
     const float dy = (static_cast<float>(y) + 0.5f) - cy;
@@ -38,6 +39,13 @@ struct RectEval
     // |a dx + b| < R
     const auto clip = [&](float a, float b, float R) -> bool
     {
+      // The span must be a SUPERSET of the pixels rowWeights gives weight > 0
+      // (MaskComposite::rowSpan and applyMaskToBlock rely on it). The edge is
+      // solved here as a linear equation, but rowWeights evaluates the same
+      // edge per pixel in another order of operations (FMA, vectorization), so
+      // a pixel sitting exactly on the edge can get a ~1e-13 weight while this
+      // says "outside". A tiny tolerance on R absorbs that rounding.
+      R = R * 1.00001f + 1e-4f;
       if (std::fabs(a) < 1e-6f)
         return std::fabs(b) < R; // the row is parallel to this pair of edges
       float l = (-R - b) / a, h = (R - b) / a;
