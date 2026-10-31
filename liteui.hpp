@@ -1397,8 +1397,12 @@ private:
 #include <wincodec.h>
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
+#pragma comment(lib, "user32")
+#pragma comment(lib, "gdi32")
 #pragma comment(lib, "d2d1")
 #pragma comment(lib, "dwrite")
+#pragma comment(lib, "windowscodecs")
+#pragma comment(lib, "ole32")
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h"      // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
