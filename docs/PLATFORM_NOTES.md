@@ -1,158 +1,141 @@
-# Platform notes & known limitations
+# Platform notes
 
-This is a single reference for everything in `liteui.hpp` that behaves
-differently between Windows and Linux, or that's a deliberate v1
-simplification rather than a bug. Pulled together from the comments
-already sitting next to the relevant code — if you're debugging
-something that looks wrong, check here before assuming it's a bug.
+LiteUI runs on **Windows** (Direct2D) and **Linux under Wayland** (EGL/GLES2, Cairo, Pango). The layout engine, event dispatch, scrolling, focus and the whole public API are shared, so most code behaves identically. This page is the one-stop list of where the platforms **differ**, with a link to the detail for each item.
 
-Internal names mentioned below (`liteui_svg`, `liteui_xml`,
-`resolveScrollTarget`, `kTitlebarHeight`, and so on) live in the
-implementation section of `liteui.hpp` — the part compiled under
-`LITEUI_IMPLEMENTATION`. They're referenced to help you find the relevant
-code, not because they're public API.
+- [Support matrix](#support-matrix)
+- [Differences at a glance](#differences-at-a-glance)
+- [Windows notes](#windows-notes)
+- [Linux notes](#linux-notes)
+- [Writing portable apps](#writing-portable-apps)
+- [Known platform gaps](#known-platform-gaps)
 
-## Canvas 2D (`CanvasContext`)
+## Support matrix
 
-The Windows backend (Direct2D, v1 `ID2D1RenderTarget`) and the Linux
-backend (Cairo) expose the identical public API, but a few operations
-resolve differently or aren't fully implemented on one side:
-
-| Feature | Linux (Cairo) | Windows (Direct2D) |
+| | Windows | Linux |
 |---|---|---|
-| `getImageData` | Fully supported — reads back the canvas's own backing surface | Fully supported — reads the WIC bitmap that backs each canvas node's render target. Like Linux, it ignores the current transform and returns raw device pixels |
-| `putImageData` / `drawImage` | Supported | Supported |
-| `clearRect` | True, transform-aware sub-rectangle clear (`CAIRO_OPERATOR_CLEAR`), antialiased at rotated/skewed edges | True, transform-aware sub-rectangle clear, written straight into the WIC bitmap (Direct2D's own `Clear()` would wipe the whole target). The edges of a rotated/skewed rect are a hard pixel-center test, **not** antialiased |
-| `globalCompositeOperation` | Full range, maps 1:1 onto Cairo operators | Only ever draws normal source-over alpha blending — a plain `ID2D1RenderTarget` has no Porter-Duff blend control. The value is stored but has no visible effect |
-| Radial gradients | Exact — Cairo's native two-circle model | Approximated. Direct2D only models a single circle plus a focal point, so the inner-radius stop is approximated by rescaling stop offsets rather than drawn exactly |
+| Window system | Win32 | **Wayland only** (xdg-shell) |
+| Rendering | Direct2D | EGL + GLES2 |
+| Text | DirectWrite | Pango, rasterized with Cairo |
+| Canvas | Direct2D on a WIC bitmap | Cairo image surface |
+| Image decoding | WIC (any format WIC supports) | libpng, libjpeg (**PNG and JPEG only**) |
+| Bundled presets | `msvc-*` | `gcc-*` |
+| Other platforms | macOS and X11 are **not supported**; there is no DPI or output-scale handling on either backend | |
 
-Independent of platform:
+Setup, packages and flags for each are in [BUILDING.md](BUILDING.md).
 
-- **No image decoding inside `CanvasContext` itself.** `CanvasImage`
-  just wraps raw, already-decoded RGBA8 pixels — `drawImage` never
-  reads a PNG/JPEG file for you. (The higher-level `Image` node *does*
-  decode PNG/JPEG automatically via libpng/libjpeg on Linux and WIC on
-  Windows — this limitation is specifically about calling
-  `CanvasContext::drawImage` directly inside a `Canvas` node's
-  `onPaint`.)
-- **Shadows are a flat, unblurred offset copy** — `setShadow`'s blur
-  parameter is accepted but ignored on both backends. There's no
-  Gaussian blur pass.
-- **`strokeText` is an approximation**, not a true stroked glyph
-  outline. Both backends draw the fill text in the stroke color,
-  nudged across a small ring of directions, to fake a stroke effect.
-  It will look wrong for large stroke widths or unusual fonts.
-- **`fillText`/`strokeText`'s `maxWidth` parameter is accepted for API
-  familiarity with HTML canvas but currently does nothing** — there's
-  no horizontal squeeze-to-fit.
+## Differences at a glance
 
-## SVG (`Svg` node / `liteui_svg` parser)
+Legend for the last column: **Design** means the platforms are meant to differ, **Limit** means a known limitation, and **Bug** means the behavior looks unintended and is expected to be fixed (see [Known platform gaps](#known-platform-gaps)).
 
-- Supports: `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`,
-  `polygon`, `<g>`/`<symbol>`/nested `<svg>` as transform/style
-  containers, `<use>` (both `href` and `xlink:href`, with cycle and
-  nesting-depth guards), presentation attributes, inline `style=""`,
-  and a **single-class** subset of `<style>` block CSS (`.foo {
-  fill: ...; }` rules referenced via `class="foo"`). Compound
-  selectors, `@media`, tag/id/descendant selectors, and CSS
-  specificity rules are not implemented — only flat `.classname`
-  rules are recognized, and are matched in file order.
-- **Not supported at all:** gradients, patterns, `clipPath`/`mask`,
-  and `<text>` elements inside SVG documents.
-- **`<use>` referencing a `<symbol>` does not honor that symbol's own
-  `width`/`height`/`viewBox`/`preserveAspectRatio`** — it's rendered
-  at its natural coordinates, exactly like referencing a plain `<g>`
-  would be.
-- **Group opacity is approximated**, not true isolated-layer
-  compositing — an `opacity` on a `<g>` is folded into each
-  descendant shape's own fill/stroke alpha individually. This looks
-  correct for non-overlapping shapes but will look wrong wherever a
-  group's own shapes overlap each other.
-- This stays fully vector — an `Svg` node re-renders at whatever pixel
-  size it's laid out to (including across a window resize), unlike
-  `Image`, which is a fixed-resolution bitmap.
+### Window and lifecycle
 
-## XML parsing (`liteui_xml`, used internally by SVG)
+| Area | Windows | Linux | Kind | Details |
+|---|---|---|---|---|
+| Title bar | Native | Drawn by LiteUI (32 px: minimize, maximize, close) | Design | [ARCHITECTURE.md](ARCHITECTURE.md#linux-wayland) |
+| Frameless window (`hideTitlebar`) | Supported | Supported | Same | [API.md](API.md#liteui-the-window) |
+| `setOnCloseRequest` | Called for close requests | **Never called** | Bug | [API.md](API.md#methods) |
+| `requestClose()` | Goes through the close handler | Closes immediately | Bug | [API.md](API.md#methods) |
+| Start maximized when `width` or `height` is `<= 0` | Yes | Yes | Same | [API.md](API.md#liteui-the-window) |
+| Repaint | `InvalidateRect`, painted on the next `WM_PAINT` | Synchronous redraw on every request | Design | [ARCHITECTURE.md](ARCHITECTURE.md#the-update-cycle) |
+| Pointer-motion coalescing | None | Motion events collapse to the latest position | Design | [ARCHITECTURE.md](ARCHITECTURE.md#linux) |
+| Key repeat | Delivered by the OS | Generated by the library (timerfd) | Design | [ARCHITECTURE.md](ARCHITECTURE.md#linux) |
 
-A general-purpose but intentionally partial XML parser:
+### Timers and threads
 
-- No external entity resolution, no DTD validation.
-- No namespace resolution — a prefix like `xlink:href` is kept as
-  plain attribute-name text, not resolved against a namespace URI.
-- **Mixed content order is not preserved.** All text at a given
-  nesting level is concatenated into that node's `text` field in
-  document order, regardless of where child elements fall between the
-  runs. This is fine for SVG (which never relies on interleaved
-  text/element content) but would misrepresent arbitrary XML/HTML
-  where text and elements alternate meaningfully.
+| Area | Windows | Linux | Kind | Details |
+|---|---|---|---|---|
+| `addInterval` | `SetTimer`; handle derived from the timer count, so handles **can collide** after a removal | `timerfd` with a monotonically increasing handle | Bug (Windows) | [ARCHITECTURE.md](ARCHITECTURE.md#sharp-edges) |
+| `wake()` | Posted message, coalesced by an atomic flag | `eventfd`, N wakes drain as one callback | Design | [ARCHITECTURE.md](ARCHITECTURE.md#threading-and-timers) |
 
-## Layout engine (flexbox subset)
+### Drawing and canvas
 
-- **Percentages resolve to `0` when an ancestor's size is itself
-  `Fit`** (i.e. indefinite) — there's no "auto" fallback the way CSS
-  sometimes provides.
-- **`FlexWrap::Wrap` only affects the placement pass, not sizing.** A
-  container with `Size::fit()` on its main axis still measures its
-  natural size assuming a single line, since a `Fit` main axis has no
-  definite width to wrap against in the first place. If you want
-  wrapping content inside a `Fit`-sized container to actually wrap,
-  give the container a definite or `Size::full()` main-axis size
-  instead.
+| Area | Windows | Linux | Kind | Details |
+|---|---|---|---|---|
+| Default `lineWidth` | 1 px | **2 px** (Cairo's default) | Bug | [CANVAS.md](CANVAS.md#context-state-and-defaults) |
+| `setGlobalCompositeOperation` | **Ignored** (always source-over) | Honored | Limit | [CANVAS.md](CANVAS.md#compositing) |
+| Radial gradient with inner radius | Approximated | Exact | Limit | [CANVAS.md](CANVAS.md#gradients) |
+| `putImageData` | Alpha-blends, respects clip | Replaces pixels, ignores clip | Limit | [CANVAS.md](CANVAS.md#reading-and-writing-pixels) |
+| `clearRect` on rotated edges | Hard pixel-center test | Antialiased | Limit | [CANVAS.md](CANVAS.md#reading-and-writing-pixels) |
+| `measureText` width | Fractional | Rounded to whole pixels | Design | [CANVAS.md](CANVAS.md#text) |
+| `Alphabetic` text baseline | Approximated (80% of line height) | Font's real baseline | Limit | [CANVAS.md](CANVAS.md#text) |
+| `CanvasContext::width()/height()` | Possibly fractional | Whole pixels | Design | [CANVAS.md](CANVAS.md#the-drawing-surface) |
+| Canvas bitmap upload | Re-uploaded to the GPU on **every window paint** | Uploaded only when the canvas redraws | Design | [CANVAS.md](CANVAS.md#performance-notes) |
+| Box border | Stroked centered on the edge (half outside) | Drawn inside the box, snapped to whole pixels; radius clamped to half the shorter side | Design | [LAYOUT.md](LAYOUT.md#box-model) |
+| Shadow blur, `strokeText` outline, `fillText` `maxWidth` | Not implemented | Not implemented | Limit (both) | [CANVAS.md](CANVAS.md#not-available) |
 
-## Absolute positioning, scrolling, and hit-testing
+### Assets and OS services
 
-- `Position::Absolute` descendants are **not** threaded through the
-  clip-aware walks that back scrolling, hit-testing, or tooltip
-  targeting (`resolveScrollTarget`, `hitTestFlow`,
-  `hitTestTooltipFlow`). This means an absolutely positioned view that
-  sits visually inside a scrolled-out region of some ancestor can
-  still register clicks/hover/tooltips as if it were visible. This is
-  a deliberate v1 trade-off, not an oversight — absolutes are always
-  collected and tested globally, unclipped, matching how they're also
-  always painted in a separate global-stacking pass on top of the flow
-  tree.
-- Absolute nodes stack by `zIndex`, ties broken by document discovery
-  order (`collectAbsolutes`/`sortAbsolutes`) — this ordering is shared
-  identically between painting and hit-testing, so what's on top
-  visually is also what receives the click.
+| Area | Windows | Linux | Kind | Details |
+|---|---|---|---|---|
+| Image formats | Anything WIC decodes (BMP, GIF, TIFF, ICO, ...) | PNG, JPEG | Limit | [API.md](API.md#liteui_image) |
+| File and folder pickers | Native dialogs | `zenity`, then `kdialog`; returns nothing if neither is installed | Design | [API.md](API.md#file-and-folder-pickers) |
+| System clipboard | Native | `wl-copy`/`wl-paste` (Wayland) or `xclip`/`xsel` (X11); in-process fallback | Design | [API.md](API.md#liteui_clipboard) |
+| Profiler output | Yes | **None** (no probes yet) | Limit | [PROFILING.md](PROFILING.md#platform-support) |
 
-## `TextInput`
+### Build and test
 
-- **The built-in single-line text field only accepts ASCII input**
-  (codepoints `0x20`–`0x7F`) — both typed text (`onTextInput`) and
-  pasted text (`Ctrl+V`, which strips anything ≥ `0x80` along with line
-  breaks) are filtered to ASCII. This matches the widget's own
-  byte-offset cursor tracking, which does not currently handle
-  multi-byte UTF-8 correctly. Plain `Text` rendering (via DirectWrite
-  / Pango) has no such restriction — this limitation is specific to
-  the editable `TextInput` widget.
+| Area | Windows | Linux | Details |
+|---|---|---|---|
+| Toolchain env | Developer prompt (`cl.exe` on `PATH`) | `g++` plus dev packages | [BUILDING.md](BUILDING.md) |
+| Sanitizers | AddressSanitizer (VS 2019 16.9+) | AddressSanitizer + UBSan, leaks off for tests that link LiteUI | [TESTING.md](TESTING.md#sanitizers) |
+| Platform-specific tests | None in the core suite | Keysym → `Key` mapping (`platform.inc`) | [TESTING.md](TESTING.md#platform-specific-cases) |
 
-## Clipboard
+### Identical on both
 
-- On Linux, copy/paste shells out to whichever of `wl-copy`/`wl-paste`
-  (Wayland), `xclip`, or `xsel` is actually installed and usable —
-  checked in that order, and only counted as "available" if the
-  corresponding display server environment variable is also set.
-- **If none of those tools are present, clipboard falls back to an
-  in-process string** that only round-trips within the same running
-  app — it will not see what another application copied, and other
-  applications will not see what LiteUI "copied." This fallback is
-  silent: there's no error surfaced to the app when it engages.
+The layout engine (`liteui_layout`), the XML and SVG parsers, hit-testing, click bubbling, per-button press and drag tracking, focus, scrolling behavior (wheel, thumb drag, content pan), tooltips, shortcuts, keyed-list reconciliation, and the `Dynamic<>` polling model are shared code, so they behave the same. The one behavioral wrinkle in shared scrolling code is that `Overflow::Hidden` containers still scroll, on both platforms ([LAYOUT.md](LAYOUT.md#overflow-and-scrolling)).
 
-## Native file/folder pickers
+## Windows notes
 
-- On Linux, `openFilePicker`/`saveFilePicker`/`openFolderPicker`/
-  `saveFolderPicker` shell out to `zenity` or `kdialog`, in that
-  order. **If neither is installed, every picker call returns
-  `std::nullopt`** as if the user cancelled — there is no built-in
-  fallback dialog.
+- **Build from a developer prompt.** The MSVC presets pin `cl.exe` and leave toolchain selection to the environment. See [BUILDING.md](BUILDING.md#windows-setup).
+- **Pass `/utf-8`** to MSVC so sources are read as UTF-8.
+- **Console window.** A normal `int main` program also opens a console, which is where `stderr` (including profiler output) appears. If you link a GUI-subsystem executable, redirect `stderr` to see it.
+- **Only Windows has profiler output.** Use the `msvc-*-profile` presets. See [PROFILING.md](PROFILING.md).
+- **Canvas cost.** Every window paint re-uploads every canvas bitmap, so keep canvases only as large as they need to be.
+- **Close prompts work here.** `setOnCloseRequest` is honored on Windows; make sure the handler calls `forceClose()`.
+- **ASan builds** copy the sanitizer runtime DLL next to each test executable. See [TESTING.md](TESTING.md#sanitizers).
 
-## Windowing / backend coverage
+## Linux notes
 
-- Windows: native decorations via Win32, no custom titlebar code path.
-- Linux: Wayland only (via `xdg-shell`), with a custom client-side
-  titlebar drawn in-process (`kTitlebarHeight`), since Wayland has no
-  server-side decoration guarantee. There is no X11 backend.
-- There is no macOS backend at all.
-- No touch/gesture input handling on either platform — only mouse and
-  keyboard events are wired up.
+- **Wayland only.** There is no X11 backend. A session without a Wayland display (plain X11, SSH without forwarding, many containers) fails at startup with a `std::runtime_error` from the `LiteUI` constructor. Check `WAYLAND_DISPLAY`.
+- **GPU stack.** Rendering needs EGL and GLES2 (Mesa or a vendor driver). A missing or broken driver surfaces as an initialization error.
+- **Dependencies.** Development packages for Wayland, xkbcommon, Cairo, Pango, EGL, GLES2, libpng and libjpeg; the exact module list is in [BUILDING.md](BUILDING.md#linux-setup). The Wayland protocol bindings are vendored, so `wayland-scanner` is not needed to build.
+- **Optional runtime tools.** Install `zenity` (or `kdialog`) for file dialogs, and `wl-clipboard` (or `xclip`/`xsel`) for the system clipboard. Without them, pickers return nothing and the clipboard stays inside your process.
+- **Title bar.** LiteUI draws its own. For a custom bar, create the window with `hideTitlebar = true` and use `requestMove`, `requestMinimize`, `requestMaximize` and `requestClose`.
+- **Close handling.** `setOnCloseRequest` and `requestClose()` currently skip the handler, so a "save changes?" prompt will not run. Do your confirmation in your own UI.
+- **Stroke widths.** Always call `setLineWidth` before stroking, because the default differs from Windows.
+- **Images.** Convert assets to PNG or JPEG.
+- **Redraws are synchronous.** Every timer tick redraws the whole window immediately, so keep intervals as long as your animation allows.
+
+## Writing portable apps
+
+A checklist for code that should look and behave the same on both platforms:
+
+- [ ] Call `setLineWidth` explicitly before every stroke.
+- [ ] Do not depend on `setGlobalCompositeOperation`. Use `clearRect` to erase.
+- [ ] Ship images as PNG or JPEG.
+- [ ] Treat the file pickers and clipboard as fallible: handle `std::nullopt` and empty results, and prefer `setTextWithFallback` / `getTextWithFallback` for in-app copy and paste.
+- [ ] Do not rely on `setOnCloseRequest` for data safety until it is wired up on Linux. Make unsaved-changes handling part of your normal UI flow.
+- [ ] Avoid pixel-exact expectations for text on the alphabetic baseline or for `measureText` widths; allow a pixel or two.
+- [ ] Use `putImageData` with fully opaque pixels, or draw translucent content with `drawImage`.
+- [ ] Do not give canvases more pixels than needed (cheap on Linux, repeatedly costly on Windows).
+- [ ] Keep `addInterval` usage simple on Windows (see [Known platform gaps](#known-platform-gaps)).
+- [ ] Prefer `Size::full()` and `flexGrow` over absolute sizes so layouts adapt to the different default window chrome.
+- [ ] Test on both. The shared layout code is covered by unit tests; painting and input are not.
+
+## Known platform gaps
+
+The items below are places where one platform lags the other or the behavior looks unintended. They are the ones to fix first, and this table is the single place to retire them from, along with the matching caveat in the linked guide.
+
+| Gap | Affects | Where it is documented |
+|---|---|---|
+| `setOnCloseRequest` is never called, and `requestClose()` bypasses it | Linux | [API.md](API.md#methods), README |
+| `addInterval` handles can collide after removals | Windows | [ARCHITECTURE.md](ARCHITECTURE.md#sharp-edges) |
+| Default `lineWidth` is 2 px instead of 1 px | Linux | [CANVAS.md](CANVAS.md#context-state-and-defaults) |
+| `globalCompositeOperation` is ignored | Windows | [CANVAS.md](CANVAS.md#compositing) |
+| `putImageData` blends instead of replacing | Windows | [CANVAS.md](CANVAS.md#reading-and-writing-pixels) |
+| Profiler has no probes; `recompute` and `appPaint` are never recorded | Linux (all stages), both (those two stages) | [PROFILING.md](PROFILING.md#known-gaps) |
+| Canvas bitmaps re-uploaded on every window paint | Windows | [CANVAS.md](CANVAS.md#performance-notes) |
+| Keyed-list changes clear focus without `onBlur` | Both | [ARCHITECTURE.md](ARCHITECTURE.md#sharp-edges) |
+| `Overflow::Hidden` containers still scroll | Both | [LAYOUT.md](LAYOUT.md#overflow-and-scrolling) |
+| Images limited to PNG and JPEG | Linux | [API.md](API.md#liteui_image) |
+| No DPI or output-scale handling | Both | [ARCHITECTURE.md](ARCHITECTURE.md#costs-and-trade-offs) |

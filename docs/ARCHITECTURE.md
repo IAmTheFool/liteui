@@ -1,293 +1,301 @@
 # Architecture
 
-How `liteui.hpp` is put together, for people reading or changing the
-library itself. If you just want to build a window, start with
-[`GETTING_STARTED.md`](GETTING_STARTED.md); for field-by-field reference
-see [`API.md`](API.md); for per-backend quirks see
-[`PLATFORM_NOTES.md`](PLATFORM_NOTES.md).
+This document explains how LiteUI is put together: what lives where in `liteui.hpp`, how a UI description becomes pixels, how input and updates flow, and how the Windows and Linux backends fit into the same design. It is for people who want to read, debug or extend the library. For how to *use* it, start with the [README](../README.md) and [API.md](API.md).
+
+- [Design principles](#design-principles)
+- [Map of the header](#map-of-the-header)
+- [Public surface versus implementation](#public-surface-versus-implementation)
+- [The data model](#the-data-model)
+- [The update cycle](#the-update-cycle)
+- [Layout](#layout)
+- [Rendering](#rendering)
+- [Event loop and input](#event-loop-and-input)
+- [Threading and timers](#threading-and-timers)
+- [Supporting subsystems](#supporting-subsystems)
+- [Platform strategy](#platform-strategy)
+- [Build architecture](#build-architecture)
+- [Costs and trade-offs](#costs-and-trade-offs)
+- [Sharp edges](#sharp-edges)
+- [Extending LiteUI](#extending-liteui)
 
 ## Design principles
 
-- **One file to ship.** Users copy `liteui.hpp` and write one line
-  (`#define LITEUI_IMPLEMENTATION`) in one `.cpp`.
-- **Retained mode, no diffing layer.** The app builds a `View` tree once.
-  State lives in ordinary variables the app owns; `Dynamic<T>` fields read
-  them back by polling (see [The frame pipeline](#the-frame-pipeline)).
-- **Native rendering, no abstraction layer.** Windows uses Direct2D and
-  DirectWrite; Linux uses Wayland, EGL/GLES2, Cairo and Pango. Platform
-  differences are selected at compile time with `#if defined(_WIN32)`.
-  There are no virtual backend interfaces and no vtables.
-- **Cheap to include.** The part of the header every file sees contains no
-  platform headers and compiles no function bodies of any size.
+- **One header, one implementation translation unit.** Everything is in `liteui.hpp`. The implementation sits behind `LITEUI_IMPLEMENTATION` and is compiled into exactly one `.cpp` per program.
+- **A retained tree you describe once.** You build a tree of `View`s with styles and callbacks, hand it to the window, and the library owns it from then on.
+- **Poll, don't push.** Instead of an observable or a diffing layer, fields that can change are `Dynamic<T>`: a value or a callback. After every event the library polls the callbacks, compares against a cached copy, and relays out and repaints only if something changed.
+- **No runtime polymorphism for platforms.** Windows and Linux are selected with `#if defined(_WIN32)`, not virtual interfaces. The public `LiteUI` and `CanvasContext` classes are thin handles that forward into backend classes.
+- **Native rendering per platform.** Direct2D/DirectWrite on Windows; EGL/GLES2 with Cairo and Pango on Linux (Wayland). No bundled rasterizer or font engine.
+- **Pure logic is separable.** Layout, XML, SVG parsing and key mapping are plain code. They have no window dependency, which is why they can be unit-tested directly.
 
-## The two halves of the header
+## Map of the header
 
-`liteui.hpp` is split in the style of `stb_*.h`.
+`liteui.hpp` is organized public-first, then implementation.
 
 ```
-liteui.hpp
-├── Public half            (always visible; guarded by LITEUI_HPP_INCLUDED)
-│     standard headers only, no platform headers
-│     Color / Key / KeyEvent / KeyModifiers
-│     Dynamic<T>, Size, EdgeInsets, Style, Text, TextStyle
-│     CanvasImage, FileFilter, CanvasGradient, enums
-│     CanvasContext   (declarations only)
-│     Canvas, Image, TextInput, Svg   (plain data structs)
-│     View            (the tree node)
-│     TooltipStyle, LiteUI            (declarations only)
-│     declarations of the free functions: file pickers, liteui_clipboard,
-│       liteui_image::decode*, liteui_text::caretIndexForX
-│
-└── Implementation half    (only where LITEUI_IMPLEMENTATION is defined)
-      platform headers and the remaining standard headers
-      Win32 helpers · optional frame profiler (LITEUI_PROFILE)
-      file pickers · clipboard · image decoding (WIC / libpng+libjpeg)
-      XML parser · SVG parser/renderer
-      text backend (DirectWrite / Pango)
-      CanvasContextImpl   (one definition per platform branch)
-      layout engine (liteui_layout) · xkb key mapping (Linux)
-      LiteUIImpl          (the window: Win32 or Wayland+EGL)
-      out-of-line definitions, including the public facades
+PUBLIC (always compiled)
+  basic types          Color, Size, EdgeInsets, Dynamic<T>, enums
+  input types          Key, KeyModifiers, KeyEvent
+  Style                layout + box + scroll properties
+  leaf nodes           Text, TextInput, Image, Svg, Canvas, CanvasContext
+  View                 the retained node, with View::Computed
+  LiteUI               the window handle
+  helper declarations  file pickers, liteui_clipboard, liteui_image, liteui_text
+
+#ifdef LITEUI_IMPLEMENTATION
+  profiler             liteui_prof
+  file pickers         liteui_filepicker
+  clipboard            liteui_clipboard
+  image decoding       liteui_image
+  XML parser           liteui_xml
+  SVG                  liteui_svg
+  text backend         liteui_text
+  canvas backends      CanvasContextImpl (Direct2D | Cairo)
+  layout               liteui_layout
+  window core          LiteUIImpl: state, update cycle, input dispatch
+  window, Windows      Win32 window + WndProc + Direct2D painting
+  window, Linux        Wayland + EGL/GLES2 + xkbcommon
+  glue                 View::toView overloads, LiteUI forwarding methods, run()
+#endif
 ```
 
-The implementation half is compiled in exactly one translation unit: the
-file that defines `LITEUI_IMPLEMENTATION`; the library has no separate
-implementation `.cpp`, each executable provides that file (for example its
-`main.cpp`). A second definition of the macro in the same program is a
-duplicate-symbol link error by design.
+This order is deliberate: each layer only uses things defined above it (layout uses the text backend for measurement; the window core uses layout and the canvas backends; the platform windows use the core).
 
-## The public/implementation boundary
+## Public surface versus implementation
 
-Anything an application can name lives in the public half; everything that
-needs a platform header lives behind the macro. Four patterns bridge the
-gap.
+The public half of the header must compile everywhere without platform SDK headers, so it uses **opaque handles**:
 
-### 1. `LiteUI` is a handle to `LiteUIImpl`
+- **`LiteUI`** holds a pointer to `LiteUIImpl`, which is only *defined* in the implementation section. Every `LiteUI` method is a one-line forwarder.
+- **`CanvasContext`** is a public class with no data. Its methods are defined in the implementation as `static_cast<CanvasContextImpl *>(this)->...`. The context you receive in `onPaint` is really a `CanvasContextImpl`. There are no virtual functions, so there is no vtable and no indirect call, only a cast the compiler can see through.
+- **`View::Computed`** holds the backend's cached resources (text layouts, GPU textures, canvas bitmaps) as forward-declared or type-erased pointers. Releasing them is centralized in `View::freeTextResources()`, because `View`s are copied while a tree is built and a resource must be released exactly once.
 
-`LiteUI` is the class applications construct. It holds a single
-`LiteUIImpl *p_` and every public method is a one-line forwarder defined in
-the implementation half. `LiteUIImpl` is the real window class with all the
-Win32 or Wayland state in it. `LiteUI::current()` returns the public handle;
-internal code uses `LiteUIImpl::current()`.
+The header also guards against being compiled twice with `LITEUI_IMPLEMENTATION_DONE`.
 
-### 2. `CanvasContext` is a base class of `CanvasContextImpl`
+## The data model
 
-Applications receive a `CanvasContext&` in `onPaint`. The public
-`CanvasContext` declares the drawing methods but has no data and a protected
-constructor. Each platform branch defines
-`class CanvasContextImpl : public CanvasContext`, holding the
-`ID2D1RenderTarget*` or `cairo_t*` and the real method bodies. The library
-creates a `CanvasContextImpl` and passes it as the base reference. Every
-public method is a small non-inline forwarder:
+### A tree of `View`s
 
-```cpp
-void CanvasContext::moveTo(float x, float y) {
-  static_cast<CanvasContextImpl *>(this)->moveTo(x, y);
-}
-```
+The retained tree is made only of `View`s. `Text`, `TextInput`, `Image`, `Svg` and `Canvas` are **author-facing descriptions**. `View::addChild` *flattens* each into a `View` (a text node sets `isText`; canvas-backed nodes set `isCanvas` and an `onPaint`). The rest of the library never needs to know what kind of leaf it is looking at, only whether it is text or canvas.
 
-The `static_cast` is well-defined because every `CanvasContext` the
-application ever sees really is the base of a `CanvasContextImpl`. Inside
-the implementation, code that holds a `CanvasContextImpl` calls its own
-methods directly.
+`TextInput`, `Image` and `Svg` are built on the canvas path. Their `toView` functions install an `onPaint` that draws the text, bitmap or vector document into the node's surface.
 
-### 3. `View` stays a plain struct with opaque platform pointers
+### Ownership and copies
 
-`View` is public and has no user-declared constructors, but its `computed` block caches
-platform objects (a DirectWrite text layout, a Direct2D render target, a
-GL texture, a Cairo surface). Those members are pointers to forward-declared
-types (`struct IDWriteTextLayout;`, `typedef struct _cairo_surface
-cairo_surface_t;`, and `unsigned int` in place of `GLuint`), so the public
-half never needs the platform headers. `View::freeTextResources()` and the
-`toView` conversions call into the platform, so they are declared in the
-class and defined in the implementation half.
+`addChild` and `setRoot` take their argument **by value**, so the window owns a private copy of the whole tree (`root_`). Callbacks you wrote capture your own variables by reference; the *tree* is never shared with your code. This keeps lifetime simple (no dangling parent pointers) at the cost of copy work during construction.
 
-### 4. Free functions are declared publicly, defined once
+### Style and Computed
 
-Public free functions such as `openFilePicker` or
-`liteui_image::decodeFile` are declared (with their default arguments) in
-the public half and defined, **without `inline`**, in the implementation
-half. Internal helpers keep `inline` or live in `detail` namespaces.
+`View::style` is what you declared. `View::computed` is everything the library derives:
 
-### Rules that keep the boundary intact
+| Part of `computed` | Purpose |
+|---|---|
+| `x`, `y`, `w`, `h` | Final border box in window coordinates (written by layout). |
+| `contentW/H`, `scrollX/Y` | Scroll extent and offset. |
+| `resolved*` caches | The last value polled from each `Dynamic<>` field (width, height, margin, padding, colors, border, position edges, z-index, display, visibility, text, ...). |
+| `dirty` and size stamps | Tell the renderer when a cached text layout or texture must be rebuilt. |
+| Backend resources | Text layouts and textures, canvas surfaces and bitmaps, image caches. |
+| `isHovered` | Maintained by the input code for hover colors and scrollbar auto-hide. |
 
-- No platform header, platform type or `LITEUI_PROF_*` macro in the public
-  half. The only platform names there are the opaque forward declarations.
-- No non-template, non-inline function definitions in the public half, or
-  two files including the header would define the same symbol.
-- A function that is declared in the public half must not be defined
-  `inline` in the implementation half; the compiler may then never emit it.
-- Default arguments are written once, on the public declaration, never on
-  the definition.
+The central trick is `resolveDynamic(field, cache)`: if the field holds a value, return it; if it holds a callback, return the **cached result of the last poll**. Layout and painting only ever call `resolveDynamic`. **User callbacks are never invoked during layout or painting**, only during polling, which makes frame work predictable and keeps a slow callback from stalling a paint.
 
-## Data model
+## The update cycle
 
-- **`Style`** holds layout and appearance. Most fields are `Dynamic<T>`.
-- **`Dynamic<T>`** is `std::variant<T, std::function<T()>>`. Plain values are
-  used as-is; callbacks are polled. The last polled result is cached in the
-  node's `computed.resolved*` fields so painting never calls user code.
-- **`View`** is the tree node: `style`, `children`, event handlers, and a
-  `computed` block that the layout and paint passes fill in (absolute
-  window coordinates, scroll extents, hover/dirty flags, cached platform
-  resources). Renderers only read `computed`.
-- **Author-facing leaves** (`Text`, `Canvas`, `TextInput`, `Image`, `Svg`)
-  are plain structs. `View::addChild` converts them with `toView`: `Text`
-  becomes a text node, and the other four become `isCanvas` nodes whose
-  `onPaint` draws them through `CanvasContext`.
-- **Keyed lists** (`keysSource` / `itemBuilder`) are reconciled by
-  `reconcileChildren`: surviving keys are moved over untouched, new keys are
-  built, dropped keys are freed.
-
-## The frame pipeline
-
-There is no render loop to write and no per-frame callback. Work happens in
-response to events:
+Everything that can change the screen goes through the same loop:
 
 ```
-platform event ──► dispatch (hit test, focus, shortcuts)
-  (Win32 message          │
-   or Wayland listener)   ▼
-                    app handler runs (mutates app variables)
-                          │
-timer tick / wake() ──────┤
-                          ▼
-                  pollAndRelayout()
-                    checkForUpdates(root)   poll every Dynamic<T>,
-                          │                 write changes back, mark dirty
-                          ▼ (if anything changed)
-                    reconcileChildren       keyed lists only
-                    relayout()              liteui_layout::layoutRoot
-                          │
-                          ▼
-                       redraw()
-                    Windows: paintView  (Direct2D)
-                    Linux:   renderView (GLES2 + cached textures)
+event (click, key, wheel, timer tick, wake, resize)
+   |
+   v
+your handler runs                      (on the UI thread)
+   |
+   v
+pollAndRelayout()
+   |-- checkForUpdates(root)           walk the tree:
+   |       keysSource  -> reconcile keyed children
+   |       each Dynamic<T> callback -> compare with resolved* cache
+   |       mark changed nodes dirty
+   |-- if nothing changed: stop        (no layout, no paint)
+   |-- if the tree's structure changed: drop pointers into the tree
+   |-- honor focus requests (wantsFocus / TextInput requestFocus)
+   `-- relayout()                      measure + place, onLayout callbacks
+   |
+   v
+repaint
 ```
 
-`pollAndRelayout` is the one place that polls dynamic sources and applies
-the result; `requestRepaint()` calls it too. If a structural change
-(a keyed list) happened, pointers to the old tree held by press, drag,
-focus and tooltip state are cleared first so nothing dangles.
+Details that matter:
 
-### Layout
+- **`requestRepaint()` is "poll, then repaint".** Timer ticks and wakes call it, which is why an interval callback that only changes your own variables still updates the screen. On Windows the repaint is `InvalidateRect` (painted on the next `WM_PAINT`); on Linux it redraws **synchronously**.
+- **`setRoot` lays out twice.** It runs layout, polls once (so values captured through `onLayout` take effect), and lays out again, so the first paint is already correct.
+- **Polling walks the whole tree.** There is no subscription or dependency tracking. Each event pays for one traversal plus every callback it contains. Keep callbacks cheap.
+- **Keyed lists** reconcile inside `checkForUpdates`: `keysSource` is polled, the key vector is compared with the cached one, surviving children are moved (not rebuilt), new keys call `itemBuilder`, and removed children are freed.
+- **A canvas redraws only when asked.** `canvasDirtySource` is polled in the same pass. See [CANVAS.md](CANVAS.md#when-onpaint-runs).
 
-`liteui_layout::layoutRoot` runs a flexbox subset in two passes:
-`measureNatural` computes each node's natural size bottom-up (resolving
-`Size` kinds with `resolveAxis`), then `placeNode` assigns absolute window
-coordinates top-down, writing them to `computed`. Scroll containers measure
-their children at natural size and track `contentW/H` and
-`scrollX/Y`. `Position::Absolute` nodes are gathered globally
-(`collectAbsolutes`, `sortAbsolutes` by `zIndex`) and are painted and
-hit-tested in a separate pass on top of the flow tree, using the same
-ordering so what is visually on top is what receives the click.
+## Layout
 
-### Hit testing
+Layout lives in `liteui_layout` and is pure: it reads `style` plus the polled caches and writes `computed`. It is two passes, **measure** (bottom-up natural sizes against the space offered) then **place** (top-down: basis sizes, grow/shrink, alignment, wrapping, absolute children, scroll extents). Text sizing calls into the text backend so layout and paint agree. The full rules are in [LAYOUT.md](LAYOUT.md).
 
-`hitTestFlow` walks the tree back-to-front with clip rectangles so scrolled
-out content is not hit; `hitTestTooltipFlow` and `resolveScrollTarget`
-follow the same clip-aware descent. `updateHover` mirrors it so hover state
-matches what the pointer would actually click.
+Because layout is pure code with exported helpers (`resolveAxis`, `clampSize`, `axisScrollbarVisible`, `layoutRoot`), the unit tests drive it directly with fixed-size boxes. See [TESTING.md](TESTING.md).
 
-## Platform backends
+## Rendering
+
+A repaint **paints the whole window**. There is no damage tracking or partial invalidation: every paint clears the background and draws the full tree. The order is the same on both platforms:
+
+1. Window background.
+2. The in-flow tree, depth first. Each node paints background, border, its own content (text or canvas bitmap), then its children, then its scrollbars. Scroll containers clip their children to their box.
+3. All absolutely positioned nodes, collected from the whole tree and sorted by `zIndex` then document order.
+4. (Linux) the title bar, unless the window is frameless.
+5. The tooltip.
 
 ### Windows
 
-- **Window and loop:** a Win32 window; `run()` is the standard
-  `GetMessage` / `DispatchMessage` loop and `WndProc` is the event entry
-  point. Interval timers use `SetTimer`.
-- **Painting:** Direct2D on the window's render target. Text uses cached
-  DirectWrite layouts (`computed.textLayout`), rebuilt when the width, text
-  or font values they were built for change.
-- **Canvas nodes:** each gets an offscreen Direct2D render target backed by a
-  WIC bitmap, so `CanvasContextImpl` can lock real pixels for
-  `getImageData` and `clearRect`. Each paint blits the result into the
-  window target.
-- **Decorations:** native.
+Painting happens in `WM_PAINT` on a Direct2D `HwndRenderTarget`: `BeginDraw`, clear, paint the tree with a push/pop clip stack, draw absolutes, draw the tooltip, `EndDraw`.
+
+- **Text** is laid out with DirectWrite. The `IDWriteTextLayout` is cached in `computed` and rebuilt only when the text, font or available width changes.
+- **Canvases** draw into a **CPU bitmap**: a WIC bitmap with a software Direct2D render target. When the window paints, that bitmap is converted to a GPU bitmap and drawn. This happens on **every window paint**, not only when the canvas redrew, which is the main cost of large canvases on Windows.
+- **Images** are decoded with WIC.
 
 ### Linux (Wayland)
 
-- **Window and loop:** `xdg-shell` toplevel with the protocol bindings
-  vendored under `platform/wayland-protocols/`. `run()` is a `poll()` loop
-  over the Wayland display fd, one `timerfd` per interval, and an `eventfd`
-  used by `wake()`. Pointer motion is coalesced (`flushPendingMotion`) and
-  key repeat is driven client-side.
-- **Input:** `wl_pointer`, `wl_keyboard` and `xkbcommon`; `xkbKeysymToKey`
-  maps xkb keysyms to the platform-independent `Key` enum.
-- **Painting:** an EGL/GLES2 surface. Rectangles are drawn with a small GL
-  shader. Text is laid out by Pango, rasterized by Cairo into an image
-  surface and uploaded as a cached GL texture. Canvas nodes draw through
-  Cairo into a CPU image surface that is uploaded as a texture; keeping the
-  surface is what makes `getImageData` a plain read.
-- **Decorations:** a client-side titlebar drawn in-process (`drawTitlebar`),
-  since Wayland has no server-side decoration guarantee.
+Painting is done with **EGL and GLES2** into a Wayland surface.
 
-## Threading
+- **Boxes** are quads drawn as triangle strips with small shaders, clipped with the scissor test.
+- **Text** is laid out with **Pango**, rasterized by **Cairo** into an image, and uploaded to a GL texture that is cached per node and rebuilt when text, font or size changes.
+- **Canvases** are Cairo image surfaces, uploaded to a texture **only when the canvas redraws**.
+- **Window chrome:** LiteUI draws its own 32 px title bar (minimize, maximize, close), because it does not negotiate server-side decorations.
+- **Presentation** is `eglSwapBuffers`, so the compositor owns frame timing. `redraw()` is synchronous.
+- **Images** are decoded with libpng and libjpeg.
 
-Everything runs on the UI thread. The single exception is
-`LiteUI::wake()`, which any thread may call to make the loop wake, run the
-optional wake handler, then poll and repaint. On Windows it posts a message
-with a coalescing flag; on Linux it writes to the `eventfd`. Multiple wakes
-before the UI thread runs produce one callback, and none is lost.
+## Event loop and input
 
-## Resource lifetime
+### Windows
 
-`View` has no destructor that frees platform resources, because views are
-copied freely while a tree is built (`root.addChild(heading)` copies
-`heading`) and an auto-freeing destructor would double-release across those
-copies. `freeTextResources()` frees cached textures, layouts and surfaces
-explicitly, and is called from `setRoot()` and `~LiteUI()`, the only places
-a live tree is retired.
+A standard Win32 message pump (`GetMessage` / `TranslateMessage` / `DispatchMessage`) drives a `WndProc` that handles pointer, wheel, keyboard, character, timer, paint, resize and close messages, plus a private wake message (`WM_APP + 1`).
 
-## Subsystems
+### Linux
 
-| Subsystem | Namespace | Notes |
+A single-threaded `poll()` loop sleeps on a set of file descriptors:
+
+```
+poll() over:
+  - the Wayland display fd
+  - the key-repeat timerfd
+  - the wake eventfd
+  - one timerfd per addInterval()
+```
+
+Notable choices:
+
+- **Pointer motion is coalesced.** Motion events only record the latest position; `flushPendingMotion()` applies at most one hover/drag update and one redraw before the loop sleeps again, so a flood of motion events cannot queue up redraws.
+- **Key repeat is implemented in the library** with a timerfd, because Wayland delivers key press and release but leaves repeat to the client.
+- **Keyboard input** is translated through xkbcommon: keysyms map to `Key` (a pure function, unit-tested), and composed text arrives as UTF-32 for `onTextInput`.
+- The loop obeys the `wl_display_prepare_read` protocol, and anything that can redraw (and therefore read the display inside `eglSwapBuffers`) happens *outside* that window.
+
+### Dispatch (shared logic)
+
+The platform code translates native events into calls on shared `LiteUIImpl` methods:
+
+- **Shortcuts** are checked first (exact key and modifier match; first match consumes the event), then the focused view's handlers.
+- **Hit-testing** tests absolutes first (highest `zIndex` down), then the flow tree, and returns the topmost view with a handler for the button. Clicks **bubble** to the nearest ancestor with a handler.
+- **Press and drag state** is tracked **per mouse button** (`pressedView_[3]`, `dragView_[3]`), so left, middle and right can be in different states at once. A drag only starts on a view that was hit by the press.
+- **Scrolling** resolves the deepest scrollable view under the pointer, handling the scrollbar track and thumb, wheel, and content panning (with a small drag threshold so clicks still work).
+- **Hover and tooltips:** hover state updates `isHovered`; a timer shows the tooltip after the configured delay.
+- **Focus** is a single pointer to the focused view. Only that view receives keyboard handlers.
+
+### Pointers into the tree
+
+The input state above is stored as **raw pointers into the tree** (`pressedView_`, `dragView_`, `focusedView_`, the scroll-drag target, the tooltip target). Rebuilding children invalidates them, so whenever polling changes the tree's *structure* (a keyed list gaining or losing a key), the window **clears all of them** and hides the tooltip. The consequences are described in [Sharp edges](#sharp-edges).
+
+## Threading and timers
+
+LiteUI is a single-threaded UI toolkit with one cross-thread door.
+
+- **Everything runs on the UI thread**: handlers, `Dynamic<>` callbacks, `onPaint`, timers and the wake handler.
+- **`wake()`** is the only thread-safe call. On Windows it posts the private message, guarded by an atomic flag so repeated wakes coalesce into one message in the queue. On Linux it writes to an `eventfd`; N pending wakes drain as one callback. Either way the loop then runs the wake handler and calls `requestRepaint()`.
+- **Intervals** use `SetTimer` on Windows and one `timerfd` per interval on Linux. A tick runs your callback and then `requestRepaint()`, which polls and repaints.
+- **Library timers use the same mechanism.** Tooltip delay and the text-input caret blink are ordinary intervals, created and removed through `addInterval` / `removeInterval`.
+
+## Supporting subsystems
+
+| Subsystem | Notes |
+|---|---|
+| **Text backend** (`liteui_text`) | Measures and lays out text for layout and paint, and answers `caretIndexForX`. DirectWrite on Windows, Pango on Linux. |
+| **Canvas backends** (`CanvasContextImpl`) | Direct2D with a WIC-backed target, or Cairo. Same method surface; behavior differences are catalogued in [CANVAS.md](CANVAS.md#platform-differences). |
+| **XML parser** (`liteui_xml`) | A small, forgiving subset: elements, attributes, text, entities, CDATA, comments. It returns whatever it could read rather than failing hard, and deep nesting is bounded. |
+| **SVG** (`liteui_svg`) | Parses into a `Document` of shapes (path operations plus paint and stroke state). The `Svg` node replays that document through a `CanvasContext` at the node's pixel size, which is why it stays crisp. Gradients, clip paths, masks and text are not modeled. |
+| **Image decoding** (`liteui_image`) | WIC on Windows; libpng and libjpeg on Linux. Synchronous, returns straight-alpha RGBA. |
+| **Pickers and clipboard** | Native APIs on Windows. On Linux they shell out to `zenity` / `kdialog` and `wl-clipboard` / `xclip` / `xsel`, with a process-local clipboard fallback. |
+| **Profiler** (`liteui_prof`) | Compile-time optional frame timing (Windows probes only today). See [PROFILING.md](PROFILING.md). |
+
+## Platform strategy
+
+The two backends are interleaved in one `LiteUIImpl` class using `#if defined(_WIN32)`. The *core* (tree, polling, layout call, hit-testing, scroll and focus logic) is shared, and each backend supplies a matching surface:
+
+| Concern | Windows | Linux |
 |---|---|---|
-| File and folder pickers | `liteui_filepicker` (the free functions are the public API) | `IFileOpenDialog`/`IFileSaveDialog` on Windows; shells out to `zenity`/`kdialog` on Linux. All five pickers build a `Request` and go through one platform-specific `pick()`; to add a mode, extend `Mode` and both `pick()` implementations |
-| Clipboard | `liteui_clipboard` | Win32 clipboard; `wl-copy`/`wl-paste`/`xclip`/`xsel` on Linux; silent in-process fallback |
-| Image decoding | `liteui_image` | WIC on Windows; libpng + libjpeg on Linux |
-| XML | `liteui_xml` | Intentionally partial parser, used by SVG |
-| SVG | `liteui_svg` | Parsed once at `addChild`, replayed through `CanvasContext` on every paint |
-| Text measurement | `liteui_text` | DirectWrite or Pango; `caretIndexForX` is public |
-| Frame profiler | `liteui_prof` | Compile-time `LITEUI_PROFILE`; compiles to nothing when off |
+| Window and loop | Win32, message pump | Wayland xdg-shell, `poll()` loop |
+| Painting | Direct2D in `WM_PAINT` | EGL/GLES2, synchronous `redraw()` |
+| Text | DirectWrite | Pango + Cairo textures |
+| Canvas | Direct2D on WIC bitmap | Cairo image surface |
+| Timers | `SetTimer` | `timerfd` |
+| Wake | `PostMessage` | `eventfd` |
+| Title bar | OS-provided (or custom if frameless) | Drawn by LiteUI (or custom if frameless) |
+| Key mapping | virtual keys | xkbcommon keysyms |
+| Images | WIC | libpng, libjpeg |
 
-## Build integration
+When you change behavior in the shared core, check both backends; when you change a backend, check that the other still presents the same observable semantics. Most of the documented differences in the guides are places where that parity is not yet complete.
 
-- **CMake:** `liteui::liteui` is a header-only `INTERFACE` library with no
-  sources of its own. It carries the include directory, `cxx_std_23`, the
-  optional `LITEUI_PROFILE` define, the platform libraries, and (on Linux)
-  the vendored `liteui_wayland_protocols` static library, all as
-  `INTERFACE` properties, so they propagate to every target that links it.
-  The consumer defines `LITEUI_IMPLEMENTATION` in one `.cpp`, so the
-  implementation is compiled inside the consumer. Examples are
-  `examples/<name>/{CMakeLists.txt,main.cpp}`, globbed at configure time.
-- **Protocol bindings:** `platform/wayland-protocols/` holds the generated
-  xdg-shell and xdg-decoration sources; the `regen-protocols` target
-  rebuilds them and the result must be committed.
-- **Without CMake:** copy the header and define the macro in one `.cpp`; see
-  the [README](../README.md#how-the-single-header-works).
+## Build architecture
 
-## Making changes
+- **`liteui::liteui` is an `INTERFACE` library.** It contributes the include path, `cxx_std_23`, optional `LITEUI_PROFILE`, and the platform libraries. The implementation is compiled inside the consuming executable.
+- **Wayland protocol bindings are vendored** (`platform/wayland-protocols/`), so consumers need only the runtime libraries, not `wayland-scanner`.
+- **Tests compile the implementation themselves.** The core test suite is a single translation unit that defines `LITEUI_IMPLEMENTATION` so it can reach internals such as `liteui_layout` and `liteui_svg`. See [TESTING.md](TESTING.md) and [BUILDING.md](BUILDING.md).
 
-**Add a method to `LiteUI`.** Declare it in the public `LiteUI` class, add the
-real method to `LiteUIImpl`, and add a one-line forwarder next to the others
-at the end of the implementation half.
+## Costs and trade-offs
 
-**Add a method to `CanvasContext`.** Declare it (with any default arguments)
-in the public `CanvasContext`, implement it in **both** `CanvasContextImpl`
-definitions with the same signature, and add the `static_cast` forwarder.
-Then document it in `API.md` and note any backend difference in
-`PLATFORM_NOTES.md`.
+| Choice | Benefit | Cost |
+|---|---|---|
+| Whole-window repaints | Simple, no damage bookkeeping, no stale pixels | Every repaint redraws everything; cost scales with node count. |
+| Polling the entire tree after each event | No dependency tracking; callbacks "just work" | O(nodes) per event plus every callback. Heavy callbacks hurt. |
+| Copy-on-add trees | No shared ownership or dangling parents | Construction copies; rebuilding a large tree is not free (keyed lists exist to avoid it). |
+| No virtual dispatch for backends | No vtables, trivial inlining, small ABI | Two backends in one class body; changes touch `#if` blocks. |
+| Single header | Trivial to vendor | Large header; implementation compile time lands in one TU. |
+| One window per process | Simple global state | No multi-window support (`LiteUI::current()` is the latest window). |
 
-**Add a public free function.** Declare it in the public half; define it in
-the implementation half without `inline` and without repeating default
-arguments.
+## Sharp edges
 
-**Add a platform-specific feature.** Keep it in the implementation half,
-inside the existing `#if defined(_WIN32)` / `#else` structure. If a `View`
-needs to cache a platform object, add an opaque pointer to
-`View::computed` using a forward-declared type, and release it in
-`freeTextResources()`.
+These are places where the architecture's assumptions leak into behavior. They come from reading the code, and each is worth knowing when debugging.
 
-**Check your change.** A file that only includes `liteui.hpp` must still
-compile with no platform headers on the include path. Compiling two such
-files into one program must not produce duplicate symbols.
+- **Structural tree changes drop input state.** When a keyed list gains or loses a key, the window clears focus, any in-progress press or drag, and the tooltip. In-flight drags end without `onDragEnd`. Clearing focus does **not** call `onBlur`, so a `TextInput` that was focused can keep its focused border and blinking caret while no view actually has keyboard focus. To keep typing uninterrupted across list updates, ask for focus again from the same update (`TextInput`'s `state->requestFocus`, or a `wantsFocus` callback that returns `true`); the poll re-focuses after the rebuild.
+- **Windows interval handles can collide.** `addInterval` on Windows picks the `SetTimer` id as the current number of timers plus one. After a removal, a new interval can receive an id that is still in use, which replaces the older timer's callback and period. Because tooltips and caret blinking are intervals too, add/remove sequences involving them can disturb user intervals. Linux uses a monotonically increasing handle and is not affected.
+- **`setOnCloseRequest` is Windows-only** at present. Only the Win32 close path calls the handler.
+- **Repaints on Linux are synchronous.** `requestRepaint()` redraws immediately and every timer tick triggers a full redraw, so a very short interval is a very short frame budget.
+- **Canvas upload cost differs.** Windows re-uploads each canvas bitmap on every window paint; Linux uploads only on redraw.
+- **Some options are accepted but inert**, such as `setShadow`'s blur radius, and `globalCompositeOperation` on Windows.
+
+## Extending LiteUI
+
+These are the touch points, taken from how the existing pieces are wired.
+
+### Adding a `Style` property
+
+1. Add the field to `Style`. Make it `Dynamic<T>` only if it must change at runtime.
+2. If it is `Dynamic<>`, add a `resolved*` cache to `View::Computed` and a polling branch in `checkForUpdates`, so a change marks the node dirty.
+3. Read it through `resolveDynamic(field, cache)` in layout and in **both** painters. Never call the callback during layout or paint.
+4. If it affects layout, handle it in `measureNatural` / `placeNode`, and add a layout test with fixed-size boxes.
+
+### Adding a leaf node type
+
+1. Define the author-facing struct (with a `Style`).
+2. Add a `View::addChild` overload and a `toView` that flattens it into a `View`. Prefer building on the canvas path (`isCanvas` plus an `onPaint`) so no new renderer code is needed.
+3. Forward any handlers it should expose onto the `View`.
+
+### Adding a `CanvasContext` method
+
+1. Declare it in `CanvasContext`.
+2. Implement it in **both** `CanvasContextImpl` classes (Direct2D and Cairo).
+3. Add the forwarder `CanvasContext::name(...)` that casts to `CanvasContextImpl`.
+4. Document any behavior difference in [CANVAS.md](CANVAS.md#platform-differences).
+
+### Adding or changing a platform backend
+
+The shared core expects each backend to provide window creation and the event loop, native-to-shared event translation, painting in the order described above, the text backend and canvas context, timers, wake, and clipboard, pickers and image decoding. A new platform means a new branch of each of those under a new preprocessor condition, plus an entry in the CMake file for its libraries.

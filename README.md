@@ -72,6 +72,8 @@ The bundled CMake presets use **MSVC** on Windows and **GCC** on Linux. The proj
 
 ## Getting started
 
+New to LiteUI? The [step-by-step tutorial](docs/GETTING_STARTED.md) builds a counter, a todo list, a custom-drawn widget and a background worker. The sections below are the short version.
+
 ### Using the header
 
 Include `liteui.hpp` wherever you need the API. In **exactly one** `.cpp` file of each executable, define `LITEUI_IMPLEMENTATION` first. That is the translation unit that compiles the backend and sees the platform headers:
@@ -418,6 +420,9 @@ Inside `liteui.hpp`, the public declarations come first (colors, keys, `Style`, 
 
 Detailed guides live in [`docs/`](docs/):
 
+- `GETTING_STARTED.md`: a step-by-step tutorial from an empty folder to a working app
+- `PLATFORM_NOTES.md`: every Windows and Linux difference in one place, plus known platform gaps
+- `ARCHITECTURE.md`: how the library is put together: header layout, update cycle, rendering, event loops and threading
 - `API.md`: reference for the public types and functions
 - `BUILDING.md`: platform setup, presets and options
 - `LAYOUT.md`: the layout engine and `Style` in depth
