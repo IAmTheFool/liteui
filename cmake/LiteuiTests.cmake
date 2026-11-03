@@ -132,7 +132,7 @@ function(liteui_add_test name)
         target_link_libraries(${tgt} PRIVATE Threads::Threads)
     endif()
     if(MSVC)
-        target_compile_options(${tgt} PRIVATE /utf-8)  # sources are UTF-8
+        target_compile_options(${tgt} PRIVATE /utf-8 /bigobj)  # sources are UTF-8
     endif()
 
     set(_env "")

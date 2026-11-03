@@ -30,7 +30,7 @@ target_link_libraries(literoom PRIVATE liteui::liteui Threads::Threads)
 source_group(TREE ${LITEROOM_SRC} FILES ${LITEROOM_SRC}/main.cpp ${LITEROOM_HEADERS})
 
 if(MSVC)
-    target_compile_options(literoom PRIVATE /utf-8)
+    target_compile_options(literoom PRIVATE /utf-8 /bigobj)
     # Need to split main in small build functions this is temporary but works
     target_link_options(literoom PRIVATE /STACK:8388608)
 endif()
