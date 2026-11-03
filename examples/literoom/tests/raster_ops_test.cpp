@@ -713,6 +713,6 @@ int main()
   testMovesAreExact16();
   testPreviewBase16();
   testResizeAndRotate16();
-  // testGoldenFingerprints();
+  // testGoldenFingerprints();// TODO:: need fix for linuxtarget_compile_options(${tgt} PRIVATE /utf-8)
   return finish();
 }

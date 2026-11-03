@@ -147,7 +147,7 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
             target_link_libraries(${tgt} PRIVATE Threads::Threads)
         endif()
         if(MSVC)
-            target_compile_options(${tgt} PRIVATE /utf-8)
+            target_compile_options(${tgt} PRIVATE /utf-8 /bigobj)
         endif()
 
         set(_env "")
