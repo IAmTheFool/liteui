@@ -577,6 +577,7 @@ public:
   {
     RenderParams rp;
     rp.luts = buildChannelLuts();
+    rp.toneF = makeToneSet(values_, curves_); // the float pipeline's tone tables
     rp.color = buildColorPass();
     rp.fx = neighbor_fx::gainsFromValues(get(AdjId::Texture), get(AdjId::Clarity),
                                          get(AdjId::Sharpness), get(AdjId::Dehaze),

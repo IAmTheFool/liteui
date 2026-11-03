@@ -30,6 +30,11 @@
 //    (a blur that wide has no fine detail to keep, so memory is tiny) and the
 //    slider interpolates between them; 0 is the picture itself.
 //
+// Source sample types: like detail_layer.hpp, everything here reads the source as RGBA8 or as 16-bit
+// RGBA (detail_layer::SrcTraits<S>). An 8-bit source gives exactly the results it always did. A
+// 16-bit one is measured at 16-bit precision: luma and chroma are not rounded to levels, and the
+// planes and maps keep 1/64 level (Map::fix says how many units per level a map holds).
+//
 // Like the detail layers, noise reduction and blur are applied as a DELTA
 // measured on the source ("blurred minus source"), added to the current pixel,
 // so they sit on top of the tone and color sliders instead of undoing them.
@@ -53,6 +58,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -82,12 +88,13 @@ constexpr float kBlurSigmaMin = 1.5f;
 constexpr float kBlurTargetSigma = 2.5f; // sigma, in reduced px, of the stored blur
 
 // ---- a small multi-channel map (reduced resolution) ----
-// Values are stored * 16 (4 fractional bits), like detail_layer::Plane.
+// Values are stored * fix (16 for an 8-bit source, 64 for a 16-bit one), like detail_layer::Plane.
 struct Map
 {
   int w = 0, h = 0, ch = 1;
   float scale = 1.0f; // reduced px per source px (1 / reduction factor)
   float aux = 0.0f;   // Veil: the estimated airlight A
+  float fix = 16.0f;  // plane units per level: a value / fix is in levels
   std::vector<uint16_t> v;
 };
 using MapPtr = std::shared_ptr<const Map>;
@@ -106,9 +113,10 @@ public:
   Store(size_t maxBytes, size_t maxEntries)
       : maxBytes_(maxBytes), maxEntries_(maxEntries) {}
 
-  // `build` returns a std::shared_ptr<T>, or null when cancelled.
-  template <class Build>
-  Ptr get(const uint8_t *rgba, int w, int h, int kind, Build &&build)
+  // `build` returns a std::shared_ptr<T>, or null when cancelled. `rgba` is the 8-bit or the
+  // 16-bit source (S is deduced).
+  template <class S, class Build>
+  Ptr get(const S *rgba, int w, int h, int kind, Build &&build)
   {
     const uint64_t fp = dl::fingerprint(rgba, w, h);
     {
@@ -148,13 +156,13 @@ public:
 private:
   struct Entry
   {
-    const uint8_t *rgba;
+    const void *rgba;
     int w, h, kind;
     uint64_t fp;
     Ptr v;
     uint64_t used;
   };
-  Entry *find(const uint8_t *rgba, int w, int h, int kind, uint64_t fp)
+  Entry *find(const void *rgba, int w, int h, int kind, uint64_t fp)
   {
     for (Entry &e : entries_)
       if (e.rgba == rgba && e.w == w && e.h == h && e.kind == kind &&
@@ -247,23 +255,25 @@ inline float chromaSigma(int w, int h)
 }
 
 // which: 0 = blurred (R - luma), 1 = blurred (B - luma). Stored as
-// (chroma + 255) * 16 so the signed value fits an unsigned plane.
-inline bool buildChroma(const uint8_t *rgba, int w, int h, int which,
+// (chroma + 255) * fix so the signed value fits an unsigned plane.
+template <class S>
+inline bool buildChroma(const S *rgba, int w, int h, int which,
                         dl::Plane &out, const std::atomic<uint64_t> *latest,
                         uint64_t gen)
 {
+  using T = dl::SrcTraits<S>;
   const size_t W = static_cast<size_t>(w), H = static_cast<size_t>(h);
   out.resize(W * H);
   for (size_t y = 0; y < H; ++y)
   {
-    const uint8_t *s = rgba + y * W * 4;
+    const S *s = rgba + y * W * 4;
     uint16_t *o = out.data() + y * W;
     for (size_t x = 0; x < W; ++x)
     {
-      const uint8_t *p = s + x * 4;
-      const int l = dl::lumaOf(p);
-      const int c = which == 0 ? p[0] - l : p[2] - l;
-      o[x] = static_cast<uint16_t>((c + 255) << 4);
+      float cr, cb;
+      T::chroma(s + x * 4, &cr, &cb);
+      const float c = which == 0 ? cr : cb;
+      o[x] = static_cast<uint16_t>((c + 255.0f) * T::kFix + 0.5f);
     }
   }
   return blurPlane(out, W, H, boxRadiusForSigma(chromaSigma(w, h)), latest, gen);
@@ -271,14 +281,15 @@ inline bool buildChroma(const uint8_t *rgba, int w, int h, int which,
 
 // ---- veil map (dehaze) ----
 
-// Min filter, radius r, edges clamped, separable; on a small 8-bit map.
-inline void erode(std::vector<uint8_t> &m, int w, int h, int r)
+// Min filter, radius r, edges clamped, separable; on a small map (8 or 16-bit values).
+template <class V>
+inline void erode(std::vector<V> &m, int w, int h, int r)
 {
-  std::vector<uint8_t> tmp(m.size());
+  std::vector<V> tmp(m.size());
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
     {
-      uint8_t v = 255;
+      V v = std::numeric_limits<V>::max();
       for (int k = -r; k <= r; ++k)
         v = std::min(v, m[static_cast<size_t>(y) * w + std::clamp(x + k, 0, w - 1)]);
       tmp[static_cast<size_t>(y) * w + x] = v;
@@ -286,35 +297,38 @@ inline void erode(std::vector<uint8_t> &m, int w, int h, int r)
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
     {
-      uint8_t v = 255;
+      V v = std::numeric_limits<V>::max();
       for (int k = -r; k <= r; ++k)
         v = std::min(v, tmp[static_cast<size_t>(std::clamp(y + k, 0, h - 1)) * w + x]);
       m[static_cast<size_t>(y) * w + x] = v;
     }
 }
 
-inline std::shared_ptr<Map> buildVeil(const uint8_t *rgba, int w, int h,
+template <class S>
+inline std::shared_ptr<Map> buildVeil(const S *rgba, int w, int h,
                                       const std::atomic<uint64_t> *latest,
                                       uint64_t gen)
 {
+  using T = dl::SrcTraits<S>;
   const int f = std::max(
       1, static_cast<int>(std::ceil(static_cast<float>(std::max(w, h)) /
                                     static_cast<float>(kVeilEdge))));
   const int vw = (w + f - 1) / f, vh = (h + f - 1) / f;
   // 1. Dark channel, min-pooled to the small size: smallest of R, G, B over
-  //    each f x f block.
-  std::vector<uint8_t> dark(static_cast<size_t>(vw) * vh, 255);
+  //    each f x f block. Held in plane units (level * fix): the conversion is monotone, so the
+  //    minimum of the converted values is the converted minimum.
+  std::vector<uint16_t> dark(static_cast<size_t>(vw) * vh, std::numeric_limits<uint16_t>::max());
   for (int y = 0; y < h; ++y)
   {
     if ((y & 31) == 0 && dl::cancelled(latest, gen))
       return nullptr;
-    const uint8_t *s = rgba + static_cast<size_t>(y) * w * 4;
-    uint8_t *row = dark.data() + static_cast<size_t>(y / f) * vw;
+    const S *s = rgba + static_cast<size_t>(y) * w * 4;
+    uint16_t *row = dark.data() + static_cast<size_t>(y / f) * vw;
     int cx = 0, run = 0;
     for (int x = 0; x < w; ++x)
     {
-      const uint8_t *p = s + static_cast<size_t>(x) * 4;
-      const uint8_t m = std::min({p[0], p[1], p[2]});
+      const S *p = s + static_cast<size_t>(x) * 4;
+      const uint16_t m = T::darkFix(std::min({p[0], p[1], p[2]}));
       if (m < row[cx])
         row[cx] = m;
       if (++run == f)
@@ -329,19 +343,18 @@ inline std::shared_ptr<Map> buildVeil(const uint8_t *rgba, int w, int h,
   // 3. Airlight: the brightest dark channel. A hazy scene has a region (sky,
   //    distance) where it is close to the light itself.
   float A = 0.0f;
-  for (uint8_t d : dark)
-    A = std::max(A, static_cast<float>(d));
+  for (uint16_t d : dark)
+    A = std::max(A, static_cast<float>(d) * T::kInvFix);
   A = std::clamp(A, kLightMin, 255.0f);
-  // 4. Smooth it into a transmission-ready veil (precision: * 16).
+  // 4. Smooth it into a transmission-ready veil (precision: * fix).
   auto m = std::make_shared<Map>();
   m->w = vw;
   m->h = vh;
   m->ch = 1;
   m->scale = 1.0f / static_cast<float>(f);
   m->aux = A;
-  m->v.resize(dark.size());
-  for (size_t i = 0; i < dark.size(); ++i)
-    m->v[i] = static_cast<uint16_t>(dark[i] << 4);
+  m->fix = T::kFix;
+  m->v = std::move(dark);
   if (!blurPlane(m->v, static_cast<size_t>(vw), static_cast<size_t>(vh),
                  kVeilPatch, latest, gen))
     return nullptr;
@@ -352,11 +365,13 @@ inline std::shared_ptr<Map> buildVeil(const uint8_t *rgba, int w, int h,
 
 // level 0..2: a color blur of sigma kBlurSigmaFrac[level] * long edge, stored
 // at reduced size (box average, then a small blur at that size).
-inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
+template <class S>
+inline std::shared_ptr<Map> buildBlurLevel(const S *rgba, int w, int h,
                                            int level,
                                            const std::atomic<uint64_t> *latest,
                                            uint64_t gen)
 {
+  using T = dl::SrcTraits<S>;
   const float sigma = std::max(
       kBlurSigmaMin, kBlurSigmaFrac[level] * static_cast<float>(std::max(w, h)));
   const int f = std::max(1, static_cast<int>(std::lround(sigma / kBlurTargetSigma)));
@@ -373,10 +388,10 @@ inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
     for (int rx = 0; rx < rw; ++rx)
     {
       const int x0 = rx * f, x1 = std::min(w, x0 + f);
-      uint32_t sum[3] = {0, 0, 0};
+      uint64_t sum[3] = {0, 0, 0};
       for (int y = y0; y < y1; ++y)
       {
-        const uint8_t *p = rgba + (static_cast<size_t>(y) * w + x0) * 4;
+        const S *p = rgba + (static_cast<size_t>(y) * w + x0) * 4;
         for (int x = x0; x < x1; ++x, p += 4)
         {
           sum[0] += p[0];
@@ -385,11 +400,9 @@ inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
         }
       }
       const uint32_t cnt = static_cast<uint32_t>((y1 - y0) * (x1 - x0));
-      for (int c = 0; c < 3; ++c)
-        // 64-bit: sum * 16 would overflow 32 bits for blocks over ~1M pixels.
+      for (int c = 0; c < 3; ++c) // 64-bit sums: sum * fix would overflow 32 bits for big blocks
         ch[static_cast<size_t>(c)][static_cast<size_t>(ry) * rw + rx] =
-            static_cast<uint16_t>(
-                (static_cast<uint64_t>(sum[c]) * 16 + cnt / 2) / cnt);
+            T::fixFromSum(sum[c], cnt);
     }
   }
   const int r = boxRadiusForSigma(std::max(0.8f, sigma / static_cast<float>(f)));
@@ -401,6 +414,7 @@ inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
   m->h = rh;
   m->ch = 3;
   m->scale = 1.0f / static_cast<float>(f);
+  m->fix = T::kFix;
   m->v.resize(n * 3);
   for (size_t i = 0; i < n; ++i)
     for (size_t c = 0; c < 3; ++c)
@@ -409,7 +423,8 @@ inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h,
 }
 
 // Bilinear sample of a map at SOURCE pixel (x, y); `out` gets `ch` values
-// (still * 16). Coordinates are clamped to the map.
+// in the map's own plane units (still * m.fix: 16 for an 8-bit source, 64 for a 16-bit one).
+// Coordinates are clamped to the map.
 inline void sampleMap(const Map &m, int x, int y, float *out)
 {
   float fx = (static_cast<float>(x) + 0.5f) * m.scale - 0.5f;
@@ -504,11 +519,12 @@ struct Planes
   MapPtr blur[3];
 };
 
-// Fetches (or builds, the first time) what `need` asks for. False = cancelled.
-// (No pixels or a non-positive size means nothing to do: true, planes null.)
-inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
-                    uint32_t need, const std::atomic<uint64_t> *latest,
-                    uint64_t gen)
+// Fetches (or builds, the first time) what `need` asks for, from the RGBA8 or the 16-bit source.
+// False = cancelled. (No pixels or a non-positive size means nothing to do: true, planes null.)
+template <class S>
+inline bool acquireT(Planes &out, const S *rgba, int w, int h,
+                     uint32_t need, const std::atomic<uint64_t> *latest,
+                     uint64_t gen)
 {
   if (!rgba || w <= 0 || h <= 0)
     return true;
@@ -547,6 +563,17 @@ inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
     }
   return true;
 }
+// The 8-bit one is a plain function (a null pointer still finds it); the 16-bit one is its twin.
+inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, uint32_t need,
+                    const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  return acquireT<uint8_t>(out, rgba, w, h, need, latest, gen);
+}
+inline bool acquire(Planes &out, const uint16_t *rgba, int w, int h, uint32_t need,
+                    const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  return acquireT<uint16_t>(out, rgba, w, h, need, latest, gen);
+}
 
 // ---- applying ----
 
@@ -560,6 +587,15 @@ inline uint8_t toU8(float v)
   if (v > 255.0f)
     return 255;
   return static_cast<uint8_t>(v + 0.5f);
+}
+
+// Stores one channel of a finished pixel: a byte is rounded and clamped (toU8); a float is
+// clamped to 0..255 (NaN -> 0) and NOT rounded, so the float pipeline keeps the precision
+// between passes and rounds once at the end. `Dst` below is the destination's sample type.
+inline void put(uint8_t *d, float v) { *d = toU8(v); }
+inline void put(float *d, float v)
+{
+  *d = !(v >= 0.0f) ? 0.0f : (v > 255.0f ? 255.0f : v);
 }
 
 // True when plane `p` covers pixels [first, first + count).
@@ -586,7 +622,8 @@ struct Walker
   }
 };
 
-inline void dehazePass(const Map *veil, float amount, uint8_t *dst,
+template <class Dst>
+inline void dehazePass(const Map *veil, float amount, Dst *dst,
                        size_t count, size_t first, int W)
 {
   if (amount < 0.0f)
@@ -596,7 +633,7 @@ inline void dehazePass(const Map *veil, float amount, uint8_t *dst,
       for (int c = 0; c < 3; ++c)
       {
         const float v = static_cast<float>(dst[i * 4 + c]);
-        dst[i * 4 + c] = toU8(v + (kHazeLight - v) * h);
+        put(&dst[i * 4 + c], v + (kHazeLight - v) * h);
       }
     return;
   }
@@ -604,25 +641,28 @@ inline void dehazePass(const Map *veil, float amount, uint8_t *dst,
     return;
   const float omega = kDehazeStrength * amount;
   const float A = veil->aux, invA = 1.0f / A;
+  const float invFix = 1.0f / veil->fix;
   Walker wk(first, W);
   for (size_t i = 0; i < count; ++i, wk.next())
   {
     float d;
     sampleMap(*veil, wk.x, wk.y, &d);
-    float t = 1.0f - omega * (d * (1.0f / 16.0f)) * invA;
+    float t = 1.0f - omega * (d * invFix) * invA;
     t = t < kDehazeMinT ? kDehazeMinT : (t > 1.0f ? 1.0f : t);
     const float invT = 1.0f / t;
     for (int c = 0; c < 3; ++c)
     {
       const float v = static_cast<float>(dst[i * 4 + c]);
-      dst[i * 4 + c] = toU8(A + (v - A) * invT);
+      put(&dst[i * 4 + c], A + (v - A) * invT);
     }
   }
 }
 
-inline void nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src,
-                       uint8_t *dst, size_t count, size_t first)
+template <class Dst, class S>
+inline void nrLumaPass(const dl::Plane *sharp, float s, const S *src,
+                       Dst *dst, size_t count, size_t first)
 {
+  using Tr = dl::SrcTraits<S>;
   if (!covers(sharp, first, count))
     return;
   const uint16_t *b = sharp->data() + first;
@@ -630,21 +670,22 @@ inline void nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src,
   const float invT2 = 1.0f / (T * T);
   for (size_t i = 0; i < count; ++i)
   {
-    const uint8_t *p = src + i * 4;
-    const int l = (dl::kLumaR * p[0] + dl::kLumaG * p[1] + dl::kLumaB * p[2] + 128) >> 8;
-    const float d = (static_cast<float>(l << 4) - static_cast<float>(b[i])) * (1.0f / 16.0f);
+    const S *p = src + i * 4;
+    const float d = (Tr::lumaFix(p) - static_cast<float>(b[i])) * Tr::kInvFix;
     const float k = -s * d / (1.0f + d * d * invT2);
-    uint8_t *o = dst + i * 4;
-    o[0] = toU8(static_cast<float>(o[0]) + k);
-    o[1] = toU8(static_cast<float>(o[1]) + k);
-    o[2] = toU8(static_cast<float>(o[2]) + k);
+    Dst *o = dst + i * 4;
+    put(&o[0], static_cast<float>(o[0]) + k);
+    put(&o[1], static_cast<float>(o[1]) + k);
+    put(&o[2], static_cast<float>(o[2]) + k);
   }
 }
 
+template <class Dst, class S>
 inline void nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s,
-                        const uint8_t *src, uint8_t *dst, size_t count,
+                        const S *src, Dst *dst, size_t count,
                         size_t first)
 {
+  using Tr = dl::SrcTraits<S>;
   if (!covers(cr, first, count) || !covers(cb, first, count))
     return;
   const uint16_t *br = cr->data() + first;
@@ -655,24 +696,27 @@ inline void nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s,
   const float invWG = 1.0f / static_cast<float>(dl::kLumaG);
   for (size_t i = 0; i < count; ++i)
   {
-    const uint8_t *p = src + i * 4;
-    const int l = (dl::kLumaR * p[0] + dl::kLumaG * p[1] + dl::kLumaB * p[2] + 128) >> 8;
+    const S *p = src + i * 4;
+    float pr, pb; // this pixel's R - luma and B - luma, in levels
+    Tr::chroma(p, &pr, &pb);
     // Move toward the blurred chroma. dg follows from dr and db because the
     // luma weights of the three chroma moves must sum to zero.
-    const float dr = static_cast<float>(br[i]) * (1.0f / 16.0f) - 255.0f - static_cast<float>(p[0] - l);
-    const float db = static_cast<float>(bb[i]) * (1.0f / 16.0f) - 255.0f - static_cast<float>(p[2] - l);
+    const float dr = static_cast<float>(br[i]) * Tr::kInvFix - 255.0f - pr;
+    const float db = static_cast<float>(bb[i]) * Tr::kInvFix - 255.0f - pb;
     const float dg = -(wR * dr + wB * db) * invWG;
     const float w = s / (1.0f + (dr * dr + db * db + dg * dg) * invT2);
-    uint8_t *o = dst + i * 4;
-    o[0] = toU8(static_cast<float>(o[0]) + w * dr);
-    o[1] = toU8(static_cast<float>(o[1]) + w * dg);
-    o[2] = toU8(static_cast<float>(o[2]) + w * db);
+    Dst *o = dst + i * 4;
+    put(&o[0], static_cast<float>(o[0]) + w * dr);
+    put(&o[1], static_cast<float>(o[1]) + w * dg);
+    put(&o[2], static_cast<float>(o[2]) + w * db);
   }
 }
 
-inline void blurPass(const MapPtr *levels, float amount, const uint8_t *src,
-                     uint8_t *dst, size_t count, size_t first, int W)
+template <class Dst, class S>
+inline void blurPass(const MapPtr *levels, float amount, const S *src,
+                     Dst *dst, size_t count, size_t first, int W)
 {
+  using Tr = dl::SrcTraits<S>;
   const float pos = std::min(amount, 1.0f) * 3.0f;
   const int seg = std::min(static_cast<int>(pos), 2);
   const float t = pos - static_cast<float>(seg);
@@ -680,32 +724,35 @@ inline void blurPass(const MapPtr *levels, float amount, const uint8_t *src,
   const Map *hi = levels[seg].get();
   if (!hi || (seg > 0 && !lo))
     return;
+  const float fix = hi->fix, invFix = 1.0f / fix; // the maps' own units (16 or 64 per level)
   Walker wk(first, W);
   for (size_t i = 0; i < count; ++i, wk.next())
   {
     float a[3], b[3];
     sampleMap(*hi, wk.x, wk.y, b);
-    const uint8_t *p = src + i * 4;
+    const S *p = src + i * 4;
     if (lo)
       sampleMap(*lo, wk.x, wk.y, a);
     else
       for (int c = 0; c < 3; ++c)
-        a[c] = static_cast<float>(p[c]) * 16.0f;
-    uint8_t *o = dst + i * 4;
+        a[c] = Tr::level(p[c]) * fix;
+    Dst *o = dst + i * 4;
     for (int c = 0; c < 3; ++c)
     {
-      const float blurred = (a[c] + (b[c] - a[c]) * t) * (1.0f / 16.0f);
-      o[c] = toU8(static_cast<float>(o[c]) + (blurred - static_cast<float>(p[c])));
+      const float blurred = (a[c] + (b[c] - a[c]) * t) * invFix;
+      put(&o[c], static_cast<float>(o[c]) + (blurred - Tr::level(p[c])));
     }
   }
 }
 
-// All the neighbor effects for `count` consecutive pixels of `dst` (RGBA8,
-// alpha untouched). `src` holds the SOURCE pixels for the same positions and
-// `first` is their index in the whole picture of width W (which must be
-// positive; otherwise nothing is done).
-inline void apply(const Planes &pl, const Gains &g, const uint8_t *src,
-                  uint8_t *dst, size_t count, size_t first, int W)
+// All the neighbor effects for `count` consecutive pixels of `dst` (RGBA8 or float levels,
+// alpha untouched). `src` holds the SOURCE pixels for the same positions (RGBA8 or 16-bit: the
+// planes in `pl` must have been built from a source of the same type) and `first` is their index
+// in the whole picture of width W (which must be positive; otherwise nothing is done). `Dst` is the
+// first template parameter so apply<Dst>(...) keeps working; the source type is deduced.
+template <class Dst, class S>
+inline void apply(const Planes &pl, const Gains &g, const S *src,
+                  Dst *dst, size_t count, size_t first, int W)
 {
   if (W <= 0)
     return;

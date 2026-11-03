@@ -1,5 +1,6 @@
 // color_pass.hpp - The float per-pixel color pass: white balance, vibrance, saturation,
-// hue, colorize, Color Mixer, Color Grading. Runs in place on RGBA8.
+// hue, Color Mixer, colorize, Color Grading, Filters, 3D LUT. applyColorPassF runs on float
+// levels (the pipeline); applyColorPass is the same pass on RGBA8 bytes.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -99,7 +100,7 @@ inline float filterSCurve255(float v, float amt)
 
 // One pixel, float in and out (0..255, may leave the range; the caller rounds
 // and clamps once). Plain code, no std:: helpers, for the Debug-build reason
-// stated at applyColorPass.
+// stated at applyColorPassF.
 inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
 {
   r = filterClamp255(r);
@@ -208,12 +209,10 @@ inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
 }
 
 // ---------------- Color pass (float, per pixel) ----------------
-// Runs on the LUT's 8-bit output. Everything here is computed in float and
-// rounded/clamped once at the end, so stacking Temperature + Vibrance +
-// Saturation doesn't accumulate 8-bit rounding the way chained LUT stages do.
-// Order: white balance gains -> vibrance -> saturation -> hue -> color mixer ->
-// colorize -> color grading. Works on the gamma-encoded values directly (no
-// linearization) — a standard, cheap approximation for a first version.
+// Runs after the tone tables. Everything here is computed in float; applyColorPass
+// rounds/clamps to bytes once at the end (applyColorPassF leaves the values as they
+// are), so stacking Temperature + Vibrance + Saturation doesn't accumulate 8-bit
+// rounding the way chained LUT stages do.
 //
 // makeColorPass sanitizes every slider value (clamped to its range, NaN/inf
 // treated as 0), so the per-pixel loop only ever sees finite values and its
@@ -421,10 +420,12 @@ inline ColorPass colorPassWithLut(const ColorPass &cp, const LutPass &lut)
   return o;
 }
 
-// Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched). Raw pointers
-// and no std::clamp/min/max calls in the loop, for the same Debug-build
-// reason as AdjustmentSet::applyTo.
-inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
+// The color pass on float levels: applies `cp` in place to `n` floats of RGBA (4 per pixel,
+// R, G, B in levels 0..255; alpha untouched). The result is NOT rounded and NOT clamped, so
+// it can lie outside 0..255 (the caller decides what happens to that; applyColorPass below
+// rounds and clamps). Raw pointers and no std::clamp/min/max calls in the loop, for the
+// same Debug-build reason as AdjustmentSet::applyTo.
+inline void applyColorPassF(const ColorPass &cp, float *p, std::size_t n)
 {
   if (!cp.active)
     return;
@@ -450,9 +451,9 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
   const float *lutLum = cp.mixLut.lumAdj.data();
   for (std::size_t i = 0; i + 3 < n; i += 4)
   {
-    float r = static_cast<float>(p[i]) * gR;
-    float g = static_cast<float>(p[i + 1]) * gG;
-    float b = static_cast<float>(p[i + 2]) * gB;
+    float r = p[i] * gR;
+    float g = p[i + 1] * gG;
+    float b = p[i + 2] * gB;
     if (doVib)
     {
       // Positive vibrance boosts muted colors most (weight 1 - s); negative
@@ -616,8 +617,38 @@ inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
       b = b > 0.0f ? (b < 255.0f ? b : 255.0f) : 0.0f;
       applyLutPixel(lp, r, g, b);
     }
-    p[i] = toU8Clamped(r);
-    p[i + 1] = toU8Clamped(g);
-    p[i + 2] = toU8Clamped(b);
+    p[i] = r;
+    p[i + 1] = g;
+    p[i + 2] = b;
+  }
+}
+
+// Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched; a trailing partial pixel is
+// left alone): the float pass above on blocks of pixels, each channel rounded and clamped to a
+// byte once at the end.
+// Its output is pinned by the golden fingerprints and the bulk-vs-per-pixel test in
+// tests/color_pass_test.cpp.
+inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
+{
+  if (!cp.active)
+    return;
+  constexpr std::size_t kChunkPixels = 1024;
+  float buf[kChunkPixels * 4];
+  std::size_t px = n / 4;
+  while (px > 0)
+  {
+    const std::size_t c = px < kChunkPixels ? px : kChunkPixels;
+    const std::size_t k = c * 4;
+    for (std::size_t i = 0; i < k; ++i)
+      buf[i] = static_cast<float>(p[i]);
+    applyColorPassF(cp, buf, k);
+    for (std::size_t i = 0; i < k; i += 4)
+    {
+      p[i] = toU8Clamped(buf[i]);
+      p[i + 1] = toU8Clamped(buf[i + 1]);
+      p[i + 2] = toU8Clamped(buf[i + 2]);
+    }
+    p += k;
+    px -= c;
   }
 }

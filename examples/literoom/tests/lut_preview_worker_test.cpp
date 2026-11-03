@@ -4,12 +4,13 @@
 // Real .cube files in a temp folder, the real renderer. CHECK is not thread-safe
 // (check.hpp), so assertions only run on the main thread; every wait has a timeout
 // so a broken worker fails instead of hanging.
+#define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
 #include "workers/lut_preview_worker.hpp"
 #include "check.hpp"
 
 #include <charconv>
-#include <chrono>
+#include <chrono> 
 #include <fstream>
 
 using namespace std::chrono_literals;

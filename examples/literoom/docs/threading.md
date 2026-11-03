@@ -37,16 +37,16 @@ A job must therefore be a **pure function of its inputs**. It gets an immutable 
 
 One qualification: the segmentation job keeps per-image state (the loaded model, the encoded image embedding, the stand-in's prepared image) in function-local statics. That is safe only because a single thread ever runs it, and each cache is keyed by the image (`imageKey`), so a new picture never reuses a stale one. The one value the UI reads back from that worker, the engine label shown in the Object panel, goes through a mutex-guarded string.
 
-This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs.
+This is also why the editor never edits images in place: a render job holds a pointer to `source`, and that pointer must stay valid and unchanged for as long as the job runs. The shared neighbor-plane caches (see below) rest on the same promise: they are keyed by the pixel pointer, size and a sampled fingerprint, so a tool that edited pixels in place would have to clear them (`neighbor_fx::clearCaches()`) afterwards.
 
 ## The eight workers
 
 | Worker | Job | Can it be cancelled? | Notes |
 |---|---|---|---|
-| **Render** | Full-resolution `renderWith()` of `source` using a `RenderParams` copy. | Yes, checked between 128-row blocks and while building blur planes. | Started after an adjustment-only change on a large photo whose size hasn't changed: a slider release, undo, redo and so on. |
-| **Geometry** | The whole pipeline: orient → straighten → crop → render, from `original`. | Yes, between stages, every 64 rows of the straighten, and between render blocks. | Used for rotate/straighten/crop on large photos. See below. |
-| **Decode** | Decode a PNG/JPEG file and apply its EXIF rotation. | **No.** The image libraries have no cancel hook. | A second "open" queues behind a running decode; the first result is simply dropped. |
-| **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Keeps per-image state in worker-only statics (see the rule above). |
+| **Render** | Full-resolution `renderWith()` of `source` using a `RenderParams` copy; for a 16-bit picture, `renderToDisplay()` of its 16-bit twin `source16` (`RenderJob::src16`). | Yes, checked between 128-row blocks and while building blur planes. | Started after an adjustment-only change on a large photo whose size hasn't changed: a slider release, undo, redo and so on. |
+| **Geometry** | The whole pipeline (and, for a 16-bit picture, the same chain on its 16-bit twin, `wide_chain.hpp`): orient → straighten → crop → render, from `original`. | Yes, between stages, every 64 rows of the straighten, and between render blocks. | Used for rotate/straighten/crop on large photos. See below. |
+| **Decode** | Open a PNG/JPEG file through `image_source::openUpright` and apply its EXIF rotation. A truncated PNG is refused; a 16-bit PNG is also read at full precision (`DecodeResult::wide`). | **No.** The image libraries have no cancel hook. | A second "open" queues behind a running decode; the first result is simply dropped. |
+| **Segment** | Object selection: MobileSAM if available, otherwise the color-grow stand-in. | Partly. The stand-in can be cancelled at any time; MobileSAM's encode step can't be interrupted, so a superseded result is discarded after encoding. | Also does a "prefetch" job that only encodes the image, to warm up the model. Which engine is used is decided once, on the first job, and kept. Keeps per-image state in worker-only statics (see the rule above). |
 | **Thumbnail** | Decode, orient and shrink each picture of the folder. | Not applicable (it is a queue). | **Different design**, see below. |
 | **Sync** | Write one look into the sidecars of the pictures picked in the filmstrip (Sync Settings), or apply one rating / flag / color label change to them (a batch rating). | **No.** It always finishes its batch. | A `LatestWorker` used as a one-shot batch, see below. |
 | **Export** | Batch export: render each picked picture from its own saved edits and write it to one folder. | **Yes.** Stop Export drops the queue and abandons the picture in flight (checked between render blocks and every 64 rows of the straighten). | A FIFO like Thumbnail, with `cancel()`; see below. |
@@ -64,7 +64,7 @@ Switching between copies of the picture that is already open needs **no decode**
 
 A render job can start from `source`, because the source has not changed. A geometry job might be *changing* the source, so it always rebuilds the entire chain from `original`. That wastes some work (an unchanged straighten is redone when only the crop moved), but it keeps a job a pure function of its inputs with nothing that can drift out of sync, and the cost is only latency on a background thread, never a frozen window.
 
-Its result is a `GeometryBundle` containing every geometry-derived field. The UI thread adopts it as **one atomic swap**, so the picture, the document size and the crop selection always change together.
+Its result is a `GeometryBundle` containing every geometry-derived field, including the 16-bit twins (`oriented16`, `rotated16`, `source16`, `previewBase16`; null for an 8-bit file). The UI thread adopts it as **one atomic swap**, so the picture, the document size and the crop selection always change together.
 
 While a geometry job is running, `state.rotated`, `state.source` and the crop selection still describe the *previous* geometry although the edit state already holds the new one. So `geometryBusy()` is true until the bundle lands, and any edit that measures against those (a second rotate that remaps the crop, Apply Crop) is ignored; their buttons are dimmed to match. The status bar shows "Applying changes..." meanwhile.
 
@@ -76,12 +76,12 @@ Thumbnails are a different kind of work: you want *all* of them, not just the ne
 - The item already in flight finishes.
 - Results accumulate until `collect()` drains them.
 - Like `LatestWorker`, `setNotify()` must be called before the first `setQueue()`.
-- For each file it also reads the saved-edits sidecar (up to 64 MiB, like the editor): whether it holds real edits is what puts the dot on a thumbnail, and the rating, flag and color label in it are what the filmstrip filter uses. A picture that can't be decoded still gets those.
+- For each file it also reads the saved-edits sidecar (up to 64 MiB, like the editor): whether it holds real edits is what puts the dot on a thumbnail, and the rating, flag and color label in it are what the filmstrip filter uses. A picture that can't be decoded still gets those. The picture is always decoded as 8-bit (`image_source::decodeForThumb`, which also refuses a truncated PNG, so such a file gets no thumbnail), and the worker turns it with the orientation function the app injects, so a thumbnail is upright exactly like the editor's picture.
 - **A virtual copy is read for its sidecar only.** Its path carries the `|vc<n>` marker (see [sidecar-format.md](sidecar-format.md#virtual-copies)), so `sidecarFileOf` finds the copy's own file. The worker never decodes it (`Result::thumbSkipped`), because it shows the same picture as its original: `collectThumbJobs` hands the original's raw thumbnail to the copies that follow it, and a failed original is the only failure that counts. A copy that is opened and left gets its own thumbnail like any picture.
 
 ### The sync worker is a batch that is never superseded
 
-Sync Settings copies the open picture's look onto the other pictures selected in the filmstrip. Those pictures are not open, so there is no `AdjustmentSet` to edit. The job rewrites each one's sidecar file directly (see [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures)). A picture with no sidecar yet is decoded once to learn its size, which is why this is background work.
+Sync Settings copies the open picture's look onto the other pictures selected in the filmstrip. Those pictures are not open, so there is no `AdjustmentSet` to edit. The job rewrites each one's sidecar file directly (see [sidecar-format.md](sidecar-format.md#syncing-a-look-onto-other-pictures)). A picture with no sidecar yet is decoded once to learn its size (`image_source::uprightSize`, which for now decodes the whole file), which is why this is background work.
 
 It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not for "newest wins", because dropping a half-finished batch would leave some pictures synced and others not:
 
@@ -97,10 +97,10 @@ It uses `LatestWorker` for the thread, the parking slot and the wake-up, but not
 
 Batch export (File > Export Selected... / Export All Shown..., or the same buttons in the Export pane) writes many pictures to one folder with the Export pane's settings. The pictures are not open, so like Sync there is no `AdjustmentSet` to read. Unlike Sync, the job needs the *pixels* too, so `exportPicture()` (in `export_worker.hpp`) is the whole per-picture pipeline as a pure function of the path and the settings:
 
-1. Decode `vcImageOf(path)` and apply the EXIF rotation (what the decode worker does), so the picture is the same upright "original" the saved edits were made against.
+1. Open `vcImageOf(path)` through `image_source::openUpright` with its EXIF rotation (what the decode worker does: a truncated PNG is refused, and a 16-bit PNG is read at full precision), so the picture is the same upright "original" the saved edits were made against.
 2. Read the picture's sidecar from disk into a **local** `AdjustmentSet` (`setOriginalSize`, then `loadJson`). The editor's set is never touched. A missing sidecar is normal (the picture exports unedited); one that exists but can't be used (damaged, newer, too big, written for a different size, or using a LUT that the LUT library no longer has) **skips that picture with a reason**, where the editor would open it clean. Silently exporting an unedited picture in the middle of a batch would be worse.
-3. The geometry worker's chain from the original: `orientImage`, `rotateArbitrary`, `cropImage`, then `renderWith(source, buildRenderParams())`. Intermediate pictures are released before the render so the peak stays near one picture.
-4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile` / `encodePngFile`). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
+3. The geometry worker's chain from the original: `orientImage`, `rotateArbitrary`, `cropImage`, then `renderForExport()` (`workers/export_render.hpp`) with `buildRenderParams()`: `renderWith` for an 8-bit original, `renderToDisplay` for a 16-bit one, or `renderToImage16` when 16-bit output is wanted (a PNG with the 16-bit option on, from either kind of original). Intermediate pictures are released before the render so the peak stays near one picture.
+4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile`, `encodePngFile`, or `encodePng16File` for a 16-bit PNG). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
 
 `ExportWorker` queues the pictures in strip order:
 
@@ -137,7 +137,7 @@ Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 
 ## Practical consequences
 
-- **Export blocks on purpose.** `exportImage()` calls `finishGeometryJob()` and `finishFullRender()` first, so you never export a stale frame.
+- **Export blocks on purpose.** `exportImage()` calls `finishGeometryJob()` and `finishFullRender()` first, so you never export a stale frame. A 16-bit PNG export then renders the 16-bit twin again on the UI thread (`renderToImage16`), because the picture on screen is only 8-bit.
 - **A drag cancels the full render.** `enterDrag()` invalidates the render worker, because the render in flight would be for values the drag is about to change.
 - **A result for something that no longer exists is dropped.** For example, a finished object segmentation for a mask you deleted in the meantime, or a thumbnail for a folder you have left.
 - **A new picture invalidates everything in flight.** When a decode lands, `adoptDecoded` invalidates the render, geometry and segmentation workers and bumps `imageSerial`, so nothing made for the old picture can be adopted over the new one.

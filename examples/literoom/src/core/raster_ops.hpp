@@ -1,18 +1,38 @@
-// raster_ops.hpp - Pixel-buffer operations on a CanvasImage (RGBA8): crop, rotate by
-// quarter turns, mirror, orient, straighten by any angle, the box
-// downsample behind the interactive preview, and the area-average resize used
-// by Export's "long edge" option. Needs liteui.hpp only for the CanvasImage
-// struct.
+// raster_ops.hpp - Pixel-buffer operations on a picture: crop, rotate by quarter turns, mirror,
+// orient, straighten by any angle, the box downsample behind the interactive preview, and the
+// area-average resize used by Export's "long edge" option.
+//
+// Every operation is a template over the picture type, so the same code serves liteui's
+// CanvasImage (RGBA8, what the screen shows) and Image16 (RGBA 16-bit, what the float pipeline
+// starts from; image16.hpp). The only thing a picture type must have is `width`, `height`, a
+// `pixels` vector of unsigned samples (R, G, B, A interleaved) and a (w, h) constructor. For
+// CanvasImage the arithmetic is exactly what it was before these were templates (the test
+// raster_ops_generic_test keeps the old code as a reference), so 8-bit pictures give the same
+// bytes as ever. Needs liteui.hpp only for the CanvasImage struct.
 #pragma once
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "core/geometry.hpp"
+#include "core/image16.hpp"
 #include "liteui.hpp"
+
+namespace raster_detail
+{
+  // The sample type of a picture (uint8_t for CanvasImage, uint16_t for Image16) and its top value.
+  template <class Img>
+  using Sample = typename std::decay_t<decltype(std::declval<Img &>().pixels)>::value_type;
+  template <class Img>
+  constexpr int kMaxSample = static_cast<int>(std::numeric_limits<Sample<Img>>::max());
+} // namespace raster_detail
 
 // Interactive-preview sizing (see EditorState::previewBase): the preview's
 // long side is at most kPreviewMaxEdge px, and images whose long side is
@@ -28,7 +48,8 @@ constexpr float kPreviewMinRatio = 1.5f;
 // a single editing session for one big photo always takes the same path —
 // it doesn't flip to synchronous just because a crop happened to shrink
 // `source` below the threshold.
-inline bool isLargeImage(const CanvasImage &img)
+template <class Img>
+inline bool isLargeImage(const Img &img)
 {
   return std::max(img.width, img.height) >
          static_cast<int>(kPreviewMaxEdge * kPreviewMinRatio);
@@ -39,8 +60,10 @@ inline bool isLargeImage(const CanvasImage &img)
 // within kPreviewMaxEdge * kPreviewMinRatio — below that, a preview
 // wouldn't be meaningfully cheaper than the full image, so the drag path
 // just uses the full-resolution one. Runs once per opened image.
-inline std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)
+template <class Img>
+inline std::shared_ptr<Img> makePreviewBase(const Img &src)
 {
+  using S = raster_detail::Sample<Img>;
   if (!isLargeImage(src))
     return nullptr;
   int longEdge = std::max(src.width, src.height);
@@ -48,24 +71,24 @@ inline std::shared_ptr<CanvasImage> makePreviewBase(const CanvasImage &src)
   int w = src.width / k, h = src.height / k;
   if (w <= 0 || h <= 0)
     return nullptr;
-  auto out = std::make_shared<CanvasImage>(w, h);
-  const int area = k * k;
+  auto out = std::make_shared<Img>(w, h);
+  const int64_t area = static_cast<int64_t>(k) * k;
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
     {
-      int sum[4] = {0, 0, 0, 0};
+      int64_t sum[4] = {0, 0, 0, 0};
       for (int dy = 0; dy < k; ++dy)
       {
-        const uint8_t *row =
+        const S *row =
             &src.pixels[(static_cast<size_t>(y * k + dy) * src.width + x * k) *
                         4];
         for (int dx = 0; dx < k; ++dx)
           for (int c = 0; c < 4; ++c)
             sum[c] += row[dx * 4 + c];
       }
-      uint8_t *o = &out->pixels[(static_cast<size_t>(y) * w + x) * 4];
+      S *o = &out->pixels[(static_cast<size_t>(y) * w + x) * 4];
       for (int c = 0; c < 4; ++c)
-        o[c] = static_cast<uint8_t>((sum[c] + area / 2) / area);
+        o[c] = static_cast<S>((sum[c] + area / 2) / area);
     }
   return out;
 }
@@ -105,15 +128,17 @@ inline Dims fitLongEdge(int w, int h, int longEdge)
 // alpha (like rotateArbitrary), so a transparent corner never darkens its
 // neighbors. A fully opaque, flat area keeps its exact value.
 // An invalid size (dw or dh below 1, or an empty `src`) returns a copy of `src`.
-inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
-                                               int dh)
+template <class Img>
+inline std::shared_ptr<Img> resizeArea(const Img &src, int dw, int dh)
 {
+  using S = raster_detail::Sample<Img>;
+  constexpr double kMaxD = static_cast<double>(raster_detail::kMaxSample<Img>);
   const int sw = src.width, sh = src.height;
   if (dw < 1 || dh < 1 || sw < 1 || sh < 1)
-    return std::make_shared<CanvasImage>(src);
+    return std::make_shared<Img>(src);
   if (dw == sw && dh == sh)
-    return std::make_shared<CanvasImage>(src);
-  auto out = std::make_shared<CanvasImage>(dw, dh);
+    return std::make_shared<Img>(src);
+  auto out = std::make_shared<Img>(dw, dh);
   const double xr = static_cast<double>(sw) / dw;
   const double yr = static_cast<double>(sh) / dh;
   // One source row's worth of alpha-weighted sums: (c0 a, c1 a, c2 a, a) per column.
@@ -132,7 +157,7 @@ inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
       if (wy <= 0.0)
         continue;
       wyTotal += wy;
-      const uint8_t *p = &src.pixels[static_cast<size_t>(iy) * sw * 4];
+      const S *p = &src.pixels[static_cast<size_t>(iy) * sw * 4];
       double *a = acc.data();
       for (int x = 0; x < sw; ++x, p += 4, a += 4)
       {
@@ -143,7 +168,7 @@ inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
         a[3] += wa;
       }
     }
-    uint8_t *o = &out->pixels[static_cast<size_t>(dy) * dw * 4];
+    S *o = &out->pixels[static_cast<size_t>(dy) * dw * 4];
     for (int dx = 0; dx < dw; ++dx, o += 4)
     {
       const double sx0 = dx * xr;
@@ -169,10 +194,10 @@ inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
         o[0] = o[1] = o[2] = o[3] = 0;
         continue;
       }
-      o[0] = static_cast<uint8_t>(std::clamp(s0 / sa + 0.5, 0.0, 255.0));
-      o[1] = static_cast<uint8_t>(std::clamp(s1 / sa + 0.5, 0.0, 255.0));
-      o[2] = static_cast<uint8_t>(std::clamp(s2 / sa + 0.5, 0.0, 255.0));
-      o[3] = static_cast<uint8_t>(std::clamp(sa / area + 0.5, 0.0, 255.0));
+      o[0] = static_cast<S>(std::clamp(s0 / sa + 0.5, 0.0, kMaxD));
+      o[1] = static_cast<S>(std::clamp(s1 / sa + 0.5, 0.0, kMaxD));
+      o[2] = static_cast<S>(std::clamp(s2 / sa + 0.5, 0.0, kMaxD));
+      o[3] = static_cast<S>(std::clamp(sa / area + 0.5, 0.0, kMaxD));
     }
   }
   return out;
@@ -181,8 +206,9 @@ inline std::shared_ptr<CanvasImage> resizeArea(const CanvasImage &src, int dw,
 // `src` scaled so its long side is `longEdge` (see fitLongEdge). When nothing
 // changes (already small enough, or `longEdge` < 1) it returns `src` itself, so
 // a picture that needs no resize costs no copy.
-inline std::shared_ptr<CanvasImage>
-resizeToLongEdge(const std::shared_ptr<CanvasImage> &src, int longEdge)
+template <class Img>
+inline std::shared_ptr<Img>
+resizeToLongEdge(const std::shared_ptr<Img> &src, int longEdge)
 {
   if (!src)
     return src;
@@ -192,19 +218,24 @@ resizeToLongEdge(const std::shared_ptr<CanvasImage> &src, int longEdge)
   return resizeArea(*src, d.w, d.h);
 }
 
+// A literal `nullptr` names no picture type, so the template above cannot deduce one from it; this is
+// the old non-template behaviour for that call (null in, null out).
+inline std::shared_ptr<CanvasImage> resizeToLongEdge(std::nullptr_t, int) { return nullptr; }
+
 // Copies the `r` region of `src` into a new image (clamped to src's bounds).
-inline std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src,
-                                              const CropRect &r)
+template <class Img>
+inline std::shared_ptr<Img> cropImage(const Img &src, const CropRect &r)
 {
+  using S = raster_detail::Sample<Img>;
   const int x0 = std::clamp(r.x, 0, src.width);
   const int y0 = std::clamp(r.y, 0, src.height);
   const int x1 = std::clamp(r.x + r.w, x0, src.width);
   const int y1 = std::clamp(r.y + r.h, y0, src.height);
   const int w = x1 - x0, h = y1 - y0;
-  auto out = std::make_shared<CanvasImage>(w, h);
+  auto out = std::make_shared<Img>(w, h);
   for (int y = 0; y < h; ++y)
   {
-    const uint8_t *from =
+    const S *from =
         src.pixels.data() + (static_cast<size_t>(y0 + y) * src.width + x0) * 4;
     std::copy_n(from, static_cast<size_t>(w) * 4,
                 out->pixels.data() + static_cast<size_t>(y) * w * 4);
@@ -213,27 +244,29 @@ inline std::shared_ptr<CanvasImage> cropImage(const CanvasImage &src,
 }
 
 // Returns `src` rotated 90 degrees clockwise (w x h becomes h x w).
-inline std::shared_ptr<CanvasImage> rotate90cw(const CanvasImage &src)
+template <class Img>
+inline std::shared_ptr<Img> rotate90cw(const Img &src)
 {
+  using S = raster_detail::Sample<Img>;
   const int w = src.width, h = src.height;
-  auto out = std::make_shared<CanvasImage>(h, w);
+  auto out = std::make_shared<Img>(h, w);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
     {
       // Source (x, y) lands at column h-1-y, row x of the result.
-      const uint8_t *from = &src.pixels[(static_cast<size_t>(y) * w + x) * 4];
-      uint8_t *to =
-          &out->pixels[(static_cast<size_t>(x) * h + (h - 1 - y)) * 4];
+      const S *from = &src.pixels[(static_cast<size_t>(y) * w + x) * 4];
+      S *to = &out->pixels[(static_cast<size_t>(x) * h + (h - 1 - y)) * 4];
       std::copy_n(from, 4, to);
     }
   return out;
 }
 
 // Returns `src` mirrored left-right.
-inline std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src)
+template <class Img>
+inline std::shared_ptr<Img> flipHorizontal(const Img &src)
 {
   const int w = src.width, h = src.height;
-  auto out = std::make_shared<CanvasImage>(w, h);
+  auto out = std::make_shared<Img>(w, h);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
       std::copy_n(&src.pixels[(static_cast<size_t>(y) * w + x) * 4], 4,
@@ -243,18 +276,22 @@ inline std::shared_ptr<CanvasImage> flipHorizontal(const CanvasImage &src)
 
 // Applies `o` to `src`. The identity orientation returns `src` itself (no
 // copy), so an unrotated image costs nothing extra.
-inline std::shared_ptr<CanvasImage>
-orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o)
+template <class Img>
+inline std::shared_ptr<Img>
+orientImage(const std::shared_ptr<Img> &src, const Orient &o)
 {
-  if (o.identity())
-    return src;
-  std::shared_ptr<CanvasImage> cur = src;
+  if (!src || o.identity())
+    return src; // nothing to turn (a null picture used to be dereferenced here)
+  std::shared_ptr<Img> cur = src;
   if (o.flip)
     cur = flipHorizontal(*cur);
   for (int i = 0; i < o.rot; ++i)
     cur = rotate90cw(*cur);
   return cur;
 }
+
+// Same for a literal `nullptr` (see resizeToLongEdge): null in, null out.
+inline std::shared_ptr<CanvasImage> orientImage(std::nullptr_t, const Orient &) { return nullptr; }
 
 // ---- Arbitrary-angle rotation ("straighten") ----
 
@@ -272,23 +309,26 @@ orientImage(const std::shared_ptr<CanvasImage> &src, const Orient &o)
 // unwanted work. Checked every kRotateCheckRows rows rather than every row:
 // the check itself is cheap, but so is one scanline, so batching it keeps
 // the overhead negligible either way.
-inline std::shared_ptr<CanvasImage>
-rotateArbitrary(const CanvasImage &src, float deg, bool expand,
+template <class Img>
+inline std::shared_ptr<Img>
+rotateArbitrary(const Img &src, float deg, bool expand,
                 const std::atomic<uint64_t> *latest = nullptr,
                 uint64_t gen = 0)
 {
+  using S = raster_detail::Sample<Img>;
+  constexpr float kMaxF = static_cast<float>(raster_detail::kMaxSample<Img>);
   if (deg == 0.0f)
-    return std::make_shared<CanvasImage>(src);
+    return std::make_shared<Img>(src);
   constexpr int kRotateCheckRows = 64;
   const Dims d = rotatedDims(src.width, src.height, deg, expand);
-  auto out = std::make_shared<CanvasImage>(d.w, d.h);
+  auto out = std::make_shared<Img>(d.w, d.h);
   const double rad = static_cast<double>(deg) * kDegToRad;
   const double cs = std::cos(rad), sn = std::sin(rad);
   const int sw = src.width, sh = src.height;
   const double scx = sw / 2.0, scy = sh / 2.0;   // source center
   const double dcx = d.w / 2.0, dcy = d.h / 2.0; // output center
-  const uint8_t *sp = src.pixels.data();
-  uint8_t *op = out->pixels.data();
+  const S *sp = src.pixels.data();
+  S *op = out->pixels.data();
   auto clampi = [](int v, int hi)
   { return v < 0 ? 0 : (v > hi ? hi : v); };
 
@@ -323,10 +363,10 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
                   fy = static_cast<float>(v - y0);
       const int xa = clampi(x0, sw - 1), xb = clampi(x0 + 1, sw - 1);
       const int ya = clampi(y0, sh - 1), yb = clampi(y0 + 1, sh - 1);
-      const uint8_t *p00 = sp + (static_cast<size_t>(ya) * sw + xa) * 4;
-      const uint8_t *p10 = sp + (static_cast<size_t>(ya) * sw + xb) * 4;
-      const uint8_t *p01 = sp + (static_cast<size_t>(yb) * sw + xa) * 4;
-      const uint8_t *p11 = sp + (static_cast<size_t>(yb) * sw + xb) * 4;
+      const S *p00 = sp + (static_cast<size_t>(ya) * sw + xa) * 4;
+      const S *p10 = sp + (static_cast<size_t>(ya) * sw + xb) * 4;
+      const S *p01 = sp + (static_cast<size_t>(yb) * sw + xa) * 4;
+      const S *p11 = sp + (static_cast<size_t>(yb) * sw + xb) * 4;
       const float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
       const float w01 = (1 - fx) * fy, w11 = fx * fy;
       // Alpha-weighted taps: transparent pixels contribute no color.
@@ -335,14 +375,14 @@ rotateArbitrary(const CanvasImage &src, float deg, bool expand,
       const float A = a00 + a10 + a01 + a11;
       if (A <= 0.0f)
         continue;
-      uint8_t *o = op + (static_cast<size_t>(y) * d.w + x) * 4;
+      S *o = op + (static_cast<size_t>(y) * d.w + x) * 4;
       for (int ch = 0; ch < 3; ++ch)
       {
         const float c =
             (p00[ch] * a00 + p10[ch] * a10 + p01[ch] * a01 + p11[ch] * a11) / A;
-        o[ch] = static_cast<uint8_t>(std::clamp(c + 0.5f, 0.0f, 255.0f));
+        o[ch] = static_cast<S>(std::clamp(c + 0.5f, 0.0f, kMaxF));
       }
-      o[3] = static_cast<uint8_t>(std::clamp(A * cov + 0.5f, 0.0f, 255.0f));
+      o[3] = static_cast<S>(std::clamp(A * cov + 0.5f, 0.0f, kMaxF));
     }
   }
   return out;

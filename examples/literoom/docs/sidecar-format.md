@@ -17,6 +17,7 @@ This page describes what is in that file, when it is written and read, and how l
 | **Virtual copies** (more sidecars for one picture, see [below](#virtual-copies)) | `virtual_copy.hpp` (the path marker, the file-name rules, the folder scan); `sidecarFileOf` in `sidecar.hpp`; `createVirtualCopy`, `deleteVirtualCopy` and the filmstrip code in `main.cpp` |
 | The separate **preset** file (a saved look, see [Presets](#presets-a-related-file) below) | `preset.hpp`, which reuses the readers and writers in `sidecar.hpp` |
 | Putting a look into **another picture's** sidecar without opening it (Sync Settings, see [below](#syncing-a-look-onto-other-pictures)) | `sidecarSyncLook` in `sidecar.hpp`; the file reading, atomic write and worker are in `main.cpp` (`readSidecarText`, `writeTextAtomic`, `runSyncJob`) |
+| Reading a picture's sidecar for **batch export** (a local `AdjustmentSet`, never the editor's) | `exportLoadEdits` and `exportPicture` in `export_worker.hpp` |
 | The **3D LUT** (the `lut` object, and `LUT Amount` in `adjust`; see [below](#the-3d-lut)) | `LutRef` and the name / hash helpers in `lut3d.hpp`; `sidecarLutToJson` / `sidecarLutFromJson` in `sidecar.hpp`; the table files, the folder and the cache in `lut_library.hpp` |
 
 ## What the file contains
@@ -34,7 +35,7 @@ The top level wraps the edits with a little information about the picture:
 }
 ```
 
-`image.width` and `image.height` are the size of the **original** picture. They are how a sidecar written for a different-sized picture is detected and ignored. `image.name` is informational only and is never compared. `version` is `kSidecarVersion`: a file with a higher (or a missing) version is ignored.
+`image.width` and `image.height` are the size of the **original** picture. They are how a sidecar written for a different-sized picture is detected and ignored. `image.name` is informational only and is never compared. The edits do not depend on the picture's bit depth: a 16-bit PNG's sidecar has exactly the same format as a JPEG's, and the same sidecar gives the same look at either precision. `version` is `kSidecarVersion`: a file with a higher (or a missing) version is ignored.
 
 `meta` is the picture's **rating, flag and color label**. It is optional and written only when something differs from the default, so a picture that was never rated has no `meta` key. These are **not edits**: they have no undo step and no History label, they sit beside `edits` rather than inside it, and Sync Settings leaves them alone. Fields (each left out at its default): `rating` 1 to 5, `flag` `"pick"` or `"reject"`, `label` one of `"red"`, `"yellow"`, `"green"`, `"blue"`, `"purple"`. Loading clamps a rating into 0 to 5 and turns anything it doesn't recognize (a non-number rating, an unknown flag or color name) into "none"; a `meta` that isn't an object is ignored. Adding it needed no `kSidecarVersion` bump: an older build ignores the key and, when it next saves that picture, writes the file without it.
 
@@ -61,7 +62,7 @@ Each mask is an object with:
 - optional `amount` (omitted when 100), `colorMix`, `colorGrading` and `curves` (each omitted when untouched)
 - `parts`: a list of shapes. Each part is an object with a `type`, the shape's own fields, and an `op` (`"add"`, `"subtract"` or `"intersect"`) saying how it joins the parts before it.
 
-The six shape types and their fields:
+The eight shape types and their fields:
 
 | `type` | Fields |
 |---|---|
@@ -71,6 +72,8 @@ The six shape types and their fields:
 | `luminosity` | `lo`, `hi`, `feather` |
 | `colorRange` | `set`, `r`, `g`, `b`, `range`, `feather` |
 | `object` | `feather`, `grow`, `prompts` (each `[x, y, fg]`) and `map` = `{ "w", "h", "rle" }`, where `rle` is base64 text of the run-length-coded bytes |
+| `rect` | `cx`, `cy`, `rx`, `ry`, `angle`, `feather` (the same fields as `radial`, read with the same ranges) |
+| `polygon` | `feather` and `pts`, a flat list `x0, y0, x1, y1, ...` of the outline's vertices |
 
 Shape positions are **fractions of the original picture** (centers as a fraction of its width and height, radii as a fraction of its shorter side). This is why a mask survives rotating, straightening and cropping without being rewritten. See [architecture.md](architecture.md).
 
@@ -97,7 +100,7 @@ A picture's LUT is stored as a **reference**, never as a table:
 - **If saving fails** (a read-only folder, for example) the status bar says "Couldn't save edits...". The change still counts as seen, so a failing disk is not retried every frame, only on the next edit. After a successful save of **edits** the picture's thumbnail in the filmstrip gets its "has edits" dot; a save that only records a rating, flag or color label does not set it.
 - **Written for other pictures** by Sync Settings, and by a batch rating when pictures are selected: the sidecars of the pictures selected in the filmstrip are rewritten in the background (see [below](#syncing-a-look-onto-other-pictures)). The open picture is never one of them.
 - **Not written** if you opened a picture and changed nothing. The open picture's sidecar is written only by the editor (autosave); other pictures' sidecars are written only by the Sync worker (Sync Settings, or a batch rating), never behind the editor's back. A picture that is rated and has no edits gets a sidecar whose `edits` are the neutral ones.
-- **Read** when the picture is opened. A missing file is normal.
+- **Read** when the picture is opened. A missing file is normal. A sidecar is also read, without opening the picture, by the thumbnail worker (`sidecarScan`: the "has edits" dot and the rating, flag and label), by the Sync worker (`sidecarReadForRewrite`) and by batch export (`exportLoadEdits`, into a local `AdjustmentSet`; an unusable sidecar skips that picture with a reason instead of exporting it unedited).
 - **The undo history is not saved.** It starts fresh each time the picture is opened.
 
 ## What happens when a file is bad
@@ -109,7 +112,7 @@ A sidecar can be damaged, hand-edited, written by a newer version, or written fo
 - A tone curve must keep the editor's own rules (2 to 16 points, end points at x = 0 and 255, the rest at least a minimum gap apart). Anything else becomes a straight line.
 - The crop is checked against the size of the turned and straightened picture, and dropped if it does not fit.
 - At most 16 masks are read (`kMaxMasks`) and at most 6 parts per mask (`kMaxMaskParts`). Further ones are ignored. A mask with no valid part is dropped.
-- Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped.
+- Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped. A polygon keeps at most `kPolyMaxPoints` points (one with fewer than 3 is kept and simply selects nothing), and a rectangle's size and angle are clamped like a radial one's.
 - **A bad `lut` never makes a file bad.** If it is not an object, has no string `name`, or has a name with nothing left after cleaning, the picture simply has no LUT (the rest of the file loads normally). A `hash` that is not exactly 16 hex digits is dropped. Whether the named file exists is not checked at load time: that is the library's business, reported when the LUT is first used.
 - Object masks are limited: at most 256 prompts per selection, and a stored bitmap must be 1 to 16,384 pixels on each side, no more than about 67 million pixels in total (`kSidecarMaxMapPixels`), and decode to exactly `w × h` bytes.
 - **Snapshots never make a file bad.** `snapshots` that isn't an array gives none. Each entry is skipped if it isn't an object or its `edits` can't be loaded, and each one that is kept goes through `sidecarEditsFromJson` like the live edits (sliders clamped, the crop checked against the picture's size, at most 16 masks, and so on). At most `kMaxSnapshots` (20) are kept, and the name is cleaned (printable ASCII, trimmed, at most 32 characters; a blank one becomes `Snapshot`).
@@ -233,7 +236,7 @@ How the UI treats them (`main.cpp`):
 - **Image > Delete Virtual Copy** (choose it twice) deletes the open copy's sidecar and returns to the original. The picture and its other copies are untouched. The original cannot be deleted this way.
 - **Each copy has its own rating, flag, color label and "has edits" dot**, read from its own sidecar by the thumbnail worker. The worker does not decode a copy; a copy's thumbnail is its original's until the copy has been opened and left.
 - **Sync Settings and batch ratings** treat a selected copy as any other picture: its own sidecar is rewritten. The open copy is never in the batch, but the original and the other copies are.
-- **Export** names the file `<picture>-copy2-edit.jpg` by default and copies the real picture's metadata.
+- **Export** names the file `<picture>-copy2-edit.jpg` by default and copies the real picture's metadata (for a JPEG its EXIF and ICC profile, with the GPS cut out if the export option says so; XMP and IPTC are not carried over, and a PNG gets none).
 - **Limits of the design.** Renaming or deleting the picture in a file manager leaves its `.vc` files behind (they simply stop being shown). A copy's sidecar is checked against the picture's size like any other.
 
 ## Changing the format

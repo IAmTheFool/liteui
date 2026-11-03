@@ -2,14 +2,14 @@
 
 One entry for every engine header. Each says what the file is for, the ideas worth knowing before you edit it, and what it depends on. For the bigger picture of how they fit together, read [architecture.md](architecture.md) first.
 
-"No UI" means the header does not include `liteui.hpp` and can be tested alone. A few headers need LiteUI only for its `CanvasImage` (an RGBA8 picture) or its decoders; those are marked.
+"No UI" means the header does not include `liteui.hpp` and can be tested alone. A few headers need LiteUI only for its `CanvasImage` (an RGBA8 picture) or its decoders; those are marked. `Image16` (an RGBA picture with 16 bits per channel) is Literoom's own type, in `image16.hpp`, and needs no UI.
 
 **How an entry is laid out.** Each entry gives: what the file is for; what it **depends on** and which **test** covers it; its **constants** (name, type, value, meaning); its **types** (fields with type, default and range); and every **function** with its signature, inputs (type and valid range), return value, and details (rounding, cancellation, caching, what happens on bad input).
 
 **Conventions used throughout.**
-- A picture is RGBA8 (4 bytes per pixel, row-major, alpha last). Functions that take a byte count (`n`) mean bytes, not pixels, unless stated.
+- A picture is RGBA8 (4 bytes per pixel, row-major, alpha last), or, for the 16-bit twin of the pipeline, `Image16`: the same layout with `uint16_t` samples (8 bytes per pixel, straight alpha). Functions that take a count `n` mean samples/bytes, not pixels, unless stated. The float passes work in "levels" (0..255 as floats); a 16-bit sample is 257 times a level's byte value, so 8-bit data widened with `widen8` is exact in levels.
 - **Cancellation contract:** long routines take `const std::atomic<uint64_t> *latest, uint64_t gen` and stop early (returning false or `nullopt`) when `latest->load() != gen`. A null `latest` means "never cancel". See `latest_worker.hpp`.
-- **Rounding rule:** every float-to-byte conversion goes through `toU8Clamped` (`pixel_math.hpp`) so results stay bit-identical.
+- **Rounding rule:** every float-to-byte conversion goes through `toU8Clamped` (`pixel_math.hpp`) so results stay bit-identical; the 16-bit counterpart is `toU16Clamped` (same file, used by `levelsToSamples` in `image16.hpp`). In the float pipeline a value is rounded **once**, by whoever consumes it (see `tone_table.hpp`).
 - **Sanitizing rule:** slider values are clamped to their range and NaN/infinity become 0 (the neutral value) before they reach any table index or cast.
 
 ## Contents
@@ -34,17 +34,17 @@ Every header sits under `src/`, which is the include root, so a header is always
 
 | Folder | Headers |
 |---|---|
-| `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops` |
+| `core/` | `pixel_math`, `geometry`, `adjustments`, `auto_tone`, `raster_ops`, `image16`, `image16_convert`, `tone_table`, `wide_chain` |
 | `color/` | `color_mix`, `color_grade`, `color_pass`, `curves`, `lut3d` |
 | `detail/` | `detail_layer`, `neighbor_fx`, `film_fx` |
 | `mask/` | `mask`, `mask_geom`, `mask_range`, `mask_rect`, `mask_polygon`, `mask_raster`, `mask_brush`, `mask_object`, `seg_basic`, `sam_segmenter` |
 | `edit/` | `adjustment_set`, `render_params` |
-| `render/` | `render`, `histogram`, `scopes` |
-| `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `exif`, `image_meta`, `lut_cube`, `lut_library` |
-| `workers/` | `latest_worker`, `thumb_worker`, `export_worker`, `lut_preview_worker` |
+| `render/` | `render`, `render_core`, `render_bytes`, `histogram`, `scopes` |
+| `io/` | `sidecar`, `photo_meta`, `preset`, `virtual_copy`, `minijson`, `file_utils`, `image_codec`, `image_codec16`, `image_source`, `exif`, `image_meta`, `lut_cube`, `lut_library` |
+| `workers/` | `latest_worker`, `thumb_worker`, `export_render`, `export_worker`, `lut_preview_worker` |
 | `tests/` | `check.hpp`, next to the test files that use it |
 
-The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`; `export_worker` and `lut_preview_worker` are the exceptions that also use `edit` and `render`, because they run the pixel pipeline. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list.
+The folders are layers, lowest first: `core`, then `color`, `detail` and `mask`, then `io`, then `edit`, then `render`. `workers` sits beside `render` and uses `core` and `io`; `export_render`, `export_worker` and `lut_preview_worker` are the exceptions that also use `edit` and `render`, because they run the pixel pipeline. A header may include headers from folders below its own, never from folders above it, so the "Depends on" lines in the entries below always point down this list. Two exceptions to know about: `core/tone_table.hpp` includes `color/curves.hpp` (it composes the Tone sliders with the curves), and `core/image16_convert.hpp` includes `liteui.hpp` for `CanvasImage` (declarations only, no platform code).
 
 ---
 
@@ -74,6 +74,44 @@ Three tiny helpers used everywhere.
 - Input: any float. Returns: a byte.
 - Rule (**the** rounding rule of the whole pipeline): NaN → 0; the value is clamped to 0..255 (so infinities saturate); then `(uint8_t)(v + 0.5f)`, i.e. round to nearest with halves rounding up (within float precision of the `+ 0.5` step).
 - Anything that turns a float into a byte should use it so results stay bit-identical. `neighbor_fx::toU8` is the same rule written without `std::` calls.
+
+---
+
+### `image16.hpp`
+`Image16`, the 16-bit-per-channel RGBA picture the float pipeline starts from, and the row conversions between it, the 8-bit samples of a `CanvasImage`, and the float "levels" (0..255) the pixel passes work in. Plain buffers, no editor state.
+
+Why 16 bits and not float for storage: a 24 MP picture is 192 MB at 16 bits and 384 MB as float, and the editor keeps several stages of it (original, oriented, rotated, source). 16 bits holds everything a 16-bit PNG or a 12-14 bit RAW can say; the passes themselves compute in float, a block of rows at a time (`render.hpp`).
+
+**Depends on:** `pixel_math.hpp` (`u16ToLevels`, `toU8Clamped`, `toU16Clamped`). No UI. **Test:** `image16_test`.
+
+**Types**
+
+- `struct Image16 { int width = 0, height = 0; std::vector<uint16_t> pixels; }`: R, G, B, A interleaved, **straight** (not premultiplied) alpha, row-major, no padding; the same layout as `CanvasImage` with `uint16_t` samples. Alpha is 16-bit too (0 = transparent, 65535 = opaque). `pixels.size()` is `width * height * 4`.
+  - `Image16()`: empty. `Image16(int w, int h)`: a zero-filled (transparent black) picture; a negative `w` or `h` counts as 0.
+  - `bool empty() const`: true when `width <= 0 || height <= 0`. `size_t pixelCount() const`: `width * height`.
+
+**Functions**
+
+**`inline uint16_t widen8(uint8_t v)`**: `v * 257`, which spreads 0..255 over 0..65535 exactly (255 × 257 = 65535).
+
+**`inline uint8_t narrow16(uint16_t v)`**: `(v + 128) / 257`, the nearest byte (halfway rounds up). `narrow16(widen8(x)) == x` for every byte.
+
+**`inline void widenSamples(const uint8_t *src, uint16_t *dst, size_t n)`** / **`inline void narrowSamples(const uint16_t *src, uint8_t *dst, size_t n)`**: `widen8` / `narrow16` over `n` **samples** (not pixels). No bounds check; the caller sizes both buffers.
+
+**`inline void samplesToLevels(const uint8_t *src, float *dst, size_t n)`** / **`(const uint16_t *src, float *dst, size_t n)`**: loads `n` samples as float levels. The 8-bit form is a plain cast; the 16-bit form goes through `u16ToLevels`. Both are exact for 8-bit data and for its widened form.
+
+**`inline void levelsToSamples(const float *src, uint8_t *dst, size_t n)`** / **`(const float *src, uint16_t *dst, size_t n)`**: stores with the rounding rule (`toU8Clamped` / `toU16Clamped`): round to nearest, clamp to the sample's range, NaN gives 0.
+
+---
+
+### `image16_convert.hpp`
+`CanvasImage` (RGBA8, LiteUI) <-> `Image16`. Kept apart from `image16.hpp` so that one stays UI-free. It needs `liteui.hpp` only for the `CanvasImage` struct (declarations, no `LITEUI_IMPLEMENTATION`), so any translation unit may include it. The codecs in `image_codec16.hpp` are the part that needs the platform libraries.
+
+**Depends on:** `image16.hpp`, `liteui.hpp`. **Test:** no file of its own: `image_codec16_test` covers it (`testConversions`: widen, narrow, empty pictures, nearest-byte rounding of in-between values). `wide_chain_test` does not use this header; it widens with `widenSamples` from `image16.hpp`.
+
+**`inline Image16 widenImage(const CanvasImage &src)`**: every sample `v` becomes `v * 257`. A new `Image16` of the same size.
+
+**`inline CanvasImage narrowImage(const Image16 &src)`**: every sample to the nearest byte. `narrowImage(widenImage(x))` equals `x` exactly. Both copy `min(destination size, source size)` samples, so a source whose `pixels` is shorter than `width * height * 4` leaves the rest zero instead of reading past the end.
 
 ---
 
@@ -175,6 +213,51 @@ The Effects labels (`Vignette`, `Vignette Midpoint`, `Vignette Feather`, `Grain`
   - The optional curve is applied last, indexed by the already-rounded level, and rounded again.
   - Shared by `AdjustmentSet::buildLut` and by masks.
 
+### `tone_table.hpp`
+The Tone stage of the **float** pipeline: the same sliders and curves as `toneLutFromValues`, composed into one table of floats instead of 256 bytes, **without the rounding after every slider**.
+
+`toneLutFromValues` rounds to a byte after each Tone slider, so that one table equals separate 8-bit passes. In float that rounding is gone: each slider's function is applied to the previous one's float result, clamped to 0..255 (the clamp stays; it is what makes Highlights / Whites / Contrast behave at the ends), and the answer is rounded once, by whoever consumes it. The old table stays as it is: it is the reference the tests compare against, and Auto Tone still reasons with it.
+
+**Depends on:** `adjustments.hpp`, `curves.hpp` (`curveSample`, `curveToLut`, `curveIsIdentity`). No UI. **Test:** `tone_table_test` (it also covers the head: `testGammaLiftHasNoSteepStartError`, `testOtherSlidersStayWithinTheirDocumentedError`, `testHeadWithCurves`, `testEightBitLevelsAreExact`, `testEdgesAreSafe`).
+
+**Constants**
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `kToneSub` | `int` | 16 | Grid points per level: the table samples the curve every 1/16 level |
+| `kToneSize` | `int` | 4081 | `255 * kToneSub + 1`: entries for 0, 1/16, ..., 255 |
+| `kToneHeadPerLevel` | `float` | 257 | head cells per level (one per 16-bit sample) |
+| `kToneHeadLevels` | `int` | 2 | the head covers 0..2 levels |
+| `kToneHeadCells` / `kToneHeadSize` | `int` | 514 / 515 | cells / entries of the head |
+| `kToneTableSize` | `int` | 4596 | `kToneSize + kToneHeadSize`: a `ToneTable`'s `y` holds the main grid, then the head |
+
+An integer level lands exactly on a grid point, so an 8-bit input gets the exact value (no interpolation error at all for 8-bit pictures). For 16-bit input the 1/16-level grid is too coarse right above black for a curve with a steep start (Gamma +100 is off by up to 15 levels in the first cell), so each table also carries a **head**: the same curve at every 1/257 level (every 16-bit sample) over the first `kToneHeadLevels` levels, read by `toneLookupWide`. Worst error over all 65536 samples: about 0.002 level for Gamma +100 (under one 16-bit step, 0.0039), at most about 0.03 level for any other slider (Blacks −100, the steepest band; a smooth deviation, no banding). Integer levels stay exact.
+
+**Types**
+
+- `struct ToneTable { std::array<float, kToneTableSize> y; }`: the composed curve: `y[0, kToneSize)` the main grid, `y[kToneSize, kToneTableSize)` the head.
+  - `float at(float x) const`: `toneLookupWide(y.data(), x)`.
+  - `bool isIdentity() const`: true when every entry is **exactly** its own input level (`i / 16`), meaning the stage can be skipped.
+- `struct ToneSet { std::array<ToneTable, 3> ch; bool shared = true; bool identity = true; }`: what the render loop holds, the R, G and B tables. With no per-channel curve all three are the same table, so only `ch[0]` is built and `shared` is set (the loop reads one table, like the byte pipeline's shared-LUT fast path). `identity` is true when the whole stage does nothing. `const ToneTable &at(int c) const` returns `ch[0]` when `shared`, else `ch[c]` (`c` 0..2, not range-checked).
+
+**Functions**
+
+**`inline float toneClamp(float v)`**: `v` clamped to 0..255; NaN gives 0.
+
+**`inline float toneLookup(const float *tbl, float x)`**: linear interpolation in a `kToneSize` table at `x` levels (clamped to 0..255 first, NaN gives 0). One multiply, one float-to-int and one lerp. `tbl` must hold `kToneSize` floats. Plain grid only: used for the curve tables; a `ToneTable` is read with `toneLookupWide`.
+
+**`inline float toneLookupWide(const float *tbl, float x)`**: reads a `kToneTableSize` table (`ToneTable::y.data()`): below `kToneHeadLevels` through the head (exact at every 16-bit sample), above through the main grid (`toneLookup`). `x` is clamped to 0..255 first (NaN gives 0); the head index is clamped because `x * 257` can round up to the cell count.
+
+**`inline ToneTable toneTableFromValues(const AdjValues &values, const CurvePoints *master, const CurvePoints *channel)`**
+- Inputs: the sliders; the master curve (null for none); one channel's own curve (null for none).
+- Order per grid point: every Tone slider of `kAdjustmentSpecs` that has an `apply` function and a non-zero value, in table order (each result `toneClamp`ed); then the master curve; then the channel curve (the order of `AdjustmentSet::buildChannelLuts`). So the R, G and B tables are three calls that differ only in `channel`.
+- Slider values go through `sanitizedValue` first (clamped, NaN/infinity become 0). A curve that is not evaluable gives the identity, like `curveToLut`. The curves are sampled at 1/16-level steps with `curveSample`.
+
+**`inline std::shared_ptr<const ToneSet> makeToneSet(const AdjValues &values, const CurveSet &curves)`**
+- `curves` is `{master, R, G, B}`. A curve is **used** only when `curveIsIdentity(curveToLut(curve))` is false: the **same rule as the byte pipeline** for deciding a curve is a straight line, so an untouched curve never changes a pixel (even though the float table would sample it more finely).
+- No per-channel curve in use: builds one table, `shared = true`, `identity = ch[0].isIdentity()`. Otherwise builds all three (a channel without its own curve gets just the master), `shared = false`, and `identity` is true only if all three are.
+- Returns a new `ToneSet` each call; never null. Cost is about 4081 points times the active sliders, per table.
+
 ### `auto_tone.hpp`
 Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and Blacks. A pure function of 256 counts. No UI, no pixels, no editor state. See [architecture.md](architecture.md#auto-tone).
 
@@ -215,7 +298,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 ### `adjustment_set.hpp`
 `AdjustmentSet`: the live value of every edit, the undo/redo history, the History labels, the sidecar JSON and the `RenderParams`. No UI, no pixels. See [undo-and-history.md](undo-and-history.md).
 
-**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `lut3d.hpp`, `lut_library.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `preset.hpp`, `render_params.hpp`, `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
+**Depends on:** `adjustments.hpp`, `color_grade.hpp`, `color_mix.hpp`, `color_pass.hpp`, `curves.hpp`, `geometry.hpp`, `lut3d.hpp`, `lut_library.hpp`, `mask.hpp`, `minijson.hpp`, `neighbor_fx.hpp`, `preset.hpp`, `render_params.hpp` (and through it `tone_table.hpp`, for `makeToneSet`), `sidecar.hpp`. **Test:** `adjustment_set_test`. **Thread model:** UI thread only. Even some `const` members write `mutable` state (`version_`, the label cache), so don't call any member from two threads. Other threads get a `RenderParams` copy instead.
 
 **Constants:** `kMaxUndoSteps` (`size_t`, 200): the history holds the baseline plus at most this many steps (so `historySize()` is at most 201); older steps are dropped as new edits come in.
 
@@ -267,7 +350,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`void resetAllCurves()`**: all four curves back to straight lines, as one step (no-op if they already are). **`void endCurveEdit()`**: the point drag ended; the next curve edit starts a fresh step.
 
 **`void setMix(MixChan c, size_t band, float value)`**
-- Sets one Color Mixer slider. A drag on the same slider folds into one step; no-op if the value is unchanged. `band` is not range-checked (it must be below `kMixBandCount`). **`void resetMix()`**: zeroes all 24 sliders as one step (no-op if already 0), labelled "Color Mix: Reset".
+- Sets one Color Mixer slider. A drag on the same slider folds into one step; no-op if the value is unchanged. `band` is not range-checked (it must be below `kMixBandCount`). **`void resetMix()`**: zeroes all 24 sliders as one step (no-op if already 0). Its History label comes from the usual diff, so it reads "Color Mix: Reset" only when **two or more** values were non-zero; if exactly one was, the step reads like a single slider edit (for example `Color Mix: Red Hue +0`).
 
 **`void setGrade(const ColorGrade &g, int key)`**
 - Commits a grade. Repeated calls with the same non-negative `key` (the control being dragged) fold into one step until `endGradeEdit()`. `key < 0` is a discrete action (eye toggle, reset) and always its own step. No-op if unchanged. **`void endGradeEdit()`** closes the drag.
@@ -280,7 +363,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`bool setLut(const LutRef &ref)`**
 - Chooses the LUT, or removes it (an empty `ref`, or a name with nothing left after `sanitizeLutName`), as **one undo step**. The name is cleaned on the way in, so no caller can store an unsafe file-name stem.
 - The amount follows the choice so the result is visible at once and a LUT-less picture stays untouched: choosing a LUT while `LUT Amount` is 0 sets it to 100; choosing another one while an amount is set keeps that amount; removing the LUT sets the amount back to 0. Both changes are in the same step, so one undo brings back both.
-- Returns false, adding **no step** and not bumping `version()`, if neither the reference nor the amount would change.
+- Returns false, adding **no step** and not bumping `version()`, if neither the reference nor the amount would change. The amount counts: removing "the LUT" from a picture that has none, but whose `LUT Amount` is above 0, still returns true, because the amount goes back to 0 (one `Remove LUT` step). Choosing the LUT the picture already has, with an amount above 0, returns false.
 - Like `applyPreset` it goes through `pushStep()`, so it ends any slider drag in progress. Its label is stored in the step: `"LUT: <name>"`, or `"Remove LUT"`.
 - Does not look at the library: a reference to a file that does not exist is accepted (see `lutStatus`).
 
@@ -294,7 +377,7 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 **`bool applyPreset(const Preset &p)`**
 - **Replaces the whole look** with `p` as **one undo step**. A slider the preset does not set (its value is 0) is reset to 0, not left alone; this is "replace", not "merge". Crop, orientation, angle, corner mode and masks are not touched. The LUT is part of the look: a preset **without** one clears the picture's LUT (its `LUT Amount` comes from the preset's slider values like any other slider). The preset's LUT name is cleaned again; a preset that differs from the picture only in its LUT is a change.
 - Each slider value is run through `sanitizedValue` (clamped to its range, NaN/infinity become 0), so a hand-built `Preset` cannot put an out-of-range slider in. The curves, Mixer values and grade are taken **as given**: a `Preset` that came from `presetFromJson` already satisfies the editor's rules (see `sidecarCurveFromJson`), but a hand-built one must keep them itself.
-- Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders, the curves, the Mixer values and the grade all equal the current ones. Otherwise returns true.
+- Returns false, and adds **no step** and does not bump `version()`, if the sanitized sliders, the curves, the Mixer values, the grade **and the (cleaned) LUT reference** all equal the current ones. Otherwise returns true.
 - The step is always its own: it goes through `pushStep()`, which ends any slider/curve/Mixer/grade/mask drag, so the next slider touch starts a fresh step rather than overwriting the preset step. Its label is `"Preset: <name>"` (the name sanitized again), or just `"Preset"` if the name is blank. The label is stored in the new snapshot, so it survives undo, redo and History jumps, and it stays even if the preset *file* is later deleted: history holds a full copy of the look, never a link to the file.
 
 **White balance picker** (the eyedropper's edit; the math is `solveWhiteBalance` in [`color_pass.hpp`](#color_passhpp))
@@ -358,17 +441,17 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - The Tone sliders composed into one 256-entry table, then the **master** curve on top (Lightroom's order). The curve is skipped when it rounds to identity (`curveIsIdentity`), so an untouched curve gives bit-identical results. O(256) whatever the image size.
 
 **`std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const`**
-- Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what `renderWith`'s fast path checks).
+- Per-channel R, G, B tables: `buildLut()` and then each channel's own curve on top (`lut[k] = clamp(lround(curve[base[k]]), 0, 255)`). A channel whose curve is a straight line reuses the shared table, so with no per-channel curves all three are identical (which is what the byte pipeline's, `renderWithBytes`, fast path checks). These are the **byte** tables; the float pipeline uses `toneF`, built in `buildRenderParams()`.
 
 **`ColorPass buildColorPass() const`**: `makeColorPass` from Temperature, Tint, Vibrance, Saturation, Hue, Colorize Hue and Amount, the Mixer, the grade, the ten Filters (via `filterValuesFromAdj(values_)`) and the 3D LUT: `makeLutPass(acquireLut(lut_).lut, LUT Amount)`, so the pass holds a shared pointer to the cached table and an unavailable LUT is simply inactive.
 
 **`RenderParams buildRenderParams() const`**
-- Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks), and `film` from `filmFromAdj(values_)` (Vignette and Grain: global, applied after the masks).
+- Freezes the whole state into a self-contained value: `luts` from `buildChannelLuts()`, `toneF` from `makeToneSet(values_, curves_)` (the float tone tables `renderWith` uses; always set, even when nothing is on, in which case `toneF->identity` is true and the stage is skipped), `color` from `buildColorPass()`, `fx` from `neighbor_fx::gainsFromValues` (Texture, Clarity, Sharpness, Dehaze, Noise Reduction, Color Noise, Blur), `masks` from `buildMaskPasses(masks_, geoFrame())` (only if there are masks), and `film` from `filmFromAdj(values_)` (Vignette and Grain: global, applied after the masks).
 
 ### `render_params.hpp`
 `RenderParams` and `MaskPass`: everything the per-pixel pipeline needs, frozen into one small copyable value. Built from the edit state in O(256), so the UI thread builds one and hands a copy to a worker; the worker never touches the `AdjustmentSet`, which the UI thread keeps mutating. No pixels, no UI.
 
-**Depends on:** `adjustments.hpp`, `color_pass.hpp`, `curves.hpp`, `film_fx.hpp`, `geometry.hpp`, `mask.hpp`, `neighbor_fx.hpp`. **Test:** `render_params_test`.
+**Depends on:** `adjustments.hpp`, `color_pass.hpp`, `curves.hpp`, `film_fx.hpp`, `geometry.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `tone_table.hpp`. **Test:** `render_params_test`.
 
 **Types**
 
@@ -379,18 +462,19 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 | `parts` | `std::vector<MaskPassPart>` | empty | The mask's shapes, **already mapped into the current picture**, combined left to right |
 | `invert` | `bool` | false | Adjust everything outside the shapes |
 | `amount` | `float` | 1 | 0..1; multiplies the weight |
-| `tone` | `bool` | false | Any Tone slider or curve is non-neutral, so `luts` is valid |
-| `luts` | `std::array<std::array<uint8_t, 256>, 3>` | zeros | R, G, B tone tables (only filled when `tone`) |
+| `tone` | `bool` | false | Any Tone slider or curve is non-neutral, so `luts` and `toneF` are valid |
+| `luts` | `std::array<std::array<uint8_t, 256>, 3>` | zeros | R, G, B tone tables, the **byte** pipeline's (only filled when `tone`) |
+| `toneF` | `std::shared_ptr<const ToneSet>` | null | The same tone stage as **float** tables, the float pipeline's (set with `tone`; null means `render_core` falls back to `luts`) |
 | `color` | `ColorPass` | inactive | The mask's own color pass |
 | `fx` | `neighbor_fx::Gains` | all 0 | The mask's Texture, Clarity, Sharpness, Dehaze, Noise and Blur gains |
 
-`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel), `color` (`ColorPass`, runs after the tables; it holds the picture's 3D LUT as a shared pointer, so copying a `RenderParams` never copies a table), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it), `film` (`film_fx::Params`: Vignette and Grain, the very last step, after the masks).
+`struct RenderParams`: `luts` (three 256-entry byte tables: tone sliders plus tone curves, per channel; what `renderWithBytes` reads), `toneF` (`std::shared_ptr<const ToneSet>`: the same stage as float tables, what `renderWith` / `render_core` reads; **null = use `luts`**, so a hand-built `RenderParams` that only sets `luts` still renders, rounding after the tone stage like the byte pipeline), `color` (`ColorPass`, runs after the tables; it holds the picture's 3D LUT as a shared pointer, so copying a `RenderParams` never copies a table), `fx` (`neighbor_fx::Gains`, after the color pass), `masks` (`std::vector<MaskPass>`, applied after all of it), `film` (`film_fx::Params`: Vignette and Grain, the very last step, after the masks).
 
 **Functions**
 
 **`inline FilterValues filterValuesFromAdj(const AdjValues &a)`**: picks the ten Filter sliders (Greyscale, Sepia, Vintage, Fade, Negative, Posterize, Solarize, Bleach Bypass, Threshold, Cross Process) out of an `AdjValues` in the form `makeColorPass` takes. It must be passed at **both** `makeColorPass` call sites (`AdjustmentSet::buildColorPass()` and `buildMaskPasses()`); a site that forgets it silently ignores the Filters.
 
-**`inline film_fx::Params filmFromAdj(const AdjValues &a)`**: picks the six Effects sliders (Vignette, Vignette Midpoint, Vignette Feather, Grain, Grain Size, Grain Roughness) out of an `AdjValues` and sanitizes them through `film_fx::paramsFromValues`. Its only call site is `AdjustmentSet::buildRenderParams()`: masks never read these sliders.
+**`inline film_fx::Params filmFromAdj(const AdjValues &a)`**: picks the six Effects sliders (Vignette, Vignette Midpoint, Vignette Feather, Grain, Grain Size, Grain Roughness) out of an `AdjValues` and sanitizes them through `film_fx::paramsFromValues`. Its only call site is `AdjustmentSet::buildRenderParams()`: masks never read these sliders. The result feeds `film_fx::prepare` inside the renderer.
 
 **`inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks, const GeoFrame &frame)`**
 - Inputs: the user's masks (stored against the original picture) and the `GeoFrame` of the picture being rendered.
@@ -398,19 +482,21 @@ Auto Tone: turns a luma histogram into values for Exposure, Contrast, Whites and
 - A mask is skipped if it is disabled, has no parts, has `amount <= 0` (`amount` is clamped to 0..100 first), or has no effect (no tone, no active color pass, no neighbor effects).
 - How each part is built:
   - `tone` is set if any Tone slider is non-zero or any of the four curves is not the identity (checked with `curveIsIdentity`).
-  - Tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
+  - Float tables: when `tone` is set, `toneF = makeToneSet(adj, curves)` (see `tone_table.hpp`; it uses the same "is this curve a straight line" rule as below, so both table sets agree on which curves count).
+  - Byte tables: `toneLutFromValues(adj, masterCurve or null)` gives the base table. A channel with its own non-identity curve then maps through it: `lut[k] = clamp(lround(channelCurve[base[k]]), 0, 255)`. Order is sliders, master curve, channel curve (same as `AdjustmentSet::buildChannelLuts`).
   - `color` comes from `makeColorPass` (Temperature, Tint, Vibrance, Saturation, the mask's own mixer and grade, Hue, Colorize Hue, Colorize Amount, and the Filters through `filterValuesFromAdj`). A mask with only a Filter slider set counts as having an active color pass, so it is kept.
   - `fx` comes from `neighbor_fx::gainsFromValues` with the seven detail sliders.
   - The Effects sliders (Vignette, Grain) and **LUT Amount** are **not read**: a mask that carries one has no adjustment from it, and one with nothing else is dropped. A mask's color pass never gets a LUT.
+- A second use besides `AdjustmentSet::buildRenderParams()`: `main.cpp` calls it with a **prefix** of the mask list (`MaskSet(ms.begin(), ms.begin() + sel)`) to render "the picture just before mask `sel`", which is what the Luminosity / Color Range masks sample. There it also sets `rp.film = {}`, because Vignette and Grain run after the masks and would not be in that picture. Skipped masks are dropped from the result as usual, so the result can be shorter than the prefix.
 
 ---
 
 ## Color
 
 ### `color_pass.hpp`
-The float per-pixel color pass, run in place on RGBA8: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters → 3D LUT. Rounds to 8 bits once, at the end. Works on gamma-encoded values directly (no linearization). Also holds `solveWhiteBalance`, the inverse of the white-balance gains, used by the app's eyedropper.
+The float per-pixel color pass: white-balance gains → vibrance → saturation → hue → Color Mixer → colorize → Color Grading → Filters → 3D LUT. `applyColorPassF` runs it in place on float levels (what the float pipeline in `render_core.hpp` uses, **not rounded or clamped**); `applyColorPass` is the same pass on RGBA8 bytes, rounding to 8 bits once at the end. Works on gamma-encoded values directly (no linearization). Also holds `solveWhiteBalance`, the inverse of the white-balance gains, used by the app's eyedropper.
 
-**Depends on:** `color_grade.hpp`, `color_mix.hpp`, `lut3d.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test` (the order of the LUT among the stages is also checked through the real renderer in `lut_render_test`).
+**Depends on:** `color_grade.hpp`, `color_mix.hpp`, `lut3d.hpp`, `pixel_math.hpp`. No UI. **Test:** `color_pass_test`, which also holds the float-vs-byte agreement test (`testColorPassFloatAgrees`), the chunking test (`testBulkEqualsPerPixel`), hashed fingerprints (`testGoldenFingerprints`, recorded with MSVC Release, so compiler-dependent) and the LUT tests (`testLut*`, `testColorPassWithLut`). The order of the LUT among the stages is also checked through the real renderer in `lut_render_test` and the golden test's `lut/` scenarios.
 
 **Constants**
 
@@ -418,6 +504,7 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 |---|---|---|---|
 | `kHueShiftDegrees` | `float` | 90 | The Hue slider at ±100 turns colors by ±90° |
 | `kColorizeStrength` | `float` | 0.6 | Colorize Amount 100 = this fraction of the tint's chroma |
+| `kThresholdLevel` | `float` | 128 | Threshold filter: luma at or above this goes white, below goes black |
 | `kWbMinLevel` | `float` | 6 | White-balance picker: every channel of the sampled spot must be at least this (0..255), or the spot is `TooDark` |
 | `kWbMaxLevel` | `float` | 254 | White-balance picker: a channel at or above this counts as clipped (`Clipped`) |
 
@@ -455,6 +542,10 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
 
 **Functions**
 
+**`inline FilterPass makeFilterPass(const FilterValues &v)`**: freezes the ten Filter sliders. Each value goes NaN/infinity → 0, else clamped to 0..100 and divided by 100. Posterize becomes a level count `round(256 · (2/256)^p)` (`p` = strength 0..1), at least 2; 256 or more means off, otherwise `posterLevels`, `posterScale` and `posterInv` are set. `any` is true if any strength is above 0 or `posterLevels != 0`.
+
+**`inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)`**: one pixel through the Filters, float in and out (may leave 0..255 only through Cross Process / Vintage; the caller rounds). Clamps to 0..255 first and again after Sepia, because earlier steps can overshoot. Fixed order and formulas are listed in step 8 of `applyColorPassF` below. Helpers: `filterLerp`, `filterClamp255`, `filterBleachChannel` (overlay blend of a channel with the luma, `k` fading from multiply to screen around luma 0.45..0.55), `filterSCurve255` (smoothstep S-curve blended in by an amount). No `std::` helpers, for the Debug-build reason below.
+
 **`inline ColorPass makeColorPass(float temperature, float tint, float vibrance, float saturation, const MixValues &mix, const ColorGrade &grade, float hueShift = 0.0f, float colorizeHue = 0.0f, float colorizeAmount = 0.0f, const FilterValues &filters = FilterValues{}, const LutPass &lut = LutPass{})`**
 - Inputs (all UI slider values):
   - `temperature`, `tint`, `vibrance`, `saturation`, `hueShift`: -100..100, 0 = untouched.
@@ -475,12 +566,13 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   - `cp.filters = makeFilterPass(filters)` is built before `active` is computed, and `filters.any` is part of `active`; without that the fast path would skip a lone Filter.
   - `cp.lut` is stored (only when `lut.any()`) before `active` is computed, and `lut.any()` is part of `active`; without that the fast path would skip a lone LUT. A LUT alone also computes the (neutral) white-balance gains: they are within a float rounding of 1, so a LUT-only pass need not be bit-exact with a default pass, which is why `colorPassWithLut` below rebuilds through `makeColorPass` in that case.
 
-**`inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)`**
+**`inline void applyColorPassF(const ColorPass &cp, float *p, std::size_t n)`**
 - Inputs:
   - `cp`: the frozen pass.
-  - `p`: pointer to RGBA8 pixels, modified in place.
-  - `n`: number of **bytes** (4 per pixel), not pixels. Trailing bytes that don't make a whole pixel are left alone.
+  - `p`: pointer to RGBA **floats** (levels, R, G, B in 0..255), modified in place.
+  - `n`: number of **floats** (4 per pixel), not pixels. Trailing floats that don't make a whole pixel are left alone.
 - Returns: nothing. Alpha is never touched. Returns at once if `!cp.active`.
+- **The result is neither rounded nor clamped**, so it can lie outside 0..255 (for example with only Vibrance or Saturation active; stages that clamp are the Mixer, Grading, Filters and the LUT, each on its own input). The caller decides: the float pipeline clamps R, G, B with `render_core::clampRgb`, `applyColorPass` rounds.
 - Per-pixel order and rules:
   1. Multiply by the white-balance gains.
   2. **Vibrance**: HSV saturation `s = (max − min)/max`. Positive vibrance scales chroma by `1 + vib(1 − s)` (muted colors most); negative by `1 + vib·s` (saturated colors most). Chroma is measured from Rec. 601 luma.
@@ -490,9 +582,13 @@ The float per-pixel color pass, run in place on RGBA8: white-balance gains → v
   6. **Colorize**: adds `tintVec × 4·l·(1 − l)` where `l` is luma 0..1 (strongest in midtones, zero at black and white).
   7. **Grading**: clamp to 0..255, `yi = int(luma + 0.5)`, add `gradeLut[c][yi]`.
   8. **Filters** (only if `filters.any`): `applyFilterPixel`, still in float. Each filter is `lerp(pixel, filtered, strength)`, so strength 0 is exactly the identity (existing renders do not change). Fixed order: Vintage (desaturate 35%, warm cast, lifted blacks, contrast × 0.92) → Fade (blacks lifted to 40, white stays 255) → Greyscale (`kGradeLuma*`) → Sepia (the classic 3×3 matrix) → clamp to 0..255 → Solarize (invert channel values above 128) → Bleach Bypass (half-desaturate, then overlay the luma: more contrast, less color, black and white fixed) → Cross Process (S-curve on R at 0.9, on G at 0.5, B lifted from 0 to 32 and lowered from 255 to 225) → Threshold (luma at or above `kThresholdLevel` = 128 goes white, below goes black; the slider is the blend strength) → Posterize → Negative (`255 − x`). The input is clamped to 0..255 first, because earlier stages can overshoot. Posterize is a hard quantize whose level count falls smoothly from 256 (slider 0) to 2 (slider 100); 256 levels counts as off.
-  9. **3D LUT** (only if `lut.any()`): clamp R, G and B to 0..255 (NaN to 0), then `applyLutPixel`: the table's tetrahedral lookup, blended with the pixel by the amount, `lerp(pixel, lut(pixel), amount)`. Last, so the LUT sees the finished color; before the neighbor effects, the masks and Vignette / Grain (see `renderWith`).
-  10. Write back with `toU8Clamped`, once.
+  9. **3D LUT** (only if `lut.any()`): clamp R, G and B to 0..255 (NaN to 0), then `applyLutPixel`: the table's tetrahedral lookup, blended with the pixel by the amount, `lerp(pixel, lut(pixel), amount)`. Last, so the LUT sees the finished color; before the neighbor effects, the masks and Vignette / Grain (see `renderPipeline` in `render_core.hpp`).
+  10. Write the floats back as they are.
 - Notes: raw pointers and no `std::` helpers in the loop, on purpose, for Debug-build speed. The Mixer index is computed inline (not via `mixLutIndex`) with the same formula.
+
+**`inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)`**
+- The same pass on RGBA8 bytes, in place. `n` is the number of **bytes** (4 per pixel); trailing bytes that don't make a whole pixel are left alone. Alpha is never touched; returns at once if `!cp.active`.
+- How: converts blocks of 1024 pixels to float (a 16 KiB stack buffer), runs `applyColorPassF`, and writes each channel back with `toU8Clamped`, once. Its output is pinned by `color_pass_test`: `testColorPassFloatAgrees` (the float core, rounded by hand, equals this function over 100 random passes), `testBulkEqualsPerPixel` (one call over any length, across the 1024-pixel chunk edges, equals one call per pixel; stray trailing bytes and alpha untouched) and `testGoldenFingerprints`. Used by the byte pipeline (`render_bytes.hpp`) and the tests.
 
 **`inline ColorPass colorPassWithLut(const ColorPass &cp, const LutPass &lut)`**
 - Returns a copy of `cp` whose LUT is `lut`; an inactive `lut` (a default `LutPass{}`) removes it. Everything else in the pass is kept exactly. This is how the LUT previews swap one LUT for another on the picture's own `RenderParams` without the sliders that made the pass (`lutPreviewParams`).
@@ -560,7 +656,7 @@ The Color Mixer (HSL): eight hue bands × (Hue, Saturation, Luminance), baked in
 **`inline std::size_t mixLutIndex(float hueDeg)`**
 - Input: hue in degrees (any finite value; wraps).
 - Returns: nearest table index, always `0..719`. NaN/infinity → 0.
-- Always use this instead of rounding by hand: `round(hue/360 × 720)` reaches 720 for hues near 360. Here 359.9° → 0 and -0.1° → 719.
+- Always use this instead of rounding by hand: `round(hue/360 × 720)` reaches 720 for hues near 360. Here 359.9° and -0.1° (the same hue) both give 0, and -0.3° gives 719. (The comment in `color_mix.hpp` says -0.1 → 719; that is off by one step, the code returns 0.)
 
 **`inline MixLut buildMixLut(const MixValues &m)`**
 - Input: the 24 slider values (sanitized inside with `mixClamped`).
@@ -618,9 +714,9 @@ Color Grading: Shadows, Midtones, Highlights and Global wheels, baked into one p
   5. **Monotonic guard**: the luminance part is held at a plateau wherever `i + offset` would drop below an earlier output level, so large offsets with low Blending can't invert tones. Settings that were already monotonic are copied through unchanged.
 
 ### `curves.hpp`
-Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 256-entry table, and the operations that keep the point list valid.
+Tone curves: control points, the monotone cubic (PCHIP) that turns them into a table (`curveSample` for any grid, `curveToLut` for the 256-entry byte-level one), and the operations that keep the point list valid.
 
-**Depends on:** `pixel_math.hpp`. No UI. **Test:** `curves_test`.
+**Depends on:** `pixel_math.hpp`. No UI. **Test:** `curves_test`. `tone_table.hpp` samples curves on a finer grid with `curveSample`.
 
 **Constants**
 
@@ -641,12 +737,16 @@ Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 2
 **`inline CurvePoints identityCurve()`**: `{(0,0), (255,255)}`. **`inline CurveSet identityCurves()`**: four identity curves.
 
 **`inline bool curveEvaluable(const CurvePoints &pts)`**
-- Returns true if there are at least 2 points, all coordinates are finite, and `x` is strictly increasing. This is the minimum `curveToLut` needs; the edit functions below keep stricter invariants.
+- Returns true if there are at least 2 points, all coordinates are finite, and `x` is strictly increasing. This is the minimum `curveSample` / `curveToLut` need; the edit functions below keep stricter invariants.
+
+**`inline void curveSample(const CurvePoints &pts, float *lut, std::size_t count, float step)`**
+- Inputs: control points; `lut`, room for `count` floats; `count` the number of samples; `step` the distance between sample inputs (**must be >= 0**: the segment search only walks forward).
+- Output: `lut[i]` = the curve at input level `x = i * step`, for `i = 0..count-1`, **unrounded** and clamped to 0..255. The 256-entry, step-1 case is `curveToLut`; the float pipeline samples a finer grid (`kToneSub` = 16 per level, `tone_table.hpp`).
+- Details: Fritsch–Carlson PCHIP. It passes through every point and never overshoots. Interior slope is the weighted harmonic mean of neighboring secants, or 0 at a local extremum or flat spot. End slopes are shape-preserving one-sided estimates; with exactly two points the curve is the straight line between them. Interval widths are floored at 1e-3. Outside the first/last point the value is held flat.
+- Gotcha: if the points are not evaluable (see `curveEvaluable`) the output is the identity `lut[i] = i * step`, which is **not clamped**, so it can pass 255 if `count * step` does.
 
 **`inline std::array<float, 256> curveToLut(const CurvePoints &pts)`**
-- Input: control points.
-- Returns: the curve evaluated at every level 0..255, **unrounded**, clamped to 0..255. If the points are not evaluable, returns the identity table.
-- Details: Fritsch–Carlson PCHIP. It passes through every point and never overshoots. Interior slope is the weighted harmonic mean of neighboring secants, or 0 at a local extremum or flat spot. End slopes are shape-preserving one-sided estimates. Interval widths are floored at 1e-3. Outside the first/last point the value is held flat.
+- Returns: the curve evaluated at every level 0..255 (`curveSample(pts, ..., 256, 1.0f)`), **unrounded**, clamped to 0..255. If the points are not evaluable, returns the identity table. Details as for `curveSample`.
 
 **`inline bool curveIsIdentity(const std::array<float, 256> &lut)`**
 - Returns true if every entry rounds to its own index with `toU8Clamped`. The pipeline then skips the curve stage. It must use the same rounding as the code that applies the curve, which is why it uses `toU8Clamped`.
@@ -665,7 +765,7 @@ Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 2
 ### `lut3d.hpp`
 3D color LUTs as plain values: the table (`Lut3D`), the name that points at one in the library (`LutRef`), the per-pixel lookup (tetrahedral interpolation) and the frozen form the render loop holds (`LutPass`). No files, no UI, no editor state. See [3D LUTs](architecture.md#3d-luts).
 
-**Depends on:** standard library only. **Test:** `lut3d_test`. **Thread model:** no shared state. A `Lut3D` is built once and then only read, so a `std::shared_ptr<const Lut3D>` is shared freely between threads.
+**Depends on:** standard library only. **Tests:** `lut3d_test`; the LUT through the real pipeline is checked by `lut_render_test` (numbers) and the golden test's `lut/` scenarios (fingerprints). **Thread model:** no shared state. A `Lut3D` is built once and then only read, so a `std::shared_ptr<const Lut3D>` is shared freely between threads.
 
 **Constants**
 
@@ -685,15 +785,15 @@ Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 2
 **`inline std::string sanitizeLutName(const std::string &s)`**
 - Returns: `s` reduced to printable ASCII (the `TextInput` widget is ASCII), with each of `< > : " / \ | ? *` replaced by `_`, trimmed, cut to `kLutNameMax` and stripped of trailing dots and spaces. May be empty. The result is always safe as a file-name stem, so a name read from a hand-edited sidecar can never point outside the library folder (`"../x"` becomes `".._x"`).
 
-**`inline std::string lutFileStem(const std::string &name)`**: the stem a LUT is stored under: `sanitizeLutName(name)`, `"lut"` if that is empty, and the Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, any case) prefixed with `_`.
+**`inline std::string lutFileStem(const std::string &name)`**: the stem a LUT is stored under: `sanitizeLutName(name)`, `"lut"` if that is empty, and the Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, any case) prefixed with `_` (`COM10` is not reserved). A name that sanitizes to nothing, such as `".."`, gives `"lut"`.
 
 **`inline std::string lutHashToHex(uint64_t h)`** / **`inline bool lutHashFromHex(std::string_view s, uint64_t *out)`**: 16 lowercase hex digits and back. `FromHex` accepts upper case and **only exactly 16 digits**; anything else returns false and leaves `*out` untouched.
 
 **`inline Lut3D identityLut(int n)`**: a table that changes nothing (up to float rounding), `n` clamped to `kLutMinSize..kLutMaxSize`. Used by tests and previews.
 
 **`inline void lutEval(const Lut3D &L, float r, float g, float b, float *out)`**
-- Inputs: a **valid** table, and a pixel in 0..255 units (values outside that, and NaN, are clamped first: NaN becomes 0). `out` receives three floats in the same units (not clamped: a table may hold values outside 0..255).
-- Method: the pixel is mapped to a grid position through the domain (`scale` / `offset`), clamped to the grid, and the cell it falls in is cut into **six tetrahedra** along its main diagonal. The output is linear inside the tetrahedron the fractional parts select: the path from the cell's origin to its far corner visits the axes in order of decreasing fractional part. Compared with trilinear this keeps the gray axis exactly gray (no color cast between grid points) and reproduces any table that is affine inside a cell exactly (`lut3d_test` checks both, with every one of the six cases exercised).
+- Inputs: a **valid** table, and a pixel in 0..255 units (values outside that are clamped first: NaN and -infinity become 0, +infinity 255). `out` receives three floats in the same units (not clamped: a table may hold values outside 0..255).
+- Method: the pixel value `v` is read as `v / 255` in the file's domain units and mapped to a grid position through the domain (`scale` / `offset`): with `DOMAIN_MAX` 0.5, pixel value 127.5 is the **last** grid point, and with a domain of -1..1 pixel value 0 sits at the middle of the grid. The position is clamped to the grid, and the cell it falls in is cut into **six tetrahedra** along its main diagonal. The output is linear inside the tetrahedron the fractional parts select: the path from the cell's origin to its far corner visits the axes in order of decreasing fractional part. Compared with trilinear this keeps the gray axis exactly gray (no color cast between grid points) and reproduces any table that is affine inside a cell exactly (`lut3d_test` checks the affine case on a 5-point grid with 2000 random pixels, counting that every one of the six tetrahedra was hit, and checks that an identity table keeps every gray 0..255 gray).
 - Raw pointers and no `std::` helpers, for Debug-build speed, like `applyColorPass`.
 
 **`inline LutPass makeLutPass(std::shared_ptr<const Lut3D> lut, float slider)`**
@@ -708,7 +808,7 @@ Tone curves: control points, the monotone cubic (PCHIP) that turns them into a 2
 ### `detail_layer.hpp`
 Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `detail = luma − blur(luma)`, then `result = pixel + gain × detail`. The three differ only in blur size. All of it lives in `namespace detail_layer`.
 
-**Depends on:** standard library only. No UI (plain RGBA8 pointers). **Test:** `detail_layer_test`.
+**Depends on:** standard library only. No UI (plain RGBA8 or 16-bit pointers). **Test:** `detail_layer_test`. For 16-bit sources it checks only the blur plane against a reference (`testBlurMatchesReference16`) and a flat plane; the 16-bit `addPixels` and `SrcTraits<uint16_t>::lumaMid` are exercised only through `render_core_test` (see that entry). The planes are built from, and each pixel's own luma is measured on, the **source at its own precision**: RGBA8 (`uint8_t`) or 16-bit (`uint16_t`), through `SrcTraits<S>` (below). For 8 bits every result is bit-identical to what it always was; only the destination may be float.
 
 **Design rules worth knowing**
 - The blur is of the **source** picture's luma, so a plane depends only on the image: it is built once and cached. No slider drag recomputes it (Texture's own slider only changes `gain`).
@@ -726,7 +826,7 @@ Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `det
 | `kSigmaMin[3]` | `float[3]` | 1, 3, 0.6 | Floor on sigma, in pixels |
 | `kGain[3]` | `float[3]` | 0.8, 1.0, 1.5 | What slider ±100 adds |
 | `kClarityLimit` | `float` | 64 | Soft limit on Clarity's detail, in levels |
-| `kMaxBoxRadius` | `int` | 1000 | Keeps every running sum exact in float (at most about 8.2 million, below 2^24) |
+| `kMaxBoxRadius` | `int` | 1000 | Keeps every running sum exact in float for 8-bit sources (at most about 8.2 million, below 2^24). With 16-bit sources a sum can pass 2^24 (the sums are `uint32_t`, still exact); only its conversion to float rounds, by under 0.01 plane count |
 | `kLumaR/G/B` | `int` | 54, 183, 19 | 8-bit luma weights, /256, summing to exactly 256 (`static_assert`). Used both to build planes and to measure each pixel; they must agree |
 
 **Types**
@@ -739,6 +839,10 @@ Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `det
 **Functions**
 
 **`inline int lumaOf(const uint8_t *p)`**: `p` points at an RGBA pixel. Returns 0..255, `(54R + 183G + 19B + 128) >> 8`.
+
+**`template <class S> struct SrcTraits`** (specialized for `uint8_t` and `uint16_t`): the one place that knows how the planes and passes read one source pixel. Members: `kFix` / `kInvFix` (plane units per level and its inverse), `level(v)` (a sample in levels), `lumaFix(p)` (luma in plane units), `lumaMid(p, &lumaFix, &mid)` (that plus Clarity's midtone weight `4 l (1 − l)`), `chroma(p, &cr, &cb)` (R − luma, B − luma in levels), `fixFromSum(sum, cnt)` (a block average in plane units) and `darkFix(m)` (a sample in plane units).
+- `SrcTraits<uint8_t>`: `kFix` 16 (4 fractional bits). The integer arithmetic these passes always used: luma is rounded to a whole level, the midtone weight comes from the 256-entry table. Bit-identical to before.
+- `SrcTraits<uint16_t>`: `kFix` 64 (6 fractional bits). A sample is `v / 257` levels (a division, so a widened 8-bit value `k * 257` is exactly `k`). Luma is **not** rounded (the weighted sum of samples is below 2^24, exact in float, times `1 / (256 * 257)`), and the midtone weight is computed from it. Rounding luma to a level was a ±0.5 level sawtooth on every gradient that Texture, Clarity and Sharpness multiplied; on a smooth 16-bit gradient the measured detail is now about 0.01 level (about 0.3 to 0.6 for the same gradient squeezed to 8 bits).
 
 **`inline int boxRadius(int kind, int w, int h)`**
 - Inputs: layer `kind` (0..2, **not validated**), picture size.
@@ -754,17 +858,17 @@ Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `det
 - Vertical box blur `in` → `out` (different buffers). `col` is scratch for `W` running column sums, so memory is read row by row. Edges replicate. Polls cancellation every 16 rows.
 - Returns: false if cancelled (`out` is then incomplete).
 
-**`inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+**`inline bool blurLuma(const uint8_t *rgba, ...)`** and **`blurLuma(const uint16_t *rgba, ...)`** (both `(int w, int h, int r, Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`; one template, `blurLumaT<S>`)
 - Inputs: RGBA8 picture, size, box radius `r` (≥ 1), the output plane (resized), and the cancellation pair.
 - Returns: true on success. False if `rgba` is null, a size is non-positive, `r < 1`, or it was cancelled; `out` is then garbage.
 - Details: luma × 16, then 3 horizontal passes, then 3 vertical passes.
 
-**`inline uint64_t fingerprint(const uint8_t *rgba, int w, int h)`**
+**`template <class S> inline uint64_t fingerprint(const S *rgba, int w, int h)`** (S = `uint8_t` or `uint16_t`; the sample size is mixed in, so a 16-bit picture never shares a key with an 8-bit one)
 - Returns: a 64-bit FNV-1a hash seeded with the size, over about 1024 bytes spread across the picture plus the last byte. **Not a full hash**: a small edit between the samples goes unnoticed, which is why the cache assumes pixels are never edited in place.
 
 **`class Cache`** (shared by the UI thread and render workers; internally locked)
 - `using PlanePtr = std::shared_ptr<const Plane>`.
-- `PlanePtr get(const uint8_t *rgba, int w, int h, int kind, const std::atomic<uint64_t> *latest, uint64_t gen)`: the plane for this picture and layer, built if absent. Returns **null** if cancelled (nothing is cached then) or if an argument is invalid (null pixels, non-positive size, kind outside 0..2). The key is pixel pointer + size + kind + fingerprint. The blur runs outside the lock; two threads may rarely build the same plane and one wins.
+- `PlanePtr get(const uint8_t *rgba, ...)` / `get(const uint16_t *rgba, ...)` (`int w, int h, int kind, const std::atomic<uint64_t> *latest, uint64_t gen`): the plane for this picture and layer, built if absent (from the source at its own precision). Returns **null** if cancelled (nothing is cached then) or if an argument is invalid (null pixels, non-positive size, kind outside 0..2). The key is pixel pointer + size + kind + fingerprint. The blur runs outside the lock; two threads may rarely build the same plane and one wins.
 - `void clear()`: drops everything. Call it after any in-place edit of pixels.
 - `size_t size() const`: number of cached planes.
 - Limits: 9 entries and 384 MiB. The least recently used are evicted, never the newest. A plane still held by a render stays alive through its `shared_ptr`.
@@ -775,20 +879,22 @@ Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `det
 - Inputs: slider values; texture and clarity -100..100, sharpness 0..100. Each is clamped; NaN/infinity count as 0.
 - Returns: `g = value/100 × kGain[kind]`. Always finite.
 
-**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, unsigned need, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, unsigned need, const std::atomic<uint64_t> *latest, uint64_t gen)`** and its twin with `const uint16_t *rgba` (both are one-line wrappers of `template <class S> acquireT`)
 - Inputs: `need` is the bitmask from `Gains::need()`. Fills `out.p[k]` for each requested layer from the cache.
 - Returns: false if cancelled. Returns **true** with the planes left null if `rgba` is null or a size is non-positive (nothing to do).
 
 **`inline const float *midWeights()`**: pointer to a 256-entry table of `4 l (1 − l)` (l = index/255). Clarity uses it so it leaves the ends alone and can't clip highlights or crush shadows.
 
-**`inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**
+**`inline void putLevel(uint8_t *d, float v)`** / **`inline void putLevel(float *d, float v)`**: stores one channel of a finished pixel. A byte gets `v` clamped to 0..255 and rounded to nearest; a float gets it clamped to 0..255 and **not rounded** (the float pipeline rounds once, at the very end). Plain comparisons, no `std::` calls (NaN is not handled here; gains are always finite).
+
+**`template <class Dst, class S> inline void addPixels(const Planes &pl, const Gains &gn, const S *src, Dst *dst, size_t count, size_t first)`** (`S` = `uint8_t` or `uint16_t`, deduced; `Dst` stays the first parameter so `addPixels<Dst>(...)` keeps working)
 - Inputs:
   - `pl`, `gn`: the planes and gains for this render.
   - `src`: the **source** pixels for these positions (they give each pixel's own luma).
-  - `dst`: the pixels to modify (RGBA8, alpha untouched). They may already be tone/color adjusted.
+  - `dst`: the pixels to modify, 4 samples per pixel, alpha untouched. `Dst` is `uint8_t` (RGBA8 bytes) or `float` (levels 0..255, what the float pipeline passes). They may already be tone/color adjusted.
   - `count`: number of pixels.
   - `first`: index (`y × width + x`) of the first pixel in the whole picture, used to index the planes.
-- Behavior: for each pixel, `d = luma − blur` in levels, then one offset `k` is added to R, G and B, clamped and rounded:
+- Behavior: for each pixel, `d = luma − blur` in levels, then one offset `k` is added to R, G and B through `putLevel` (clamped; rounded to a byte only for a `uint8_t` destination, left as a float for a `float` one):
   - Texture: `k += gTexture × d`.
   - Clarity: `d` is soft-limited, `d / (1 + |d|/64)`, then `k += gClarity × mid[luma] × d`.
   - Sharpness: `k += gSharpness × d`.
@@ -797,7 +903,7 @@ Texture, Clarity and Sharpness, which share one idea, the **detail layer**: `det
 ### `neighbor_fx.hpp`
 Dehaze, noise reduction (luminance and color) and Blur, built on the same idea as `detail_layer.hpp`: every effect is a per-pixel formula that reads precomputed, cached planes of the **source** picture, so it needs no halo rows, works the same inside masks, and never recomputes while a slider is dragged. Read the top of `detail_layer.hpp` first. Everything is in `namespace neighbor_fx` (alias `dl` = `detail_layer`).
 
-**Depends on:** `detail_layer.hpp`. No UI. **Test:** `neighbor_fx_test`.
+**Depends on:** `detail_layer.hpp`. No UI. **Test:** `neighbor_fx_test`, which also holds the float-destination tests (`testFloatAgreesWithBytes`, `testFloatPartialRangesMatchWhole`, `testFloatKeepsPrecisionAndClamps`) and hashed fingerprints (`testGoldenFingerprints`, recorded with MSVC Release; the test notes that g++ gives the same values). It builds only 8-bit sources: the 16-bit source path of this header (`Map::fix` = 64, the `uint16_t` `acquire`, the `S` of the passes) is covered only through `render_core_test`.
 
 **How each effect works**
 - **Luminance noise reduction** takes away only the *small* part of the finest detail layer (the Sharpness plane: pixel minus a roughly 1.4 px blur). Per pixel, with `d` = that difference in levels and `s` = the slider (0..1): `k = −s·d / (1 + d²/T²)` is added to R, G and B, where `T = 2 + 14·s` levels. Small differences (noise) are removed, large ones (real edges) are spared.
@@ -826,10 +932,10 @@ Dehaze, noise reduction (luminance and color) and Blur, built on the same idea a
 | `kBlurTargetSigma` | `float` | 2.5 | Sigma, in reduced px, of the stored blur (sets the reduction factor) |
 
 **Types**
-- `struct Map { int w, h, ch = 1; float scale = 1; float aux = 0; std::vector<uint16_t> v; }`: a small multi-channel map at reduced resolution. Values are stored × 16 (4 fractional bits). `scale` = reduced px per source px; `aux` holds the estimated airlight `A` for a veil map. `using MapPtr = std::shared_ptr<const Map>`.
+- `struct Map { int w, h, ch = 1; float scale = 1; float aux = 0; float fix = 16; std::vector<uint16_t> v; }`: a small multi-channel map at reduced resolution. Values are stored × `fix` (16 for an 8-bit source, 64 for a 16-bit one; 4 or 6 fractional bits), so a value in levels is `v / fix`. `scale` = reduced px per source px; `aux` holds the estimated airlight `A` for a veil map. `using MapPtr = std::shared_ptr<const Map>`.
 - `template <class T> class Store`: a keyed, byte-capped LRU cache for any plane type (`Ptr` = `std::shared_ptr<const T>`).
   - `Store(size_t maxBytes, size_t maxEntries)`.
-  - `Ptr get(const uint8_t *rgba, int w, int h, int kind, Build &&build)`: returns the cached item or builds it. `build` is a callable returning `std::shared_ptr<T>` or null if cancelled; a cancelled build is never cached. Key = pixel pointer + size + `detail_layer::fingerprint` + `kind`. The build runs outside the lock.
+  - `template <class S, class Build> Ptr get(const S *rgba, int w, int h, int kind, Build &&build)` (`S` = `uint8_t` or `uint16_t`): returns the cached item or builds it. `build` is a callable returning `std::shared_ptr<T>` or null if cancelled; a cancelled build is never cached. Key = pixel pointer + size + `detail_layer::fingerprint` + `kind`. The build runs outside the lock.
   - `void clear()`, `size_t size() const`. Eviction drops the least recently used, never the newest.
 - `struct Gains`: slider values as multipliers.
 
@@ -864,47 +970,49 @@ With `detail_layer`'s own cache (384 MiB) the worst case is about 700 MB of cach
 
 **`inline float chromaSigma(int w, int h)`**: `max(2, 0.0025 × long edge)`.
 
-**`inline bool buildChroma(const uint8_t *rgba, int w, int h, int which, dl::Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`**
-- `which`: 0 = blurred (R − luma), 1 = blurred (B − luma). Stored as `(chroma + 255) × 16` so the signed value fits an unsigned plane. Returns false if cancelled.
+**`template <class S> inline bool buildChroma(const S *rgba, int w, int h, int which, dl::Plane &out, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- `which`: 0 = blurred (R − luma), 1 = blurred (B − luma). Stored as `(chroma + 255) × kFix` (16 for 8-bit, 64 for 16-bit sources) so the signed value fits an unsigned plane. Returns false if cancelled.
 
-**`inline void erode(std::vector<uint8_t> &m, int w, int h, int r)`**: separable min filter of radius `r` on a small 8-bit map, in place, edges clamped.
+**`template <class V> inline void erode(std::vector<V> &m, int w, int h, int r)`**: separable min filter of radius `r` on a small map (8- or 16-bit values), in place, edges clamped.
 
-**`inline std::shared_ptr<Map> buildVeil(const uint8_t *rgba, int w, int h, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+**`template <class S> inline std::shared_ptr<Map> buildVeil(const S *rgba, int w, int h, const std::atomic<uint64_t> *latest, uint64_t gen)`**
 - Returns the veil map, or null if cancelled. Steps: min-pool `min(R, G, B)` over `f × f` blocks (`f = ceil(longEdge / 384)`), erode by `kVeilPatch`, set airlight `A` = the brightest dark-channel value clamped to `[180, 255]` (stored in `aux`), then blur the map.
 
-**`inline std::shared_ptr<Map> buildBlurLevel(const uint8_t *rgba, int w, int h, int level, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+**`template <class S> inline std::shared_ptr<Map> buildBlurLevel(const S *rgba, int w, int h, int level, const std::atomic<uint64_t> *latest, uint64_t gen)`**
 - `level` 0..2 (**not validated**). Builds a 3-channel color blur of sigma `max(1.5, kBlurSigmaFrac[level] × longEdge)`, stored at reduced size (box average by `f = round(sigma / 2.5)`, then a small blur). Null if cancelled.
 
-**`inline void sampleMap(const Map &m, int x, int y, float *out)`**: bilinear sample of a map at **source** pixel `(x, y)`; `out` receives `m.ch` values (still × 16). Coordinates are clamped to the map.
+**`inline void sampleMap(const Map &m, int x, int y, float *out)`**: bilinear sample of a map at **source** pixel `(x, y)`; `out` receives `m.ch` values (still × `m.fix`: 16 for an 8-bit source, 64 for a 16-bit one). Coordinates are clamped to the map.
 
 **`inline Gains gainsFromValues(float texture, float clarity, float sharpness, float dehaze = 0, float noiseLuma = 0, float noiseColor = 0, float blur = 0)`**
 - Inputs are UI values: texture, clarity, dehaze in -100..100; the rest 0..100. Each is clamped and NaN/infinity count as 0, so every gain is finite. Returns the `Gains` (values divided by 100; the three detail values go through `dl::gainsFromValues`).
 
-**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, uint32_t need, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+**`inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, uint32_t need, const std::atomic<uint64_t> *latest, uint64_t gen)`** and its twin with `const uint16_t *rgba` (both call `template <class S> acquireT`; the 8-bit one is a plain function so a null pointer still finds it)
 - Fetches (or builds, the first time) the planes in `need`. Returns false if cancelled. With null pixels or a non-positive size it returns **true** and leaves the planes null.
 
 **`inline uint8_t toU8(float v)`**: the `toU8Clamped` rule without `std::` calls (NaN → 0, over 255 → 255, otherwise `v + 0.5` truncated).
 
+**`inline void put(uint8_t *d, float v)`** / **`inline void put(float *d, float v)`**: stores one channel of a finished pixel. A byte gets `toU8(v)` (rounded and clamped); a float gets `v` clamped to 0..255 (NaN to 0) and **not rounded**, so the float pipeline keeps its precision between passes and rounds once at the end.
+
 **`inline bool covers(const dl::Plane *p, size_t first, size_t count)`**: true if the plane exists and covers pixels `[first, first + count)`.
 
-**Per-pixel passes** (all take `count` consecutive pixels of `dst`, RGBA8, alpha untouched; `src` is the **source** pixels at the same positions; `first` is the index in the whole picture; the loops use raw pointers for Debug-build speed)
-- **`dehazePass(const Map *veil, float amount, uint8_t *dst, size_t count, size_t first, int W)`**: see above. A positive amount with a null `veil` does nothing.
-- **`nrLumaPass(const dl::Plane *sharp, float s, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**: skipped if the plane doesn't cover the range.
-- **`nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s, const uint8_t *src, uint8_t *dst, size_t count, size_t first)`**: skipped unless both planes cover the range. `dg` is derived so the luma-weighted moves sum to zero.
-- **`blurPass(const MapPtr *levels, float amount, const uint8_t *src, uint8_t *dst, size_t count, size_t first, int W)`**: `pos = min(amount, 1) × 3`, `seg = min(int(pos), 2)`, `t = pos − seg`. Blends level `seg−1` (or the source itself when `seg == 0`) toward level `seg`, then adds `blurred − source` to `dst`. Skipped if a needed level is missing.
+**Per-pixel passes** (all are templates over the destination sample type `Dst`, `uint8_t` or `float`, and take `count` consecutive pixels of `dst`, 4 samples per pixel, alpha untouched; every channel is stored through `put`; `src` is the **source** pixels at the same positions (RGBA8 or 16-bit: a second template parameter `S`, deduced, which must be the type the planes were built from), whatever `Dst` is; `first` is the index in the whole picture; the loops use raw pointers for Debug-build speed)
+- **`template <class Dst> dehazePass(const Map *veil, float amount, Dst *dst, size_t count, size_t first, int W)`**: see above. A positive amount with a null `veil` does nothing.
+- **`template <class Dst, class S> nrLumaPass(const dl::Plane *sharp, float s, const S *src, Dst *dst, size_t count, size_t first)`**: skipped if the plane doesn't cover the range.
+- **`template <class Dst, class S> nrColorPass(const dl::Plane *cr, const dl::Plane *cb, float s, const S *src, Dst *dst, size_t count, size_t first)`**: skipped unless both planes cover the range. `dg` is derived so the luma-weighted moves sum to zero.
+- **`template <class Dst, class S> blurPass(const MapPtr *levels, float amount, const S *src, Dst *dst, size_t count, size_t first, int W)`**: `pos = min(amount, 1) × 3`, `seg = min(int(pos), 2)`, `t = pos − seg`. Blends level `seg−1` (or the source itself when `seg == 0`) toward level `seg`, then adds `blurred − source` to `dst`. Skipped if a needed level is missing.
 
-**`inline void apply(const Planes &pl, const Gains &g, const uint8_t *src, uint8_t *dst, size_t count, size_t first, int W)`**
+**`template <class Dst, class S> inline void apply(const Planes &pl, const Gains &g, const S *src, Dst *dst, size_t count, size_t first, int W)`**
 - Runs all the effects in the order above for `count` consecutive pixels. `W` is the picture width and must be positive, otherwise nothing is done. Each effect runs only when its gain is non-zero.
 
 ### `film_fx.hpp`
-Vignette and Grain: the two effects that depend on **where a pixel is**, which no other stage knows. Plain functions on plain values, no UI and no editor state. Both are the last step of the pixel pipeline (after the masks, see `renderWith`) and global only.
+Vignette and Grain: the two effects that depend on **where a pixel is**, which no other stage knows. Plain functions on plain values, no UI and no editor state. Both are the last step of the pixel pipeline (after the masks, see `render_core::renderPipeline`) and global only. `applyF` runs them on float levels (what the float pipeline uses); `apply` is the same on RGBA8 bytes.
 
-**Depends on:** `pixel_math.hpp` (`toU8Clamped`). **Test:** `film_fx_test` (and `render_test`, `render_params_test`, `adjustment_set_test`, the golden scenarios `film/` and `geo_film/`).
+**Depends on:** `pixel_math.hpp` (`toU8Clamped`). **Test:** `film_fx_test` (and `render_test`, `render_params_test`, `adjustment_set_test`, the golden scenarios `film/` and `geo_film/`; `render_core_test` checks that the film effects alone give exactly the old byte pipeline's bytes).
 
-- **Vignette** is measured against the picture's own frame, i.e. it is "post-crop": centered on the picture as shown or exported and following its aspect ratio, so a crop, rotation or flip just gives the vignette of the new frame. The distance `d` is 0 at the center and 1 at the corners (an ellipse through all four corners). A smoothstep ramp centered on `midpoint` with a half-width set by `feather` turns `d` into a weight `t` (0 untouched, 1 full). Negative amount darkens, `p' = p (1 - k|a|t)`; positive lightens, `p' = p (1 - k a t) + 255 k a t`. No `GeoFrame` is needed because `renderWith` is handed the already-geometried picture.
-- **Grain** is a deterministic function of the pixel's (x, y) in the picture being rendered: an integer hash, with no random number generator, no state, and no dependence on render order, block size, thread or compiler. It is added equally to R, G and B (monochrome), scaled by a weight that is 1 at mid-gray and 0.4 at black and white. `size` sets the grain cell as a fraction of the long edge (at least 1 px), so the preview and the full picture look alike (not the same pixels: their grids differ); `roughness` blends smooth value noise (per cell) with crisp per-pixel noise.
-- Both are computed in float on the finished pixel and rounded once. Pixels with alpha 0 (the empty corners of a straightened picture) are left exactly as they are; alpha is never changed.
-- Order inside `apply()`: vignette, then grain.
+- **Vignette** is measured against the picture's own frame, i.e. it is "post-crop": centered on the picture as shown or exported and following its aspect ratio, so a crop, rotation or flip just gives the vignette of the new frame. The distance `d` is 0 at the center and 1 at the corners (an ellipse through all four corners). A smoothstep ramp centered on `midpoint` with a half-width set by `feather` turns `d` into a weight `t` (0 untouched, 1 full). Negative amount darkens, `p' = p (1 - k|a|t)`; positive lightens, `p' = p (1 - k a t) + 255 k a t`. No `GeoFrame` is needed because the renderer is handed the already-geometried picture.
+- **Grain** is a deterministic function of the pixel's (x, y) in the picture being rendered: an integer hash, with no random number generator, no state, and no dependence on render order, block size, thread or compiler. It is added equally to R, G and B (monochrome), scaled by a weight that is 1 at mid-gray and 0.4 at black and white (`4·l·(1 − l)` blended with `kGrainEndWeight`; `l` is the pixel's luma `(54R + 183G + 19B) / (256 · 255)`, clamped to 0..1, measured after the vignette). `size` sets the grain cell as a fraction of the long edge (at least 1 px), so the preview and the full picture look alike (not the same pixels: their grids differ); `roughness` blends smooth value noise (per cell) with crisp per-pixel noise.
+- Both are computed in float on the finished pixel. `applyF` leaves the result **unrounded and unclamped** (the caller rounds once); `apply` rounds once with `toU8Clamped`. Pixels with alpha 0 (the empty corners of a straightened picture) are left exactly as they are; alpha is never changed.
+- Order inside `applyF()` / `apply()`: vignette, then grain.
 
 **Constants** (namespace `film_fx`)
 
@@ -930,7 +1038,9 @@ Vignette and Grain: the two effects that depend on **where a pixel is**, which n
 - **`inline float valueNoise(float u, float v, uint32_t seed)`**: smooth value noise at grain-cell coordinates (`u`, `v` ≥ 0); at integer coordinates it is exactly the hash there.
 - **`inline float grainAt(const Prepared &f, int x, int y)`**: the grain value at a pixel (roughly -1.5..1.5, before Amount and the tone weight). Depends only on (x, y), size and roughness.
 - **`inline float vignetteWeight(const Prepared &f, int x, int y)`**: the vignette weight 0..1 of a pixel.
-- **`inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)`**: applies both to `count` consecutive RGBA8 pixels of a picture `W` wide, in place. `first` is the index (`y * W + x`) of the first pixel in the **whole** picture, so any split of the picture into blocks (even mid-row) gives the same bytes. Does nothing when `any()` is false. The loop uses raw pointers for Debug-build speed.
+- **`inline float finiteClamp(float v, float lo, float hi)`**: `v` clamped to `[lo, hi]`; NaN/infinity give 0 (used by `paramsFromValues`).
+- **`inline void applyF(const Prepared &f, float *p, size_t count, size_t first)`**: applies both to `count` consecutive RGBA pixels of **float levels** (4 floats per pixel, 0..255) of a picture `W` wide, in place. `first` is the index (`y * W + x`) of the first pixel in the **whole** picture, so any split of the picture into blocks (even mid-row) gives the same result. A pixel whose alpha is exactly 0 is left alone; alpha is never changed. The result is **not rounded or clamped**. Does nothing when `any()` is false. The loop uses raw pointers and no `std::` helpers (apart from `sqrt`) for Debug-build speed.
+- **`inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)`**: the same on `count` consecutive RGBA8 pixels, in place: `applyF` on blocks of 1024 pixels (a 16 KiB stack buffer), each channel rounded and clamped once with `toU8Clamped`. Gives the bytes the old byte loop gave. Same `first` rule; does nothing when `any()` is false.
 
 ---
 
@@ -1045,6 +1155,25 @@ Pixel-buffer operations on a `CanvasImage` (RGBA8): crop, rotate by quarter turn
 
 ---
 
+### `wide_chain.hpp`
+The 16-bit twin of the editor's picture chain. The editor holds original -> oriented -> rotated (straightened) -> source (cropped), built by `orientImage` / `rotateArbitrary` / `cropImage`, all RGBA8. A picture that really has more than 8 bits (a 16-bit PNG) also gets a twin of every stage as `Image16`, built from the 16-bit original by the **same operations with the same arguments**, so each twin stage has exactly the size of its 8-bit namesake. The 8-bit chain stays what every tool measures against (and is the "view" the neighbor effects read, see `render_core.hpp`); only the full-resolution render starts from the twin. A twin stage is **null when the file is 8-bit**.
+
+These functions mirror, line for line, what `EditorState::syncSource` and `runGeometryJob` do for the 8-bit chain, so the two cannot drift apart.
+
+**Depends on:** `geometry.hpp`, `image16.hpp`, `raster_ops.hpp` (its `Image16` forms of `orientImage`, `rotateArbitrary` and `cropImage`). Needs LiteUI only through `raster_ops.hpp`. **Test:** `wide_chain_test` (checks sizes and content against the 8-bit chain; links LiteUI).
+
+**`namespace wide_chain`**, with `using Wide = std::shared_ptr<Image16>`:
+
+**`inline Wide oriented(const Wide &original, const Orient &o)`**: `orientImage(original, o)`. The identity orientation returns `original` **itself** (no copy). Null in, null out.
+
+**`inline Wide rotated(const Wide &oriented, float angle, bool expand, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
+- An angle of exactly 0 returns `oriented` itself (no copy); otherwise `rotateArbitrary`. Null in, null out.
+- Gotcha: with `latest` / `gen` it can be superseded, which gives **null from a non-null input**. A caller that needs to tell "no twin" from "cancelled" checks its input first (`runGeometryJob` does).
+
+**`inline Wide cropped(const Wide &rotated, const CropRect &crop)`**: an empty crop returns `rotated` itself; otherwise `cropImage`. Null in, null out.
+
+---
+
 ## Masks
 
 ### `mask.hpp`
@@ -1107,8 +1236,8 @@ The mask data model: `MaskType`, the `MaskShape` and `MaskEval` variants, the Ad
 **`MaskComposite::rowSpan(int y, int W, int &x0, int &x1) const`**
 - Folds the parts' spans: **Add widens** the union, **Intersect narrows** (and drops the span if nothing is left or the span is empty), **Subtract** can only remove weight so it leaves the span alone. Part 0 counts as Add. Returns false if nothing is left. The result is a superset, so it is safe to cut work with it.
 
-**`MaskComposite::rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix, float *tmp) const`**
-- Weights for pixels `[x0, x1)` of row `y`. `tmp` is scratch for one row of weights (at least `x1 − x0` floats). An empty composite gives zeros. Plain loops, no `std::` helpers.
+**`MaskComposite::rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix, float *tmp) const`** and **`rowWeightsF(..., const float *pix, float *tmp) const`**
+- Weights for pixels `[x0, x1)` of row `y`. `tmp` is scratch for one row of weights (at least `x1 − x0` floats). An empty composite gives zeros. Plain loops, no `std::` helpers. `rowWeightsF` is the same with the row as float levels (0..255, 4 per pixel): Luminosity and Color Range call their `rowWeightsF` (via `maskRowWeightsF`), every other kind ignores the pixels and is called as before. Both share one private fold.
 
 **`inline MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts, int W, int H)`**: resolves every part for one image size.
 
@@ -1166,13 +1295,15 @@ The two gradient masks: **Radial** (a rotated ellipse) and **Linear** (graduated
 ### `mask_range.hpp`
 The two masks that select by the picture's own values: **Luminosity** and **Color Range**. Neither is spatial, so neither maps through a `GeoFrame` (`toSource` returns the shape unchanged and `applySourceEdit` just copies `after`). Both are evaluated on the picture as it stands when the mask is reached (after the global adjustments and earlier masks) but before the mask's own adjustments, so darkening the shadows doesn't change which pixels are "shadows".
 
-**Depends on:** `geometry.hpp`. No UI. **Test:** `mask_range_test`. See `mask_geom.hpp` for the common shape contract.
+**Depends on:** `geometry.hpp`. No UI. **Test:** `mask_range_test`: both the byte path (`rowWeights`) and the float-level path (`rowWeightsF`: `testFineTable`, `testWholeLevelGraysMatchTheByteVersionExactly`, `testLumaIsNotRoundedToAByte`, `testSixteenBitLevelsGiveTheByteResult`, `testColorRangeFloatEqualsByte`). See `mask_geom.hpp` for the common shape contract.
 
 **Constants**
 
 | Name | Type | Value | Meaning |
 |---|---|---|---|
 | `kLumMaxRamp` | `float` | 0.5 | Soft edge width at Feather = 100%, as a fraction of 0..1 luminance |
+| `kLumSub` | `int` | 16 | Entries per level of the fine luminance table (1/16 level), read by `rowWeightsF` |
+| `kLumFineSize` | `int` | 4081 | `255 * kLumSub + 1`: size of that table |
 | `kColorRangeMaxDist` | `float` | 0.75 | Distance reached at Range = 100% |
 | `kColorRangeLumWeight` | `float` | 0.35 | How much brightness differences count in Color Range |
 
@@ -1180,9 +1311,10 @@ The two masks that select by the picture's own values: **Luminosity** and **Colo
 - `struct LuminosityShape`: `lo` (`float`, default 0): luminance 0..1 where full weight begins; `hi` (0.35): where it ends (a new mask picks out the shadows); `feather` (0.4): 0 = hard cut .. 1 = widest soft edge.
   - `void setLo(float v)` / `void setHi(float v)`: clamp to 0..1 and push the other end so **Min can never pass Max** (the end being dragged wins).
   - `prepare`: `a = min(lo, hi)`, `b = max(lo, hi)`, ramp width `f = feather × 0.5`. For each of the 256 luminance levels, with `f <= 1e-4` a hard cut (1 inside `[a, b]`), otherwise `smooth((t − (a − f))/f) × (1 − smooth((t − b)/f))` (a ramp **outside** each end).
-- `struct LuminosityEval`: `std::array<float, 256> lut` (weight per 8-bit luminance, built once per render request).
+- `struct LuminosityEval`: `std::array<float, 256> lut` (weight per 8-bit luminance, built once per render request) and `fine` (`std::shared_ptr<const std::vector<float>>`, `kLumFineSize` entries of the same curve at 1/16 level; shared and immutable so copying an eval is cheap; null on a default-constructed eval, which makes `rowWeightsF` return zeros).
   - `rowSpan`: every row, the whole width (`W > 0`).
   - `rowWeights`: luminance per pixel is the integer `(54R + 183G + 19B + 128) >> 8` (about Rec. 709), then a table read. With `pix == nullptr` (can't happen through the pipeline) it returns zeros.
+  - `rowWeightsF(y, x0, x1, out, const float *pix)`: the float pipeline's version: luma `(54R + 183G + 19B) / 256` in float levels, not rounded, read from a second table `fine` (`kLumFineSize` = 4081 entries, 1/16 level apart, same `weightAt` function as `lut`) by linear interpolation. For a pixel whose luma is a whole level (every 8-bit gray) it equals `rowWeights` exactly; a hard edge (Smoothness 0) now falls where the real luma is, so a pixel within half a level of the edge can be classified differently than the byte version.
 
 **Color Range**
 - `struct ColorRangeShape`: `set` (`bool`, false until a color is clicked), `r, g, b` (`float` 0..1, the sample as it was when clicked), `range` (0.30, 0..1 tolerance), `feather` (0.5).
@@ -1190,7 +1322,7 @@ The two masks that select by the picture's own values: **Luminosity** and **Colo
   - `prepare`: `outer = clamp(range) × 0.75`, `inner = outer × (1 − clamp(feather))`, `invFall = 1 / max(1e-4, outer − inner)`.
 - `struct ColorRangeEval`: `set`, sample `y0, cb0, cr0`, `inner`, `outer`, `invFall`.
   - `rowSpan`: the whole width if `set`, otherwise none.
-  - `rowWeights`: `d = sqrt((0.35·(y − y0))² + (cb − cb0)² + (cr − cr0)²)`; weight 1 for `d <= inner`, 0 for `d >= outer`, otherwise `1 − smoothstep`. Zeros if `!set` or `pix == nullptr`.
+  - `rowWeights`: `d = sqrt((0.35·(y − y0))² + (cb − cb0)² + (cr − cr0)²)`; weight 1 for `d <= inner`, 0 for `d >= outer`, otherwise `1 − smoothstep`. Zeros if `!set` or `pix == nullptr`. `rowWeightsF` takes float levels through the same private template body, so for byte-valued input it is identical.
 
 ### `mask_raster.hpp`
 `RasterEval`: a 0-to-255 coverage map resolved for one image size and read back with bilinear interpolation. Brush and Object masks both use it; they differ only in how the map is made. It keeps a per-row `[lo, hi)` range of non-zero pixels so empty areas are skipped. Standard library only; no UI.
@@ -1364,15 +1496,23 @@ The stand-in segmenter, used when the app is built without ONNX: a magic wand th
 - Gotcha: **worker thread only**. The cache of the prepared image is a plain `static`, not locked.
 
 ### `sam_segmenter.hpp`
-Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything is in `namespace sam`. Only compiled in with `LITEROOM_ONNX`; without it the same `Segmenter` class exists (same method names) but is never available: `loaded()` and `encoded()` return false, and `load`, `encode` and `decode` return false with the error "built without LITEROOM_ONNX".
+Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything is in `namespace sam`. `Point`, `kInputSize`, `Prepared` and `preprocess` are always compiled (no ONNX needed); the real `Segmenter` is only compiled in with `LITEROOM_ONNX`, and without it the same `Segmenter` class exists (same method names) but is never available: `loaded()` and `encoded()` return false, and `load`, `encode` and `decode` return false with the error "built without LITEROOM_ONNX".
 
-**Depends on:** ONNX Runtime (`onnxruntime_cxx_api.h`) when enabled; `toWide` from LiteUI on Windows. **Not thread-safe**: use it from one thread, the segmentation worker.
+**Depends on:** ONNX Runtime (`onnxruntime_cxx_api.h`) when enabled; `toWide` from LiteUI on Windows; `preprocess` needs the standard library only. **Test:** `sam_segmenter_test` (the stand-in `Segmenter` of a build without ONNX, and `preprocess`; the real model path is **not** covered). **Not thread-safe**: use it from one thread, the segmentation worker.
 
 **Types**
 - `struct Point { float x = 0, y = 0; bool fg = true; }`: a prompt as a fraction of the picture's width / height; `fg` false = background.
-- `class Segmenter`. `static constexpr int kInput = 1024`: SAM's longest-side input size.
+- `inline constexpr int kInputSize` = 1024: SAM's longest-side input size. `Segmenter::kInput` is the same value.
+- `struct Prepared { std::vector<float> data; int nw = 0, nh = 0; }`: what `encode` feeds the encoder. `nw` x `nh` is the picture as resized (long side `kInputSize`); `ok()` is `nw > 0 && nh > 0`.
+- `class Segmenter`.
 
-**Encoder layouts** (detected from the model's input rank): **rank 4**: NCHW `1 × 3 × 1024 × 1024`, normalized here (mean 123.675 / 116.28 / 103.53, std 58.395 / 57.12 / 57.375) and zero-padded at the bottom/right. **Rank 3**: HWC raw 0..255 RGB at the resized size (`nh × nw × 3`); the model normalizes and pads itself (samexporter-style export).
+**`inline Prepared preprocess(const uint8_t *rgba, int w, int h, int rank)`**: the resize / normalize / pad step of `encode`, a plain function so it can be tested without ONNX Runtime or a model.
+- Returns an empty result (`nw == nh == 0`, no data) for a null picture or `w <= 0` / `h <= 0`.
+- Size: scale `1024 / max(w, h)`, each side `lround`ed and at least 1 (2000 x 1000 gives 1024 x 512; 4000 x 1 gives 1024 x 1). Resampling is a **box average when shrinking** (a fractional factor such as 1.5 is handled; each box reaches its last partly covered pixel) and **nearest when enlarging**. Alpha is ignored.
+- `rank == 4`: normalized `(v - mean) / std` per channel (the constants under *Encoder layouts*), planar R, G, B, in a **zero-padded `1024 x 1024` square** (`data.size() == 3 * 1024 * 1024`). The padding is zero *after* normalization, not the normalized value of black.
+- any other rank (the encoder only allows 3): raw 0..255 R, G, B, HWC, `nh x nw x 3` floats, no padding.
+
+**Encoder layouts** (detected from the model's input rank; `preprocess` builds either): **rank 4**: NCHW `1 × 3 × 1024 × 1024`, normalized here (mean 123.675 / 116.28 / 103.53, std 58.395 / 57.12 / 57.375) and zero-padded at the bottom/right. **Rank 3**: HWC raw 0..255 RGB at the resized size (`nh × nw × 3`); the model normalizes and pads itself (samexporter-style export).
 
 **Members**
 
@@ -1396,39 +1536,84 @@ Segment-Anything-style segmentation through ONNX Runtime (MobileSAM). Everything
 ## Rendering
 
 ### `render.hpp`
-The pixel pass: tone tables → color pass (whose last step is the 3D LUT) → neighbor effects → masks → Vignette and Grain, in blocks of 128 rows that a background render can abandon. (Needs LiteUI for `CanvasImage`.)
+The synchronous convenience entry for rendering an `AdjustmentSet`. The pixel pass itself lives in [`render_core.hpp`](#render_corehpp) (the float pipeline the app uses) and [`render_bytes.hpp`](#render_byteshpp) (the old byte pipeline, kept as a test reference); `renderWith` and `applyMaskToBlock` are documented there. (Needs LiteUI for `CanvasImage`.)
 
-**Depends on:** `adjustment_set.hpp`, `color_pass.hpp`, `detail_layer.hpp`, `film_fx.hpp`, `liteui.hpp`, `mask.hpp`, `neighbor_fx.hpp`, `pixel_math.hpp`, `render_params.hpp`. **Test:** `render_test`.
+**Depends on:** `adjustment_set.hpp`, `render_core.hpp`. **Tests:** `render_test`; `lut_render_test` renders everything through `renderAdjusted`.
 
 **Functions**
 
-**`inline std::shared_ptr<CanvasImage> renderWith(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
-- Inputs: the source picture (**never modified**), the frozen parameters, and the optional cancellation pair.
-- Returns: a new rendered picture, or **null if cancelled**. With no `latest` it always runs to completion (the synchronous path).
-- Order per pixel: tone tables → color pass (ending with the Filters and then the 3D LUT: nothing in this header knows about LUTs, the pass does it) → neighbor effects (Dehaze, Texture/Clarity/Sharpness, Noise Reduction, Blur) → masks, each mask doing the same three steps on its own copy → Vignette and Grain on the finished pixel (`film_fx::apply`, global only).
-- How it works:
-  - Masks are resolved against **this** image's size (`prepareComposite`), so preview and full-size renders agree.
-  - Neighbor planes for the global effects **and every mask** are acquired once up front from `src`'s pixels (a cancelled build returns null). The detail layers come from whole-image planes, not halo rows, which is why `src` must stay untouched.
-  - Vignette and Grain are resolved against **this** image's size (`film_fx::prepare`) and run after the masks on each block, given the index of the block's first pixel (`off / 4`), so a block gives the same bytes as the whole picture in one go.
-  - Rows are processed in blocks of 128; `latest` is re-read before every block. Each pixel is independent, so blocking doesn't change the result.
-  - When all three channel tables are identical (no per-channel curves) a single-table fast path is used.
-
-**`inline void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev, uint8_t *q, size_t n, int y0, int W, uint8_t *scratch, float *wbuf, float *wbuf2, const uint8_t *ref, const neighbor_fx::Planes &dp)`**
-- Inputs:
-  - `mp`, `ev`: the frozen mask and its composite resolved for this image size.
-  - `q`, `n`: the rows to edit (`n` bytes = whole rows; the first is image row `y0`).
-  - `W`: picture width.
-  - `scratch`: one row of RGBA; `wbuf`, `wbuf2`: one row of weights each (`wbuf2` for combining parts).
-  - `ref`: the **source** pixels of the same rows (the neighbor effects measure against them).
-  - `dp`: the whole-image planes.
-- Per row:
-  1. Find the span the shape touches (`rowSpan`). **Inverted masks use the whole row** (weight is `1 − w`), so no span cut applies.
-  2. Compute the weights from the row **before** this mask edits it, so a mask's own adjustment never changes what it selects.
-  3. Copy the span to `scratch`; run the mask's tone tables (if `tone`), its color pass, and its neighbor effects (planes from `dp`, so they have all their neighbors whatever the span).
-  4. Blend back: `w = (invert ? 1 − w : w) × amount`; each channel becomes `toU8Clamped(a + (b − a)·w)`. Pixels with `w <= 0` are skipped.
-
 **`inline std::shared_ptr<CanvasImage> renderAdjusted(const AdjustmentSet &set, const CanvasImage &original)`**
 - The simple synchronous entry point: `renderWith(original, set.buildRenderParams())`. Non-destructive; always starts from `original`'s untouched pixels. Big images go through the render worker instead.
+
+### `render_core.hpp`
+The pixel pass **in float**: tone tables → color pass → neighbor effects → masks → Vignette and Grain, in blocks of rows that a background render can abandon. This is the pipeline the app, the workers and the golden test call (through `renderWith`). (Needs LiteUI for `CanvasImage`.)
+
+A block of rows is loaded from the source (RGBA8 or RGBA 16-bit) into float **levels** (0..255, the unit every constant of the passes is written in), goes through every stage as floats, and is **rounded once**, when it is stored into the result. The byte pipeline (`render_bytes.hpp`) rounded after the tone sliders, the color pass, every neighbor pass, every mask and the film effects. Where that code clamped to 0..255 so does this (after the color pass, inside every neighbor pass, after each mask's color pass), so highlights cannot run past white between stages.
+
+For a picture that started as 8-bit the result is the old result up to the rounding that is no longer done between stages: **exactly equal** when only one stage did anything (a single tone slider, the color pass alone, one neighbor effect, the film effects), and within a few levels when stages are stacked. A 16-bit picture keeps its extra precision through every stage. Each pixel is independent, so blocking does not change the result: preview, background render and batch export agree.
+
+**Nothing is measured on a rounded copy any more.** The neighbor effects read the source at its own precision (RGBA8 or 16-bit), and a Luminosity / Color Range mask picks its weights from the row as float levels. A picture that is a *widened* 8-bit one therefore gives the 8-bit result exactly when no neighbor effect is on, and within a few levels (measured: about 1 for one effect at 100, about 2 for all of them stacked) when one is, because a 16-bit source's luma is no longer rounded to a level.
+
+**Depends on:** `liteui.hpp`, `color_pass.hpp`, `image16.hpp`, `pixel_math.hpp`, `tone_table.hpp`, `detail_layer.hpp`, `film_fx.hpp`, `neighbor_fx.hpp`, `render_params.hpp`, `mask.hpp`. **Tests:** `render_core_test` (the float pipeline against `renderWithBytes`: single stages exactly equal, stacked stages within a few levels, blocks, masks reading the row before they edit it, cancellation; and the 16-bit paths: a widened 8-bit picture gives the 8-bit result, 16-bit precision, a smooth gradient through Texture / Clarity / Sharpness), `render_test`, `export_render_test`, `lut_render_test` and the golden test (all link LiteUI; the golden test renders 8-bit pictures only, so it does not pin the 16-bit entry points). **16-bit neighbor effects are tested only here**, through random sliders on a widened picture (within 4 levels of the 8-bit result when an effect is on) and the Texture / Clarity / Sharpness gradient test; there is no unit test of them in `neighbor_fx_test` or `detail_layer_test`. Everything but the three public entry points is in `namespace render_core`.
+
+**Constants:** `render_core::kBlockRows` (`int`) = 128, the same as the byte pipeline, so cancellation latency is unchanged.
+
+**Functions in `render_core`**
+
+**`inline void clampRgb(float *p, size_t n)`**: clamps R, G and B of `n` floats (4 per pixel) to 0..255; NaN gives 0. Alpha is left alone. Plain comparisons, no `std::` helpers, for Debug-build speed like the other per-pixel loops.
+
+**`inline void applyTone(const ToneSet &ts, float *p, size_t n)`**: the tone stage on `n` floats: each R, G, B through its channel's table (`ts.at(c)`, `toneLookupWide`). Not rounded.
+
+**`inline void applyByteLuts(const std::array<std::array<uint8_t, 256>, 3> &luts, float *p, size_t n)`**: the fallback for a `RenderParams` that has no float tables (built by hand): each value is first rounded to a byte with `toU8Clamped`, then looked up, exactly as the byte pipeline does.
+
+**`inline bool partsReadPixels(const std::vector<MaskPassPart> &parts)`**: true if any part is a mask type whose weights read the picture's own pixels (`maskTypeUsesPixels`: Luminosity, Color Range).
+
+**`inline void applyMaskToBlock(const MaskPass &mp, const MaskComposite &ev, bool readsPixels, float *q, int rows, int y0, int W, float *scratch, float *wbuf, float *wbuf2, const S *ref, const neighbor_fx::Planes &dp)`** (`template <class S>`, `S` = `uint8_t` or `uint16_t`)
+- Inputs:
+  - `mp`, `ev`: the frozen mask and its composite resolved for this image size. `readsPixels`: `partsReadPixels(mp.parts)`.
+  - `q`, `rows`, `y0`: `rows` whole rows of floats (4 per pixel) to edit; the first is image row `y0`. `W`: picture width.
+  - `scratch`: one row of RGBA floats. `wbuf`, `wbuf2`: one row of weights each. A pixel-reading mask is shown the row itself, as float levels (no byte rounding).
+  - `ref`: the **source samples** of the same rows, of the type the planes in `dp` were built from (RGBA8 or 16-bit); only read when `mp.fx.any()` (may be null otherwise). `dp`: the whole-image planes.
+- Per row:
+  1. Find the span the shape touches (`rowSpan`). **Inverted masks use the whole row** (weight is `1 − w`), so no span cut applies.
+  2. Compute the weights (`rowWeightsF`) from the row **before** this mask edits it, so a mask's own adjustment never changes what it selects; the row is passed only when `readsPixels` (no other shape reads it).
+  3. Copy the span to `scratch`; run the mask's tone (`mp.toneF`, else the byte tables `mp.luts` via `applyByteLuts`; only if `mp.tone`), its color pass (`applyColorPassF`, then `clampRgb` if `mp.color.active`) and its neighbor effects (planes from `dp`).
+  4. Blend back **in float**: `w = (invert ? 1 − w : w) × amount`; each channel becomes `a + (b − a)·w`. Pixels with `w <= 0` are skipped. No rounding or clamp here.
+- Replaces the byte version `applyMaskToBlockBytes`.
+
+**`template <class SrcImg, class OutImg> inline std::shared_ptr<OutImg> renderPipeline(const SrcImg &src, const CanvasImage *view8, const RenderParams &rp, const std::atomic<uint64_t> *latest, uint64_t gen)`**
+- Inputs: `SrcImg` is `CanvasImage` or `Image16`; `OutImg` is what is produced (`CanvasImage` for the screen, `Image16` for a 16-bit export). `src` is **never modified**. `latest` / `gen`: the usual cancellation pair (`latest` may be null).
+- Returns: a new `W × H` picture, or **null if cancelled** (between blocks, or while building the neighbor planes). An empty source, or one whose `pixels` is shorter than `W * H * 4`, returns an empty / zero-filled picture of the same size, not null.
+- **`view8`:** **not used any more.** The neighbor effects used to measure an 8-bit view of a 16-bit source; they now read the source itself, at its own precision (RGBA8 or 16-bit, `SrcTraits`). Their planes are cached per buffer address, so a source that lives as long as a slider drag keeps them cached (a null `view8` is no longer slower). The parameter stays so callers that pass a view keep compiling.
+- Order per block of 128 rows: load samples to levels (`samplesToLevels`) → tone (float tables `rp.toneF`, else `rp.luts` through `applyByteLuts`; skipped when `rp.toneF->identity`; with no float tables the byte tables are **always** applied, even if they are the identity) → color pass (`applyColorPassF` then `clampRgb`, only if `rp.color.active`) → neighbor effects (`neighbor_fx::apply`, if `rp.fx.any()`) → each mask (`applyMaskToBlock`) → Vignette and Grain (`film_fx::applyF`, if any; global only, on the finished pixel) → round once into the output (`levelsToSamples`).
+- How it works:
+  - Masks are resolved against **this** image's size (`prepareComposite`), so preview and full-size renders agree. Vignette and Grain likewise (`film_fx::prepare`), and are handed the index of a block's first pixel (`off / 4`), so a block gives the same pixels as the whole picture in one go.
+  - Neighbor planes for the global effects **and every mask** are acquired once up front, from the source itself, only if some effect needs planes (`fxNeed != 0`). A negative Dehaze needs no planes but still gets the source pointer, which is why the pointer is set whenever any effect is in use.
+  - One float buffer of up to 128 rows is reused for every block.
+
+**Entry points** (global, not in `render_core`)
+
+**`inline std::shared_ptr<CanvasImage> renderWith(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**: an 8-bit picture in, an 8-bit picture out. The signature the app, the workers and the golden test have always called. Null if cancelled.
+
+**`inline std::shared_ptr<CanvasImage> renderToDisplay(const Image16 &src, const CanvasImage *view8, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**: a 16-bit picture to RGBA8 for the screen. `view8` is not used (may be null).
+
+**`inline std::shared_ptr<Image16> renderToImage16(const Image16 &src, const CanvasImage *view8, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**: a 16-bit picture to 16 bits (a 16-bit export): the same pipeline, rounded to 16 bits once.
+
+**`inline std::shared_ptr<Image16> renderToImage16(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**: an RGBA8 picture to 16 bits. A heavy edit of an 8-bit photo then comes out as smooth gradients instead of re-quantized steps (a 16-bit PNG export).
+
+### `render_bytes.hpp`
+The **original byte pipeline** (RGBA8 in, a byte table per slider stage, every pass rounding to a byte), kept verbatim as `renderWithBytes`. **The app does not use it any more**: `renderWith` in `render_core.hpp` is the float pipeline. It stays as the reference the tests compare the float pipeline against, and can be deleted once the new golden file has been recorded. (Needs LiteUI for `CanvasImage`.)
+
+**Depends on:** `liteui.hpp`, `color_pass.hpp`, `pixel_math.hpp`, `detail_layer.hpp`, `film_fx.hpp`, `neighbor_fx.hpp`, `render_params.hpp`, `mask.hpp`. No test of its own: `render_core_test` includes it as the reference the float pipeline is compared with (the only test that does, so deleting this header removes that reference). It reads only the byte tables `rp.luts` and `mp.luts`; the float tables (`toneF`) are ignored.
+
+**`inline std::shared_ptr<CanvasImage> renderWithBytes(const CanvasImage &src, const RenderParams &rp, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
+- Inputs: the source picture (**never modified**), the frozen parameters, and the optional cancellation pair. Returns: a new rendered picture, or **null if cancelled**.
+- Order per pixel, **rounding to a byte after every stage**: tone LUTs → color pass (`applyColorPass`) → neighbor effects → masks, each doing the same three steps on its own copy → Vignette and Grain (`film_fx::apply`, global only).
+- How it works: blocks of 128 rows, `latest` re-read before each; masks and film resolved against this image's size; neighbor planes acquired once up front from `src`'s pixels; when all three channel tables are identical (no per-channel curves) a single-table fast path is used. Raw pointers and no `std::` helpers in the inner loops (Debug-build speed, like `applyColorPass`).
+
+**`inline void applyMaskToBlockBytes(const MaskPass &mp, const MaskComposite &ev, uint8_t *q, size_t n, int y0, int W, uint8_t *scratch, float *wbuf, float *wbuf2, const uint8_t *ref, const neighbor_fx::Planes &dp)`**
+- The byte version of `render_core::applyMaskToBlock`: `q`, `n` are whole rows of bytes (the first is image row `y0`), `scratch` one row of RGBA bytes, `ref` the source bytes of the same rows.
+- Per row: span (`rowSpan`; inverted masks use the whole row) → weights from the row **before** the edit → copy to `scratch` → tone tables (if `tone`), color pass, neighbor effects → blend back, each channel `toU8Clamped(a + (b − a)·w)` with `w = (invert ? 1 − w : w) × amount`; pixels with `w <= 0` are skipped.
 
 ### `histogram.hpp`
 Counting the pixels: R/G/B/luma histograms, which channels are clipped, and the clipping overlay. Pure functions of an image and a few flags; the editor's state is not touched. Everything is in `namespace histogram` except the constants. (Needs LiteUI for `CanvasImage` and `Color`.)
@@ -1730,7 +1915,7 @@ Reads a 3D LUT in the Adobe / DaVinci Resolve **`.cube`** format, and says wheth
 ### `lut_library.hpp`
 The LUT library: `.cube` files kept in one folder, found by name, with a small cache of the ones in use. Standard library plus `file_utils` / `lut_cube` / `lut3d`: no UI, no editor state, so everything here is tested against a temp folder. See [3D LUTs](architecture.md#3d-luts).
 
-**Depends on:** `lut3d.hpp`, `lut_cube.hpp`, `file_utils.hpp`. **Test:** `lut_library_test` (links the thread library: several threads resolve one LUT at once). **Thread model:** the cache is a mutex-guarded global (`acquireLut`, `clearLutCache`, `lutCachePut` are safe from any thread; the UI thread and the export worker both resolve LUTs). `lutDirOverride()` is a plain global meant to be set by tests before any thread uses the library. Everything else is a pure function. **This is the only place a render-side LUT is ever read from a file**; the render loop and the previews' renders see frozen tables.
+**Depends on:** `lut3d.hpp`, `lut_cube.hpp`, `file_utils.hpp`. **Tests:** `lut_library_test` (links the thread library: several threads resolve one LUT at once); `lut_render_test` (resolves LUTs through `lutCachePut`); `lut_pane_test` (a real temp library driven through the LUTs pane's functions in `main.cpp`: refresh, import, apply, remove, status texts). **Thread model:** the cache is a mutex-guarded global (`acquireLut`, `clearLutCache`, `lutCachePut` are safe from any thread; the UI thread and the export worker both resolve LUTs). `lutDirOverride()` is a plain global meant to be set by tests before any thread uses the library. Everything else is a pure function. **This is the only place a render-side LUT is ever read from a file**; the render loop and the previews' renders see frozen tables.
 
 **Constants**
 
@@ -1921,6 +2106,60 @@ Encoding a `CanvasImage` as PNG or JPEG: libpng and libjpeg on Linux, WIC on Win
 - Returns: true on success, with the whole JPEG in `*out`; otherwise false and `*errorOut` is set.
 - Details: encoded **to memory** so the source photo's EXIF and ICC can be spliced in before the file is written (`embedSourceMetadata`, then `writeFileAtomic`). Alpha is flattened onto white. Linux installs a custom libjpeg error handler (`JpegEncErr`, `jpegEncErrExit`) that `longjmp`s back instead of letting libjpeg `exit()` the app. Windows writes in chunks of 64 rows and asks for 4:4:4 as a best-effort property. The size is checked first, on both platforms: a picture that fails `jpegSizeOk` (empty, negative, or a side over `kJpegMaxSide`) is refused with the error "JPEG can't hold a picture this size", before any pixel is read and with `*out` untouched. So no caller can skip the limit.
 
+### `image_codec16.hpp`
+Reading and writing 16-bit pictures (`Image16`): libpng on Linux, WIC on Windows, the libraries `liteui.hpp` already pulls in (which is why it needs `liteui.hpp`). LiteUI's decoders reduce every PNG to 8 bits (libpng `png_set_strip_16`; WIC `32bppRGBA`), so a 16-bit PNG needs its own read path; that is all this adds. TIFF and RAW would be more branches of `decodeImage16` (they need libtiff / LibRaw, which Literoom does not link yet).
+
+A translation unit that includes it must define `LITEUI_IMPLEMENTATION` before `liteui.hpp`, like `image_codec.hpp`'s users. `widenImage` / `narrowImage` live in `image16_convert.hpp`, which needs no platform code.
+
+**Depends on:** `image16.hpp`, `image16_convert.hpp`, `file_utils.hpp` (`fsPath`, `toWide`), `liteui.hpp`. **Test:** `image_codec16_test` (the PNG test vectors are embedded in the test file; links LiteUI). **Platform note:** the Windows (WIC) half was written on Linux and is **not built or run** by its author; it follows `decodeFile` / `encodePngFile` line for line with `64bppRGBA` in place of `32bppRGBA`. Run the test on Windows before trusting it.
+
+**Types**
+
+- `struct PngHeader { uint32_t width = 0, height = 0; int bitDepth = 0; int colorType = 0; }`: `bitDepth` is 1, 2, 4, 8 or 16 (0 = not a PNG / unreadable); `colorType` is 0 gray, 2 RGB, 3 palette, 4 gray + alpha, 6 RGBA. `bool ok() const` is `bitDepth != 0`.
+
+**Functions**
+
+**`inline PngHeader parsePngHeader(const uint8_t *d, size_t n)`**: the IHDR of a PNG held in memory (at least its first 33 bytes). A default `PngHeader` (`ok()` false) for null `d`, `n < 33`, a wrong signature, an IHDR that is not 13 bytes or not first, a zero width or height, or a bit depth / color type outside the PNG set. It does **not** check that the depth fits the color type.
+
+**`inline PngHeader readPngHeader(const std::string &path)`**: reads the first 33 bytes of the file at `path` (UTF-8, through `fsPath`) and parses them. `ok()` false if it can't be opened or isn't a PNG.
+
+**`inline bool hostIsLittleEndian()`**: PNG samples are big-endian, so on a little-endian machine (every machine Literoom runs on) the 16-bit samples are byte-swapped with `png_set_swap` on read and write.
+
+**`inline uint32_t pngCrcUpdate(uint32_t crc, const uint8_t *d, size_t n)`**: CRC-32 as PNG uses it (polynomial `0xEDB88320`), continued across calls. Start from `0xFFFFFFFF` and xor the final value with `0xFFFFFFFF`.
+
+**`inline bool validatePngChunks(const std::string &path, std::string *errorOut)`**
+- Walks every chunk and checks the file is whole: signature, IHDR first, each chunk's data and CRC present and correct, at least one IDAT, and a closing IEND. Errors: *"failed to open file"*, *"not a valid PNG file"*, *"PNG is truncated"*, *"PNG chunk length is invalid"*, *"PNG has no IHDR first"*, *"PNG is corrupt (chunk CRC mismatch)"*, *"PNG has no image data"*.
+- Why: libpng enforces this itself; WIC does not (a cut-off or corrupted PNG can decode "fine" with zeroed rows), so the Windows decoder calls it first. Reads in 64 KiB pieces.
+
+**`inline std::optional<Image16> decodePng16File(const std::string &path, std::string *errorOut)`**
+- Reads a **16-bit** PNG of any color type at full precision as straight-alpha RGBA. Returns `nullopt` with `*errorOut` set otherwise.
+- Linux (libpng): setup is liteui's `decodePngFile` (palette and gray expanded to RGB, tRNS to alpha, an opaque alpha added when there is none), minus `png_set_strip_16`, plus `png_set_swap`. A file that is not 16-bit gives *"not a 16-bit PNG"* (so does a zero size or one beyond `0x7FFFFFFF / 8` wide); other errors: *"failed to open file"*, *"not a valid PNG file"*, *"libpng init failed"*, *"libpng decode error"*, *"unexpected PNG layout"*. The `Image16` and row table are declared **before** `setjmp` on purpose: libpng's error `longjmp` skips destructors of anything created after it, which would leak a whole picture. The path is opened with `fopen(path.c_str())`.
+- Windows (WIC): converts frame 0 to `64bppRGBA` with no dither; error *"WIC: 16-bit decode failed"* (and the ones of `CoCreateInstance` / open).
+
+**`inline bool encodePng16File(const std::string &path, const Image16 &img, std::string *errorOut)`**
+- Writes `img` as an RGBA PNG, 16 bits per channel, straight alpha, no interlace. Returns false with *"nothing to write"* for an empty picture or one whose `pixels` is shorter than `pixelCount() * 4`. Linux errors: *"failed to open file for writing"*, *"libpng: failed to create write struct"*, *"libpng: error during write"*; Windows: *"WIC: 16-bit PNG encode failed"* (it fails if the encoder wants a pixel format other than `64bppRGBA`; unlike `encodePngFile` there is no BGRA swap).
+- Writes straight to `path`, not atomically (use `writeFileAtomic` on a buffer if a caller needs that).
+
+**`inline std::optional<Image16> decodeImage16(const std::string &path, std::string *errorOut = nullptr)`**
+- The one entry point: a 16-bit PNG (`readPngHeader` says depth 16) goes through `decodePng16File` at full precision; anything else (JPEG, 8-bit PNG, ...) goes through `liteui_image::decodeFile` and is widened with `widenImage` (`v * 257`), so the 16-bit pipeline starts from **exactly** the pixels the editor shows for it. `nullopt` with `*errorOut` on failure.
+
+### `image_source.hpp`
+The one place that knows how a picture file is opened. The editor's decode job, the batch export and the sidecar-size read each used to decide for themselves whether a file is a 16-bit PNG; now they ask here, so a new kind of source (TIFF, later RAW) is one more branch of `depthOf` / `openUpright`, not three edits that have to agree. The orientation is passed in (`exifOrientationOf(path)` for now), so the header does not depend on `image_meta.hpp` and the filmstrip worker keeps injecting its own. A translation unit that includes it needs `LITEUI_IMPLEMENTATION` defined before `liteui.hpp` (it includes `image_codec16.hpp`).
+
+**Depends on:** `liteui.hpp`, `geometry.hpp` (`Orient`), `image16.hpp`, `image16_convert.hpp`, `raster_ops.hpp` (`orientImage`), `image_codec16.hpp`. **Test:** `image_source_test` (real files; links LiteUI).
+
+**Types**
+- `enum class Depth { Narrow, Wide }`: 8 bits per channel (the 8-bit chain is the whole picture) or more (an `Image16` twin carries the precision).
+- `struct Opened { std::shared_ptr<CanvasImage> image; std::shared_ptr<Image16> wide; }`: `image` is the 8-bit form, upright (null only for a Wide file opened with `want8 = false`); `wide` is set for a Wide file only.
+
+**Functions**
+- `Depth depthOf(const std::string &realPath)`: from the file's header, not its extension. Today only a PNG whose `readPngHeader` says 16 bits is Wide. Unreadable or unrecognized files are Narrow (the 8-bit decoder then reports what is wrong).
+- `std::optional<Opened> openUpright(const std::string &realPath, const Orient &orient, bool want8, std::string *errorOut = nullptr)`: a Wide file is read at full precision (`decodeImage16`) and turned upright into `wide`; with `want8` its 8-bit form (`narrowImage`) is made too. A Narrow file gives `image` only. **A Wide file whose full-precision read fails is retried through the 8-bit decoder** (which says what is wrong if it fails as well), for the editor and the export alike, so the two always agree on what a file is. `nullopt` with `*errorOut` set when nothing could be read. `realPath` is a virtual copy's *picture file* (`vcImageOf`), not the copy's own path.
+- `bool uprightSize(const std::string &realPath, const Orient &orient, int *w, int *h, std::string *errorOut = nullptr)`: the size once upright (a quarter turn swaps the sides). It decodes the file today; the place for a header-only read for JPEG, TIFF or RAW.
+- `std::optional<CanvasImage> decodeForThumb(const std::string &realPath, std::string *errorOut = nullptr)`: what a thumbnail is made from: always 8-bit (a Wide file's plain 8-bit decode), **not** turned (`ThumbWorker` turns it with its own orientation function).
+
+**Callers:** `runDecodeJob` (`main.cpp`: `want8 = true`), `exportPicture` (`export_worker.hpp`: `want8 = false`, only the twin that is needed is kept alive), `runSyncJob` (`uprightSize`), `ThumbWorker` (`decodeForThumb`).
+
 ### `exif.hpp`
 JPEG metadata with no dependencies: the EXIF orientation tag, carrying a source JPEG's EXIF block and ICC profile into a re-encoded one, and the camera data the Info pane shows (make, model, lens, ISO, shutter, aperture, focal length, date taken) with the functions that turn it into display text. Everything is in `namespace exif`. Every read is bounds-checked, so a damaged or hostile file yields "no metadata" rather than reading out of range.
 
@@ -2106,21 +2345,46 @@ The filmstrip's thumbnails, made off the UI thread: `makeThumb` box-averages a p
 - **`void setQueue(std::vector<std::string> paths)`**: replaces what is still to do (starting the thread on first use). The file being processed finishes; results already made stay until collected. Call it again whenever the open picture changes so the work starts next to it.
 - **`std::vector<Result> collect()`**: returns everything made since the last call and empties the list. Thread-safe, non-blocking.
 - **`void shutdown()`**: clears the queue, requests stop and joins the thread.
-- Per file, the worker: decodes it (`liteui_image::decodeFile` on `vcImageOf(path)`; skipped for a virtual copy), applies the orientation from `orientOf` (also given the real file's path), makes the thumbnail, then reads the sidecar (`readSidecarForThumb` through `sidecarFileOf`, so a copy reads its own file; at most 64 MiB) and runs `sidecarScan` on it.
+- Per file, the worker: decodes it (`image_source::decodeForThumb` on `vcImageOf(path)`; skipped for a virtual copy), applies the orientation from `orientOf` (also given the real file's path), makes the thumbnail, then reads the sidecar (`readSidecarForThumb` through `sidecarFileOf`, so a copy reads its own file; at most 64 MiB) and runs `sidecarScan` on it.
 
 ---
+
+### `export_render.hpp`
+The pixel half of exporting one picture: from the decoded **original** to the rendered picture the encoders write. A pure function of its inputs (no files, no editor state, no sidecar), so it is tested without any of those; `exportPicture` (`export_worker.hpp`) does the file work around it. (Needs LiteUI for `CanvasImage`.)
+
+The chain is the geometry worker's: orient -> straighten -> crop, from the untouched original, then the render. The original is either 8-bit (a JPEG, an 8-bit PNG: `CanvasImage`) or 16-bit (a 16-bit PNG: `Image16`), and the picture stays in that type until it is rendered. The result is 8-bit (JPEG / 8-bit PNG) or, when `want16` is set, 16-bit (16-bit PNG). An 8-bit original can be exported as 16-bit too: the float pipeline then keeps its extra precision, so a heavy edit does not show steps in smooth gradients.
+
+**Depends on:** `geometry.hpp`, `image16.hpp`, `raster_ops.hpp` (the `CanvasImage` and `Image16` forms of `orientImage`, `rotateArbitrary`, `cropImage`, `resizeToLongEdge`), `render_params.hpp`, `render_core.hpp`, `liteui.hpp`. **Test:** `export_render_test` (links LiteUI).
+
+**Types**
+
+- `struct ExportPixels { std::shared_ptr<CanvasImage> img8; std::shared_ptr<Image16> img16; }`: what the encoders get; **exactly one** is set.
+  - `bool is16() const`: `img16 != nullptr`. `int width() const` / `int height() const`: of whichever is set, 0 if neither.
+  - `void resizeToLongEdge(int longEdge)`: scales whichever is set so the long side is `longEdge` (`fitLongEdge` rules: never enlarges, `longEdge < 1` changes nothing).
+- `struct ExportGeometry { Orient orient; float angle = 0; bool expand = false; CropRect crop; }`: the geometry edits of one picture (`AdjustmentSet::orient` / `angle` / `expand` / `crop`). `crop` is on the oriented, straightened picture, as everywhere.
+
+**Functions**
+
+**`inline bool renderForExport(std::shared_ptr<CanvasImage> original, const ExportGeometry &g, const RenderParams &rp, bool want16, const std::atomic<uint64_t> *latest, uint64_t gen, ExportPixels *out)`**: renders an 8-bit original. `want16` false gives `out->img8` via `renderWith`; true gives `out->img16` via `renderToImage16(source, rp, ...)` (the source is its own 8-bit view).
+
+**`inline bool renderForExport(std::shared_ptr<Image16> original, const ExportGeometry &g, const RenderParams &rp, bool want16, const std::atomic<uint64_t> *latest, uint64_t gen, ExportPixels *out)`**: renders a 16-bit original. `want16` false gives `out->img8` via `renderToDisplay`; true gives `out->img16` via `renderToImage16`. Both pass a **null** `view8`, so if a neighbor effect is in use a temporary 8-bit view is made once for this render (fine for a single export; it is only slow for repeated renders).
+
+- Both overloads: `latest` / `gen` are the usual cancellation pair (`latest` may be null). Returns **false when superseded**, or when the render produced nothing; `*out` then holds no picture (it is reset to empty once the geometry is built, and left untouched if the geometry itself was superseded). True means exactly one of `out->img8` / `out->img16` is set. `out` must not be null.
+- The caller's `original` is taken by value and **moved** in, never modified; when the geometry does nothing (identity orientation, angle 0, empty crop) the render reads the original directly, with no copy.
+
+**`export_render_detail::buildSource`** (template, internal): orient -> straighten (`rotateArbitrary`, only when `angle != 0`) -> crop (only when `crop` is not empty). Each intermediate is released as soon as the next step has what it needs, to keep the peak memory low (the biggest cost of exporting a large picture). Returns null when `rotateArbitrary` saw `latest != gen`. It is the same chain as `wide_chain.hpp` and the geometry worker.
 
 ### `export_worker.hpp`
 Batch export: `exportPicture` renders one picture from its own saved edits and writes it, and `ExportWorker` runs a queue of them off the UI thread. A first-in-first-out queue with **no generations** (like `ThumbWorker`) that can be cancelled. (Needs LiteUI's decoder and encoders.)
 
-**Depends on:** `liteui.hpp`, `geometry.hpp`, `raster_ops.hpp`, `adjustment_set.hpp`, `render.hpp`, `file_utils.hpp`, `image_codec.hpp`, `image_meta.hpp`, `minijson.hpp`, `sidecar.hpp`, `virtual_copy.hpp`, and through `adjustment_set.hpp` the LUT library. **Test:** `export_worker_test` (links LiteUI and the thread library; loop it after changing the header).
+**Depends on:** `liteui.hpp`, `geometry.hpp`, `raster_ops.hpp`, `adjustment_set.hpp`, `render.hpp`, `file_utils.hpp`, `image_codec.hpp`, `image_codec16.hpp`, `image_meta.hpp`, `minijson.hpp`, `sidecar.hpp`, `virtual_copy.hpp`, `export_render.hpp`, and through `adjustment_set.hpp` the LUT library. **Test:** `export_worker_test` (links LiteUI and the thread library; loop it after changing the header).
 
-**Constants:** `kExportMaxSidecarBytes` = 64 MiB (the limit the editor puts on a sidecar).
+**Constants:** `kExportMaxSidecarBytes` (`std::streamoff`) = 64 MiB (the limit the editor puts on a sidecar).
 
 **Types**
 
-- `struct ExportSettings { bool jpeg = true; int quality = 92; bool keepMetadata = true; bool removeGps = false; bool resize = false; int longEdge = 2048; std::string folder; bool overwrite = false; }`: a copy of the Export pane's settings plus the destination folder. `overwrite` false means a taken name gets `-2`, `-3`, ...
-- `struct ExportOutcome { std::string path; bool ok; bool cancelled; std::string outFile; std::string error; int width, height; }`: one per picture. `path` is the picture's path (a copy's `|vc<n>` included). `cancelled` is **not** a failure: the picture was dropped or abandoned by `cancel()` and nothing was written. `error` says why a picture was skipped. `outFile`, `width` and `height` are set only when `ok`.
+- `struct ExportSettings { bool jpeg = true; bool png16 = false; int quality = 92; bool keepMetadata = true; bool removeGps = false; bool resize = false; int longEdge = 2048; std::string folder; bool overwrite = false; }`: a copy of the Export pane's settings plus the destination folder. `png16` applies to PNG only (ignored when `jpeg`): write 16 bits per channel instead of 8. `overwrite` false means a taken name gets `-2`, `-3`, ...
+- `struct ExportOutcome { std::string path; bool ok = false; bool cancelled = false; std::string outFile; std::string error; int width = 0, height = 0; }`: one per picture. `path` is the picture's path (a copy's `|vc<n>` included). `cancelled` is **not** a failure: the picture was dropped or abandoned by `cancel()` and nothing was written. `error` says why a picture was skipped. `outFile`, `width` and `height` are set only when `ok`.
 
 **Functions**
 
@@ -2134,27 +2398,32 @@ Batch export: `exportPicture` renders one picture from its own saved edits and w
 - Returns: `<folder>/<stem>-edit.<ext>`, or with `-2`, `-3`, ... up to 9999 when that name is in `used` (compared **without case**, so `a.jpg` and `A.png` can't collide on a case-insensitive disk) or, unless `overwrite`, already exists. The chosen name is added to `used`. `used` wins over `overwrite`: a name already taken in this batch is never reused. Empty string if every name is taken.
 
 **`inline bool exportLoadEdits(const std::string &path, int w, int h, AdjustmentSet *adj, std::string *err)`**
-- `adj` must already have `setOriginalSize(w, h)` (the upright size). No sidecar file: returns true and leaves `adj` neutral. A sidecar that exists but is empty or over 64 MiB, unreadable, not valid JSON, from a newer version, written for a different size, or whose `edits` can't be loaded: returns false with a reason in `*err`. **This is stricter than the editor**, which opens such a picture clean: a batch must not quietly export an unedited picture. The same goes for a LUT: if the picture's LUT is in use (`LUT Amount` above 0) and the library reports it `Missing` (*"its LUT \"<name>\" is not in the LUT library"*) or `Unreadable` (*"... can't be read"*), the picture is skipped with that reason rather than exported without its look. A LUT whose file has changed (`HashChanged`) is used as it is, and a LUT at amount 0 never blocks a picture. The table is resolved here, on the worker thread, through `acquireLut`.
+- `adj` must already have `setOriginalSize(w, h)` (the upright size). No sidecar file: returns true and leaves `adj` neutral. A sidecar that exists but is empty or over 64 MiB, unreadable, not valid JSON, from a newer version, written for a different size, or whose `edits` can't be loaded: returns false with a reason in `*err`. **This is stricter than the editor**, which opens such a picture clean: a batch must not quietly export an unedited picture. The same goes for a LUT: if the picture's LUT is in use (`LUT Amount` above 0) and the library reports it `Missing` (*"its LUT \"<name>\" is not in the LUT library"*) or `Unreadable` (*"... can't be read"*), the picture is skipped with that reason rather than exported without its look. A LUT whose file has changed (`HashChanged`) is used as it is, and a LUT at amount 0 never blocks a picture. The table is resolved here, on the worker thread, through `acquireLut`. The reasons come back in `*err`: *"couldn't read its saved edits"* (can't open or read the file), *"its saved edits have an unexpected size"* (empty or over `kExportMaxSidecarBytes`), *"its saved edits are unreadable"* (not valid JSON, or no usable `edits` object), *"its saved edits are from a newer Literoom"* (a missing or non-numeric `version` counts as newer too) and *"the picture's size has changed since it was edited"* (the sidecar's `image` width and height must equal `w` and `h`). If the existence check itself fails, the file is treated as absent.
 
 **`inline ExportOutcome exportPicture(const std::string &path, const ExportSettings &s, std::set<std::string> &used, const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)`**
-- The whole pipeline for one picture, a pure function of its inputs (see [threading.md](threading.md#the-export-worker-is-a-cancellable-fifo-of-whole-pipelines)): decode `vcImageOf(path)`, apply the EXIF rotation, load the edits into a **local** `AdjustmentSet`, `orientImage` -> `rotateArbitrary` -> `cropImage` -> `renderWith`, then `fitLongEdge` / `resizeToLongEdge` (never enlarging), the JPEG size check, a free name from `exportTargetPath`, and the encode. The JPEG keeps the source's metadata from the **real** file behind a copy.
-- Cancellation: `latest` / `gen` are the usual pair (both may be null / 0 for a synchronous call). Once superseded the outcome is `cancelled` and **nothing is written**.
-- Failures (undecodable picture, unusable sidecar, JPEG too large, unwritable folder) come back as an outcome with `error` set; the function never throws for them.
+- The whole pipeline for one picture, a pure function of its inputs (see [threading.md](threading.md#the-export-worker-is-a-cancellable-fifo-of-whole-pipelines)):
+  1. **Decode** `vcImageOf(path)` with `image_source::openUpright` (`want8 = false`). A PNG whose header says 16 bits is read at full precision and stays 16-bit; everything else (JPEG, 8-bit PNG) stays 8-bit. If the full-precision read fails the 8-bit decoder is tried, exactly as the editor does. The EXIF rotation is applied, which gives the upright "original" the saved edits are stored against.
+  2. **Edits:** load them into a **local** `AdjustmentSet` with `exportLoadEdits`, then freeze `buildRenderParams()`.
+  3. **Render:** `renderForExport` (see [`export_render.hpp`](#export_renderhpp)) does orient -> straighten -> crop -> render from the untouched original, with `want16 = !s.jpeg && s.png16`. So a 16-bit source written as JPEG or 8-bit PNG is rendered down to 8 bits, and an 8-bit source with `png16` on is rendered to 16 bits.
+  4. **Size:** `fitLongEdge` gives the final size (never enlarging). For a JPEG, `jpegSizeOk` is checked on that **final** size, **before** the resize; then `ExportPixels::resizeToLongEdge`.
+  5. **Write:** a free name from `exportTargetPath` (`.jpg` or `.png`), then the encode: `encodePng16File` when the result is 16-bit, `saveJpegFile` for a JPEG, otherwise `encodePngFile`. The JPEG keeps the source's metadata from the **real** file behind a copy, and `removeGps` only counts when `keepMetadata` is also on.
+- Cancellation: `latest` / `gen` are the usual pair (both may be null / 0 for a synchronous call). Once superseded the outcome is `cancelled` and **nothing is written**. It is polled before the decode, after the decode, inside `renderForExport`, and after the resize. It is **not** polled during the encode, so a picture that has reached the encoder is finished.
+- Failures come back as an outcome with `error` set; the function never throws for them. The messages: *"couldn't open it: <decoder's reason>"*, whatever `exportLoadEdits` said, *"too large for JPEG (turn on Resize, or export as PNG)"*, *"no free file name in the folder"*, and the encoder's own message when writing fails (or *"couldn't write <file name>"* if it gave none).
 
-**`class ExportWorker`** (non-copyable)
+**`class ExportWorker`** (non-copyable). **Thread model:** `start()`, `cancel()`, `busy()`, `collect()` and `shutdown()` from the UI thread only; `setNotify()` before the first `start()`. The worker thread (a `std::jthread`) starts at the first `start()` and handles one picture at a time, in the order given.
 
 - **`~ExportWorker()`**: calls `shutdown()`.
 - **`void setNotify(std::function<void()> fn)`**: called **on the worker thread** after each result is stored. Set it before the first `start()`.
-- **`bool start(std::vector<std::string> paths, ExportSettings settings)`**: queues the batch (starting the thread on first use). False, with nothing changed, if `paths` is empty or a batch is still running.
+- **`bool start(std::vector<std::string> paths, ExportSettings settings)`**: queues the batch (starting the thread on first use). False, with nothing changed, if `paths` is empty or a batch is still running. The set of used output names (`used`) is cleared here, so names are only de-duplicated within one batch (against each other, and against files already in the folder unless `overwrite`).
 - **`void cancel()`**: drops what is still queued (each picture gets a `cancelled` outcome), bumps the epoch that `renderWith` and `rotateArbitrary` poll so the picture in flight is abandoned, and returns at once. A picture that had already been written stays written.
 - **`bool busy() const`**: true from `start()` until every picture has an outcome. `size_t total() const` and `size_t done() const` give the progress.
 - **`std::vector<ExportOutcome> collect()`**: every outcome made since the last call, in the order they finished, and empties the list. **Call `busy()` first**: if it was already false, these are the last outcomes. Asking after `collect()` could miss a result that lands in between.
-- **`void shutdown()`**: clears the queue, abandons the picture in flight, requests stop and joins. Safe to call twice.
+- **`void shutdown()`**: clears the queue, abandons the picture in flight, requests stop and joins. Safe to call twice. It is for teardown: pictures still queued are simply dropped **without** an outcome (unlike `cancel()`), so `done()` never reaches `total()` and `busy()` stays true afterwards; only the picture in flight still gets its (cancelled) outcome.
 
 ### `lut_preview_worker.hpp`
 The LUTs pane's previews, made off the UI thread: each LUT of the library applied to the open picture. One job is the picture, its current look and a list of LUT files; the worker posts one result per file. See [threading.md](threading.md#the-lut-preview-worker-streams-results-for-the-newest-job).
 
-**Depends on:** `liteui.hpp` (`CanvasImage`), `color_pass.hpp`, `lut3d.hpp`, `render_params.hpp`, `lut_cube.hpp`, `lut_library.hpp`, `render.hpp`, `thumb_worker.hpp` (`makeThumb`, `kFilmThumbW` / `kFilmThumbH`). **Test:** `lut_preview_worker_test` (links LiteUI and the thread library; loop it after changing the header). **Thread model:** `submit()`, `cancel()`, `busy()`, `collect()` and `shutdown()` from the UI thread only; `setNotify()` before the first `submit()`. The worker thread starts at the first `submit()`.
+**Depends on:** `liteui.hpp` (`CanvasImage`), `color_pass.hpp`, `lut3d.hpp`, `render_params.hpp`, `lut_cube.hpp`, `lut_library.hpp`, `render.hpp`, `thumb_worker.hpp` (`makeThumb`, `kFilmThumbW` / `kFilmThumbH`). **Tests:** `lut_preview_worker_test` (links LiteUI and the thread library; loop it after changing the header); `lut_pane_test` also runs the real worker through the pane's per-frame poll. **Thread model:** `submit()`, `cancel()`, `busy()`, `collect()` and `shutdown()` from the UI thread only; `setNotify()` before the first `submit()`. The worker thread starts at the first `submit()`.
 
 **Types**
 

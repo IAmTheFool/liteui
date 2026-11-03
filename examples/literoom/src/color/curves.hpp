@@ -67,17 +67,19 @@ inline bool curveEvaluable(const CurvePoints &pts)
   return true;
 }
 
-// Evaluates the curve at every input level 0..255 (unrounded, clamped).
-// Points that can't be evaluated (see curveEvaluable) give the identity table.
-inline std::array<float, 256> curveToLut(const CurvePoints &pts)
+// Evaluates the curve at `count` input levels x = i * step (i = 0..count-1),
+// unrounded and clamped to 0..255, into `lut`. Points that can't be evaluated
+// (see curveEvaluable) give the identity. curveToLut below is the 256-entry,
+// step-1 case; the float pipeline samples a finer grid (tone_table.hpp).
+inline void curveSample(const CurvePoints &pts, float *lut, std::size_t count,
+                        float step)
 {
-  std::array<float, 256> lut{};
   const std::size_t n = pts.size();
   if (!curveEvaluable(pts))
   {
-    for (std::size_t i = 0; i < 256; ++i)
-      lut[i] = static_cast<float>(i);
-    return lut;
+    for (std::size_t i = 0; i < count; ++i)
+      lut[i] = static_cast<float>(i) * step;
+    return;
   }
   std::vector<float> h(n - 1), d(n - 1), m(n);
   for (std::size_t k = 0; k + 1 < n; ++k)
@@ -118,9 +120,9 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
     m[n - 1] = endSlope(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
   }
   std::size_t k = 0;
-  for (std::size_t i = 0; i < 256; ++i)
+  for (std::size_t i = 0; i < count; ++i)
   {
-    const float x = static_cast<float>(i);
+    const float x = static_cast<float>(i) * step;
     float v;
     if (x <= pts.front().x)
     {
@@ -142,6 +144,14 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
     }
     lut[i] = std::clamp(v, 0.0f, 255.0f);
   }
+}
+
+// Evaluates the curve at every input level 0..255 (unrounded, clamped).
+// Points that can't be evaluated (see curveEvaluable) give the identity table.
+inline std::array<float, 256> curveToLut(const CurvePoints &pts)
+{
+  std::array<float, 256> lut{};
+  curveSample(pts, lut.data(), 256, 1.0f);
   return lut;
 }
 

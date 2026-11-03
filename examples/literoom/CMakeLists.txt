@@ -30,7 +30,7 @@ target_link_libraries(literoom PRIVATE liteui::liteui Threads::Threads)
 source_group(TREE ${LITEROOM_SRC} FILES ${LITEROOM_SRC}/main.cpp ${LITEROOM_HEADERS})
 
 if(MSVC)
-    target_compile_options(literoom PRIVATE /utf-8 /bigobj)
+    target_compile_options(literoom PRIVATE /utf-8)
     # Need to split main in small build functions this is temporary but works
     target_link_options(literoom PRIVATE /STACK:8388608)
 endif()
@@ -147,7 +147,7 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
             target_link_libraries(${tgt} PRIVATE Threads::Threads)
         endif()
         if(MSVC)
-            target_compile_options(${tgt} PRIVATE /utf-8 /bigobj)
+            target_compile_options(${tgt} PRIVATE /utf-8)
         endif()
 
         set(_env "")
@@ -170,11 +170,18 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     endfunction()
 
     # Pure header tests: no liteui, no threads.
+    #   color_pass holds hashed fingerprints recorded with MSVC Release
+    #   (testGoldenFingerprints): they depend on the compiler's float code, so if
+    #   it fails on another compiler or with -DLITEUI_SANITIZE=ON, re-record it
+    #   (see the test) before suspecting the pipeline.
+    #   sam_segmenter covers the no-ONNX stand-in and sam::preprocess only; the
+    #   real model path (LITEROOM_ONNX) has no test.
     foreach(t minijson exif
               pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves film_fx
               mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
               sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter
-              lut3d lut_cube)
+              lut3d lut_cube
+              image16 tone_table)
         literoom_add_test(${t})
     endforeach()
 
@@ -183,6 +190,9 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     #   ctest -C Release -L threaded --repeat until-fail:50
     #
     # detail_layer and neighbor_fx start std::threads (shared-cache race tests);
+    # neighbor_fx also holds hashed fingerprints recorded with MSVC Release (same
+    # caveat as color_pass above). Neither has a 16-bit unit test of the neighbor
+    # effects: that path is exercised by render_core (below).
     # latest_worker runs a std::jthread. lut_library starts std::threads (several
     # threads resolving one LUT at once).
     foreach(t detail_layer neighbor_fx latest_worker lut_library)
@@ -207,13 +217,22 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     literoom_add_test(lut_pane LITEUI THREADS LABEL threaded TIMEOUT 120)
 
     # These take liteui's CanvasImage, so their tests link liteui like the app.
-    foreach(t raster_ops seg_basic render image_codec histogram scopes lut_render)
+    #   render_core compares the float pipeline with render/render_bytes.hpp (the
+    #   old byte pipeline, kept as the reference) and holds the only tests of the
+    #   16-bit render paths; deleting render_bytes.hpp removes that reference.
+    #   render and lut_render go through renderAdjusted (the LUT stage in the real
+    #   pipeline, numbers rather than fingerprints). image_codec16 also covers
+    #   core/image16_convert.hpp (widenImage / narrowImage); wide_chain covers
+    #   core/wide_chain.hpp.
+    foreach(t raster_ops seg_basic render render_core export_render wide_chain image_codec image_codec16 image_source histogram scopes lut_render)
         literoom_add_test(${t} LITEUI)
     endforeach()
 
     # ---- Golden render test: the refactoring safety net ----
     # Compiles src/main.cpp itself (main() renamed) and fingerprints every render
-    # scenario (the test prints the exact count when it runs).
+    # scenario (the test prints the exact count when it runs). Scenarios render
+    # 8-bit CanvasImage pictures only: the 16-bit entry points (renderToDisplay /
+    # renderToImage16) are not pinned by it, render_core_test covers those.
     # One golden file per compiler + configuration, because float results differ
     # between compilers and flags:
     #   cmake --build . --config Release --target literoom_golden_record  (once, BEFORE refactoring)

@@ -1,5 +1,10 @@
 // Build: g++ -std=c++20 -I.. -I<folder with liteui.hpp> render_test.cpp -o render_test
 // render.hpp takes liteui's CanvasImage, so in CMake this test links liteui.
+//
+// renderWith is the float pipeline (render_core.hpp): it rounds ONCE, when a block is stored, where the old
+// byte pipeline rounded after every stage. So: a single stage is still an exact lookup / blend, written here
+// against the float tables; stacked stages are compared with what the byte tables say to within the rounding
+// that is no longer done (render_core_test.cpp measures that against the old pipeline over random edits).
 #include "render/render.hpp"
 #include "check.hpp"
 
@@ -62,21 +67,31 @@ static void testToneTablesAreExactLookups()
   s.setCurve(CurveChannel::Blue, CurvePoints{{0, 30}, {255, 200}}, false); // per-channel tables differ
   const RenderParams rp = s.buildRenderParams();
   CHECK(!(rp.luts[0] == rp.luts[2]) && !rp.color.active && !rp.fx.any() && rp.masks.empty());
+  CHECK(rp.toneF && !rp.toneF->shared); // the float tables: a per-channel curve gives that channel its own table
   const auto out = renderWith(src, rp);
+  int gap = 0;
   for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
   {
-    CHECK(out->pixels[i] == rp.luts[0][src.pixels[i]]);
-    CHECK(out->pixels[i + 1] == rp.luts[1][src.pixels[i + 1]]);
-    CHECK(out->pixels[i + 2] == rp.luts[2][src.pixels[i + 2]]);
+    for (size_t c = 0; c < 3; ++c)
+    {
+      const uint8_t in = src.pixels[i + c];
+      // The tone stage alone is an exact lookup in the float table (rounded once)...
+      CHECK(out->pixels[i + c] == toU8Clamped(rp.toneF->at(static_cast<int>(c)).at(static_cast<float>(in))));
+      // ...and is close to the byte table, which rounded between the sliders and the curves.
+      gap = std::max(gap, std::abs(static_cast<int>(out->pixels[i + c]) - static_cast<int>(rp.luts[c][in])));
+    }
     CHECK(out->pixels[i + 3] == src.pixels[i + 3]);
   }
-  // The shared-table fast path gives the same bytes as separate equal tables would.
+  CHECK(gap <= 3);
+  // One stage on its own is exactly the byte table too, through the shared-table fast path.
   AdjustmentSet same = setFor(33, 21);
   same.set(AdjId::Contrast, 35.0f);
   const RenderParams shared = same.buildRenderParams();
+  CHECK(shared.toneF && shared.toneF->shared);
   const auto a = renderWith(src, shared);
   for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
-    CHECK(a->pixels[i] == shared.luts[0][src.pixels[i]] && a->pixels[i + 2] == shared.luts[0][src.pixels[i + 2]]);
+    for (size_t c = 0; c < 3; ++c)
+      CHECK(a->pixels[i + c] == shared.luts[0][src.pixels[i + c]]);
 }
 
 static void testBlocksDoNotChangeTheResult()
@@ -94,11 +109,14 @@ static void testBlocksDoNotChangeTheResult()
   {
     const Img src = scene(9, h, static_cast<uint32_t>(h));
     const auto whole = renderWith(src, rp);
-    std::vector<uint8_t> manual = src.pixels; // the passes by hand, over the whole buffer
-    for (size_t i = 0; i + 3 < manual.size(); i += 4)
-      for (int c = 0; c < 3; ++c)
-        manual[i + static_cast<size_t>(c)] = rp.luts[static_cast<size_t>(c)][manual[i + static_cast<size_t>(c)]];
-    applyColorPass(rp.color, manual.data(), manual.size());
+    // The passes by hand, in float, over the whole buffer: tables, color pass, one rounding at the end.
+    std::vector<float> lv(src.pixels.size());
+    samplesToLevels(src.pixels.data(), lv.data(), lv.size());
+    render_core::applyTone(*rp.toneF, lv.data(), lv.size());
+    applyColorPassF(rp.color, lv.data(), lv.size());
+    render_core::clampRgb(lv.data(), lv.size());
+    std::vector<uint8_t> manual(lv.size());
+    levelsToSamples(lv.data(), manual.data(), lv.size());
     CHECK(whole->pixels == manual);
     std::vector<uint8_t> rows;
     for (int y = 0; y < h; ++y)
@@ -180,7 +198,7 @@ static void checkExposureMask(const Mask &mask, int W, int H, const char *tag)
   const float amount = std::clamp(mask.amount, 0.0f, 100.0f) / 100.0f;
   AdjValues v{};
   v[static_cast<size_t>(AdjId::Exposure)] = mask.adj[static_cast<size_t>(AdjId::Exposure)];
-  const auto lut = toneLutFromValues(v, nullptr);
+  const ToneTable tone = toneTableFromValues(v, nullptr, nullptr); // the mask's own tone stage, in float
   int changed = 0, untouched = 0;
   for (int y = 0; y < H; ++y)
   {
@@ -196,7 +214,9 @@ static void checkExposureMask(const Mask &mask, int W, int H, const char *tag)
       for (int c = 0; c < 3; ++c)
       {
         const int s0 = src.pixels[i + static_cast<size_t>(c)];
-        const int want = wt <= 0.0f ? s0 : static_cast<int>(toU8Clamped(static_cast<float>(s0) + static_cast<float>(lut[static_cast<size_t>(s0)] - s0) * wt));
+        const float f0 = static_cast<float>(s0);
+        // The blend is done on the unrounded adjusted value and rounded once.
+        const int want = wt <= 0.0f ? s0 : static_cast<int>(toU8Clamped(f0 + (tone.at(f0) - f0) * wt));
         if (out->pixels[i + static_cast<size_t>(c)] != want)
         {
           std::printf("  [%s] pixel (%d,%d) channel %d: got %d, want %d (weight %g)\n", tag, x, y, c, out->pixels[i + static_cast<size_t>(c)], want, wt);
@@ -322,9 +342,28 @@ static void testFilmEffects()
   };
   const RenderParams rpBase = edited(false), rpBoth = edited(true);
   CHECK(!rpBase.film.any() && rpBoth.film.any() && rpBoth.masks.size() == 1);
-  auto want = renderWith(src, rpBase)->pixels;
-  film_fx::apply(film_fx::prepare(rpBoth.film, 80, 140), want.data(), want.size() / 4, 0);
-  CHECK(renderWith(src, rpBoth)->pixels == want);
+  // The picture the other passes make is kept at 16 bits here (so almost nothing is lost to rounding), run
+  // through film_fx, and rounded to a byte once. The render does the same in float: the two can differ
+  // only where the 16-bit intermediate (1/257 of a level) tips a value across a rounding boundary.
+  const auto base16 = renderToImage16(src, rpBase);
+  CHECK(base16 && base16->pixels.size() == src.pixels.size());
+  std::vector<float> lv(src.pixels.size());
+  samplesToLevels(base16->pixels.data(), lv.data(), lv.size());
+  film_fx::applyF(film_fx::prepare(rpBoth.film, 80, 140), lv.data(), lv.size() / 4, 0);
+  std::vector<uint8_t> want(lv.size());
+  levelsToSamples(lv.data(), want.data(), lv.size());
+  const auto got = renderWith(src, rpBoth);
+  size_t differ = 0;
+  int worst = 0;
+  for (size_t i = 0; i < want.size(); ++i)
+  {
+    const int d = std::abs(static_cast<int>(got->pixels[i]) - static_cast<int>(want[i]));
+    worst = std::max(worst, d);
+    differ += d != 0;
+  }
+  CHECK(worst <= 1 && differ * 100 <= want.size()); // at most 1 % of the samples, by one level
+  // ...and film really did come last: the result is not the film-less picture.
+  CHECK(got->pixels != renderWith(src, rpBase)->pixels);
   // A transparent pixel (the empty corner of a straightened picture) stays as it was.
   Img clear = scene(30, 20);
   for (size_t i = 0; i < 4 * 30; i += 4)

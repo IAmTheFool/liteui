@@ -2,6 +2,9 @@
 #include "color/color_pass.hpp"
 #include "check.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -26,10 +29,60 @@ static ColorPass pass(float temperature = 0, float tint = 0, float vibrance = 0,
 // A pass with only the given Filters set.
 static ColorPass filterPass(const FilterValues &f) { return pass(0, 0, 0, 0, MixValues{}, ColorGrade{}, 0, 0, 0, f); }
 static constexpr float FilterValues::*kFilterFields[] = {&FilterValues::greyscale, &FilterValues::sepia, &FilterValues::vintage,
-                                                          &FilterValues::fade, &FilterValues::negative, &FilterValues::posterize,
-                                                          &FilterValues::solarize, &FilterValues::bleachBypass, &FilterValues::threshold,
-                                                          &FilterValues::crossProcess};
+                                                         &FilterValues::fade, &FilterValues::negative, &FilterValues::posterize,
+                                                         &FilterValues::solarize, &FilterValues::bleachBypass, &FilterValues::threshold,
+                                                         &FilterValues::crossProcess};
 static int luma(const Px &p) { return static_cast<int>(std::lround(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])); }
+
+// ---- random passes (used by the float / bulk / fingerprint tests at the end) ----
+static float rnd(std::mt19937 &g, float lo, float hi)
+{
+  return lo + (hi - lo) * static_cast<float>(g() & 0xFFFFFF) / 16777215.0f;
+}
+static bool coin(std::mt19937 &g) { return (g() & 1) != 0; }
+
+// Every stage is independently on or off, so the random passes cover the combinations.
+static ColorPass randomPass(std::mt19937 &g)
+{
+  const float t = coin(g) ? rnd(g, -100, 100) : 0, ti = coin(g) ? rnd(g, -100, 100) : 0;
+  const float v = coin(g) ? rnd(g, -100, 100) : 0, sa = coin(g) ? rnd(g, -100, 100) : 0;
+  MixValues mix{};
+  if (coin(g))
+    for (float &m : mix)
+      m = coin(g) ? rnd(g, -100, 100) : 0;
+  ColorGrade gr;
+  if (coin(g))
+    for (auto &w : gr.wheel)
+    {
+      w.hue = rnd(g, 0, 359);
+      w.sat = rnd(g, 0, 100);
+      w.lum = rnd(g, -100, 100);
+    }
+  FilterValues f;
+  if (coin(g))
+  {
+    f.greyscale = coin(g) ? rnd(g, 0, 100) : 0;
+    f.sepia = coin(g) ? rnd(g, 0, 100) : 0;
+    f.vintage = coin(g) ? rnd(g, 0, 100) : 0;
+    f.fade = coin(g) ? rnd(g, 0, 100) : 0;
+    f.negative = coin(g) ? rnd(g, 0, 100) : 0;
+    f.posterize = coin(g) ? rnd(g, 0, 100) : 0;
+    f.solarize = coin(g) ? rnd(g, 0, 100) : 0;
+    f.bleachBypass = coin(g) ? rnd(g, 0, 100) : 0;
+    f.threshold = coin(g) ? rnd(g, 0, 100) : 0;
+    f.crossProcess = coin(g) ? rnd(g, 0, 100) : 0;
+  }
+  LutPass lut;
+  if (coin(g))
+  {
+    auto L = std::make_shared<Lut3D>(identityLut(9));
+    for (float &x : L->rgb)
+      x = std::clamp(x + rnd(g, -20, 20), 0.0f, 255.0f);
+    lut = makeLutPass(L, rnd(g, 10, 100));
+  }
+  return makeColorPass(t, ti, v, sa, mix, gr, coin(g) ? rnd(g, -100, 100) : 0,
+                       rnd(g, 0, 360), coin(g) ? rnd(g, 0, 100) : 0, f, lut);
+}
 
 static void testActiveFlags()
 {
@@ -222,8 +275,8 @@ static void testFilterValuesAreSanitized()
 {
   FilterValues v;
   v.greyscale = 50.0f;
-  v.sepia = 250.0f;   // clamped to 100
-  v.vintage = -5.0f;  // clamped to 0
+  v.sepia = 250.0f;  // clamped to 100
+  v.vintage = -5.0f; // clamped to 0
   v.fade = std::nanf("");
   v.negative = INFINITY;
   v.solarize = 100.0f;
@@ -371,9 +424,9 @@ static int spread(const Px &p) { return std::max({int(p[0]), int(p[1]), int(p[2]
 static void testNewFilterValuesAreSanitized()
 {
   FilterValues v;
-  v.bleachBypass = 250.0f;  // clamped to 100
+  v.bleachBypass = 250.0f;     // clamped to 100
   v.threshold = std::nanf(""); // NaN becomes 0
-  v.crossProcess = -5.0f;   // clamped to 0
+  v.crossProcess = -5.0f;      // clamped to 0
   const FilterPass f = makeFilterPass(v);
   CHECK(f.bleach == 1.0f && f.threshold == 0.0f && f.cross == 0.0f && f.any);
   v.bleachBypass = 40.0f;
@@ -511,8 +564,8 @@ static void testFilterBufferHandling()
   const ColorPass cp = filterPass(f);
   Px buf = {10, 200, 90, 17, 250, 3, 77, 201, 99, 98, 97, 96};
   const Px before = buf;
-  applyColorPass(cp, buf.data(), 8); // two pixels of three
-  CHECK(buf[3] == 17 && buf[7] == 201); // alpha never touched
+  applyColorPass(cp, buf.data(), 8);                                 // two pixels of three
+  CHECK(buf[3] == 17 && buf[7] == 201);                              // alpha never touched
   CHECK(std::equal(buf.begin() + 8, buf.end(), before.begin() + 8)); // third pixel untouched
   CHECK(!std::equal(buf.begin(), buf.begin() + 3, before.begin()));
   // Out-of-range values arriving from earlier stages (here a big saturation boost) are fine.
@@ -540,7 +593,9 @@ static void testBufferHandling()
   CHECK(buf[3] == 17 && buf[7] == 201);
   CHECK(std::equal(buf.begin() + 8, buf.end(), before.begin() + 8)); // third pixel untouched
   CHECK(!std::equal(buf.begin(), buf.begin() + 3, before.begin()));  // first one did change
-  applyColorPass(all, buf.data(), 0);                                // n = 0: nothing
+  Px untouched = before;
+  applyColorPass(all, untouched.data(), 0); // n = 0: nothing at all
+  CHECK(untouched == before);
   // Deterministic.
   Px a = before, b = before;
   applyColorPass(all, a.data(), a.size());
@@ -754,6 +809,109 @@ static void testColorPassWithLut()
   CHECK(!busy.lut.any() && !pass().lut.any());
 }
 
+// The float core on 8-bit values, rounded by hand, equals the byte entry point.
+static void testColorPassFloatAgrees()
+{
+  std::mt19937 g(77);
+  int active = 0;
+  for (int round = 0; round < 100; ++round)
+  {
+    const ColorPass cp = randomPass(g);
+    active += cp.active;
+    const size_t px = 1 + g() % 50;
+    std::vector<uint8_t> bytes(px * 4);
+    std::vector<float> fl(px * 4);
+    for (size_t i = 0; i < bytes.size(); ++i)
+      fl[i] = static_cast<float>(bytes[i] = static_cast<uint8_t>(g()));
+    applyColorPass(cp, bytes.data(), bytes.size());
+    applyColorPassF(cp, fl.data(), fl.size());
+    for (size_t i = 0; i < bytes.size(); ++i)
+      CHECK((i % 4 == 3) ? bytes[i] == static_cast<uint8_t>(fl[i]) : bytes[i] == toU8Clamped(fl[i]));
+  }
+  CHECK(active > 70); // the random passes really were active
+  // Not clamped: a strong saturation boost leaves levels outside 0..255 for the caller to see.
+  const ColorPass boost = makeColorPass(0, 0, 0, 100, MixValues{}, ColorGrade{});
+  float px[4] = {250.0f, 20.0f, 20.0f, 255.0f};
+  applyColorPassF(boost, px, 4);
+  CHECK(px[0] > 255.0f || px[1] < 0.0f || px[2] < 0.0f);
+  CHECK(px[3] == 255.0f); // alpha untouched
+}
+
+// Pixels are independent, so one big call (which works in 1024-pixel chunks) must give the same
+// bytes as one call per pixel, whatever the buffer length; a trailing partial pixel is left alone.
+static void testBulkEqualsPerPixel()
+{
+  std::mt19937 g(99);
+  const size_t sizes[] = {1, 2, 17, 1023, 1024, 1025, 2047, 2048, 2049, 3000};
+  int round = 0;
+  for (int rep = 0; rep < 12; ++rep)
+    for (size_t px : sizes)
+    {
+      const ColorPass cp = randomPass(g);
+      const size_t extra = static_cast<size_t>(round++ % 3); // 0..2 stray bytes after the last pixel
+      Px bulk(px * 4 + extra);
+      for (uint8_t &v : bulk)
+        v = static_cast<uint8_t>(g());
+      if (round % 7 == 0) // extremes get their own share
+        for (uint8_t &v : bulk)
+          v = (g() & 1) ? 255 : 0;
+      Px each = bulk;
+      const Px original = bulk;
+      applyColorPass(cp, bulk.data(), bulk.size());
+      for (size_t i = 0; i < px; ++i)
+        applyColorPass(cp, each.data() + i * 4, 4);
+      CHECK(bulk == each);
+      CHECK(std::equal(bulk.begin() + static_cast<std::ptrdiff_t>(px * 4), bulk.end(),
+                       original.begin() + static_cast<std::ptrdiff_t>(px * 4))); // stray bytes untouched
+      for (size_t i = 3; i < px * 4; i += 4)
+        CHECK(bulk[i] == original[i]); // alpha untouched
+    }
+}
+
+// Golden fingerprints: a fixed-seed set of random passes over fixed random pixels, hashed.
+// Changing the pipeline on purpose changes these; update them then. Changing them by accident
+// is exactly what this test is for. The values depend on float behavior, so they are valid for
+// the compiler/flags you record them with (no -ffast-math; FMA contraction can change bytes).
+static std::uint64_t fnv1a(std::uint64_t h, const Px &v)
+{
+  for (uint8_t b : v)
+  {
+    h ^= b;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+static void testGoldenFingerprints()
+{
+  constexpr int kGroups = 8, kPassesPerGroup = 8;
+  // Recorded from MSVC Release. If you change the pipeline on purpose, re-record them:
+  // set the entry to 0, run the test, and paste the printed value.
+  static const std::uint64_t kGolden[kGroups] = {
+      0x9e8e9e4de2178db1ull, 0x72264c1fb7b3b28eull, 0x1af4da7b2f08391eull, 0xb51a04329cd552a1ull,
+      0xaadea4010b57cebcull, 0x0c798b587c0529c3ull, 0x132cde7980658a07ull, 0x0555d21b5369cc6aull};
+  std::mt19937 g(2024);
+  for (int grp = 0; grp < kGroups; ++grp)
+  {
+    std::uint64_t h = 14695981039346656037ull;
+    for (int k = 0; k < kPassesPerGroup; ++k)
+    {
+      const ColorPass cp = randomPass(g);
+      Px img(4 * 997);
+      for (uint8_t &v : img)
+        v = static_cast<uint8_t>(g());
+      applyColorPass(cp, img.data(), img.size());
+      h = fnv1a(h, img);
+    }
+    if (kGolden[grp] == 0)
+    {
+      std::printf("GOLDEN group %d: 0x%016llxull\n", grp, static_cast<unsigned long long>(h));
+      CHECK(!"golden fingerprint not recorded yet");
+    }
+    else
+      CHECK(h == kGolden[grp]);
+  }
+}
+
 int main()
 {
   testActiveFlags();
@@ -785,5 +943,8 @@ int main()
   testFilterBufferHandling();
   testBufferHandling();
   testWhiteBalancePicker();
+  testColorPassFloatAgrees();
+  testBulkEqualsPerPixel();
+  testGoldenFingerprints();
   return finish();
 }

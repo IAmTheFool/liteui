@@ -36,7 +36,16 @@
 //    wider than their nominal sigma and don't shrink any further. See boxRadius.)
 //
 // This header has no dependency on the UI library: it works on plain RGBA8
-// pointers, so it can be unit-tested on its own (tests/detail_layer_test.cpp).
+// (or RGBA 16-bit) pointers, so it can be unit-tested on its own
+// (tests/detail_layer_test.cpp).
+//
+// SOURCE SAMPLE TYPES. The planes and the per-pixel passes read the source picture as
+// uint8_t samples (RGBA8) or uint16_t samples (a 16-bit picture, core/image16.hpp); SrcTraits<S>
+// (below) is the one place that knows the difference. For 8 bits everything is exactly what it
+// always was (integer-rounded luma, planes in 1/16 level). For 16 bits a pixel's luma is NOT
+// rounded to a level (the rounding was a +-0.5 level sawtooth on every gradient that Texture,
+// Clarity and Sharpness then multiplied) and the planes keep 1/64 level, so the detail measured on
+// a smooth 16-bit gradient is zero, as it should be.
 
 #pragma once
 
@@ -49,6 +58,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 namespace detail_layer
@@ -76,12 +86,16 @@ constexpr float kGain[kKindCount] = {0.8f, 1.0f, 1.5f};
 // saturates toward +/- kClarityLimit levels.
 constexpr float kClarityLimit = 64.0f;
 
-constexpr int kMaxBoxRadius = 1000; // keeps every running sum exact in float
+constexpr int kMaxBoxRadius = 1000; // keeps every running sum exact in float for 8-bit sources
 // (a box sums at most 2 * 1000 + 1 values of at most 255 * 16 = 4080, i.e. about
-// 8.2 million, below the 2^24 float can hold exactly)
+// 8.2 million, below the 2^24 float can hold exactly). For 16-bit sources the planes hold
+// 255 * 64 = 16320 per value and a sum can pass 2^24 (the running sums are uint32_t, so they are
+// still exact); only the conversion of such a sum to float rounds, by less than 0.01 plane count,
+// which can't change a rounded result except at an exact tie (and a flat picture stays flat).
 
-// One blurred luma plane: width * height values, each luma * 16 (4 fractional
-// bits, so the blur isn't rounded to whole levels before it is subtracted).
+// One blurred luma plane: width * height values, each luma * kFix (see SrcTraits: 4 fractional
+// bits for an 8-bit source, 6 for a 16-bit one, so the blur isn't rounded to whole levels before
+// it is subtracted).
 using Plane = std::vector<uint16_t>;
 
 // 8-bit luma weights, /256. They sum to exactly 256, so the result is 0..255.
@@ -94,6 +108,101 @@ inline int lumaOf(const uint8_t *p)
 {
   return (kLumaR * p[0] + kLumaG * p[1] + kLumaB * p[2] + 128) >> 8;
 }
+
+// Midtone weight 4 l (1 - l) by luma: Clarity leaves the ends alone, so it
+// can't clip highlights or crush shadows.
+inline const float *midWeights()
+{
+  static const std::array<float, 256> t = []
+  {
+    std::array<float, 256> a{};
+    for (int i = 0; i < 256; ++i)
+    {
+      const float l = static_cast<float>(i) / 255.0f;
+      a[static_cast<size_t>(i)] = 4.0f * l * (1.0f - l);
+    }
+    return a;
+  }();
+  return t.data();
+}
+
+// ---- Source sample types ----
+// How the planes and passes read one pixel of the SOURCE picture, per sample type S:
+//   kFix / kInvFix  plane units per level (a plane or map value is level * kFix) and its inverse
+//   level(v)        one sample in levels (0..255)
+//   lumaFix(p)      the pixel's luma in plane units
+//   lumaMid(p,..)   lumaFix plus Clarity's midtone weight 4 l (1 - l)
+//   chroma(p,..)    R - luma and B - luma, in levels
+//   fixFromSum      the average of `cnt` samples (their sum) in plane units, rounded
+//   darkFix(m)      a sample (the smallest of R, G, B) in plane units
+// The uint8_t version is exactly the integer arithmetic these passes always used: every 8-bit
+// result is bit-identical to before. The uint16_t version works in float: a 16-bit sample is
+// v / 257 levels (a division, so a widened 8-bit value k * 257 is exactly k again).
+template <class S>
+struct SrcTraits;
+
+template <>
+struct SrcTraits<uint8_t>
+{
+  static constexpr float kFix = 16.0f;
+  static constexpr float kInvFix = 1.0f / 16.0f;
+  static float level(uint8_t v) { return static_cast<float>(v); }
+  static float lumaFix(const uint8_t *p) { return static_cast<float>(lumaOf(p) << 4); }
+  static void lumaMid(const uint8_t *p, float *lumaFixOut, float *mid)
+  {
+    const int l = lumaOf(p);
+    *lumaFixOut = static_cast<float>(l << 4);
+    *mid = midWeights()[l];
+  }
+  static void chroma(const uint8_t *p, float *cr, float *cb)
+  {
+    const int l = lumaOf(p);
+    *cr = static_cast<float>(p[0] - l);
+    *cb = static_cast<float>(p[2] - l);
+  }
+  static uint16_t fixFromSum(uint64_t sum, uint32_t cnt)
+  {
+    return static_cast<uint16_t>((sum * 16 + cnt / 2) / cnt);
+  }
+  static uint16_t darkFix(uint8_t m) { return static_cast<uint16_t>(m << 4); }
+};
+
+template <>
+struct SrcTraits<uint16_t>
+{
+  static constexpr float kFix = 64.0f;
+  static constexpr float kInvFix = 1.0f / 64.0f;
+  static float level(uint16_t v) { return static_cast<float>(v) / 257.0f; }
+  // Rec. 709 luma in levels, NOT rounded. The weighted sum of samples is below 2^24, so it is exact
+  // in float; one multiply by 1 / (256 * 257) turns it into levels.
+  static float lumaLevels(const uint16_t *p)
+  {
+    return (static_cast<float>(kLumaR) * static_cast<float>(p[0]) +
+            static_cast<float>(kLumaG) * static_cast<float>(p[1]) +
+            static_cast<float>(kLumaB) * static_cast<float>(p[2])) *
+           (1.0f / (256.0f * 257.0f));
+  }
+  static float lumaFix(const uint16_t *p) { return lumaLevels(p) * kFix; }
+  static void lumaMid(const uint16_t *p, float *lumaFixOut, float *mid)
+  {
+    const float lv = lumaLevels(p);
+    *lumaFixOut = lv * kFix;
+    const float t = lv * (1.0f / 255.0f);
+    *mid = 4.0f * t * (1.0f - t);
+  }
+  static void chroma(const uint16_t *p, float *cr, float *cb)
+  {
+    const float lv = lumaLevels(p);
+    *cr = level(p[0]) - lv;
+    *cb = level(p[2]) - lv;
+  }
+  static uint16_t fixFromSum(uint64_t sum, uint32_t cnt)
+  {
+    const uint64_t d = static_cast<uint64_t>(cnt) * 257u;
+    return static_cast<uint16_t>((sum * 64 + d / 2) / d);
+  }
+  static uint16_t darkFix(uint16_t m) { return static_cast<uint16_t>((static_cast<uint32_t>(m) * 64u + 128u) / 257u); }
+};
 
 // Three passes of a box blur approximate a Gaussian. For n passes of width w
 // the variance is n (w^2 - 1) / 12, so for n = 3: w = sqrt(4 sigma^2 + 1).
@@ -180,8 +289,9 @@ inline bool vbox(const uint16_t *in, uint16_t *out, size_t W, size_t H, int r,
 // if `latest` stopped matching `gen` part-way (the same cancellation contract
 // as renderWith), or if the size or radius is invalid; `out` is then garbage
 // and must not be used.
-inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
-                     const std::atomic<uint64_t> *latest, uint64_t gen)
+template <class S>
+inline bool blurLumaT(const S *rgba, int w, int h, int r, Plane &out,
+                      const std::atomic<uint64_t> *latest, uint64_t gen)
 {
   if (!rgba || w <= 0 || h <= 0 || r < 1)
     return false;
@@ -189,10 +299,10 @@ inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
   out.resize(W * H);
   for (size_t y = 0; y < H; ++y)
   {
-    const uint8_t *s = rgba + y * W * 4;
+    const S *s = rgba + y * W * 4;
     uint16_t *o = out.data() + y * W;
     for (size_t x = 0; x < W; ++x)
-      o[x] = static_cast<uint16_t>(lumaOf(s + x * 4) << 4);
+      o[x] = static_cast<uint16_t>(SrcTraits<S>::lumaFix(s + x * 4) + 0.5f);
   }
   const float inv = 1.0f / static_cast<float>(2 * r + 1);
   std::vector<uint16_t> pad(W + 2 * static_cast<size_t>(r));
@@ -214,25 +324,41 @@ inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
   return true;
 }
 
+// The 8-bit and 16-bit versions (the 8-bit one is a plain function, so a null pointer or a pointer
+// of another constness still finds it).
+inline bool blurLuma(const uint8_t *rgba, int w, int h, int r, Plane &out,
+                     const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  return blurLumaT<uint8_t>(rgba, w, h, r, out, latest, gen);
+}
+inline bool blurLuma(const uint16_t *rgba, int w, int h, int r, Plane &out,
+                     const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  return blurLumaT<uint16_t>(rgba, w, h, r, out, latest, gen);
+}
+
 // About 1024 bytes spread over the picture: cheap, and two different pictures
 // will almost surely differ at some sampled byte. It is NOT a full hash: a
 // small edit that falls between the samples goes unnoticed, which is why the
 // Cache below assumes pixels are never edited in place.
-inline uint64_t fingerprint(const uint8_t *rgba, int w, int h)
+template <class S>
+inline uint64_t fingerprint(const S *rgba, int w, int h)
 {
   uint64_t hash = 1469598103934665603ULL ^
                   (static_cast<uint64_t>(static_cast<uint32_t>(w)) << 32 |
                    static_cast<uint32_t>(h));
+  if (sizeof(S) != 1) // a 16-bit picture never shares a key with an 8-bit one
+    hash ^= static_cast<uint64_t>(sizeof(S)) * 0x9e3779b97f4a7c15ULL;
   const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
   if (n == 0)
     return hash;
   const size_t stride = (n / 1024) | 1; // odd, so every channel gets sampled
   for (size_t i = 0; i < n; i += stride)
   {
-    hash ^= rgba[i];
+    hash ^= static_cast<uint64_t>(rgba[i]);
     hash *= 1099511628211ULL;
   }
-  hash ^= rgba[n - 1];
+  hash ^= static_cast<uint64_t>(rgba[n - 1]);
   hash *= 1099511628211ULL;
   return hash;
 }
@@ -253,9 +379,23 @@ public:
   using PlanePtr = std::shared_ptr<const Plane>;
 
   // Null when cancelled (nothing is cached then) or when the arguments are
-  // invalid (no pixels, non-positive size, unknown kind).
+  // invalid (no pixels, non-positive size, unknown kind). The picture is RGBA8 or 16-bit RGBA:
+  // the plane is built from whatever it is handed (see SrcTraits).
   PlanePtr get(const uint8_t *rgba, int w, int h, int kind,
                const std::atomic<uint64_t> *latest, uint64_t gen)
+  {
+    return getT<uint8_t>(rgba, w, h, kind, latest, gen);
+  }
+  PlanePtr get(const uint16_t *rgba, int w, int h, int kind,
+               const std::atomic<uint64_t> *latest, uint64_t gen)
+  {
+    return getT<uint16_t>(rgba, w, h, kind, latest, gen);
+  }
+
+private:
+  template <class S>
+  PlanePtr getT(const S *rgba, int w, int h, int kind,
+                const std::atomic<uint64_t> *latest, uint64_t gen)
   {
     if (!rgba || w <= 0 || h <= 0 || kind < 0 || kind >= kKindCount)
       return nullptr;
@@ -271,7 +411,7 @@ public:
     // Built outside the lock: a slow blur must not stall the other thread's
     // cache hits. Two threads may rarely build the same plane; one wins.
     auto plane = std::make_shared<Plane>();
-    if (!blurLuma(rgba, w, h, boxRadius(kind, w, h), *plane, latest, gen))
+    if (!blurLumaT<S>(rgba, w, h, boxRadius(kind, w, h), *plane, latest, gen))
       return nullptr;
     std::lock_guard<std::mutex> lock(m_);
     if (Entry *e = find(rgba, w, h, kind, fp))
@@ -285,6 +425,7 @@ public:
     return plane;
   }
 
+public:
   void clear()
   {
     std::lock_guard<std::mutex> lock(m_);
@@ -301,7 +442,7 @@ public:
 private:
   struct Entry
   {
-    const uint8_t *rgba;
+    const void *rgba;
     int w, h, kind;
     uint64_t fp;
     PlanePtr plane;
@@ -310,7 +451,7 @@ private:
   static constexpr size_t kMaxBytes = 384u * 1024u * 1024u;
   static constexpr size_t kMaxEntries = 9;
 
-  Entry *find(const uint8_t *rgba, int w, int h, int kind, uint64_t fp)
+  Entry *find(const void *rgba, int w, int h, int kind, uint64_t fp)
   {
     for (Entry &e : entries_)
       if (e.rgba == rgba && e.w == w && e.h == h && e.kind == kind &&
@@ -391,9 +532,9 @@ struct Planes
 // Fetches the planes in `need` for the picture at `rgba`. False = cancelled.
 // (No pixels or a non-positive size means there is nothing to do: true, with
 // the planes left null.)
-inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
-                    unsigned need, const std::atomic<uint64_t> *latest,
-                    uint64_t gen)
+template <class S>
+inline bool acquireT(Planes &out, const S *rgba, int w, int h, unsigned need,
+                     const std::atomic<uint64_t> *latest, uint64_t gen)
 {
   if (!rgba || w <= 0 || h <= 0)
     return true;
@@ -406,34 +547,44 @@ inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h,
     }
   return true;
 }
-
-// Midtone weight 4 l (1 - l) by luma: Clarity leaves the ends alone, so it
-// can't clip highlights or crush shadows.
-inline const float *midWeights()
+inline bool acquire(Planes &out, const uint8_t *rgba, int w, int h, unsigned need,
+                    const std::atomic<uint64_t> *latest, uint64_t gen)
 {
-  static const std::array<float, 256> t = []
-  {
-    std::array<float, 256> a{};
-    for (int i = 0; i < 256; ++i)
-    {
-      const float l = static_cast<float>(i) / 255.0f;
-      a[static_cast<size_t>(i)] = 4.0f * l * (1.0f - l);
-    }
-    return a;
-  }();
-  return t.data();
+  return acquireT<uint8_t>(out, rgba, w, h, need, latest, gen);
+}
+inline bool acquire(Planes &out, const uint16_t *rgba, int w, int h, unsigned need,
+                    const std::atomic<uint64_t> *latest, uint64_t gen)
+{
+  return acquireT<uint16_t>(out, rgba, w, h, need, latest, gen);
 }
 
-// Adds the detail term to `count` consecutive pixels of `dst` (RGBA8, alpha
-// untouched). `src` holds the SOURCE pixels for the same positions (they give
-// each pixel's own luma) and `first` is the index, in the whole picture, of
-// the first of them (the planes are indexed y * width + x). A plane that
-// doesn't cover [first, first + count) (built for a different picture size,
-// say) is skipped instead of being read out of range. Raw pointers and no
-// std:: helpers in the loop: same Debug-build reason as applyColorPass.
-inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src,
-                      uint8_t *dst, size_t count, size_t first)
+// Stores one channel of a finished pixel: a byte gets the value clamped to 0..255 and rounded
+// to nearest; a float gets it clamped to 0..255 and NOT rounded (the float pipeline rounds
+// once, at the very end). Plain comparisons, no std:: calls, same Debug-build reason as above.
+inline void putLevel(uint8_t *d, float v)
 {
+  v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+  *d = static_cast<uint8_t>(v + 0.5f);
+}
+inline void putLevel(float *d, float v)
+{
+  *d = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+}
+
+// Adds the detail term to `count` consecutive pixels of `dst` (RGBA, alpha untouched).
+// `Dst` is the destination's sample type: uint8_t (RGBA8 bytes) or float (levels 0..255). `S` is
+// the SOURCE's (uint8_t or uint16_t) and is deduced; Dst stays the first template parameter so
+// addPixels<Dst>(...) keeps working.
+// `src` holds the SOURCE pixels for the same positions (they give each pixel's own luma) and
+// `first` is the index, in the whole picture, of the first of them (the planes are indexed
+// y * width + x). A plane that doesn't cover [first, first + count) (built for a different
+// picture size, say) is skipped instead of being read out of range. Raw pointers and no
+// std:: helpers in the loop: same Debug-build reason as applyColorPass.
+template <class Dst, class S>
+inline void addPixels(const Planes &pl, const Gains &gn, const S *src,
+                      Dst *dst, size_t count, size_t first)
+{
+  using T = SrcTraits<S>;
   auto usable = [&](int k) -> const uint16_t *
   {
     const Cache::PlanePtr &p = pl.p[k];
@@ -449,14 +600,13 @@ inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src,
   const float g2 = b2 ? gn.g[Sharpness] : 0.0f;
   if (g0 == 0.0f && g1 == 0.0f && g2 == 0.0f)
     return;
-  const float *mid = midWeights();
-  const float inv16 = 1.0f / 16.0f;
+  const float inv16 = T::kInvFix; // (named for the 8-bit case it began as: plane units -> levels)
   const float invLimit = 1.0f / kClarityLimit;
   for (size_t i = 0; i < count; ++i)
   {
-    const uint8_t *s = src + i * 4;
-    const int l = (kLumaR * s[0] + kLumaG * s[1] + kLumaB * s[2] + 128) >> 8;
-    const float l16 = static_cast<float>(l << 4);
+    const S *s = src + i * 4;
+    float l16, mid; // the pixel's luma in plane units, and Clarity's midtone weight
+    T::lumaMid(s, &l16, &mid);
     float k = 0.0f;
     if (g0 != 0.0f)
       k += g0 * (l16 - static_cast<float>(b0[i])) * inv16;
@@ -464,17 +614,13 @@ inline void addPixels(const Planes &pl, const Gains &gn, const uint8_t *src,
     {
       float d = (l16 - static_cast<float>(b1[i])) * inv16;
       d = d / (1.0f + (d < 0.0f ? -d : d) * invLimit);
-      k += g1 * mid[l] * d;
+      k += g1 * mid * d;
     }
     if (g2 != 0.0f)
       k += g2 * (l16 - static_cast<float>(b2[i])) * inv16;
-    uint8_t *d8 = dst + i * 4;
+    Dst *d8 = dst + i * 4;
     for (int c = 0; c < 3; ++c)
-    {
-      float v = static_cast<float>(d8[c]) + k;
-      v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
-      d8[c] = static_cast<uint8_t>(v + 0.5f);
-    }
+      putLevel(&d8[c], static_cast<float>(d8[c]) + k);
   }
 }
 

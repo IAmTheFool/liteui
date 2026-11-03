@@ -1,13 +1,19 @@
 // Build: g++ -std=c++20 -I.. -I<folder with liteui.hpp> raster_ops_test.cpp -o raster_ops_test
 // raster_ops.hpp only needs liteui.hpp for the CanvasImage struct, so in CMake
 // this test links liteui::liteui like the app does.
+//
+// Everything raster_ops.hpp does is tested here, on both picture types it is templated over:
+// CanvasImage (RGBA8) in the first half, Image16 (RGBA 16-bit) after it, and golden fingerprints
+// of the exact output bytes at the end.
 #include "core/raster_ops.hpp"
 #include "io/exif.hpp"
 #include "check.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <random>
 #include <utility>
+#include <vector>
 
 using Img = CanvasImage;
 
@@ -74,6 +80,9 @@ static void testOrientMatchesTheGeoFrameAndExif()
   const int W = 9, H = 5;
   auto src = std::make_shared<Img>(coords(W, H));
   CHECK(orientImage(src, Orient{}) == src); // identity: the very same image, no copy
+  // A null picture comes back null (it used to be dereferenced), for a bare nullptr too.
+  CHECK(orientImage(nullptr, Orient{1, true}) == nullptr);
+  CHECK(orientImage(std::shared_ptr<Img>(), Orient{1, true}) == nullptr);
   for (int rot = 0; rot < 4; ++rot)
     for (bool flip : {false, true})
     {
@@ -155,6 +164,22 @@ static void testRotateArbitrary()
     for (int x = 0; x < fit->width; ++x)
       opaque = opaque && px(*fit, x, y)[3] == 255;
   CHECK(opaque);
+  // ...and, the real property of fit: every output pixel centre maps back onto the picture (the
+  // opaque check above cannot show it, because fit mode clamps every sample to the picture).
+  {
+    const GeoFrame ff = makeGeoFrame(60, 40, Orient{}, 20.0f, false, CropRect{});
+    bool inside = true;
+    for (int y = 0; y < fit->height; ++y)
+      for (int x = 0; x < fit->width; ++x)
+      {
+        double ox, oy;
+        ff.toOrig(x + 0.5, y + 0.5, ox, oy);
+        inside = inside && ox >= -1.0 && ox <= 61.0 && oy >= -1.0 && oy <= 41.0;
+      }
+    CHECK(inside);
+    // It is also a real fit, not a tiny one: the canvas takes up most of the picture.
+    CHECK(fit->width * 2 > 60 && fit->height * 2 > 40);
+  }
   // A smooth gradient comes through a turn in the right place: red = 4 * x of the
   // source, so a sampled output pixel must show the source column the frame maps
   // it to (bilinear on a linear ramp is exact, apart from rounding).
@@ -212,10 +237,10 @@ static void testPreview()
   if (pv)
   {
     const uint8_t *p = px(*pv, 10, 3);
-    CHECK(p[0] == 5);     // (0 + 10 + 10 + 0 + 2) / 4
-    CHECK(p[1] == 255);   // (254 + 255 + 255 + 254 + 2) / 4
+    CHECK(p[0] == 5);   // (0 + 10 + 10 + 0 + 2) / 4
+    CHECK(p[1] == 255); // (254 + 255 + 255 + 254 + 2) / 4
     CHECK(p[2] == 77);
-    CHECK(p[3] == 128);   // alpha is averaged too: (0 + 255 + 255 + 0 + 2) / 4
+    CHECK(p[3] == 128); // alpha is averaged too: (0 + 255 + 255 + 0 + 2) / 4
   }
   // The factor is the smallest whole number that gets the long side to 1024 or less.
   auto k3 = makePreviewBase(Img(3000, 10));
@@ -249,8 +274,8 @@ static void testFitLongEdge()
   CHECK(fit(6000, 4000, 2048) == P(2048, 1365)); // 4000 * 2048 / 6000 = 1365.33
   CHECK(fit(4000, 6000, 2048) == P(1365, 2048)); // portrait: the height is the long side
   CHECK(fit(4000, 4000, 1000) == P(1000, 1000));
-  CHECK(fit(3, 2, 1) == P(1, 1));                // 2 / 3 rounds to 1
-  CHECK(fit(1000, 1, 100) == P(100, 1));         // the short side never reaches 0
+  CHECK(fit(3, 2, 1) == P(1, 1));        // 2 / 3 rounds to 1
+  CHECK(fit(1000, 1, 100) == P(100, 1)); // the short side never reaches 0
   CHECK(fit(1, 1000, 100) == P(1, 100));
   // Never enlarges: already small enough, or exactly the size.
   CHECK(fit(3000, 2000, 3000) == P(3000, 2000));
@@ -326,8 +351,14 @@ static void testResizeArea()
   // Transparent pixels add no color: red next to nothing stays red, at half the alpha.
   Img edge(2, 1);
   uint8_t *l = &edge.pixels[0], *r = &edge.pixels[4];
-  l[0] = 255; l[1] = 0; l[2] = 0; l[3] = 255;
-  r[0] = 0; r[1] = 0; r[2] = 0; r[3] = 0;
+  l[0] = 255;
+  l[1] = 0;
+  l[2] = 0;
+  l[3] = 255;
+  r[0] = 0;
+  r[1] = 0;
+  r[2] = 0;
+  r[3] = 0;
   const auto one = resizeArea(edge, 1, 1);
   CHECK(px(*one, 0, 0)[0] == 255 && px(*one, 0, 0)[1] == 0 && px(*one, 0, 0)[2] == 0);
   CHECK(px(*one, 0, 0)[3] == 128); // 127.5 rounds up
@@ -385,6 +416,7 @@ static void testResizeToLongEdge()
   CHECK(resizeToLongEdge(src, 500) == src);
   CHECK(resizeToLongEdge(src, 0) == src);
   CHECK(resizeToLongEdge(nullptr, 100) == nullptr);
+  CHECK(resizeToLongEdge(std::shared_ptr<Img>(), 10) == nullptr); // a null picture of a known type
   const auto out = resizeToLongEdge(src, 60);
   CHECK(out != src && out->width == 60 && out->height == 40);
   CHECK(src->width == 120 && src->height == 80); // the original is left alone
@@ -393,6 +425,277 @@ static void testResizeToLongEdge()
   // The result is the same as asking resizeArea for the size fitLongEdge gives.
   const Dims d = fitLongEdge(120, 80, 45);
   CHECK(resizeToLongEdge(src, 45)->pixels == resizeArea(*src, d.w, d.h)->pixels);
+}
+
+// ---- Cancellation ----
+static void testCancellation()
+{
+  const Img im = coords(40, 255);
+  std::atomic<uint64_t> latest{5};
+  // A superseded generation returns null, a current one runs; both for straighten modes.
+  CHECK(rotateArbitrary(im, 7.0f, true, &latest, 4) == nullptr);
+  CHECK(rotateArbitrary(im, 7.0f, false, &latest, 4) == nullptr);
+  CHECK(rotateArbitrary(im, 7.0f, true, &latest, 5) != nullptr);
+  CHECK(rotateArbitrary(im, 0.0f, false, &latest, 4) != nullptr); // 0 degrees is a copy: never checked
+  // The same for a 16-bit picture.
+  const Image16 w16(40, 255);
+  CHECK(rotateArbitrary(w16, 7.0f, true, &latest, 4) == nullptr);
+  CHECK(rotateArbitrary(w16, 7.0f, true, &latest, 5) != nullptr);
+  // A generation that is already stale when the work starts is abandoned at the first check.
+  std::atomic<uint64_t> moving{1};
+  const Img tall = coords(8, 300);
+  CHECK(rotateArbitrary(tall, 3.0f, false, &moving, 1) != nullptr);
+  moving = 2;
+  CHECK(rotateArbitrary(tall, 3.0f, false, &moving, 1) == nullptr);
+}
+
+// ====================================================================== Image16
+// Pictures with 16-bit samples go through the same templates. Pure moves must be exact, averages
+// exact to the 16-bit rounding, and detail below one 8-bit step must survive.
+static Img randomImage(int w, int h, uint32_t seed, int alphaMode)
+{
+  Img im(w, h);
+  std::mt19937 g(seed);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+    {
+      uint8_t *p = &im.pixels[(static_cast<size_t>(y) * w + x) * 4];
+      p[0] = static_cast<uint8_t>(g());
+      p[1] = static_cast<uint8_t>(g());
+      p[2] = static_cast<uint8_t>(g());
+      // 0: opaque, 1: any alpha, 2: a quarter fully transparent, the rest mostly opaque
+      p[3] = alphaMode == 0 ? 255 : alphaMode == 1 ? static_cast<uint8_t>(g())
+                                                   : ((g() % 4) == 0 ? 0 : static_cast<uint8_t>(g() | 0x80));
+    }
+  return im;
+}
+static Image16 widen(const Img &a)
+{
+  Image16 o(a.width, a.height);
+  widenSamples(a.pixels.data(), o.pixels.data(), a.pixels.size());
+  return o;
+}
+static int maxDiff16(const Image16 &a, const Image16 &b)
+{
+  if (a.width != b.width || a.height != b.height || a.pixels.size() != b.pixels.size())
+    return 1 << 30;
+  int m = 0;
+  for (size_t i = 0; i < a.pixels.size(); ++i)
+    m = std::max(m, std::abs(static_cast<int>(a.pixels[i]) - static_cast<int>(b.pixels[i])));
+  return m;
+}
+
+static void testMovesAreExact16()
+{
+  const Img im = randomImage(23, 17, 11, 1);
+  const Image16 w = widen(im);
+  const auto shared = std::make_shared<Image16>(w);
+  const auto shared8 = std::make_shared<Img>(im);
+  for (const CropRect &r : {CropRect{3, 2, 9, 8}, CropRect{-5, -5, 12, 9}, CropRect{20, 15, 50, 50}, CropRect{1, 1, 0, 0}})
+    CHECK(maxDiff16(*cropImage(w, r), widen(*cropImage(im, r))) == 0);
+  CHECK(maxDiff16(*rotate90cw(w), widen(*rotate90cw(im))) == 0);
+  CHECK(maxDiff16(*flipHorizontal(w), widen(*flipHorizontal(im))) == 0);
+  for (int flip = 0; flip < 2; ++flip)
+    for (int rot = 0; rot < 4; ++rot)
+    {
+      const Orient o{rot, flip != 0};
+      const auto a = orientImage(shared, o);
+      CHECK(maxDiff16(*a, widen(*orientImage(shared8, o))) == 0);
+      CHECK((a == shared) == o.identity());
+    }
+  // rotateArbitrary by 0 is a copy, exactly.
+  CHECK(maxDiff16(*rotateArbitrary(w, 0.0f, true), w) == 0);
+  // Moves keep every low bit: a picture whose samples differ by 1 at 16 bits.
+  Image16 fine(9, 6);
+  for (size_t i = 0; i < fine.pixels.size(); ++i)
+    fine.pixels[i] = static_cast<uint16_t>(30000 + i * 3 + (i % 5));
+  const auto turned = rotate90cw(fine);
+  for (int y = 0; y < fine.height; ++y)
+    for (int x = 0; x < fine.width; ++x)
+      for (int c = 0; c < 4; ++c)
+        CHECK(turned->pixels[(static_cast<size_t>(x) * fine.height + (fine.height - 1 - y)) * 4 + c] ==
+              fine.pixels[(static_cast<size_t>(y) * fine.width + x) * 4 + c]);
+}
+
+static void testPreviewBase16()
+{
+  const Img im = randomImage(2000, 30, 8, 1);
+  const Image16 w = widen(im);
+  const auto p = makePreviewBase(w);
+  CHECK(p && p->width == 1000 && p->height == 15); // k = 2
+  if (!p)
+    return;
+  const int k = 2;
+  for (int y = 0; y < p->height; ++y)
+    for (int x = 0; x < p->width; ++x)
+      for (int c = 0; c < 4; ++c)
+      {
+        int64_t s = 0; // the 8-bit sum: the 16-bit sum is exactly 257 times it
+        for (int dy = 0; dy < k; ++dy)
+          for (int dx = 0; dx < k; ++dx)
+            s += im.pixels[(static_cast<size_t>(y * k + dy) * im.width + x * k + dx) * 4 + c];
+        const int64_t area = k * k;
+        CHECK(p->pixels[(static_cast<size_t>(y) * p->width + x) * 4 + c] == (257 * s + area / 2) / area);
+      }
+  CHECK(!makePreviewBase(Image16(1536, 4)));
+  CHECK(isLargeImage(Image16(1537, 1)) && !isLargeImage(Image16(1536, 1)));
+  // Detail below one 8-bit step: the average of 20000, 20001, 20002, 20003 is 20001.5 -> 20002 (8-bit
+  // storage could only have said 78 * 257 = 20046 for all four).
+  Image16 fine(1600, 2);
+  for (int y = 0; y < 2; ++y)
+    for (int x = 0; x < 1600; ++x)
+      for (int c = 0; c < 4; ++c)
+        fine.pixels[(static_cast<size_t>(y) * 1600 + x) * 4 + c] = static_cast<uint16_t>(20000 + (c == 3 ? 0 : (x % 2) + 2 * y));
+  const auto pf = makePreviewBase(fine);
+  CHECK(pf && pf->pixels[0] == 20002 && pf->pixels[3] == 20000);
+}
+
+static void testResizeAndRotate16()
+{
+  for (int alpha = 0; alpha < 3; ++alpha)
+  {
+    const Img im = randomImage(31, 23, 40 + alpha, alpha);
+    const Image16 w = widen(im);
+    // The 16-bit result is the exact average; the 8-bit one is that, rounded to a byte (half a
+    // level is 128.5 units of 16 bits, so a difference of up to 129 is the byte's own rounding).
+    for (const auto &d : {std::pair{10, 7}, std::pair{15, 12}, std::pair{62, 46}, std::pair{1, 1}})
+      CHECK(maxDiff16(*resizeArea(w, d.first, d.second), widen(*resizeArea(im, d.first, d.second))) <= 130);
+    for (float deg : {0.1f, 5.0f, -12.3f, 30.0f, 45.0f})
+      for (bool expand : {false, true})
+      {
+        const auto a = rotateArbitrary(w, deg, expand);
+        const auto b = rotateArbitrary(im, deg, expand);
+        CHECK(a && a->width == b->width && a->height == b->height);
+        CHECK(maxDiff16(*a, widen(*b)) <= 131);
+      }
+  }
+  // Flat opaque areas keep their exact 16-bit value, through both operations.
+  Image16 flat(40, 30);
+  for (size_t i = 0; i < flat.pixels.size(); i += 4)
+  {
+    flat.pixels[i] = 12345;
+    flat.pixels[i + 1] = 40001;
+    flat.pixels[i + 2] = 777;
+    flat.pixels[i + 3] = 65535;
+  }
+  const auto rs = resizeArea(flat, 13, 9);
+  for (size_t i = 0; i < rs->pixels.size(); i += 4)
+    CHECK(rs->pixels[i] == 12345 && rs->pixels[i + 1] == 40001 && rs->pixels[i + 2] == 777 && rs->pixels[i + 3] == 65535);
+  const auto rot = rotateArbitrary(flat, 3.7f, false); // "fit": every pixel lands inside the picture
+  for (size_t i = 0; i < rot->pixels.size(); i += 4)
+    CHECK(std::abs(rot->pixels[i] - 12345) <= 1 && std::abs(rot->pixels[i + 1] - 40001) <= 1 && std::abs(rot->pixels[i + 2] - 777) <= 1 && rot->pixels[i + 3] == 65535);
+  // Expand: the empty corners are fully transparent (the new picture starts out zero-filled), the
+  // centre is opaque.
+  const auto ex = rotateArbitrary(flat, 30.0f, true);
+  CHECK(ex->pixels[3] == 0);
+  CHECK(ex->pixels[((static_cast<size_t>(ex->height / 2)) * ex->width + ex->width / 2) * 4 + 3] == 65535);
+  // Detail below one 8-bit step survives a resize: a 2 x 1 picture 20000 | 20003 averaged to 1 x 1.
+  Image16 two(2, 1);
+  for (int x = 0; x < 2; ++x)
+  {
+    two.pixels[static_cast<size_t>(x) * 4] = static_cast<uint16_t>(20000 + x * 3);
+    two.pixels[static_cast<size_t>(x) * 4 + 1] = two.pixels[static_cast<size_t>(x) * 4 + 2] = 100;
+    two.pixels[static_cast<size_t>(x) * 4 + 3] = 65535;
+  }
+  CHECK(resizeArea(two, 1, 1)->pixels[0] == 20002); // 20001.5 rounds up; an 8-bit pipeline would give 78 * 257
+  // Out-of-range requests behave like the 8-bit ones.
+  CHECK(resizeArea(two, 0, 3)->pixels == two.pixels);
+  const auto none = resizeToLongEdge(std::make_shared<Image16>(two), 5);
+  CHECK(none && none->width == 2);
+  CHECK(resizeToLongEdge(std::shared_ptr<Image16>(), 5) == nullptr);
+  const auto small = resizeToLongEdge(std::make_shared<Image16>(flat), 20);
+  CHECK(small && small->width == 20 && small->height == 15);
+}
+
+// ============================================================ golden fingerprints
+// A fixed-seed set of pictures through every operation, the output bytes hashed. They pin the exact
+// bytes of each operation on both picture types, so a change in the output can't slip in unnoticed.
+// Changing an operation on purpose changes these: re-record them then (set an entry to 0, run the
+// test, paste the printed value). The values depend on float and libm behavior (the rotation uses
+// sin and cos), so they are valid for the compiler and flags they were recorded with (no
+// -ffast-math; FMA contraction can change bytes).
+static std::uint64_t fnvBytes(std::uint64_t h, const void *data, size_t n)
+{
+  const uint8_t *b = static_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < n; ++i)
+  {
+    h ^= b[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+template <class I>
+static std::uint64_t fnvImage(std::uint64_t h, const std::shared_ptr<I> &im)
+{
+  if (!im)
+    return fnvBytes(h, "null", 4);
+  const int dims[2] = {im->width, im->height};
+  h = fnvBytes(h, dims, sizeof dims);
+  return fnvBytes(h, im->pixels.data(), im->pixels.size() * sizeof(im->pixels[0]));
+}
+
+static void testGoldenFingerprints()
+{
+  constexpr int kGroups = 8;
+  // Recorded from MSVC Release. To re-record after an intentional change: set the entry to 0,
+  // run the test, and paste the printed value.
+  static const std::uint64_t kGolden[kGroups] = {
+      0x96e27f8ea3c48147ull, 0xc11d80f7283407cdull, 0xba4f670e387e91dbull, 0x9ed50f2488ff7620ull,
+      0xefd7e2e71c4a694full, 0x9cce0d68b3864f20ull, 0x4279091837534b0bull, 0xd69a7e57401e3d2eull};
+  static const char *const kName[kGroups] = {"crop", "orient", "resizeArea", "resizeToLongEdge",
+                                             "rotate fit", "rotate expand", "preview", "Image16 mix"};
+  const int sizes[][2] = {{1, 1}, {2, 3}, {7, 5}, {33, 20}, {64, 64}, {101, 37}};
+  std::uint64_t h[kGroups];
+  for (auto &v : h)
+    v = 14695981039346656037ull;
+  uint32_t seed = 500;
+  for (const auto &sz : sizes)
+    for (int alpha = 0; alpha < 3; ++alpha)
+    {
+      const Img im = randomImage(sz[0], sz[1], seed++, alpha);
+      const auto shared = std::make_shared<Img>(im);
+      for (const CropRect &r : {CropRect{0, 0, sz[0], sz[1]}, CropRect{1, 1, sz[0] / 2 + 1, sz[1] / 2 + 1}, CropRect{-3, -2, 5, 4},
+                                CropRect{sz[0] - 1, sz[1] - 1, 9, 9}, CropRect{2, 2, 0, 0}, CropRect{0, 0, 100000, 100000}})
+        h[0] = fnvImage(h[0], cropImage(im, r));
+      for (int flip = 0; flip < 2; ++flip)
+        for (int rot = 0; rot < 4; ++rot)
+          h[1] = fnvImage(h[1], orientImage(shared, Orient{rot, flip != 0}));
+      for (const auto &d : {std::pair{1, 1}, std::pair{sz[0] / 2 + 1, sz[1] / 3 + 1}, std::pair{sz[0], sz[1]}, std::pair{sz[0] * 2 + 1, sz[1] * 3},
+                            std::pair{5, 7}, std::pair{0, 4}, std::pair{4, -1}})
+        h[2] = fnvImage(h[2], resizeArea(im, d.first, d.second));
+      for (int edge : {0, 1, 5, 20, 100})
+        h[3] = fnvImage(h[3], resizeToLongEdge(shared, edge));
+      for (float deg : {0.0f, 0.1f, 5.0f, -12.3f, 30.0f, 45.0f, -45.0f, 89.0f})
+      {
+        h[4] = fnvImage(h[4], rotateArbitrary(im, deg, false));
+        h[5] = fnvImage(h[5], rotateArbitrary(im, deg, true));
+      }
+      // the same operations on the widened picture
+      const Image16 w = widen(im);
+      h[7] = fnvImage(h[7], cropImage(w, CropRect{1, 1, sz[0] / 2 + 1, sz[1] / 2 + 1}));
+      h[7] = fnvImage(h[7], rotate90cw(w));
+      h[7] = fnvImage(h[7], resizeArea(w, sz[0] / 2 + 1, sz[1] / 3 + 1));
+      h[7] = fnvImage(h[7], rotateArbitrary(w, -12.3f, true));
+      h[7] = fnvImage(h[7], rotateArbitrary(w, 30.0f, false));
+    }
+  // Preview bases: big, thin pictures (the threshold is a long side over 1536).
+  for (const auto &sz : {std::pair{1537, 9}, std::pair{2000, 30}, std::pair{3100, 20}, std::pair{40, 3300}, std::pair{4097, 5}})
+    for (int alpha = 0; alpha < 3; ++alpha)
+    {
+      const Img im = randomImage(sz.first, sz.second, static_cast<uint32_t>(sz.first + alpha), alpha);
+      h[6] = fnvImage(h[6], makePreviewBase(im));
+      h[7] = fnvImage(h[7], makePreviewBase(widen(im)));
+    }
+  for (int g = 0; g < kGroups; ++g)
+  {
+    if (kGolden[g] == 0)
+    {
+      std::printf("GOLDEN group %d (%s): 0x%016llxull\n", g, kName[g], static_cast<unsigned long long>(h[g]));
+      CHECK(!"golden fingerprint not recorded yet");
+    }
+    else
+      CHECK(h[g] == kGolden[g]);
+  }
 }
 
 int main()
@@ -406,5 +709,10 @@ int main()
   testFitLongEdge();
   testResizeArea();
   testResizeToLongEdge();
+  testCancellation();
+  testMovesAreExact16();
+  testPreviewBase16();
+  testResizeAndRotate16();
+  testGoldenFingerprints();
   return finish();
 }

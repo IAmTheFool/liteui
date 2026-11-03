@@ -6,12 +6,19 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "core/geometry.hpp"
 
 // Luminosity range masks.
 constexpr float kLumMaxRamp = 0.5f; // soft edge width at Smoothness = 100%,
                                     // as a fraction of the 0..1 luminance
+
+// The float form of a Luminosity mask reads its weight from a table with kLumSub entries per level
+// (1/16 level), so a 16-bit picture is not quantized to 256 luminances before it is selected.
+constexpr int kLumSub = 16;
+constexpr int kLumFineSize = 255 * kLumSub + 1; // 4081: luma 0, 1/16, ..., 255 levels
 
 // Color Range: distance (in the opponent space of ColorRangeShape) that
 // Range = 100% reaches, and how much brightness differences count.
@@ -30,6 +37,9 @@ struct LuminosityEval
 {
   // Weight for each 8-bit luminance, built once per render request.
   std::array<float, 256> lut{};
+  // The same curve at kLumSub entries per level (kLumFineSize of them), for rowWeightsF. Shared and
+  // immutable, so copying an eval stays cheap. Null on a default-constructed eval.
+  std::shared_ptr<const std::vector<float>> fine;
 
   // Every pixel can be selected, so every row is in play.
   bool rowSpan(int /*y*/, int W, int &x0, int &x1) const
@@ -57,6 +67,37 @@ struct LuminosityEval
       const uint8_t *p = pix + static_cast<size_t>(i) * 4;
       const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
       out[i] = t[l];
+    }
+  }
+
+  // The same weights from a row of float levels (0..255, 4 per pixel, alpha ignored), as the float
+  // pipeline holds it: luma is NOT rounded to a byte, and the weight is read from the fine table by
+  // linear interpolation. For a pixel whose luma is a whole level (every 8-bit gray) the result is
+  // exactly rowWeights'. `pix` null gives 0, like rowWeights.
+  void rowWeightsF(int /*y*/, int x0, int x1, float *out, const float *pix) const
+  {
+    const int len = x1 - x0;
+    if (!pix || !fine || fine->size() < static_cast<size_t>(kLumFineSize))
+    {
+      for (int i = 0; i < len; ++i)
+        out[i] = 0.0f;
+      return;
+    }
+    const float *t = fine->data();
+    for (int i = 0; i < len; ++i)
+    {
+      const float *p = pix + static_cast<size_t>(i) * 4;
+      // Rec. 709 luma, the weights of rowWeights over 256 (exact for whole-level grays).
+      float l = (54.0f * p[0] + 183.0f * p[1] + 19.0f * p[2]) * (1.0f / 256.0f);
+      l = !(l > 0.0f) ? 0.0f : (l > 255.0f ? 255.0f : l); // NaN -> 0
+      const float q = l * static_cast<float>(kLumSub);
+      const int j = static_cast<int>(q);
+      if (j >= kLumFineSize - 1)
+      {
+        out[i] = t[kLumFineSize - 1];
+        continue;
+      }
+      out[i] = t[j] + (t[j + 1] - t[j]) * (q - static_cast<float>(j));
     }
   }
 };
@@ -102,22 +143,22 @@ struct LuminosityShape
       x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
       return x * x * (3.0f - 2.0f * x);
     };
-    for (size_t i = 0; i < 256; ++i)
+    // The weight at luminance t (0..1): one function for both tables, so they agree at every level.
+    const auto weightAt = [&](float t)
     {
-      const float t = static_cast<float>(i) / 255.0f;
-      float w;
       if (f <= 1e-4f)
-      {
-        w = (t >= a && t <= b) ? 1.0f : 0.0f;
-      }
-      else
-      {
-        const float up = smooth((t - (a - f)) / f);  // rises into [a, b]
-        const float dn = 1.0f - smooth((t - b) / f); // falls after b
-        w = up * dn;
-      }
-      e.lut[i] = w;
-    }
+        return (t >= a && t <= b) ? 1.0f : 0.0f;
+      const float up = smooth((t - (a - f)) / f);  // rises into [a, b]
+      const float dn = 1.0f - smooth((t - b) / f); // falls after b
+      return up * dn;
+    };
+    for (size_t i = 0; i < 256; ++i)
+      e.lut[i] = weightAt(static_cast<float>(i) / 255.0f);
+    auto fine = std::make_shared<std::vector<float>>(static_cast<size_t>(kLumFineSize));
+    for (int k = 0; k < kLumFineSize; ++k) // k / 16 is exact, so a whole level gives the same t as above
+      (*fine)[static_cast<size_t>(k)] =
+          weightAt((static_cast<float>(k) / static_cast<float>(kLumSub)) / 255.0f);
+    e.fine = std::move(fine);
     return e;
   }
 };
@@ -146,6 +187,19 @@ struct ColorRangeEval
   void rowWeights(int /*y*/, int x0, int x1, float *out,
                   const uint8_t *pix = nullptr) const
   {
+    weights(x0, x1, out, pix);
+  }
+  // The same from a row of float levels (0..255, 4 per pixel): no rounding to bytes first.
+  void rowWeightsF(int /*y*/, int x0, int x1, float *out, const float *pix) const
+  {
+    weights(x0, x1, out, pix);
+  }
+
+private:
+  // One body for both sample types (a byte or a float level), so they cannot drift apart.
+  template <class P>
+  void weights(int x0, int x1, float *out, const P *pix) const
+  {
     const int len = x1 - x0;
     if (!pix || !set)
     {
@@ -156,7 +210,7 @@ struct ColorRangeEval
     const float k = 1.0f / 255.0f;
     for (int i = 0; i < len; ++i)
     {
-      const uint8_t *p = pix + static_cast<size_t>(i) * 4;
+      const P *p = pix + static_cast<size_t>(i) * 4;
       const float r = p[0] * k, g = p[1] * k, b = p[2] * k;
       const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
       const float dy = (y - y0) * kColorRangeLumWeight;

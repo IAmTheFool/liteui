@@ -35,6 +35,7 @@
 #include "core/adjustments.hpp"
 #include "core/auto_tone.hpp"
 #include "core/raster_ops.hpp"
+#include "core/wide_chain.hpp"
 
 // color
 #include "color/color_mix.hpp"
@@ -59,6 +60,8 @@
 #include "io/exif.hpp"
 #include "io/image_meta.hpp"
 #include "io/image_codec.hpp"
+#include "io/image_codec16.hpp"
+#include "io/image_source.hpp"
 
 // edit state and rendering
 #include "edit/adjustment_set.hpp"
@@ -260,6 +263,10 @@ struct RenderJob
 {
   std::shared_ptr<const CanvasImage> src;
   RenderParams params;
+  // The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it.
+  // `src` is then the same picture as 8-bit and is passed along only for the entry points' `view8`
+  // argument, which the render no longer uses (the neighbor effects read the 16-bit source itself).
+  std::shared_ptr<const Image16> src16;
 };
 struct RenderResult
 {
@@ -269,7 +276,8 @@ struct RenderResult
 // Worker thread only.
 static std::optional<RenderResult> runRenderJob(RenderJob &&job, WorkerCancel c)
 {
-  auto img = renderWith(*job.src, job.params, c.latest, c.gen);
+  auto img = job.src16 ? renderToDisplay(*job.src16, job.src.get(), job.params, c.latest, c.gen)
+                       : renderWith(*job.src, job.params, c.latest, c.gen);
   if (!img)
     return std::nullopt; // abandoned part-way: superseded
   return RenderResult{std::move(img)};
@@ -474,6 +482,12 @@ struct EditorState
                                         // applied (== rotated if none) —
                                         // what adjustments are run on
   CropRect sourceCrop;                  // the crop `source` was built with
+  // The 16-bit twin of original / oriented / rotated / source, for a picture that really has more than 8
+  // bits (a 16-bit PNG); all null for any other file. Built from `original16` by the same operations, so
+  // each stage has the size of its 8-bit namesake (core/wide_chain.hpp). The 8-bit chain above is unchanged
+  // and is still what every tool measures and what the neighbor effects read; only the full-resolution
+  // render (and 16-bit export) starts from the twin. The drag preview stays on the 8-bit chain.
+  std::shared_ptr<Image16> original16, oriented16, rotated16, source16;
   std::shared_ptr<CanvasImage> image;   // source + adjustments applied —
                                         // this is what's drawn and exported
   std::string imagePath;                // full path of the opened file
@@ -491,6 +505,7 @@ struct EditorState
 
   // Export pane settings.
   bool exportJpeg = true;   // the format the Export dialog offers first
+  bool exportPng16 = false; // PNG export writes 16 bits per channel (the pane's "PNG  16-bit"); never set with exportJpeg
   int jpegQuality = 92;     // 1..100
   bool keepMetadata = true; // carry the photo's EXIF + ICC profile into a JPEG
   bool removeGps = false;   // ...but without the GPS location (JPEG only; needs keepMetadata)
@@ -519,6 +534,11 @@ struct EditorState
   // null for images already small enough that a preview wouldn't be
   // cheaper, in which case dragging just uses the full-resolution path.
   std::shared_ptr<CanvasImage> previewBase;
+  // The 16-bit twin of `previewBase` (box-downsampled from `source16` by the same factor, so the same
+  // size), for a picture that has a 16-bit twin; null otherwise. A drag renders it, so the preview
+  // starts from the same precision as the full-resolution render that follows it. `previewBase` is
+  // then its 8-bit view for the neighbor effects.
+  std::shared_ptr<Image16> previewBase16;
   std::shared_ptr<CanvasImage> previewImage;
   bool dragging = false;
 
@@ -748,10 +768,12 @@ static void updateImageFromAdjustments()
   if (canDefer)
   {
     updatePreviewFromAdjustments(); // cheap stand-in, shown immediately
-    renderWorker.submit(RenderJob{state.source, state.adjust.buildRenderParams()});
+    renderWorker.submit(RenderJob{state.source, state.adjust.buildRenderParams(), state.source16});
     return;
   }
-  state.image = renderAdjusted(state.adjust, *state.source);
+  state.image = state.source16
+                    ? renderToDisplay(*state.source16, state.source.get(), state.adjust.buildRenderParams())
+                    : renderAdjusted(state.adjust, *state.source);
   state.previewImage.reset(); // superseded by the full-resolution result
   state.previewDocW = state.previewDocH = 0.0f;
   state.histStale = true;
@@ -766,7 +788,9 @@ static void updatePreviewFromAdjustments()
 {
   if (!state.previewBase)
     return;
-  state.previewImage = renderAdjusted(state.adjust, *state.previewBase);
+  state.previewImage = state.previewBase16
+                           ? renderToDisplay(*state.previewBase16, state.previewBase.get(), state.adjust.buildRenderParams())
+                           : renderAdjusted(state.adjust, *state.previewBase);
   state.histStale = true;
   state.markDirty();
 }
@@ -858,6 +882,7 @@ static void syncSource(bool force)
   if (orientChanged)
   {
     state.oriented = orientImage(state.original, orient);
+    state.oriented16 = wide_chain::oriented(state.original16, orient);
     state.orientedFor = orient;
     state.orientedPreview = makePreviewBase(*state.oriented);
   }
@@ -866,12 +891,15 @@ static void syncSource(bool force)
     state.rotated = angle == 0.0f
                         ? state.oriented
                         : rotateArbitrary(*state.oriented, angle, expand);
+    state.rotated16 = wide_chain::rotated(state.oriented16, angle, expand);
     state.rotatedAngle = angle;
     state.rotatedExpand = expand;
   }
   state.sourceCrop = crop;
   state.source = crop.empty() ? state.rotated : cropImage(*state.rotated, crop);
+  state.source16 = wide_chain::cropped(state.rotated16, crop);
   state.previewBase = makePreviewBase(*state.source);
+  state.previewBase16 = state.source16 ? makePreviewBase(*state.source16) : nullptr;
   state.previewImage.reset();
   resetCropSelection();
 }
@@ -913,7 +941,9 @@ struct GeometryBundle
   std::shared_ptr<CanvasImage> source;
   CropRect sourceCrop;
   std::shared_ptr<CanvasImage> previewBase;
+  std::shared_ptr<Image16> previewBase16; // the 16-bit twin of previewBase (null for an 8-bit file or a small picture)
   std::shared_ptr<CanvasImage> image;
+  std::shared_ptr<Image16> oriented16, rotated16, source16; // the 16-bit twin (null for an 8-bit file)
 };
 struct GeometryResult
 {
@@ -931,6 +961,7 @@ struct GeometryJob
   bool expand = false;
   CropRect crop;
   RenderParams renderParams;
+  std::shared_ptr<Image16> original16; // the 16-bit twin of `original`, if the picture has one
 };
 
 // The pipeline itself (worker thread only). Checked for cancellation between
@@ -970,8 +1001,22 @@ static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
   b.source = job.crop.empty() ? b.rotated : cropImage(*b.rotated, job.crop);
   if (c.cancelled())
     return std::nullopt;
+  if (job.original16)
+  { // the 16-bit twin of the same chain; the render below starts from it
+    b.oriented16 = wide_chain::oriented(job.original16, job.orient);
+    if (c.cancelled())
+      return std::nullopt;
+    b.rotated16 = wide_chain::rotated(b.oriented16, job.angle, job.expand, c.latest, c.gen);
+    if (!b.rotated16)
+      return std::nullopt; // abandoned mid-straighten
+    b.source16 = wide_chain::cropped(b.rotated16, job.crop);
+    if (c.cancelled())
+      return std::nullopt;
+  }
   b.previewBase = makePreviewBase(*b.source);
-  b.image = renderWith(*b.source, job.renderParams, c.latest, c.gen);
+  b.previewBase16 = b.source16 ? makePreviewBase(*b.source16) : nullptr;
+  b.image = b.source16 ? renderToDisplay(*b.source16, b.source.get(), job.renderParams, c.latest, c.gen)
+                       : renderWith(*b.source, job.renderParams, c.latest, c.gen);
   if (!b.image)
     return std::nullopt; // abandoned mid-render
   return GeometryResult{std::move(b)};
@@ -1013,7 +1058,7 @@ static void submitGeometryJob()
   geometryWorker.submit(GeometryJob{
       state.original, state.adjust.orient(), state.adjust.angle(),
       state.adjust.expand(), state.adjust.crop(),
-      state.adjust.buildRenderParams()});
+      state.adjust.buildRenderParams(), state.original16});
   setStatus("Applying changes...", /*isError=*/false);
 }
 
@@ -1032,6 +1077,10 @@ static void adoptGeometryBundle(GeometryWorker::Result &&r)
   state.source = std::move(b.source);
   state.sourceCrop = b.sourceCrop;
   state.previewBase = std::move(b.previewBase);
+  state.previewBase16 = std::move(b.previewBase16);
+  state.oriented16 = std::move(b.oriented16);
+  state.rotated16 = std::move(b.rotated16);
+  state.source16 = std::move(b.source16);
   state.image = std::move(b.image);
   state.previewImage.reset(); // the real thing replaces any stand-in
   state.previewDocW = state.previewDocH = 0.0f;
@@ -1415,8 +1464,9 @@ struct DecodeJob
 struct DecodeResult
 {
   std::string path;
-  std::optional<CanvasImage> image; // empty on failure
+  std::optional<CanvasImage> image; // empty on failure (for a 16-bit file: its 8-bit form)
   std::string error;                // library message when image is empty
+  std::shared_ptr<Image16> wide;    // a 16-bit PNG at full precision (upright); null for every other file
 };
 
 // Worker thread only. Always returns a value (a failure is an empty `image`
@@ -1425,18 +1475,14 @@ static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel)
 {
   DecodeResult r;
   r.path = job.path;
-  r.image = liteui_image::decodeFile(vcImageOf(job.path), &r.error); // a copy decodes its picture
-
-  if (r.image)
-  { // a camera's rotation (EXIF) is applied here, once: from now on the
-    // picture is upright everywhere (editor, masks, saved edits, export)
-    const Orient o = exifOrientationOf(vcImageOf(job.path));
-    if (!o.identity())
-    {
-      auto turned = orientImage(
-          std::make_shared<CanvasImage>(std::move(*r.image)), o);
-      r.image.emplace(std::move(*turned));
-    }
+  const std::string real = vcImageOf(job.path); // a copy decodes its picture
+  // A camera's rotation (EXIF) is applied here, once: from now on the picture is upright everywhere
+  // (editor, masks, saved edits, export). A 16-bit file is read at full precision into `wide`, and its
+  // 8-bit form (what the tools measure) is made from it. See io/image_source.hpp.
+  if (auto opened = image_source::openUpright(real, exifOrientationOf(real), /*want8=*/true, &r.error))
+  {
+    r.image.emplace(std::move(*opened->image));
+    r.wide = std::move(opened->wide);
   }
   return r;
 }
@@ -2269,14 +2315,7 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
       if (have == 0)
       { // no sidecar yet: record the picture's (upright) size
         std::string derr;
-        if (auto img = liteui_image::decodeFile(vcImageOf(path), &derr))
-        {
-          w = img->width;
-          h = img->height;
-          if (exifOrientationOf(vcImageOf(path)).rot & 1) // a quarter turn swaps the sides
-            std::swap(w, h);
-        }
-        else
+        if (!image_source::uprightSize(vcImageOf(path), exifOrientationOf(vcImageOf(path)), &w, &h, &derr))
           o.error = "couldn't open it: " + derr;
       }
       if (o.error.empty())
@@ -2430,6 +2469,7 @@ static void startExportBatch(std::vector<std::string> paths)
   flushSidecar(); // the open picture's latest edits must be on disk
   ExportSettings s;
   s.jpeg = state.exportJpeg;
+  s.png16 = !state.exportJpeg && state.exportPng16;
   s.quality = state.jpegQuality;
   s.keepMetadata = state.keepMetadata;
   s.removeGps = state.removeGps && state.keepMetadata;
@@ -3409,6 +3449,7 @@ static void adoptDecoded(DecodeWorker::Result &&r)
   ++state.imageSerial;
 
   state.original = std::make_shared<CanvasImage>(std::move(*r.image));
+  state.original16 = std::move(r.wide); // null for an 8-bit file; syncSource(true) below rebuilds the twin chain
   state.imagePath = std::move(r.path);
   state.zoom = 1.0f;    // start fresh at 100% on every newly opened image
   state.adjust.reset(); // and with no adjustment, crop or rotation applied yet
@@ -3497,7 +3538,7 @@ static void exportImage()
                                    {{"JPEG Image", "*.jpg;*.jpeg"},
                                     {"PNG Image", "*.png"}},
                                    "jpg")
-                  : saveFilePicker("Export as PNG", stem + "-edit.png",
+                  : saveFilePicker(state.exportPng16 ? "Export as PNG (16-bit)" : "Export as PNG", stem + "-edit.png",
                                    {{"PNG Image", "*.png"},
                                     {"JPEG Image", "*.jpg;*.jpeg"}},
                                    "png");
@@ -3511,6 +3552,8 @@ static void exportImage()
     jpeg = wantJpeg;
     out += jpeg ? ".jpg" : ".png";
   }
+  // The file name decides the format; 16 bits only means something for PNG.
+  const bool png16 = !jpeg && state.exportPng16;
 
   // The size that will be written: with "Resize", the long side is shrunk to
   // the chosen length (never enlarged). Checked here, before any work, so a
@@ -3526,17 +3569,35 @@ static void exportImage()
   }
   const bool resized =
       outSize.w != state.image->width || outSize.h != state.image->height;
-  const std::shared_ptr<CanvasImage> outImage =
-      resized ? resizeToLongEdge(state.image, state.exportLongEdge) : state.image;
 
   std::string err;
-  const bool ok =
-      jpeg ? saveJpegFile(out, *outImage, state.jpegQuality,
-                          state.keepMetadata, state.removeGps,
-                          vcImageOf(state.imagePath), &err)
-           : encodePngFile(out, *outImage, &err);
+  bool ok = false;
+  if (png16)
+  {
+    // The picture on screen is 8-bit, so render the current source again with the same edits, rounded to
+    // 16 bits once at the end (render_core.hpp), and scale it the same way.
+    std::shared_ptr<Image16> big =
+        state.source16 ? renderToImage16(*state.source16, state.source.get(), state.adjust.buildRenderParams())
+        : state.source ? renderToImage16(*state.source, state.adjust.buildRenderParams())
+                       : nullptr;
+    if (big && resized)
+      big = resizeToLongEdge(big, state.exportLongEdge);
+    if (big)
+      ok = encodePng16File(out, *big, &err);
+    else
+      err = "couldn't render the picture";
+  }
+  else
+  {
+    const std::shared_ptr<CanvasImage> outImage =
+        resized ? resizeToLongEdge(state.image, state.exportLongEdge) : state.image;
+    ok = jpeg ? saveJpegFile(out, *outImage, state.jpegQuality,
+                             state.keepMetadata, state.removeGps,
+                             vcImageOf(state.imagePath), &err)
+              : encodePngFile(out, *outImage, &err);
+  }
   if (ok)
-    setStatus("Exported " + baseName(out) +
+    setStatus("Exported " + baseName(out) + std::string(png16 ? " [16-bit]" : "") +
                   (resized ? " (" + std::to_string(outSize.w) + " × " +
                                  std::to_string(outSize.h) + ")"
                            : std::string()),
@@ -11164,14 +11225,31 @@ int main()
 
   exportPane.addChild(sidebarButton(
       "PNG  (lossless)", []
-      { state.exportJpeg = false; },
+      { state.exportJpeg = false; state.exportPng16 = false; },
       []
-      { return !state.exportJpeg; }));
+      { return !state.exportJpeg && !state.exportPng16; }));
+  exportPane.addChild(sidebarButton(
+      "PNG  16-bit", []
+      { state.exportJpeg = false; state.exportPng16 = true; },
+      []
+      { return !state.exportJpeg && state.exportPng16; }));
   exportPane.addChild(sidebarButton(
       "JPEG", []
-      { state.exportJpeg = true; },
+      { state.exportJpeg = true; state.exportPng16 = false; },
       []
       { return state.exportJpeg; }));
+
+  Text png16Hint;
+  png16Hint.label = std::function<std::string()>([]() -> std::string
+                                                 { return "16 bits per channel: smooth gradients survive heavy edits. "
+                                                          "Larger files, and not every program opens them."; });
+  png16Hint.fontSize = 11.0f;
+  png16Hint.color = kColorTextMuted;
+  png16Hint.style.margin = EdgeInsets{4, 0, 0, 0};
+  png16Hint.style.display = std::function<Display()>(
+      []
+      { return !state.exportJpeg && state.exportPng16 ? Display::Flex : Display::None; });
+  exportPane.addChild(std::move(png16Hint));
 
   View jpegOptions;
   jpegOptions.style.width = Size::full();

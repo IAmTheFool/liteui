@@ -23,8 +23,8 @@
 #ifndef LITEUI_HPP_INCLUDED
 #define LITEUI_HPP_INCLUDED
 
-#define LITEAUDIO_VERSION_MAJOR 0
-#define LITEAUDIO_VERSION_MINOR 6
+#define LITEUI_VERSION_MAJOR 0
+#define LITEUI_VERSION_MINOR 3
 
 #include <algorithm>
 #include <cstddef>

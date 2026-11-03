@@ -192,12 +192,13 @@ inline float vignetteWeight(const Prepared &f, int x, int y)
   return t * t * (3.0f - 2.0f * t);
 }
 
-// Applies both effects, in place, to `count` consecutive RGBA8 pixels of a
-// picture `W` wide. `first` is the index (y * W + x) of the first of them in
-// the WHOLE picture, so a block of rows gives the same bytes as the whole
-// picture in one go. Vignette first, then grain. Raw pointers and no std::
-// helpers in the loop (apart from sqrt), for Debug-build speed.
-inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
+// Applies both effects, in place, to `count` consecutive RGBA pixels of float levels
+// (4 floats per pixel, 0..255) of a picture `W` wide. `first` is the index (y * W + x) of
+// the first of them in the WHOLE picture, so a block of rows gives the same result as the
+// whole picture in one go. Vignette first, then grain. A pixel whose alpha is 0 is left
+// alone. The result is not rounded or clamped (applyF's caller does that). Raw pointers
+// and no std:: helpers in the loop (apart from sqrt), for Debug-build speed.
+inline void applyF(const Prepared &f, float *p, size_t count, size_t first)
 {
   if (!f.any())
     return;
@@ -212,10 +213,10 @@ inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
   float ny2 = ny * ny;
   for (size_t i = 0; i < count; ++i)
   {
-    uint8_t *q = p + i * 4;
-    if (q[3] != 0)
+    float *q = p + i * 4;
+    if (q[3] != 0.0f)
     {
-      float r = static_cast<float>(q[0]), g = static_cast<float>(q[1]), b = static_cast<float>(q[2]);
+      float r = q[0], g = q[1], b = q[2];
       if (f.vig)
       {
         const float nx = (static_cast<float>(x) + 0.5f) * f.invHalfW - 1.0f;
@@ -237,9 +238,9 @@ inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
         g += k;
         b += k;
       }
-      q[0] = toU8Clamped(r);
-      q[1] = toU8Clamped(g);
-      q[2] = toU8Clamped(b);
+      q[0] = r;
+      q[1] = g;
+      q[2] = b;
     }
     if (++x == W)
     {
@@ -248,6 +249,34 @@ inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
       ny = (static_cast<float>(y) + 0.5f) * f.invHalfH - 1.0f;
       ny2 = ny * ny;
     }
+  }
+}
+
+// The same on `count` consecutive RGBA8 pixels: applyF on blocks of pixels, rounded and
+// clamped to bytes once at the end, so it gives the bytes the old byte loop gave
+// (tests/color_pass_float_test.cpp keeps that loop as a reference). Alpha is never changed.
+inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
+{
+  if (!f.any())
+    return;
+  constexpr size_t kChunkPixels = 1024;
+  float buf[kChunkPixels * 4];
+  size_t done = 0;
+  while (done < count)
+  {
+    const size_t c = count - done < kChunkPixels ? count - done : kChunkPixels;
+    const size_t k = c * 4;
+    uint8_t *q = p + done * 4;
+    for (size_t i = 0; i < k; ++i)
+      buf[i] = static_cast<float>(q[i]);
+    applyF(f, buf, c, first + done);
+    for (size_t i = 0; i < k; i += 4)
+    {
+      q[i] = toU8Clamped(buf[i]);
+      q[i + 1] = toU8Clamped(buf[i + 1]);
+      q[i + 2] = toU8Clamped(buf[i + 2]);
+    }
+    done += c;
   }
 }
 

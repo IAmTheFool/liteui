@@ -25,11 +25,14 @@
 #include "edit/adjustment_set.hpp"
 #include "io/file_utils.hpp"
 #include "io/image_codec.hpp"
+#include "io/image_codec16.hpp"
 #include "io/image_meta.hpp"
+#include "io/image_source.hpp"
 #include "io/minijson.hpp"
 #include "io/sidecar.hpp"
 #include "io/virtual_copy.hpp"
 #include "render/render.hpp"
+#include "workers/export_render.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -73,6 +76,7 @@ inline bool saveJpegFile(const std::string &path, const CanvasImage &img,
 struct ExportSettings
 {
   bool jpeg = true;
+  bool png16 = false; // PNG only (ignored for JPEG): write 16 bits per channel instead of 8
   int quality = 92;
   bool keepMetadata = true;
   bool removeGps = false;
@@ -238,50 +242,46 @@ inline ExportOutcome exportPicture(const std::string &path,
     return cancel();
 
   const std::string real = vcImageOf(path);
+  // A 16-bit PNG is read at full precision and stays 16-bit through the whole chain; every other picture
+  // (JPEG, 8-bit PNG) is 8-bit as before. Either can be written as 8-bit or, for PNG, 16-bit.
+  const bool want16 = !s.jpeg && s.png16;
   std::string derr;
-  auto raw = liteui_image::decodeFile(real, &derr);
-  if (!raw)
+  // The "original" the saved edits are stored against: upright (EXIF applied). A wide file gives only
+  // `original16` (no 8-bit copy is needed here). The editor opens files the same way (image_source.hpp),
+  // so a file the editor reads through its 8-bit fallback is exported the same way.
+  auto opened = image_source::openUpright(real, exifOrientationOf(real), /*want8=*/false, &derr);
+  if (!opened)
     return fail("couldn't open it: " + derr);
-  // The "original" the saved edits are stored against: upright (EXIF applied).
-  std::shared_ptr<CanvasImage> original =
-      orientImage(std::make_shared<CanvasImage>(std::move(*raw)),
-                  exifOrientationOf(real));
+  std::shared_ptr<CanvasImage> original8 = std::move(opened->image);
+  std::shared_ptr<Image16> original16 = std::move(opened->wide);
+  opened.reset(); // the originals below are handed over to the render, so nothing else may keep them alive
+  const bool wideSource = original16 != nullptr;
+  const int ow = wideSource ? original16->width : original8->width;
+  const int oh = wideSource ? original16->height : original8->height;
   if (gone())
     return cancel();
 
   AdjustmentSet adj; // LOCAL: the editor's set is never touched
-  adj.setOriginalSize(original->width, original->height);
+  adj.setOriginalSize(ow, oh);
   std::string eerr;
-  if (!exportLoadEdits(path, original->width, original->height, &adj, &eerr))
+  if (!exportLoadEdits(path, ow, oh, &adj, &eerr))
     return fail(eerr);
 
-  // The geometry worker's chain, from the untouched original.
-  std::shared_ptr<CanvasImage> oriented = orientImage(original, adj.orient());
-  std::shared_ptr<CanvasImage> rotated = oriented;
-  if (adj.angle() != 0.0f)
-  {
-    rotated = rotateArbitrary(*oriented, adj.angle(), adj.expand(), latest, gen);
-    if (!rotated)
-      return cancel();
-  }
-  std::shared_ptr<CanvasImage> source =
-      adj.crop().empty() ? rotated : cropImage(*rotated, adj.crop());
-  original.reset(); // keep the peak low: only `source` is needed from here
-  oriented.reset();
-  rotated.reset();
-  std::shared_ptr<CanvasImage> image =
-      renderWith(*source, adj.buildRenderParams(), latest, gen);
-  if (!image)
+  // The geometry worker's chain (orient -> straighten -> crop) from the untouched original, then the
+  // render: export_render.hpp. The original is handed over, so only what is still needed stays alive.
+  const ExportGeometry geo{adj.orient(), adj.angle(), adj.expand(), adj.crop()};
+  const RenderParams rp = adj.buildRenderParams();
+  ExportPixels px;
+  const bool rendered =
+      wideSource ? renderForExport(std::move(original16), geo, rp, want16, latest, gen, &px)
+                 : renderForExport(std::move(original8), geo, rp, want16, latest, gen, &px);
+  if (!rendered)
     return cancel();
-  source.reset();
 
-  const Dims size = fitLongEdge(image->width, image->height,
-                                s.resize ? s.longEdge : 0);
+  const Dims size = fitLongEdge(px.width(), px.height(), s.resize ? s.longEdge : 0);
   if (s.jpeg && !jpegSizeOk(size.w, size.h))
     return fail("too large for JPEG (turn on Resize, or export as PNG)");
-  const bool resized = size.w != image->width || size.h != image->height;
-  const std::shared_ptr<CanvasImage> out =
-      resized ? resizeToLongEdge(image, s.longEdge) : image;
+  px.resizeToLongEdge(s.resize ? s.longEdge : 0); // < 1 or already small enough: nothing changes
   if (gone())
     return cancel();
 
@@ -291,15 +291,16 @@ inline ExportOutcome exportPicture(const std::string &path,
     return fail("no free file name in the folder");
   std::string err;
   const bool wrote =
-      s.jpeg ? saveJpegFile(target, *out, s.quality, s.keepMetadata,
-                            s.removeGps && s.keepMetadata, real, &err)
-             : encodePngFile(target, *out, &err);
+      px.is16() ? encodePng16File(target, *px.img16, &err)
+      : s.jpeg  ? saveJpegFile(target, *px.img8, s.quality, s.keepMetadata,
+                               s.removeGps && s.keepMetadata, real, &err)
+                : encodePngFile(target, *px.img8, &err);
   if (!wrote)
     return fail(err.empty() ? "couldn't write " + baseName(target) : err);
   o.ok = true;
   o.outFile = target;
-  o.width = out->width;
-  o.height = out->height;
+  o.width = px.width();
+  o.height = px.height();
   return o;
 }
 

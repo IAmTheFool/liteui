@@ -4,8 +4,11 @@
 // (add -fsanitize=thread, or -fsanitize=address,undefined, for the sanitizer runs)
 #include "detail/detail_layer.hpp"
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -256,6 +259,205 @@ static void testThreads()
   cache().clear();
 }
 
+// ------------------------------------------------------------------ gains, arguments
+static void testGainsFromValues()
+{
+  using namespace detail_layer;
+  const Gains full = gainsFromValues(100, 100, 100);
+  CHECK(full.g[Texture] == kGain[Texture] && full.g[Clarity] == kGain[Clarity] && full.g[Sharpness] == kGain[Sharpness]);
+  // Out-of-range values clamp to the slider range.
+  CHECK(gainsFromValues(500, 500, 500) == full);
+  const Gains neg = gainsFromValues(-100, -100, -100);
+  CHECK(neg.g[Texture] == -kGain[Texture] && neg.g[Clarity] == -kGain[Clarity]);
+  CHECK(neg.g[Sharpness] == 0.0f); // sharpness is 0..100: negative means 0
+  CHECK(gainsFromValues(-500, -500, -500) == neg);
+  // NaN and infinity count as "untouched": the gains are always finite.
+  const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+  CHECK(gainsFromValues(nan, nan, nan) == Gains{});
+  CHECK(gainsFromValues(inf, -inf, inf) == Gains{});
+  CHECK(!gainsFromValues(nan, inf, -inf).any() && gainsFromValues(nan, inf, -inf).need() == 0);
+  // need() has one bit per layer, any() follows the gains.
+  CHECK(gainsFromValues(50, 0, 0).need() == (1u << Texture));
+  CHECK(gainsFromValues(0, 50, 0).need() == (1u << Clarity));
+  CHECK(gainsFromValues(0, 0, 50).need() == (1u << Sharpness));
+  CHECK(gainsFromValues(-1, 1, 1).need() == 7u);
+  CHECK(!Gains{}.any() && Gains{}.need() == 0 && gainsFromValues(0, 0, 1).any());
+}
+
+static void testInvalidArguments()
+{
+  using namespace detail_layer;
+  cache().clear();
+  const Img img = makeImg(8, 8, pattern);
+  const uint8_t *none = nullptr;
+  Plane p;
+  CHECK(!blurLuma(none, 8, 8, 1, p, nullptr, 0));
+  CHECK(!blurLuma(img.data(), 0, 8, 1, p, nullptr, 0));
+  CHECK(!blurLuma(img.data(), 8, 0, 1, p, nullptr, 0));
+  CHECK(!blurLuma(img.data(), 8, 8, 0, p, nullptr, 0));
+  CHECK(!blurLuma(img.data(), 8, 8, -3, p, nullptr, 0));
+  // The cache refuses them too, and caches nothing.
+  CHECK(!cache().get(none, 8, 8, Texture, nullptr, 0));
+  CHECK(!cache().get(img.data(), 0, 8, Texture, nullptr, 0));
+  CHECK(!cache().get(img.data(), 8, 0, Texture, nullptr, 0));
+  CHECK(!cache().get(img.data(), 8, 8, -1, nullptr, 0));
+  CHECK(!cache().get(img.data(), 8, 8, kKindCount, nullptr, 0));
+  CHECK(cache().size() == 0);
+  // acquire(): no pixels or no size is "nothing to do" (true, planes left null), not a failure.
+  Planes pl;
+  CHECK(acquire(pl, none, 8, 8, 7u, nullptr, 0));
+  CHECK(acquire(pl, img.data(), 0, 8, 7u, nullptr, 0));
+  CHECK(acquire(pl, img.data(), 8, -1, 7u, nullptr, 0));
+  CHECK(!pl.p[0] && !pl.p[1] && !pl.p[2] && cache().size() == 0);
+  // need = 0 builds nothing.
+  CHECK(acquire(pl, img.data(), 8, 8, 0u, nullptr, 0) && cache().size() == 0);
+  cache().clear();
+}
+
+// ------------------------------------------------------------- applying in pieces
+static void testAddPixelsPiecesMatchWhole()
+{
+  using namespace detail_layer;
+  cache().clear();
+  const int w = 61, h = 47;
+  const size_t total = static_cast<size_t>(w) * h;
+  const Img src = makeImg(w, h, pattern);
+  const Gains g = gainsFromValues(40, -30, 50);
+  Planes pl;
+  CHECK(acquire(pl, src.data(), w, h, g.need(), nullptr, 0));
+  const size_t steps[] = {1, 60, 61, 300, 7, 1000}; // pieces that start and end mid-row
+
+  Img whole = src, pieces = src;
+  addPixels(pl, g, src.data(), whole.data(), total, 0);
+  std::vector<float> wholeF(src.begin(), src.end()), piecesF = wholeF;
+  addPixels(pl, g, src.data(), wholeF.data(), total, 0);
+  size_t pos = 0, si = 0;
+  while (pos < total)
+  {
+    const size_t n = std::min(steps[si++ % 6], total - pos);
+    addPixels(pl, g, src.data() + pos * 4, pieces.data() + pos * 4, n, pos);
+    addPixels(pl, g, src.data() + pos * 4, piecesF.data() + pos * 4, n, pos);
+    pos += n;
+  }
+  CHECK(whole != src); // the effect did something
+  CHECK(whole == pieces && wholeF == piecesF);
+  // The bytes are the rounded floats (and alpha is never touched).
+  for (size_t i = 0; i < whole.size(); ++i)
+  {
+    if (i % 4 == 3)
+      CHECK(whole[i] == 255 && wholeF[i] == 255.0f);
+    else
+      CHECK(whole[i] == static_cast<uint8_t>(wholeF[i] + 0.5f));
+  }
+
+  // A plane that doesn't cover [first, first + count) is skipped, not read out of range.
+  Img guard = src;
+  addPixels(pl, g, src.data(), guard.data(), 10, total - 3); // runs 7 pixels past the plane
+  addPixels(pl, g, src.data(), guard.data(), 1, total + 5);  // starts past the plane
+  CHECK(guard == src);
+  cache().clear();
+}
+
+// -------------------------------------------------------------------- Clarity's limit
+static void testClaritySoftLimit()
+{
+  using namespace detail_layer;
+  cache().clear();
+  // A big step: the detail at the edge is far beyond kClarityLimit, so the soft limit matters.
+  const int w = 80, h = 8;
+  const Img src = makeImg(w, h, [](int x, int, int) -> uint8_t
+                          { return x < 40 ? 40 : 230; });
+  const Gains g = gainsFromValues(0, 100, 0);
+  Planes pl;
+  CHECK(acquire(pl, src.data(), w, h, g.need(), nullptr, 0));
+  std::vector<float> dst(src.begin(), src.end());
+  addPixels(pl, g, src.data(), dst.data(), static_cast<size_t>(w) * h, 0);
+  const Plane &blur = *pl.p[Clarity];
+  double maxD = 0;
+  for (int x = 30; x < 50; ++x)
+  {
+    const size_t px = static_cast<size_t>(4) * w + x; // row 4
+    const uint8_t *s = &src[px * 4];
+    const int l = lumaOf(s);
+    const double d = (static_cast<double>(l << 4) - blur[px]) / 16.0;
+    maxD = std::max(maxD, std::fabs(d));
+    // The formula: k = gain * midWeight * d / (1 + |d| / limit), added to every channel, clamped.
+    const double k = g.g[Clarity] * midWeights()[l] * d / (1.0 + std::fabs(d) / kClarityLimit);
+    for (int c = 0; c < 3; ++c)
+    {
+      const double want = std::clamp(static_cast<double>(s[c]) + k, 0.0, 255.0);
+      CHECK(std::fabs(dst[px * 4 + static_cast<size_t>(c)] - want) < 1e-3);
+    }
+  }
+  CHECK(maxD > kClarityLimit); // the limit really was in play on this edge
+  // ...and it bounds the change: never more than gain * limit levels.
+  for (size_t i = 0; i < dst.size(); ++i)
+    if (i % 4 != 3)
+      CHECK(std::fabs(dst[i] - static_cast<float>(src[i])) <= g.g[Clarity] * kClarityLimit + 1e-3);
+  cache().clear();
+}
+
+// -------------------------------------------------------------- 16-bit source blur
+// The naive reference for a 16-bit picture: the plane starts as the unrounded luma in 1/64 level
+// (rounded once to a plane unit), then the same 3 + 3 box passes with replicated edges.
+static std::vector<int> refBlur16(const std::vector<uint16_t> &img, int w, int h, int r)
+{
+  std::vector<int> a(static_cast<size_t>(w) * h), b(a.size());
+  for (size_t i = 0; i < a.size(); ++i)
+    a[i] = static_cast<int>(detail_layer::SrcTraits<uint16_t>::lumaFix(&img[i * 4]) + 0.5f);
+  const int n = 2 * r + 1;
+  auto pass = [&](bool horiz)
+  {
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+      {
+        long sum = 0;
+        for (int k = -r; k <= r; ++k)
+        {
+          const int xx = horiz ? std::clamp(x + k, 0, w - 1) : x;
+          const int yy = horiz ? y : std::clamp(y + k, 0, h - 1);
+          sum += a[static_cast<size_t>(yy) * w + xx];
+        }
+        b[static_cast<size_t>(y) * w + x] = static_cast<int>(std::lround(static_cast<double>(sum) / n));
+      }
+    a.swap(b);
+  };
+  for (int i = 0; i < 3; ++i)
+    pass(true);
+  for (int i = 0; i < 3; ++i)
+    pass(false);
+  return a;
+}
+
+static void testBlurMatchesReference16()
+{
+  const int w = 61, h = 47;
+  std::vector<uint16_t> img(static_cast<size_t>(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+      for (int c = 0; c < 4; ++c)
+        img[(static_cast<size_t>(y) * w + x) * 4 + static_cast<size_t>(c)] =
+            c == 3 ? 65535 : static_cast<uint16_t>(pattern(x, y, c) * 257 + (x * 7 + y * 3 + c) % 200);
+  for (int r : {1, 2, 5, 30, 80})
+  {
+    detail_layer::Plane p;
+    CHECK(detail_layer::blurLuma(img.data(), w, h, r, p, nullptr, 0));
+    const auto ref = refBlur16(img, w, h, r);
+    int maxDiff = 0;
+    for (size_t i = 0; i < ref.size(); ++i)
+      maxDiff = std::max(maxDiff, std::abs(static_cast<int>(p[i]) - ref[i]));
+    if (maxDiff > 1)
+      std::printf("  16-bit radius %d: max diff %d\n", r, maxDiff);
+    CHECK(maxDiff <= 1); // one plane unit = 1/64 level
+  }
+  // A flat 16-bit picture stays exactly flat (replicated edges), at its own precision.
+  std::vector<uint16_t> flat(static_cast<size_t>(50) * 40 * 4, 33333);
+  detail_layer::Plane p;
+  CHECK(detail_layer::blurLuma(flat.data(), 50, 40, 9, p, nullptr, 0));
+  for (uint16_t v : p)
+    CHECK(v == p[0]);
+}
+
 int main()
 {
   testBlurMatchesReference();
@@ -266,6 +468,11 @@ int main()
   testAddPixels();
   testClarityLeavesEndsAlone();
   testThreads();
+  testGainsFromValues();
+  testInvalidArguments();
+  testAddPixelsPiecesMatchWhole();
+  testClaritySoftLimit();
+  testBlurMatchesReference16();
   std::printf(gFailures ? "%d FAILED\n" : "all passed\n", gFailures);
   return gFailures ? 1 : 0;
 }

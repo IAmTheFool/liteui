@@ -6,14 +6,17 @@
 // two facts: whether it holds real edits (the filmstrip's dot) and the
 // picture's rating, flag and color label. A virtual copy's path (see
 // virtual_copy.hpp) is read for its sidecar only: it shows the same picture as
-// its original, so nothing is decoded for it (Result::thumbSkipped). A different kind of worker from LatestWorker: it is a FIFO queue
-// with no generations - setQueue() replaces what is still to do, the item in
-// flight finishes, and results accumulate until collect() drains them.
+// its original, so nothing is decoded for it (Result::thumbSkipped).
+//
+// A different kind of worker from LatestWorker: it is a FIFO queue with no
+// generations - setQueue() replaces what is still to do, the item in flight
+// finishes, and results accumulate until collect() drains them.
 #pragma once
 #include "liteui.hpp"
 #include "core/geometry.hpp"      // Orient
 #include "core/raster_ops.hpp"    // orientImage
 #include "io/file_utils.hpp"      // fsPath
+#include "io/image_source.hpp"    // decodeForThumb
 #include "io/photo_meta.hpp"     // PhotoMeta
 #include "io/sidecar.hpp"         // sidecarFileOf, sidecarScan
 #include "io/virtual_copy.hpp"    // vcImageOf, vcCopyOf
@@ -188,7 +191,7 @@ private:
       const std::string real = vcImageOf(path); // the picture file behind a copy
       if (vcCopyOf(path) > 0)
         r.thumbSkipped = true; // only its sidecar is read, below
-      else if (auto img = liteui_image::decodeFile(real, &err))
+      else if (auto img = image_source::decodeForThumb(real, &err))
       {
         const Orient o = orientOf_(real); // upright, like the editor
         if (o.identity())

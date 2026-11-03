@@ -2,6 +2,9 @@
 #include "core/pixel_math.hpp"
 #include "check.hpp"
 
+#include <cstdint>
+#include <limits>
+
 static void testSmoothStep()
 {
   CHECK(smoothStep01(0.2f, 0.8f, -1.0f) == 0.0f); // below: 0
@@ -24,6 +27,10 @@ static void testSmoothStep()
   CHECK(smoothStep01(0.0f, 1.0f, 0.95f) > 0.99f);
   // Works on any interval, not just [0, 1].
   CHECK_NEAR(smoothStep01(10.0f, 30.0f, 20.0f), 0.5f, 1e-6);
+  // Non-finite input: NaN maps to 0, infinities saturate.
+  CHECK(smoothStep01(0.0f, 1.0f, std::numeric_limits<float>::quiet_NaN()) == 0.0f);
+  CHECK(smoothStep01(0.0f, 1.0f, std::numeric_limits<float>::infinity()) == 1.0f);
+  CHECK(smoothStep01(0.0f, 1.0f, -std::numeric_limits<float>::infinity()) == 0.0f);
 }
 
 static void testToU8()
@@ -37,6 +44,38 @@ static void testToU8()
   CHECK(toU8Clamped(127.4f) == 127); // rounds to nearest...
   CHECK(toU8Clamped(127.5f) == 128); // ...halves go up
   CHECK(toU8Clamped(254.5f) == 255);
+  // Non-finite input: NaN -> 0, infinities saturate.
+  CHECK(toU8Clamped(std::numeric_limits<float>::quiet_NaN()) == 0);
+  CHECK(toU8Clamped(std::numeric_limits<float>::infinity()) == 255);
+  CHECK(toU8Clamped(-std::numeric_limits<float>::infinity()) == 0);
+}
+
+static void testU16()
+{
+  // An 8-bit value k widened to k * 257 is exactly k levels again, and back.
+  for (int k = 0; k <= 255; ++k)
+  {
+    CHECK(toU16Clamped(static_cast<float>(k)) == k * 257);
+    CHECK(u16ToLevels(static_cast<uint16_t>(k * 257)) == static_cast<float>(k));
+  }
+  // Every 16-bit sample survives levels -> 16-bit unchanged.
+  for (int v = 0; v <= 65535; ++v)
+    CHECK(toU16Clamped(u16ToLevels(static_cast<uint16_t>(v))) == v);
+  // Endpoints and clamping.
+  CHECK(u16ToLevels(0) == 0.0f);
+  CHECK(u16ToLevels(65535) == 255.0f);
+  CHECK(toU16Clamped(255.0f) == 65535);
+  CHECK(toU16Clamped(-1.0f) == 0);
+  CHECK(toU16Clamped(-0.001f) == 0);
+  CHECK(toU16Clamped(255.4f) == 65535);
+  CHECK(toU16Clamped(1e9f) == 65535);
+  // Rounds to nearest: just under / over half a 16-bit step (1/257 level).
+  CHECK(toU16Clamped(100.0f + 0.4f / kU16PerLevel) == 100 * 257);
+  CHECK(toU16Clamped(100.0f + 0.6f / kU16PerLevel) == 100 * 257 + 1);
+  // Non-finite input: NaN -> 0, infinities saturate (same rule as toU8Clamped).
+  CHECK(toU16Clamped(std::numeric_limits<float>::quiet_NaN()) == 0);
+  CHECK(toU16Clamped(std::numeric_limits<float>::infinity()) == 65535);
+  CHECK(toU16Clamped(-std::numeric_limits<float>::infinity()) == 0);
 }
 
 static void testDegToRad()
@@ -49,6 +88,7 @@ int main()
 {
   testSmoothStep();
   testToU8();
+  testU16();
   testDegToRad();
   return finish();
 }

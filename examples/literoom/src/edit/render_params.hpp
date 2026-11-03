@@ -6,12 +6,14 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "color/color_pass.hpp"
 #include "color/curves.hpp"
 #include "core/adjustments.hpp"
 #include "core/geometry.hpp"
+#include "core/tone_table.hpp"
 #include "detail/film_fx.hpp"
 #include "detail/neighbor_fx.hpp"
 #include "mask/mask.hpp"
@@ -52,7 +54,8 @@ struct MaskPass
   bool invert = false;
   float amount = 1.0f;                            // 0..1, multiplies the weight
   bool tone = false;                              // any Tone slider or curve non-zero (luts is valid)
-  std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
+  std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables (the byte pipeline's)
+  std::shared_ptr<const ToneSet> toneF;           // the same, as float tables (the float pipeline's); set with `tone`
   ColorPass color;
   neighbor_fx::Gains fx; // this mask's Texture / Clarity / Sharpness (+ Dehaze, Noise, Blur)
 };
@@ -116,6 +119,7 @@ inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
       continue; // a mask with no adjustments does nothing
     if (mp.tone)
     {
+      mp.toneF = makeToneSet(m.adj, m.curves);
       const auto base = toneLutFromValues(m.adj, useMaster ? &masterCurve : nullptr);
       for (size_t c = 0; c < 3; ++c)
       {
@@ -143,7 +147,8 @@ inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
 // worker never touches the AdjustmentSet, which the UI thread keeps mutating.
 struct RenderParams
 {
-  std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables
+  std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables (the byte pipeline's, renderWithBytes)
+  std::shared_ptr<const ToneSet> toneF;           // the same as float tables (renderWith); null = use `luts`
   ColorPass color;                                // float pass, after the LUTs
   neighbor_fx::Gains fx;                          // Texture / Clarity / Sharpness / Dehaze / Noise / Blur (neighbor_fx.hpp), after the color pass
   std::vector<MaskPass> masks;                    // local adjustments, applied after all of it

@@ -5,6 +5,7 @@
 
 #include "detail/neighbor_fx.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -12,14 +13,14 @@
 using namespace neighbor_fx;
 
 static int gFailures = 0;
-#define CHECK(cond)                                                 \
-  do                                                                \
-  {                                                                 \
-    if (!(cond))                                                    \
-    {                                                               \
-      std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);   \
-      ++gFailures;                                                  \
-    }                                                               \
+#define CHECK(cond)                                               \
+  do                                                              \
+  {                                                               \
+    if (!(cond))                                                  \
+    {                                                             \
+      std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); \
+      ++gFailures;                                                \
+    }                                                             \
   } while (0)
 
 using Img = std::vector<uint8_t>;
@@ -139,7 +140,7 @@ static void testLumaNoiseReduction()
     for (int x = 0; x < w; ++x)
     {
       const int base = x < w / 2 ? 60 : 180; // a hard edge in the middle
-      const int n = r.next(17) - 8;           // luminance noise, +/-8
+      const int n = r.next(17) - 8;          // luminance noise, +/-8
       for (int c = 0; c < 3; ++c)
         src[(static_cast<size_t>(y) * w + x) * 4 + c] = static_cast<uint8_t>(base + n);
       src[(static_cast<size_t>(y) * w + x) * 4 + 3] = 255;
@@ -299,7 +300,8 @@ static void testBlur()
   }
   CHECK(prev < s0 * 0.1); // slider 100: nearly flat
   // Flat picture: untouched. Slider 0: untouched.
-  const Img flat = makeImg(50, 40, [](int, int, int) -> uint8_t { return 90; });
+  const Img flat = makeImg(50, 40, [](int, int, int) -> uint8_t
+                           { return 90; });
   CHECK(run(flat, 50, 40, gainsFromValues(0, 0, 0, 0, 0, 0, 100)) == flat);
   CHECK(run(src, w, h, gainsFromValues(0, 0, 0, 0, 0, 0, 0)) == src);
   // The 3 stored levels join smoothly: just below and above a level boundary
@@ -431,6 +433,213 @@ static void testThreads()
   clearCaches();
 }
 
+// A busy test picture: gradients, blocks and noise, so every effect has something to do.
+static Img scene(int w, int h, uint32_t seed)
+{
+  Rng r(seed);
+  Img p(static_cast<size_t>(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+    {
+      uint8_t *q = &p[(static_cast<size_t>(y) * w + x) * 4];
+      const bool blk = ((x / 17) + (y / 13)) % 2 == 0;
+      q[0] = static_cast<uint8_t>(std::min(255, (x * 255) / std::max(1, w - 1) / 2 + (blk ? 60 : 0) + r.next(24)));
+      q[1] = static_cast<uint8_t>(std::min(255, (y * 255) / std::max(1, h - 1) / 2 + (blk ? 0 : 70) + r.next(24)));
+      q[2] = static_cast<uint8_t>(60 + r.next(120));
+      q[3] = 255;
+    }
+  return p;
+}
+
+// Random slider values: mode 0 = every effect on, 1 = detail layers + negative dehaze (needs no
+// map), 2 = one effect at a time.
+static Gains randomGains(Rng &r, int mode)
+{
+  auto v = [&](int lo, int hi)
+  { return static_cast<float>(lo + r.next(hi - lo + 1)); };
+  float s[7] = {0, 0, 0, 0, 0, 0, 0}; // texture, clarity, sharpness, dehaze, nr luma, nr color, blur
+  if (mode == 0)
+  {
+    s[0] = v(-100, 100);
+    s[1] = v(-100, 100);
+    for (int i = 2; i < 7; ++i)
+      s[i] = v(10, 100);
+  }
+  else if (mode == 1)
+  {
+    s[0] = v(-100, 100);
+    s[1] = v(-100, 100);
+    s[2] = v(10, 100);
+    s[3] = v(-100, -10);
+  }
+  else
+    s[static_cast<size_t>(r.next(7))] = v(30, 100);
+  return gainsFromValues(s[0], s[1], s[2], s[3], s[4], s[5], s[6]);
+}
+
+// The float instantiation of apply() must agree with the byte one to within the rounding the byte
+// passes do after every pass, leave alpha alone, stay inside 0..255, and really change the picture.
+static void testFloatAgreesWithBytes()
+{
+  uint32_t seed = 100;
+  for (int mode = 0; mode < 3; ++mode)
+    for (const auto &sz : {std::pair{37, 29}, std::pair{160, 120}, std::pair{301, 97}})
+      for (int rep = 0; rep < (mode == 2 ? 6 : 2); ++rep, ++seed)
+      {
+        const int w = sz.first, h = sz.second;
+        Rng r(seed);
+        const Img src = scene(w, h, seed);
+        const Gains g = randomGains(r, mode);
+        clearCaches();
+        Planes pl;
+        CHECK(acquire(pl, src.data(), w, h, g.need(), nullptr, 0));
+        // The picture after "tone and color": the source nudged, so dst differs from src.
+        Img bytes = src;
+        for (size_t i = 0; i < bytes.size(); i += 4)
+          for (int c = 0; c < 3; ++c)
+            bytes[i + c] = static_cast<uint8_t>(std::min(255, bytes[i + c] + 9));
+        const Img nudged = bytes;
+        std::vector<float> fl(bytes.begin(), bytes.end());
+        const size_t total = static_cast<size_t>(w) * h;
+        apply(pl, g, src.data(), bytes.data(), total, 0, w);
+        apply(pl, g, src.data(), fl.data(), total, 0, w);
+        int worst = 0;
+        bool changed = false;
+        for (size_t i = 0; i < bytes.size(); ++i)
+        {
+          if (i % 4 == 3)
+          {
+            CHECK(fl[i] == 255.0f && bytes[i] == 255); // alpha untouched
+            continue;
+          }
+          CHECK(fl[i] >= 0.0f && fl[i] <= 255.0f);
+          worst = std::max(worst, static_cast<int>(std::lround(std::fabs(fl[i] - static_cast<float>(bytes[i])))));
+          changed |= bytes[i] != nudged[i];
+        }
+        CHECK(worst <= 3); // at most the rounding of five byte passes
+        CHECK(changed);    // the effects really did something
+      }
+  clearCaches();
+}
+
+// Pieces must give exactly the whole-picture result for floats too (the render loop and the masks
+// work in row blocks and spans).
+static void testFloatPartialRangesMatchWhole()
+{
+  const int w = 97, h = 61;
+  Rng r(31);
+  const Img src = scene(w, h, 31);
+  const Gains g = gainsFromValues(30, 20, 30, 60, 40, 40, 70);
+  clearCaches();
+  Planes pl;
+  CHECK(acquire(pl, src.data(), w, h, g.need(), nullptr, 0));
+  std::vector<float> whole(src.begin(), src.end()), pieces = whole;
+  const size_t total = static_cast<size_t>(w) * h;
+  apply(pl, g, src.data(), whole.data(), total, 0, w);
+  size_t pos = 0, si = 0;
+  const size_t steps[] = {1, 96, 97, 300, 7, 1000};
+  while (pos < total)
+  {
+    const size_t n = std::min(steps[si++ % 6], total - pos);
+    apply(pl, g, src.data() + pos * 4, pieces.data() + pos * 4, n, pos, w);
+    pos += n;
+  }
+  CHECK(whole == pieces);
+  clearCaches();
+}
+
+// The float instantiation never rounds, but it does clamp to 0..255.
+static void testFloatKeepsPrecisionAndClamps()
+{
+  Planes none;
+  // No rounding: a dehaze that adds haze to 100.0 gives the exact blend, which no byte could hold.
+  const Gains hz = gainsFromValues(0, 0, 0, -50.0f);
+  const uint8_t src1[4] = {100, 100, 100, 255};
+  float px[4] = {100.0f, 100.0f, 100.0f, 255.0f};
+  apply(none, hz, src1, px, 1, 0, 1);
+  const float expect = 100.0f + (kHazeLight - 100.0f) * (kHazeAdd * 0.5f);
+  CHECK(std::fabs(px[0] - expect) < 1e-4f);
+  CHECK(px[0] != std::floor(px[0]));
+  uint8_t b[4] = {100, 100, 100, 255};
+  apply(none, hz, src1, b, 1, 0, 1);
+  CHECK(b[0] == static_cast<uint8_t>(px[0] + 0.5f)); // the byte is the rounded float
+
+  // Clamping: Sharpness 100 on a hard 20 | 240 step overshoots on both sides of the edge. The
+  // float result must stop at exactly 0 and 255 (it is not rounded, but it is clamped).
+  const int w = 80, h = 8;
+  Img step(static_cast<size_t>(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+    {
+      uint8_t *q = &step[(static_cast<size_t>(y) * w + x) * 4];
+      q[0] = q[1] = q[2] = x < 40 ? 20 : 240;
+      q[3] = 255;
+    }
+  const Gains sh = gainsFromValues(0, 0, 100);
+  clearCaches();
+  Planes pl;
+  CHECK(acquire(pl, step.data(), w, h, sh.need(), nullptr, 0));
+  std::vector<float> f(step.begin(), step.end());
+  apply(pl, sh, step.data(), f.data(), static_cast<size_t>(w) * h, 0, w);
+  float lo = 1e9f, hi = -1e9f;
+  for (size_t i = 0; i < f.size(); ++i)
+    if (i % 4 != 3)
+    {
+      lo = std::min(lo, f[i]);
+      hi = std::max(hi, f[i]);
+    }
+  CHECK(lo == 0.0f && hi == 255.0f); // it overshot, and was clamped to the ends
+  CHECK(f[(4 * w + 39) * 4] == 0.0f && f[(4 * w + 40) * 4] == 255.0f);
+  // Far from the edge nothing moved.
+  CHECK(f[(4 * w + 2) * 4] == 20.0f && f[(4 * w + 77) * 4] == 240.0f);
+  clearCaches();
+}
+
+// Golden fingerprints: fixed-seed pictures and slider values, the byte results hashed. They pin the
+// exact bytes of every effect and combination, so a change in the output can't slip in unnoticed.
+// Changing an effect on purpose changes these: re-record them then (set an entry to 0, run the
+// test, paste the printed value). The values depend on float behavior, so they are valid for the
+// compiler and flags they were recorded with (no -ffast-math; FMA contraction can change bytes).
+static std::uint64_t fnv1a(std::uint64_t h, const Img &v)
+{
+  for (uint8_t b : v)
+  {
+    h ^= b;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+static void testGoldenFingerprints()
+{
+  constexpr int kGroups = 8, kCasesPerGroup = 6;
+  // Recorded from MSVC Release (g++ gives the same values). To re-record after an intentional
+  // change: set the entry to 0, run the test, and paste the printed value.
+  static const std::uint64_t kGolden[kGroups] = {
+      0x082ed78151662a80ull, 0x269553155294d1d1ull, 0x55ebe4a767224a4bull, 0x8621ebfddbec2a9aull,
+      0xca9543ca49b2a0fbull, 0xacdad158902bfbadull, 0x18b4c63397cdf56bull, 0x9e17f4d699ae4714ull};
+  const std::pair<int, int> sizes[] = {{37, 29}, {160, 120}, {301, 97}, {64, 64}, {5, 70}, {97, 61}};
+  Rng r(2024);
+  for (int grp = 0; grp < kGroups; ++grp)
+  {
+    std::uint64_t h = 14695981039346656037ull;
+    for (int k = 0; k < kCasesPerGroup; ++k)
+    {
+      const auto sz = sizes[static_cast<size_t>(r.next(6))];
+      const Img src = scene(sz.first, sz.second, static_cast<uint32_t>(1000 + grp * 16 + k));
+      const Gains g = randomGains(r, (grp + k) % 3);
+      h = fnv1a(h, run(src, sz.first, sz.second, g));
+    }
+    if (kGolden[grp] == 0)
+    {
+      std::printf("GOLDEN group %d: 0x%016llxull\n", grp, static_cast<unsigned long long>(h));
+      CHECK(!"golden fingerprint not recorded yet");
+    }
+    else
+      CHECK(h == kGolden[grp]);
+  }
+  clearCaches();
+}
+
 int main()
 {
   testZeroGainsDoNothing();
@@ -444,6 +653,10 @@ int main()
   testTinyAndOddSizes();
   testPartialRangesMatchWhole();
   testThreads();
+  testFloatAgreesWithBytes();
+  testFloatPartialRangesMatchWhole();
+  testFloatKeepsPrecisionAndClamps();
+  testGoldenFingerprints();
   std::printf(gFailures ? "%d FAILED\n" : "all passed\n", gFailures);
   return gFailures ? 1 : 0;
 }

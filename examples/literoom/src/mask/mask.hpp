@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -149,6 +150,26 @@ inline void maskRowWeights(const MaskEval &e, int y, int x0, int x1,
              { ev.rowWeights(y, x0, x1, out, pix); }, e);
 }
 
+// The same from a row of FLOAT levels (0..255, 4 per pixel), as the float pipeline holds it. The two
+// masks that read the picture (Luminosity, Color Range) use their rowWeightsF, so a 16-bit picture is
+// not rounded to bytes before it is selected; every other kind ignores the pixels and is called as
+// before. `pix` may be null for a mask that doesn't read the picture.
+inline void maskRowWeightsF(const MaskEval &e, int y, int x0, int x1,
+                            float *out, const float *pix)
+{
+  std::visit(
+      [&](const auto &ev)
+      {
+        using E = std::decay_t<decltype(ev)>;
+        if constexpr (std::is_same_v<E, LuminosityEval> ||
+                      std::is_same_v<E, ColorRangeEval>)
+          ev.rowWeightsF(y, x0, x1, out, pix);
+        else
+          ev.rowWeights(y, x0, x1, out, static_cast<const uint8_t *>(nullptr));
+      },
+      e);
+}
+
 // ---- Combining shapes ----
 // A mask is made of one or more parts. Part 0 starts the mask; every later
 // part is folded into what is there so far, left to right:
@@ -247,6 +268,25 @@ struct MaskComposite
   void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix,
                   float *tmp) const
   {
+    fold(y, x0, x1, out, tmp,
+         [&](const MaskEval &e, float *dst)
+         { maskRowWeights(e, y, x0, x1, dst, pix); });
+  }
+
+  // The same, with the row as float levels (see maskRowWeightsF): what the float pipeline uses.
+  void rowWeightsF(int y, int x0, int x1, float *out, const float *pix,
+                   float *tmp) const
+  {
+    fold(y, x0, x1, out, tmp,
+         [&](const MaskEval &e, float *dst)
+         { maskRowWeightsF(e, y, x0, x1, dst, pix); });
+  }
+
+private:
+  // The fold itself; `weigh(eval, dst)` fills dst with one part's weights for the row.
+  template <class Weigh>
+  void fold(int /*y*/, int x0, int x1, float *out, float *tmp, Weigh &&weigh) const
+  {
     const int len = x1 - x0;
     if (evals.empty())
     {
@@ -254,10 +294,10 @@ struct MaskComposite
         out[i] = 0.0f;
       return;
     }
-    maskRowWeights(evals[0], y, x0, x1, out, pix);
+    weigh(evals[0], out);
     for (size_t k = 1; k < evals.size(); ++k)
     {
-      maskRowWeights(evals[k], y, x0, x1, tmp, pix);
+      weigh(evals[k], tmp);
       switch (ops[k])
       {
       case MaskOp::Add:

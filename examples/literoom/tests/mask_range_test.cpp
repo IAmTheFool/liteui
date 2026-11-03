@@ -1,10 +1,21 @@
+// mask_range_test.cpp - Luminosity range and Color Range masks (mask/mask_range.hpp), header only.
+// Covers both the byte path (rowWeights) and the float-level path (rowWeightsF) that the 16-bit
+// pipeline uses.
 // Build: g++ -std=c++20 -I.. mask_range_test.cpp -o mask_range_test && ./mask_range_test
-#include "mask/mask_range.hpp"
 #include "check.hpp"
+#include "mask/mask_range.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <initializer_list>
+#include <random>
+#include <utility>
 #include <vector>
 
 using Px = std::vector<uint8_t>;
+
+// ---------------------------------------------------------------- helpers
 
 static std::vector<float> weights(const LuminosityEval &e, const Px &rgba)
 {
@@ -16,6 +27,13 @@ static std::vector<float> weights(const ColorRangeEval &e, const Px &rgba)
 {
   std::vector<float> w(rgba.size() / 4);
   e.rowWeights(0, 0, static_cast<int>(w.size()), w.data(), rgba.data());
+  return w;
+}
+static std::vector<float> weightsF(const LuminosityEval &e, const std::vector<float> &px)
+{
+  const int n = static_cast<int>(px.size() / 4);
+  std::vector<float> w(static_cast<size_t>(n));
+  e.rowWeightsF(0, 0, n, w.data(), px.data());
   return w;
 }
 static Px grays(std::initializer_list<int> v)
@@ -30,6 +48,13 @@ static Px grays(std::initializer_list<int> v)
   }
   return p;
 }
+static float smooth01(float x)
+{
+  x = std::clamp(x, 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+// ---------------------------------------------------------------- Luminosity (byte path)
 
 static void testLuminosityHardRange()
 {
@@ -141,6 +166,125 @@ static void testLuminosityRowWeights()
   CHECK(part[0] == 255 && part[1] == 77);
 }
 
+// ---------------------------------------------------------------- Luminosity (float path)
+
+static void testFineTable()
+{
+  LuminosityShape s;
+  s.lo = 0.2f;
+  s.hi = 0.6f;
+  s.feather = 0.4f;
+  const LuminosityEval e = s.prepare(1, 1);
+  CHECK(e.fine && e.fine->size() == static_cast<size_t>(kLumFineSize));
+  CHECK(kLumFineSize == 255 * kLumSub + 1);
+  // The fine table agrees with the byte table at every whole level.
+  for (int k = 0; k < 256; ++k)
+    CHECK(e.lut[static_cast<size_t>(k)] == (*e.fine)[static_cast<size_t>(k * kLumSub)]);
+  // A default-constructed eval has no fine table.
+  CHECK(!LuminosityEval{}.fine);
+}
+
+static void testWholeLevelGraysMatchTheByteVersionExactly()
+{
+  for (const float feather : {0.0f, 0.2f, 0.4f, 1.0f})
+  {
+    LuminosityShape s;
+    s.lo = 0.2f;
+    s.hi = 0.6f;
+    s.feather = feather;
+    const LuminosityEval e = s.prepare(1, 1);
+    Px pb(256 * 4);
+    std::vector<float> pf(256 * 4);
+    for (int k = 0; k < 256; ++k)
+      for (int c = 0; c < 4; ++c)
+      {
+        const size_t i = static_cast<size_t>(k * 4 + c);
+        pb[i] = static_cast<uint8_t>(c == 3 ? 255 : k);
+        pf[i] = static_cast<float>(c == 3 ? 255 : k);
+      }
+    std::vector<float> wb(256);
+    e.rowWeights(0, 0, 256, wb.data(), pb.data());
+    const std::vector<float> wf = weightsF(e, pf);
+    for (int k = 0; k < 256; ++k)
+      CHECK(wb[static_cast<size_t>(k)] == wf[static_cast<size_t>(k)]);
+  }
+}
+
+static void testLumaIsNotRoundedToAByte()
+{
+  // A soft mask: between two whole levels the weight lies between the two level weights (it is
+  // interpolated), where the byte version would give one of the two.
+  LuminosityShape s;
+  s.lo = 0.0f;
+  s.hi = 0.3f;
+  s.feather = 1.0f;
+  const LuminosityEval e = s.prepare(1, 1);
+  const float lv = 120.0f;
+  const std::vector<float> px = {lv + 0.5f, lv + 0.5f, lv + 0.5f, 255.0f};
+  const float w = weightsF(e, px)[0];
+  const float w0 = e.lut[120], w1 = e.lut[121];
+  CHECK(w >= std::min(w0, w1) - 1e-6f && w <= std::max(w0, w1) + 1e-6f);
+  CHECK(w0 != w1); // the test only means something where the table is not flat
+  // A hard edge is placed by the real luma: lo = 0.2 is 51 levels. Luma 50.9 is outside, 51.0 inside
+  // (a byte version would round 50.9 up to 51 and select it).
+  LuminosityShape hard;
+  hard.lo = 0.2f;
+  hard.hi = 1.0f;
+  hard.feather = 0.0f;
+  const LuminosityEval eh = hard.prepare(1, 1);
+  CHECK(weightsF(eh, {50.9f, 50.9f, 50.9f, 255.0f})[0] == 0.0f);
+  CHECK(weightsF(eh, {51.0f, 51.0f, 51.0f, 255.0f})[0] == 1.0f);
+}
+
+static void testSixteenBitLevelsGiveTheByteResult()
+{
+  // A 16-bit sample k * 257 is exactly k levels (u16ToLevels), so a picture that started as 8-bit
+  // selects the same pixels through the float path as it did through the byte path.
+  LuminosityShape s;
+  s.lo = 0.1f;
+  s.hi = 0.5f;
+  s.feather = 0.6f;
+  const LuminosityEval e = s.prepare(1, 1);
+  Px pb(256 * 4);
+  std::vector<float> pf(256 * 4);
+  for (int k = 0; k < 256; ++k)
+    for (int c = 0; c < 4; ++c)
+    {
+      const size_t i = static_cast<size_t>(k * 4 + c);
+      const int v = c == 3 ? 255 : k;
+      pb[i] = static_cast<uint8_t>(v);
+      pf[i] = u16ToLevels(static_cast<uint16_t>(v * 257));
+      CHECK(pf[i] == static_cast<float>(v));
+    }
+  CHECK(weights(e, pb) == weightsF(e, pf));
+}
+
+static void testNullAndOddInputs()
+{
+  const LuminosityEval e = LuminosityShape{}.prepare(1, 1);
+  float out = 9.0f;
+  e.rowWeightsF(0, 0, 1, &out, nullptr);
+  CHECK(out == 0.0f);
+  const LuminosityEval blank; // never prepared: no table
+  const float px[4] = {10.0f, 10.0f, 10.0f, 255.0f};
+  out = 9.0f;
+  blank.rowWeightsF(0, 0, 1, &out, px);
+  CHECK(out == 0.0f);
+  const float odd[2][4] = {{std::nanf(""), 0, 0, 255}, {1e9f, 1e9f, 1e9f, 255}};
+  for (const auto &p : odd)
+  {
+    e.rowWeightsF(0, 0, 1, &out, p);
+    CHECK(out >= 0.0f && out <= 1.0f);
+  }
+  // A span that starts at x0 > 0 is indexed from the pointer it is given, like the byte version.
+  const std::vector<float> two = {0, 0, 0, 255, 255, 255, 255, 255};
+  float w2[2];
+  e.rowWeightsF(0, 5, 7, w2, two.data());
+  CHECK(w2[0] == e.lut[0] && w2[1] == e.lut[255]);
+}
+
+// ---------------------------------------------------------------- Color Range
+
 static void testColorRange()
 {
   ColorRangeShape unset;
@@ -224,12 +368,46 @@ static void testColorRangeShape()
   CHECK(s.toSource(f) == s);
 }
 
-
-static float smooth01(float x)
+static void testColorRangeFloatEqualsByte()
 {
-  x = std::clamp(x, 0.0f, 1.0f);
-  return x * x * (3.0f - 2.0f * x);
+  ColorRangeShape c;
+  c.set = true;
+  c.r = 0.8f;
+  c.g = 0.3f;
+  c.b = 0.2f;
+  c.range = 0.4f;
+  c.feather = 0.5f;
+  const ColorRangeEval e = c.prepare(1, 1);
+  std::mt19937 g(7);
+  const int n = 3000;
+  Px pb(static_cast<size_t>(n) * 4);
+  std::vector<float> pf(pb.size());
+  for (size_t i = 0; i < pb.size(); ++i)
+    pf[i] = static_cast<float>(pb[i] = static_cast<uint8_t>(g()));
+  std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+  e.rowWeights(0, 0, n, a.data(), pb.data());
+  e.rowWeightsF(0, 0, n, b.data(), pf.data());
+  CHECK(a == b); // byte-valued input: the very same arithmetic
+  // Fractional levels are used as they are.
+  std::vector<float> half = pf;
+  for (float &v : half)
+    v = std::min(255.0f, v + 0.5f);
+  std::vector<float> c2(static_cast<size_t>(n));
+  e.rowWeightsF(0, 0, n, c2.data(), half.data());
+  int differ = 0;
+  for (int i = 0; i < n; ++i)
+    differ += (c2[static_cast<size_t>(i)] != b[static_cast<size_t>(i)]);
+  CHECK(differ > 0);
+  // Not set / null.
+  const ColorRangeEval unset = ColorRangeShape{}.prepare(1, 1);
+  float out = 9.0f;
+  unset.rowWeightsF(0, 0, 1, &out, pf.data());
+  CHECK(out == 0.0f);
+  e.rowWeightsF(0, 0, 1, &out, nullptr);
+  CHECK(out == 0.0f);
 }
+
+// ---------------------------------------------------------------- The written-out numbers
 
 static void testWrittenOutNumbers()
 {
@@ -278,11 +456,22 @@ int main()
 {
   testWrittenOutNumbers();
 
+  // Luminosity, byte path
   testLuminosityHardRange();
   testLuminositySoftEdges();
   testLuminosityEdits();
   testLuminosityRowWeights();
+
+  // Luminosity, float path
+  testFineTable();
+  testWholeLevelGraysMatchTheByteVersionExactly();
+  testLumaIsNotRoundedToAByte();
+  testSixteenBitLevelsGiveTheByteResult();
+  testNullAndOddInputs();
+
+  // Color Range
   testColorRange();
   testColorRangeShape();
+  testColorRangeFloatEqualsByte();
   return finish();
 }
