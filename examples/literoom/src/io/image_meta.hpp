@@ -56,6 +56,11 @@ inline Orient exifOrientationOf(const std::string &path)
 // With `removeGps`, the GPS location is cut out of the EXIF block first (see
 // exif::stripGps); everything else in it is kept.
 //
+// With `iccOnly`, the EXIF block is left out altogether and only the ICC profile
+// is carried (`removeGps` then has nothing to do). The profile says how the
+// numbers of the picture are to be read, so an export without metadata must
+// still have it: a Display P3 picture without its profile looks dull everywhere.
+//
 // Returns true when the source is a JPEG (by extension) whose header could be
 // read, i.e. when exif::embed ran; `*jpeg` is then rewritten, and stays
 // byte-identical if the source had no EXIF or ICC data. Returns false, with
@@ -63,7 +68,8 @@ inline Orient exifOrientationOf(const std::string &path)
 // empty, or does not start like a JPEG.
 inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg,
                                 const std::string &sourcePath, int width,
-                                int height, bool removeGps = false)
+                                int height, bool removeGps = false,
+                                bool iccOnly = false)
 {
   std::vector<uint8_t> head;
   exif::JpegMeta meta;
@@ -71,7 +77,9 @@ inline bool embedSourceMetadata(std::vector<uint8_t> *jpeg,
       !readFilePrefix(sourcePath, kMetaPrefixBytes, &head) ||
       !exif::readJpegMeta(head.data(), head.size(), &meta))
     return false;
-  if (removeGps)
+  if (iccOnly)
+    meta.exif.clear(); // exif::embed writes no EXIF segment for an empty block
+  else if (removeGps)
     exif::stripGps(&meta);
   *jpeg = exif::embed(*jpeg, meta, width, height);
   return true;

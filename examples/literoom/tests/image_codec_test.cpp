@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "check.hpp"
+#include "io/color_tag.hpp"
 #include "io/image_codec.hpp"
 #include "io/image_meta.hpp"
 
@@ -374,6 +375,55 @@ static void testEmbedIntoRealEncoderOutput()
   CHECK(back.has_value() && before.has_value() && back->pixels == before->pixels); // pixels untouched
 }
 
+// A JPEG source's ICC profile becomes the iCCP chunk of a PNG export (io/color_tag.hpp), and the
+// pixels of the export are untouched: liteui's decoder still reads the tagged file.
+static void testColorTagsSurviveTheEncoder()
+{
+  TempDir d("tags");
+  const CanvasImage img = noise(31, 17);
+  std::string err;
+
+  // A JPEG carrying an ICC profile (the bytes are made up: only that it is tagged matters here).
+  Bytes jpeg;
+  CHECK(encodeJpegMemory(gradient(40, 30), 92, &jpeg, nullptr));
+  exif::JpegMeta meta;
+  Bytes payload{'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0, 1, 1};
+  payload.insert(payload.end(), 200, 0x37);
+  meta.icc.push_back(payload);
+  jpeg = exif::embed(jpeg, meta, 40, 30);
+  const std::string srcJpg = d.file("src.jpg");
+  {
+    std::ofstream f(fsPath(srcJpg), std::ios::binary);
+    f.write(reinterpret_cast<const char *>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+  }
+  CHECK(color_tag::colorTagOf(srcJpg).text == "ICC profile (embedded profile, not sRGB)");
+
+  // JPEG source -> PNG export.
+  const std::string out = d.file("out.png");
+  CHECK(encodePngFile(out, img, &err));
+  CHECK(color_tag::colorTagOf(out).text == "untagged (assumed sRGB)");
+  CHECK(color_tag::carryColorToPng(out, srcJpg) == "ICC profile (embedded profile, not sRGB)");
+  CHECK(color_tag::colorTagOf(out).text == "ICC profile (embedded profile, not sRGB)");
+  const auto back = liteui_image::decodeFile(out, &err);
+  CHECK(back.has_value() && back->width == 31 && back->height == 17);
+  if (back)
+    CHECK(back->pixels == img.pixels); // lossless, and the tag changed no pixel
+
+  // PNG source -> PNG export: its chunks are copied.
+  const std::string out2 = d.file("out2.png");
+  CHECK(encodePngFile(out2, img, &err));
+  CHECK(color_tag::carryColorToPng(out2, out) == "ICC profile (embedded profile, not sRGB)");
+  const auto back2 = liteui_image::decodeFile(out2, &err);
+  CHECK(back2.has_value() && back2->pixels == img.pixels);
+
+  // An untagged source writes nothing: the export stays byte for byte what the encoder wrote.
+  const std::string plain = d.file("plain.png"), out3 = d.file("out3.png");
+  CHECK(encodePngFile(plain, img, &err) && encodePngFile(out3, img, &err));
+  const Bytes before = slurp(out3);
+  CHECK(color_tag::carryColorToPng(out3, plain).empty());
+  CHECK(slurp(out3) == before);
+}
+
 int main()
 {
   testFlattenRow();
@@ -385,5 +435,6 @@ int main()
   testJpegQualityAndChroma();
   testJpegSizeLimit();
   testEmbedIntoRealEncoderOutput();
+  testColorTagsSurviveTheEncoder();
   return finish();
 }

@@ -394,6 +394,39 @@ static void testEmbedCarriesMetadata()
   CHECK(isOrient(exifOrientationOf(src), 1, false));
 }
 
+// With iccOnly (an export with "keep metadata" off) the color profile still travels, the EXIF block
+// does not, and a source without a profile leaves the encoder's bytes alone.
+static void testEmbedIccOnly()
+{
+  TempDir d("icconly");
+  ExifSpec s;
+  s.orientation = 6;
+  const Bytes icc1 = iccSegment(1, 2, 20, 0x21), icc2 = iccSegment(2, 2, 10, 0x22);
+  const Bytes srcBytes = jpegOf({jfifSegment(), exifSegment(s), icc1, icc2});
+  const std::string src = d.file("src.jpg");
+  writeFile(src, srcBytes);
+  exif::JpegMeta srcMeta;
+  CHECK(exif::readJpegMeta(srcBytes.data(), srcBytes.size(), &srcMeta));
+  CHECK(srcMeta.icc.size() == 2 && !srcMeta.exif.empty());
+
+  const Bytes target = encodedJpeg();
+  Bytes jpeg = target;
+  CHECK(embedSourceMetadata(&jpeg, src, 1200, 800, false, true));
+  exif::JpegMeta out;
+  CHECK(exif::readJpegMeta(jpeg.data(), jpeg.size(), &out));
+  CHECK(out.icc == srcMeta.icc); // the profile, verbatim
+  CHECK(out.exif.empty());       // no EXIF at all
+  CHECK(tiffOf(jpeg).empty());
+  Bytes withGps = target; // removeGps changes nothing when there is no EXIF to cut
+  CHECK(embedSourceMetadata(&withGps, src, 1200, 800, true, true) && withGps == jpeg);
+
+  // A source with EXIF but no profile: nothing to carry, the bytes stay as encoded.
+  const std::string plain = d.file("plain.jpg");
+  writeFile(plain, jpegOf({jfifSegment(), exifSegment(s)}));
+  Bytes b = target;
+  CHECK(embedSourceMetadata(&b, plain, 10, 10, false, true) && b == target);
+}
+
 static void testEmbedBigEndianNoThumbnail()
 {
   TempDir d("embedbe");
@@ -667,6 +700,7 @@ int main()
   testOrientationIdentityCases();
   testOrientationWindow();
   testEmbedCarriesMetadata();
+  testEmbedIccOnly();
   testEmbedBigEndianNoThumbnail();
   testEmbedRemovesGps();
   testEmbedLeavesJpegAlone();

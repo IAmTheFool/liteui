@@ -177,10 +177,10 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     #   sam_segmenter covers the no-ONNX stand-in and sam::preprocess only; the
     #   real model path (LITEROOM_ONNX) has no test.
     foreach(t minijson exif
-              pixel_math adjustments auto_tone color_mix color_grade color_pass geometry curves film_fx
+              pixel_math adjustments auto_tone color_mix color_grade color_pass color_tag geometry curves film_fx
               mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
               sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter
-              lut3d lut_cube
+              lut3d lut_cube 
               image16 tone_table)
         literoom_add_test(${t})
     endforeach()

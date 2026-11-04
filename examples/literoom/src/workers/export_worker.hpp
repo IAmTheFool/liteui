@@ -27,6 +27,7 @@
 #include "io/image_codec.hpp"
 #include "io/image_codec16.hpp"
 #include "io/image_meta.hpp"
+#include "io/color_tag.hpp"
 #include "io/image_source.hpp"
 #include "io/minijson.hpp"
 #include "io/sidecar.hpp"
@@ -53,11 +54,13 @@
 // Largest sidecar a batch will read: the same limit the editor puts on one.
 constexpr std::streamoff kExportMaxSidecarBytes = std::streamoff{64} << 20;
 
-// Encodes `img` as a JPEG at `quality` (1..100). With `keepMetadata`, the EXIF
-// block and ICC profile of the photo at `sourcePath` ride along (orientation
-// reset to "upright", because the pixels already are; picture size updated; see
-// embedSourceMetadata). With `removeGps` as well, the GPS location is cut out of
-// that EXIF block. A picture JPEG can't hold (see jpegSizeOk) is refused by
+// Encodes `img` as a JPEG at `quality` (1..100). The ICC profile of the photo at
+// `sourcePath` always rides along: the editor converts no pixels, so without it
+// a Display P3 or Adobe RGB picture would be read as sRGB. With `keepMetadata`
+// the EXIF block comes too (orientation reset to "upright", because the pixels
+// already are; picture size updated; see embedSourceMetadata). With `removeGps`
+// as well, the GPS location is cut out of that EXIF block. A picture JPEG can't
+// hold (see jpegSizeOk) is refused by
 // encodeJpegMemory. (Moved here from main.cpp so the editor's single Export and
 // the batch share one function.)
 inline bool saveJpegFile(const std::string &path, const CanvasImage &img,
@@ -67,8 +70,9 @@ inline bool saveJpegFile(const std::string &path, const CanvasImage &img,
   std::vector<uint8_t> jpeg;
   if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
     return false;
-  if (keepMetadata)
-    embedSourceMetadata(&jpeg, sourcePath, img.width, img.height, removeGps);
+  // The color profile is not personal data: it is carried even without keepMetadata.
+  embedSourceMetadata(&jpeg, sourcePath, img.width, img.height,
+                      removeGps && keepMetadata, /*iccOnly=*/!keepMetadata);
   return writeFileAtomic(path, jpeg, errorOut);
 }
 
@@ -297,6 +301,8 @@ inline ExportOutcome exportPicture(const std::string &path,
                 : encodePngFile(target, *px.img8, &err);
   if (!wrote)
     return fail(err.empty() ? "couldn't write " + baseName(target) : err);
+  if (!s.jpeg) // a PNG carries its source's color tags (nothing is converted; see io/color_tag.hpp)
+    color_tag::carryColorToPng(target, real);
   o.ok = true;
   o.outFile = target;
   o.width = px.width();

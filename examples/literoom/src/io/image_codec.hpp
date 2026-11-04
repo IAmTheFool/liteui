@@ -17,6 +17,7 @@
 #include <vector>
  
 #include "liteui.hpp"
+#include "io/color_tag.hpp"
 
 // ---------------- PNG export ----------------
 // liteui.hpp only ships image *decoding* (liteui_image::decodeFile) and no
@@ -113,6 +114,13 @@ inline bool encodePngFile(const std::string &path, const CanvasImage &img,
 
   if (!ok && errorOut)
     *errorOut = "WIC: PNG encode failed";
+  if (ok)
+  {
+    // WIC always writes gAMA + cHRM chunks of its own. An export must come out of the encoder
+    // untagged, so that the source's tags (or none) are the only ones it carries
+    // (color_tag.hpp: nothing is ever invented). Best effort: the PNG is valid either way.
+    color_tag::insertColorIntoFile(path, color_tag::PngColor{});
+  }
   return ok;
 }
 

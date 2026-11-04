@@ -58,6 +58,7 @@
 #include "io/photo_meta.hpp"
 #include "io/minijson.hpp"
 #include "io/exif.hpp"
+#include "io/color_tag.hpp"
 #include "io/image_meta.hpp"
 #include "io/image_codec.hpp"
 #include "io/image_codec16.hpp"
@@ -263,9 +264,8 @@ struct RenderJob
 {
   std::shared_ptr<const CanvasImage> src;
   RenderParams params;
-  // The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it.
-  // `src` is then the same picture as 8-bit and is passed along only for the entry points' `view8`
-  // argument, which the render no longer uses (the neighbor effects read the 16-bit source itself).
+  // The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it
+  // and `src` is then only its 8-bit view for the neighbor effects.
   std::shared_ptr<const Image16> src16;
 };
 struct RenderResult
@@ -493,6 +493,9 @@ struct EditorState
   std::string imagePath;                // full path of the opened file
   exif::PhotoInfo photoInfo;            // its camera data (Info pane); see currentPhotoInfo()
   uint64_t photoInfoSerial = ~uint64_t{0}; // the imageSerial photoInfo was read for
+  color_tag::ColorTag colorTag;            // what the open file says its color space is (Info pane); see currentColorTag()
+  uint64_t colorTagSerial = ~uint64_t{0};  // the imageSerial colorTag was read for
+  bool colorNoticePending = false;         // the open's color notice may still be wiped by a geometry job; show it again when that lands
   float zoom = 1.0f;
   AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
@@ -682,6 +685,7 @@ static void updatePreviewFromAdjustments();
 // pipeline and GeometryWorker before either exists yet in the file.
 static bool geometryDirty();
 static void submitGeometryJob();
+static void announceColorTag();
 
 // ---- Handing the worker's result back to the UI thread ----
 // The event loop sleeps until the OS hands it an event, and a worker finishing
@@ -746,6 +750,7 @@ static void updateImageFromAdjustments()
   if (!state.original)
     return;
   clearStatus();             // the image is about to change: an old message is stale
+  state.colorNoticePending = false;
   renderWorker.invalidate(); // whatever was in flight is now out of date
 
   // Orient/straighten/crop are comparatively expensive at full resolution —
@@ -1087,6 +1092,11 @@ static void adoptGeometryBundle(GeometryWorker::Result &&r)
   resetCropSelection(); // the crop UI must match the new source's dimensions
   state.histStale = true;
   clearStatus(); // the "Applying changes..." message is no longer true
+  if (state.colorNoticePending)
+  {
+    state.colorNoticePending = false;
+    announceColorTag(); // a freshly opened picture's color notice, wiped by the line above
+  }
   state.markDirty();
 }
 
@@ -1756,6 +1766,34 @@ static const exif::PhotoInfo &currentPhotoInfo()
       photoInfoOf(state.imagePath, &state.photoInfo);
   }
   return state.photoInfo;
+}
+
+// What the open file says its color space is, for the Info pane and the status bar: read once per
+// opened picture, like currentPhotoInfo (a PNG's color chunks, or a JPEG's ICC profile). The editor
+// converts nothing: it edits the file's numbers as they are and carries the tag into PNG exports.
+static const color_tag::ColorTag &currentColorTag()
+{
+  if (state.colorTagSerial != state.imageSerial)
+  {
+    state.colorTagSerial = state.imageSerial;
+    state.colorTag = color_tag::ColorTag{};
+    if (!state.imagePath.empty())
+      state.colorTag = color_tag::colorTagOf(vcImageOf(state.imagePath));
+  }
+  return state.colorTag;
+}
+
+// The status-bar notice for the file just opened: what it says its color space is, for every file
+// (sRGB, untagged, or something else). A picture tagged as something other than sRGB also gets the
+// reminder that nothing is converted. Short on purpose: setStatus cuts a message at 110 characters,
+// and "Color: <profile> (embedded profile, not sRGB)" is already about 50 to 90 of them, so the part
+// that matters comes first and the rest is brief.
+static void announceColorTag()
+{
+  const color_tag::ColorTag &tag = currentColorTag();
+  if (tag.text.empty())
+    return; // the file could not be read
+  setStatus("Color: " + tag.text + (tag.srgb ? std::string() : std::string(". Shown as sRGB, not converted")), false);
 }
 
 // Writes the sidecar for the open picture. On failure (read-only folder...)
@@ -3463,6 +3501,8 @@ static void adoptDecoded(DecodeWorker::Result &&r)
   state.image.reset();          // the old file's pixels: force the synchronous path
   syncSource(true);             // source = original; builds previewBase, resets selection
   updateImageFromAdjustments(); // builds state.image from state.source
+  state.colorNoticePending = true; // a large picture's geometry job would clear the notice when it lands
+  announceColorTag();
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust.
@@ -3596,8 +3636,20 @@ static void exportImage()
                              vcImageOf(state.imagePath), &err)
               : encodePngFile(out, *outImage, &err);
   }
+  // A PNG export carries its source's color tags (io/color_tag.hpp). A PNG source's profile can't go
+  // into a JPEG (it is deflate-compressed), which the status says.
+  std::string tagNote;
+  if (ok && !jpeg)
+  {
+    const std::string kept = color_tag::carryColorToPng(out, vcImageOf(state.imagePath));
+    if (!kept.empty())
+      tagNote = " [" + kept + " kept]";
+  }
+  else if (ok && jpeg && !isJpegPath(vcImageOf(state.imagePath)) &&
+           !color_tag::colorTagOf(vcImageOf(state.imagePath)).srgb)
+    tagNote = " (color profile not carried into JPEG)";
   if (ok)
-    setStatus("Exported " + baseName(out) + std::string(png16 ? " [16-bit]" : "") +
+    setStatus("Exported " + baseName(out) + std::string(png16 ? " [16-bit]" : "") + tagNote +
                   (resized ? " (" + std::to_string(outSize.w) + " × " +
                                  std::to_string(outSize.h) + ")"
                            : std::string()),
@@ -9412,6 +9464,19 @@ int main()
   infoZoom.fontSize = 13.0f;
   infoZoom.color = kColorTextMid;
   infoPane.addChild(std::move(infoZoom));
+
+  Text infoColor;
+  infoColor.label = std::function<std::string()>([]
+                                                 {
+    if (!state.image)
+      return std::string();
+    const std::string &t = currentColorTag().text;
+    return t.empty() ? t : "Color: " + t; });
+  infoColor.fontSize = 13.0f;
+  infoColor.color = kColorTextMid;
+  infoColor.style.display = std::function<Display()>([]
+                                                     { return state.image && !currentColorTag().text.empty() ? Display::Flex : Display::None; });
+  infoPane.addChild(std::move(infoColor));
 
   // Camera data from the file's EXIF block. Each row hides itself when the file
   // doesn't say; a picture with none of it gets one muted line instead. GPS is
