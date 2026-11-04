@@ -24,11 +24,14 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 3
+#define LITEUI_VERSION_MINOR 4
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -530,6 +533,367 @@ struct CanvasImage
         pixels(static_cast<size_t>(std::max(0, w)) * std::max(0, h) * 4, 0) {}
 };
 
+// ---- Pixel formats (storage description only) ---------------------------
+// An image's storage format, its colour space and the format a display
+// backend wants are three separate properties; this enum covers only the
+// first. CanvasImage above is still always RGBA8_UNORM. The helpers are tiny
+// constexpr inline functions, so they add nothing to build time.
+enum class PixelFormat : uint8_t
+{
+  RGBA8_UNORM,   // 4 x uint8, sRGB-encoded colour, display-referred
+  RGBA16_UNORM,  // 4 x uint16, sRGB-encoded colour, display-referred
+  RGBA16_FLOAT,  // 4 x IEEE half, linear light (half the memory of FP32;
+                 // ~3 decimal digits, max 65504)
+  RGBA32_FLOAT   // 4 x IEEE single, linear light (not clamped to 0..1)
+};
+
+// Bytes in one pixel; 0 for a value that isn't a valid PixelFormat.
+constexpr size_t bytesPerPixel(PixelFormat f) noexcept
+{
+  switch (f)
+  {
+  case PixelFormat::RGBA8_UNORM:
+    return 4;
+  case PixelFormat::RGBA16_UNORM:
+  case PixelFormat::RGBA16_FLOAT:
+    return 8;
+  case PixelFormat::RGBA32_FLOAT:
+    return 16;
+  }
+  return 0;
+}
+
+// Smallest legal row size in bytes (width * bytesPerPixel), or nullopt if
+// the format is invalid or the product overflows size_t. A row may be
+// longer than this (padded stride) but never shorter.
+constexpr std::optional<size_t> minimumRowBytes(uint32_t width,
+                                                PixelFormat f) noexcept
+{
+  const size_t bpp = bytesPerPixel(f);
+  if (bpp == 0 || width > std::numeric_limits<size_t>::max() / bpp)
+    return std::nullopt;
+  return static_cast<size_t>(width) * bpp;
+}
+
+// Total buffer size for `height` rows. rowStride == 0 means tightly packed;
+// otherwise it must be >= minimumRowBytes. Returns nullopt for an invalid
+// format, a too-small stride, or any overflow. Zero width or height is
+// valid and gives 0 bytes (an empty image).
+constexpr std::optional<size_t> imageByteSize(uint32_t width, uint32_t height,
+                                              PixelFormat f,
+                                              size_t rowStride = 0) noexcept
+{
+  const auto minRow = minimumRowBytes(width, f);
+  if (!minRow)
+    return std::nullopt;
+  const size_t stride = rowStride ? rowStride : *minRow;
+  if (stride < *minRow)
+    return std::nullopt;
+  if (height != 0 && stride > std::numeric_limits<size_t>::max() / height)
+    return std::nullopt;
+  return stride * static_cast<size_t>(height);
+}
+
+// IEEE 754 binary16 <-> float. floatToHalf rounds to nearest-even, turns
+// values beyond 65504 into +-infinity, flushes nothing (subnormals are kept)
+// and keeps NaN as NaN. halfToFloat is exact.
+inline float halfToFloat(uint16_t h) noexcept
+{
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t e = (h >> 10) & 0x1Fu;
+  uint32_t m = h & 0x3FFu;
+  uint32_t bits;
+  if (e == 0)
+  {
+    if (m == 0)
+      bits = sign;
+    else // subnormal: normalise
+    {
+      int shift = 0;
+      while (!(m & 0x400u))
+      {
+        m <<= 1;
+        ++shift;
+      }
+      m &= 0x3FFu;
+      bits = sign | (static_cast<uint32_t>(113 - shift) << 23) | (m << 13);
+    }
+  }
+  else if (e == 31)
+    bits = sign | 0x7F800000u | (m << 13);
+  else
+    bits = sign | ((e + 112u) << 23) | (m << 13);
+  float f;
+  std::memcpy(&f, &bits, sizeof f);
+  return f;
+}
+
+inline uint16_t floatToHalf(float f) noexcept
+{
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof x);
+  const uint32_t sign = (x >> 16) & 0x8000u;
+  const uint32_t e = (x >> 23) & 0xFFu;
+  uint32_t m = x & 0x7FFFFFu;
+  if (e == 0xFFu) // inf / NaN
+    return static_cast<uint16_t>(sign | 0x7C00u | (m ? (0x200u | (m >> 13)) : 0u));
+  const int exp = static_cast<int>(e) - 127 + 15;
+  if (exp >= 31) // overflow
+    return static_cast<uint16_t>(sign | 0x7C00u);
+  if (exp <= 0) // subnormal half, or zero
+  {
+    if (exp < -10)
+      return static_cast<uint16_t>(sign);
+    m |= 0x800000u;
+    const int shift = 14 - exp;
+    uint32_t half = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1u);
+    const uint32_t mid = 1u << (shift - 1);
+    if (rem > mid || (rem == mid && (half & 1u)))
+      ++half;
+    return static_cast<uint16_t>(sign | half);
+  }
+  uint32_t half = (static_cast<uint32_t>(exp) << 10) | (m >> 13);
+  const uint32_t rem = m & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (half & 1u)))
+    ++half; // a carry into the exponent is correct (and may reach infinity)
+  return static_cast<uint16_t>(sign | half);
+}
+
+// Formats ImageBuffer can allocate and read/write: all of PixelFormat.
+constexpr bool isStorageSupported(PixelFormat f) noexcept
+{
+  return bytesPerPixel(f) != 0;
+}
+
+// Generic pixel storage for any supported PixelFormat, independent of the UI.
+// CanvasImage stays the RGBA8 type the canvas API uses; this is the
+// higher-precision sibling. Rows are `rowStride` bytes apart (>= one packed
+// row; padding is allowed). Bytes are std::byte because the contents are
+// uint8 or float depending on `format`; accessors go through memcpy, so no
+// alignment is assumed. Values are stored as given: no colour-space
+// conversion, no clamping of float data.
+struct ImageBuffer
+{
+  uint32_t width = 0, height = 0;
+  size_t rowStride = 0; // bytes between row starts
+  PixelFormat format = PixelFormat::RGBA8_UNORM;
+  std::vector<std::byte> pixels;
+
+  ImageBuffer() = default;
+  ImageBuffer(const ImageBuffer &) = default;
+  ImageBuffer &operator=(const ImageBuffer &) = default;
+  // A moved-from buffer is left empty (and valid), not half-described.
+  ImageBuffer(ImageBuffer &&o) noexcept
+      : width(o.width), height(o.height), rowStride(o.rowStride),
+        format(o.format), pixels(std::move(o.pixels))
+  {
+    o.reset();
+  }
+  ImageBuffer &operator=(ImageBuffer &&o) noexcept
+  {
+    if (this != &o)
+    {
+      width = o.width;
+      height = o.height;
+      rowStride = o.rowStride;
+      format = o.format;
+      pixels = std::move(o.pixels);
+      o.reset();
+    }
+    return *this;
+  }
+
+  // Allocates a zero-filled buffer. rowStride 0 = tightly packed. Returns
+  // nullopt for an unsupported format, a stride below one row, a size
+  // overflow, or allocation failure. Zero width/height gives an empty image.
+  static std::optional<ImageBuffer> create(uint32_t w, uint32_t h,
+                                           PixelFormat f,
+                                           size_t stride = 0)
+  {
+    if (!isStorageSupported(f))
+      return std::nullopt;
+    const auto total = imageByteSize(w, h, f, stride);
+    if (!total)
+      return std::nullopt;
+    ImageBuffer b;
+    try
+    {
+      b.pixels.assign(*total, std::byte{0});
+    }
+    catch (const std::exception &)
+    {
+      return std::nullopt; // bad_alloc / length_error
+    }
+    b.width = w;
+    b.height = h;
+    b.format = f;
+    b.rowStride = stride ? stride : *minimumRowBytes(w, f);
+    return b;
+  }
+
+  bool empty() const { return width == 0 || height == 0; }
+  size_t byteSize() const { return pixels.size(); }
+
+  // True when the fields and the buffer agree: supported format, stride >=
+  // one row, pixels.size() == stride * height. An empty buffer is valid.
+  bool valid() const
+  {
+    if (!isStorageSupported(format))
+      return false;
+    if (empty())
+      return pixels.empty();
+    const auto total = imageByteSize(width, height, format, rowStride);
+    return rowStride != 0 && total && *total == pixels.size();
+  }
+
+  // Start of row y, or nullptr if the buffer is invalid or y is out of range.
+  std::byte *row(uint32_t y)
+  {
+    return (y < height && valid() && !empty())
+               ? pixels.data() + static_cast<size_t>(y) * rowStride
+               : nullptr;
+  }
+  const std::byte *row(uint32_t y) const
+  {
+    return (y < height && valid() && !empty())
+               ? pixels.data() + static_cast<size_t>(y) * rowStride
+               : nullptr;
+  }
+
+  // Reads pixel (x, y) as four floats r,g,b,a exactly as stored: UNORM
+  // formats are divided by 255 / 65535 (a plain normalisation, NOT an sRGB
+  // decode), float formats are widened unchanged. False if out of range or
+  // the buffer is invalid.
+  bool getPixel(uint32_t x, uint32_t y, float out[4]) const
+  {
+    const std::byte *r = (x < width) ? row(y) : nullptr;
+    if (!r)
+      return false;
+    const size_t bpp = bytesPerPixel(format);
+    const std::byte *p = r + static_cast<size_t>(x) * bpp;
+    switch (format)
+    {
+    case PixelFormat::RGBA8_UNORM:
+      for (int i = 0; i < 4; ++i)
+        out[i] = static_cast<float>(static_cast<uint8_t>(p[i])) / 255.0f;
+      break;
+    case PixelFormat::RGBA16_UNORM:
+    {
+      uint16_t v[4];
+      std::memcpy(v, p, sizeof v);
+      for (int i = 0; i < 4; ++i)
+        out[i] = static_cast<float>(v[i]) / 65535.0f;
+      break;
+    }
+    case PixelFormat::RGBA16_FLOAT:
+    {
+      uint16_t v[4];
+      std::memcpy(v, p, sizeof v);
+      for (int i = 0; i < 4; ++i)
+        out[i] = halfToFloat(v[i]);
+      break;
+    }
+    case PixelFormat::RGBA32_FLOAT:
+      std::memcpy(out, p, 4 * sizeof(float));
+      break;
+    }
+    return true;
+  }
+
+  // Writes pixel (x, y) from four floats. RGBA32F stores the values
+  // untouched (HDR values > 1, negatives, NaN and inf are preserved).
+  // RGBA16F rounds to half precision (beyond +-65504 becomes +-inf; NaN is
+  // kept). The UNORM formats clamp to 0..1, round to nearest, and map NaN
+  // to 0. False if out of range or the buffer is invalid.
+  bool setPixel(uint32_t x, uint32_t y, const float in[4])
+  {
+    std::byte *r = (x < width) ? row(y) : nullptr;
+    if (!r)
+      return false;
+    std::byte *p = r + static_cast<size_t>(x) * bytesPerPixel(format);
+    switch (format)
+    {
+    case PixelFormat::RGBA8_UNORM:
+      for (int i = 0; i < 4; ++i)
+      {
+        float v = in[i];
+        v = (v != v) ? 0.0f : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
+        p[i] = static_cast<std::byte>(static_cast<uint8_t>(v * 255.0f + 0.5f));
+      }
+      break;
+    case PixelFormat::RGBA16_UNORM:
+    {
+      uint16_t v16[4];
+      for (int i = 0; i < 4; ++i)
+      {
+        float v = in[i];
+        v = (v != v) ? 0.0f : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
+        v16[i] = static_cast<uint16_t>(v * 65535.0f + 0.5f);
+      }
+      std::memcpy(p, v16, sizeof v16);
+      break;
+    }
+    case PixelFormat::RGBA16_FLOAT:
+    {
+      uint16_t v16[4];
+      for (int i = 0; i < 4; ++i)
+        v16[i] = floatToHalf(in[i]);
+      std::memcpy(p, v16, sizeof v16);
+      break;
+    }
+    case PixelFormat::RGBA32_FLOAT:
+      std::memcpy(p, in, 4 * sizeof(float));
+      break;
+    }
+    return true;
+  }
+
+private:
+  void reset() noexcept
+  {
+    width = height = 0;
+    rowStride = 0;
+    pixels.clear();
+  }
+};
+
+// How a scene-linear image (RGBA32_FLOAT) is turned into 8-bit display
+// pixels. Only the output transform lives here; storage and colour space
+// are separate properties (see PixelFormat / ImageBuffer).
+enum class ClampMode : uint8_t
+{
+  PerChannel, // clip each of r,g,b to 0..1 (simple; very bright colours go
+              // toward a primary or white)
+  PreserveHue // if the brightest channel exceeds 1, scale r,g,b together so
+              // it lands on 1 (keeps the r:g:b ratio); negatives still clip
+};
+
+// Display transform used by liteui_image::makeDisplayImage and by
+// Image::displaySettings. Today: exposure in stops, a clamp mode, and a
+// fixed sRGB output encoding. Applies to RGBA32_FLOAT sources only; RGBA8
+// images are already display-referred and pass through unchanged, so
+// ordinary UI assets keep their expected appearance.
+//
+// Room for later (deliberately not implemented yet, so this struct can grow
+// without changing makeDisplayImage's signature):
+//  - tone-mapping curves (filmic / Reinhard / ACES-style) ahead of the clamp
+//  - other output colour spaces (Display P3, Rec.2020, gamma 2.2/2.4) and a
+//    working-space -> display-space 3x3 matrix; ICC profiles
+//  - highlight roll-off / soft clip and a configurable white point
+//  - an RGBA16_FLOAT / RGBA32_FLOAT output option to upload float textures
+//    directly once a backend supports them (no 8-bit quantisation)
+//  - dithering before 8-bit quantisation to hide banding in gradients
+//  - black point, contrast and saturation (develop-style adjustments belong
+//    in the separate RAW/photo module, not here)
+struct DisplaySettings
+{
+  float exposureEv = 0.0f; // stops: linear rgb *= 2^exposureEv (non-finite -> 0, limited to +-32)
+  ClampMode clamp = ClampMode::PerChannel;
+
+  bool operator==(const DisplaySettings &) const = default;
+};
+
 // How a decoded image's aspect ratio is reconciled with the box it's
 // drawn into — same semantics as CSS object-fit.
 enum class ObjectFit
@@ -613,6 +977,79 @@ namespace liteui_image
                                           std::string *errorOut = nullptr);
   std::optional<CanvasImage> decodeFile(const std::string &path,
                                         std::string *errorOut = nullptr);
+
+  // ---- Pixel conversion between ImageBuffer formats ----------------------
+  // Colour conventions: the UNORM formats (RGBA8, RGBA16) hold sRGB-encoded,
+  // display-referred colour; the float formats (RGBA16F, RGBA32F) hold
+  // LINEAR-light colour (the working formats, not clamped to 0..1). Alpha is
+  // straight (not premultiplied) everywhere and is never colour-transformed:
+  // it is only scaled or quantised.
+  //
+  // IEC 61966-2-1 sRGB transfer functions. Not clamped; negative inputs are
+  // mirrored about 0 (f(-x) = -f(x)); NaN in gives NaN out.
+  float srgbToLinear(float encoded);
+  float linearToSrgb(float linear);
+
+  // Converts `src` into the format named by dst.format, replacing dst's
+  // contents with a tightly packed image of src's size. Returns false and
+  // leaves dst untouched if src is invalid, either format is unsupported, or
+  // allocation fails.
+  //   same format        : plain copy (padding dropped)
+  //   UNORM <-> UNORM    : the encoded values are rescaled (8->16 is x257,
+  //                        16->8 rounds); no transfer function is involved
+  //   anything else      : through linear float. UNORM sources are sRGB-
+  //                        decoded; UNORM destinations get NaN -> 0, a clamp
+  //                        to 0..1 (+-inf clamp), sRGB encoding and rounding.
+  //                        Float destinations keep the values (RGBA16F rounds
+  //                        to half precision and overflows to inf past 65504).
+  // Converting an image into itself is a no-op (it already has that format).
+  bool convertImage(const ImageBuffer &source, ImageBuffer &destination);
+
+  // Display-ready RGBA8 copy of `source` as a CanvasImage: RGBA8 buffers are
+  // copied as-is (padding dropped); RGBA32F buffers are treated as linear
+  // light and sRGB-encoded with clamping (no tone mapping). nullopt if the
+  // buffer is invalid/unsupported or too large for CanvasImage's int sizes.
+  std::optional<CanvasImage> toCanvasImage(const ImageBuffer &source);
+  std::optional<CanvasImage> toCanvasImage(const ImageBuffer &source,
+                                           const DisplaySettings &settings);
+
+  // Display adapter: an RGBA8 image ready for the existing paint path.
+  //  - RGBA32_FLOAT (linear light): rgb *= 2^exposureEv, then the clamp mode
+  //    (NaN -> 0, negatives -> 0, +inf is a very bright value), sRGB-encode,
+  //    round to 8 bits. Alpha is only clamped/quantised, never exposed.
+  //  - RGBA8_UNORM: already display-referred, copied unchanged (padding
+  //    dropped) whatever the settings; convert to RGBA32_FLOAT first with
+  //    convertImage if you want to apply exposure to an 8-bit image.
+  // nullopt if `source` is invalid or its format unsupported.
+  std::optional<ImageBuffer> makeDisplayImage(const ImageBuffer &source,
+                                              const DisplaySettings &settings = {});
+  // Rows are processed in small chunks (no full-size float copy), so an
+  // RGBA16_FLOAT photo is displayed without ever doubling its memory.
+  // RGBA16_UNORM is display-referred like RGBA8 and is just rescaled to 8 bits.
+
+  // A rectangle of pixels in an image.
+  struct ImageRect
+  {
+    uint32_t x = 0, y = 0, width = 0, height = 0;
+  };
+
+  // Same as makeDisplayImage but only for `region` of the source, producing
+  // an RGBA8 image of the region's size. This is the building block for
+  // tiled / viewport-only rendering of large photos: the result is bit-for-
+  // bit what the matching crop of the full display image would be. nullopt
+  // if the region does not lie inside the source.
+  std::optional<ImageBuffer> makeDisplayImage(const ImageBuffer &source,
+                                              const DisplaySettings &settings,
+                                              const ImageRect &region);
+
+  // Reduced-resolution copy for fast previews (e.g. while a slider moves):
+  // each output pixel is the box average of up to factor x factor source
+  // pixels, computed in linear light and weighted by alpha so transparent
+  // pixels don't darken edges (a block of fully transparent pixels gets rgb
+  // 0). Output is ceil(w/factor) x ceil(h/factor) in the SAME format as the
+  // source. factor 1 copies; factor 0 or an invalid source gives nullopt.
+  std::optional<ImageBuffer> downscaleImage(const ImageBuffer &source,
+                                            uint32_t factor);
 } // namespace liteui_image
 
 struct CanvasGradientStop
@@ -834,6 +1271,14 @@ struct ImageState
 {
   std::shared_ptr<CanvasImage> pixels;
   bool dirty = true; // starts true so the very first paint always runs
+  // High-precision source (Image::hdrSource): the buffer last seen, and the
+  // RGBA8 display copy in `pixels` derived from it. Replaced display copies
+  // stay in `retired` until the next paint has drawn the new one, so a new
+  // copy can never reuse a freed copy's address and fool the backends'
+  // bitmap cache (keyed on pixel-buffer identity) into a stale hit.
+  std::shared_ptr<ImageBuffer> hdr;
+  DisplaySettings settings; // settings `pixels` was built with
+  std::vector<std::shared_ptr<CanvasImage>> retired;
 };
 
 // Author-facing leaf node, addChild(Image)'d the same way Canvas/Text
@@ -841,8 +1286,10 @@ struct ImageState
 // CanvasImage (see View::toView(Image)). Set exactly one of `path` /
 // `source`: `path` is decoded synchronously via stb_image at addChild
 // time; `source` is used as-is (for procedurally generated pixels, or
-// pixels the app decoded/cached itself). If neither yields a usable
-// image, the node simply paints nothing (onError still fires).
+// pixels the app decoded/cached itself). `hdrSource` takes an ImageBuffer
+// (e.g. RGBA32_FLOAT) instead and takes precedence over the others; see
+// the field. If nothing yields a usable image, the node simply paints
+// nothing (onError still fires).
 struct Image
 {
   Style style;
@@ -868,6 +1315,20 @@ struct Image
   // dimensions if decoding succeeded.
   std::function<void(int width, int height)> onLoad;
   std::function<void(const std::string &error)> onError;
+  // High-precision source, same fixed-or-callback rules (and pointer-compare
+  // change detection) as `source`. The buffer is converted once per new
+  // pointer to an RGBA8 display copy (liteui_image::toCanvasImage): RGBA32F
+  // is treated as linear light, clamped and sRGB-encoded, with no tone
+  // mapping; an RGBA8 buffer is shown unchanged. Mutating a buffer in place
+  // is not detected: hand over a new shared_ptr. Declared last so existing
+  // positional initialisation of Image keeps working.
+  Dynamic<std::shared_ptr<ImageBuffer>> hdrSource;
+  // Output transform for hdrSource (exposure, clamp mode). Fixed, or a
+  // callback polled every dispatch cycle like `source`: when the returned
+  // settings differ from the last ones the display copy is rebuilt and the
+  // node repaints, so an exposure slider needs no new buffer. Ignored for
+  // RGBA8 buffers and for the other sources.
+  Dynamic<DisplaySettings> displaySettings;
 };
 
 // Mutable state for a TextInput, held by shared_ptr so every copy of the
@@ -2870,6 +3331,483 @@ namespace liteui_image
   }
 
 #endif
+
+  float srgbToLinear(float v)
+  {
+    const float a = std::fabs(v);
+    const float r = a <= 0.04045f ? a / 12.92f
+                                  : std::pow((a + 0.055f) / 1.055f, 2.4f);
+    return std::copysign(r, v);
+  }
+
+  float linearToSrgb(float v)
+  {
+    const float a = std::fabs(v);
+    const float r = a <= 0.0031308f
+                        ? a * 12.92f
+                        : 1.055f * std::pow(a, 1.0f / 2.4f) - 0.055f;
+    return std::copysign(r, v);
+  }
+
+  namespace detail
+  {
+    // 8-bit sRGB code -> linear float, built once.
+    inline const float *srgbDecode8Table()
+    {
+      static const auto table = []
+      {
+        std::array<float, 256> t{};
+        for (int i = 0; i < 256; ++i)
+          t[i] = srgbToLinear(static_cast<float>(i) / 255.0f);
+        return t;
+      }();
+      return table.data();
+    }
+
+    // 16-bit sRGB code -> linear float (256 KB), built once.
+    inline const float *srgbDecode16Table()
+    {
+      static const std::vector<float> table = []
+      {
+        std::vector<float> t(65536);
+        for (int i = 0; i < 65536; ++i)
+          t[i] = srgbToLinear(static_cast<float>(i) / 65535.0f);
+        return t;
+      }();
+      return table.data();
+    }
+
+    // half -> float for every possible 16-bit pattern (256 KB), built once;
+    // faster than the branchy halfToFloat in the per-pixel loops.
+    inline const float *halfDecodeTable()
+    {
+      static const std::vector<float> table = []
+      {
+        std::vector<float> t(65536);
+        for (uint32_t i = 0; i < 65536; ++i)
+          t[i] = halfToFloat(static_cast<uint16_t>(i));
+        return t;
+      }();
+      return table.data();
+    }
+
+    // linear 0..1 -> sRGB 0..1 by table lookup with linear interpolation.
+    // 16384 steps keep the error near 1e-6, far below half an LSB even of a
+    // 16-bit output, and replace a pow() per channel per pixel.
+    constexpr uint32_t kEncodeSteps = 16384;
+    inline const float *srgbEncodeTable()
+    {
+      static const std::vector<float> table = []
+      {
+        std::vector<float> t(kEncodeSteps + 1);
+        for (uint32_t i = 0; i <= kEncodeSteps; ++i)
+          t[i] = linearToSrgb(static_cast<float>(i) / static_cast<float>(kEncodeSteps));
+        return t;
+      }();
+      return table.data();
+    }
+    // `v` must already be in 0..1 (see clamp01).
+    inline float encodeFast(const float *table, float v)
+    {
+      const float t = v * static_cast<float>(kEncodeSteps);
+      const uint32_t i = static_cast<uint32_t>(t);
+      if (i >= kEncodeSteps)
+        return table[kEncodeSteps];
+      const float f = t - static_cast<float>(i);
+      return table[i] + (table[i + 1] - table[i]) * f;
+    }
+
+    // NaN -> 0, clamp to 0..1.
+    inline float clamp01(float v)
+    {
+      return (v != v) ? 0.0f : (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v));
+    }
+    inline uint8_t quantize8(float v)
+    {
+      return static_cast<uint8_t>(clamp01(v) * 255.0f + 0.5f);
+    }
+    inline uint16_t quantize16(float v)
+    {
+      return static_cast<uint16_t>(clamp01(v) * 65535.0f + 0.5f);
+    }
+
+    // Pixels processed per step by the row loops: float scratch space stays
+    // a fixed 16 KB whatever the image size.
+    constexpr uint32_t kChunk = 1024;
+
+    inline bool isUnorm(PixelFormat f)
+    {
+      return f == PixelFormat::RGBA8_UNORM || f == PixelFormat::RGBA16_UNORM;
+    }
+
+    // Loads n pixels of row y starting at column x0 as linear-light float
+    // RGBA. UNORM colour is sRGB-decoded; their alpha is just normalised.
+    // The caller has validated the buffer and the range.
+    inline void loadLinear(const ImageBuffer &b, uint32_t y, uint32_t x0,
+                           uint32_t n, float *out)
+    {
+      const std::byte *p = b.pixels.data() + static_cast<size_t>(y) * b.rowStride +
+                           static_cast<size_t>(x0) * bytesPerPixel(b.format);
+      switch (b.format)
+      {
+      case PixelFormat::RGBA8_UNORM:
+      {
+        const float *lut = srgbDecode8Table();
+        const uint8_t *q = reinterpret_cast<const uint8_t *>(p);
+        for (uint32_t i = 0; i < n; ++i, q += 4, out += 4)
+        {
+          out[0] = lut[q[0]];
+          out[1] = lut[q[1]];
+          out[2] = lut[q[2]];
+          out[3] = static_cast<float>(q[3]) / 255.0f;
+        }
+        break;
+      }
+      case PixelFormat::RGBA16_UNORM:
+      {
+        const float *lut = srgbDecode16Table();
+        for (uint32_t i = 0; i < n; ++i, p += 8, out += 4)
+        {
+          uint16_t v[4];
+          std::memcpy(v, p, sizeof v);
+          out[0] = lut[v[0]];
+          out[1] = lut[v[1]];
+          out[2] = lut[v[2]];
+          out[3] = static_cast<float>(v[3]) / 65535.0f;
+        }
+        break;
+      }
+      case PixelFormat::RGBA16_FLOAT:
+      {
+        const float *lut = halfDecodeTable();
+        for (uint32_t i = 0; i < n; ++i, p += 8, out += 4)
+        {
+          uint16_t v[4];
+          std::memcpy(v, p, sizeof v);
+          out[0] = lut[v[0]];
+          out[1] = lut[v[1]];
+          out[2] = lut[v[2]];
+          out[3] = lut[v[3]];
+        }
+        break;
+      }
+      case PixelFormat::RGBA32_FLOAT:
+        std::memcpy(out, p, static_cast<size_t>(n) * 16);
+        break;
+      }
+    }
+
+    // Inverse of loadLinear: stores n linear float RGBA pixels. UNORM
+    // destinations sanitise (NaN -> 0), clamp, sRGB-encode and round.
+    inline void storeLinear(ImageBuffer &b, uint32_t y, uint32_t x0, uint32_t n,
+                            const float *in)
+    {
+      std::byte *p = b.pixels.data() + static_cast<size_t>(y) * b.rowStride +
+                     static_cast<size_t>(x0) * bytesPerPixel(b.format);
+      switch (b.format)
+      {
+      case PixelFormat::RGBA8_UNORM:
+      {
+        const float *tab = srgbEncodeTable();
+        uint8_t *q = reinterpret_cast<uint8_t *>(p);
+        for (uint32_t i = 0; i < n; ++i, q += 4, in += 4)
+        {
+          q[0] = quantize8(encodeFast(tab, clamp01(in[0])));
+          q[1] = quantize8(encodeFast(tab, clamp01(in[1])));
+          q[2] = quantize8(encodeFast(tab, clamp01(in[2])));
+          q[3] = quantize8(in[3]);
+        }
+        break;
+      }
+      case PixelFormat::RGBA16_UNORM:
+      {
+        const float *tab = srgbEncodeTable();
+        for (uint32_t i = 0; i < n; ++i, p += 8, in += 4)
+        {
+          const uint16_t v[4] = {
+              quantize16(encodeFast(tab, clamp01(in[0]))),
+              quantize16(encodeFast(tab, clamp01(in[1]))),
+              quantize16(encodeFast(tab, clamp01(in[2]))),
+              quantize16(in[3])};
+          std::memcpy(p, v, sizeof v);
+        }
+        break;
+      }
+      case PixelFormat::RGBA16_FLOAT:
+        for (uint32_t i = 0; i < n; ++i, p += 8, in += 4)
+        {
+          uint16_t v[4];
+          for (int c = 0; c < 4; ++c)
+            v[c] = floatToHalf(in[c]);
+          std::memcpy(p, v, sizeof v);
+        }
+        break;
+      case PixelFormat::RGBA32_FLOAT:
+        std::memcpy(p, in, static_cast<size_t>(n) * 16);
+        break;
+      }
+    }
+
+    // RGBA8 display copy of `region` (already bounds-checked by the caller).
+    inline std::optional<ImageBuffer>
+    displayRegion(const ImageBuffer &src, const ImageRect &r,
+                  const DisplaySettings &settings)
+    {
+      auto out = ImageBuffer::create(r.width, r.height, PixelFormat::RGBA8_UNORM);
+      if (!out || out->empty())
+        return out;
+      const size_t bpp = bytesPerPixel(src.format);
+
+      if (src.format == PixelFormat::RGBA8_UNORM)
+      {
+        for (uint32_t y = 0; y < r.height; ++y)
+          std::memcpy(out->pixels.data() + static_cast<size_t>(y) * out->rowStride,
+                      src.pixels.data() + static_cast<size_t>(r.y + y) * src.rowStride +
+                          static_cast<size_t>(r.x) * bpp,
+                      static_cast<size_t>(r.width) * 4);
+        return out;
+      }
+      if (src.format == PixelFormat::RGBA16_UNORM)
+      {
+        for (uint32_t y = 0; y < r.height; ++y)
+        {
+          const std::byte *s = src.pixels.data() +
+                               static_cast<size_t>(r.y + y) * src.rowStride +
+                               static_cast<size_t>(r.x) * bpp;
+          uint8_t *d = reinterpret_cast<uint8_t *>(out->pixels.data()) +
+                       static_cast<size_t>(y) * out->rowStride;
+          for (size_t i = 0; i < static_cast<size_t>(r.width) * 4; ++i)
+          {
+            uint16_t v;
+            std::memcpy(&v, s + i * 2, 2);
+            d[i] = static_cast<uint8_t>((v + 128u) / 257u);
+          }
+        }
+        return out;
+      }
+
+      // Float sources (linear light): exposure, clamp mode, sRGB, quantise.
+      float ev = settings.exposureEv;
+      if (!std::isfinite(ev))
+        ev = 0.0f;
+      const float gain = std::exp2(std::clamp(ev, -32.0f, 32.0f));
+      const bool keepHue = settings.clamp == ClampMode::PreserveHue;
+      const float *tab = srgbEncodeTable();
+      float buf[kChunk * 4];
+
+      for (uint32_t y = 0; y < r.height; ++y)
+      {
+        uint8_t *d = reinterpret_cast<uint8_t *>(out->pixels.data()) +
+                     static_cast<size_t>(y) * out->rowStride;
+        for (uint32_t x0 = 0; x0 < r.width; x0 += kChunk)
+        {
+          const uint32_t n = std::min(kChunk, r.width - x0);
+          loadLinear(src, r.y + y, r.x + x0, n, buf);
+          for (uint32_t i = 0; i < n; ++i)
+          {
+            const float *px = buf + static_cast<size_t>(i) * 4;
+            float rgb[3];
+            for (int c = 0; c < 3; ++c)
+            {
+              const float v = px[c] * gain;
+              rgb[c] = (v != v) ? 0.0f : v; // NaN -> 0
+            }
+            if (keepHue)
+            {
+              const float m = std::max({rgb[0], rgb[1], rgb[2]});
+              if (std::isinf(m))
+              {
+                for (float &c : rgb) // only the infinite channels count
+                  c = std::isinf(c) && c > 0.0f ? 1.0f : 0.0f;
+              }
+              else if (m > 1.0f)
+              {
+                const float inv = 1.0f / m;
+                for (float &c : rgb)
+                  c *= inv;
+              }
+            }
+            uint8_t *o = d + static_cast<size_t>(x0 + i) * 4;
+            o[0] = quantize8(encodeFast(tab, clamp01(rgb[0])));
+            o[1] = quantize8(encodeFast(tab, clamp01(rgb[1])));
+            o[2] = quantize8(encodeFast(tab, clamp01(rgb[2])));
+            o[3] = quantize8(px[3]);
+          }
+        }
+      }
+      return out;
+    }
+  } // namespace detail
+
+  bool convertImage(const ImageBuffer &src, ImageBuffer &dst)
+  {
+    if (!src.valid() || !isStorageSupported(src.format) ||
+        !isStorageSupported(dst.format))
+      return false;
+    const PixelFormat to = dst.format;
+    if (&src == &dst)
+      return true; // dst.format == src.format here: nothing to do
+
+    auto out = ImageBuffer::create(src.width, src.height, to);
+    if (!out)
+      return false;
+    if (out->empty())
+    {
+      dst = std::move(*out);
+      return true;
+    }
+
+    const bool rescale = src.format != to && detail::isUnorm(src.format) &&
+                         detail::isUnorm(to);
+    const size_t rowBytes = *minimumRowBytes(src.width, to);
+    float buf[detail::kChunk * 4];
+    for (uint32_t y = 0; y < src.height; ++y)
+    {
+      const std::byte *s = src.pixels.data() + static_cast<size_t>(y) * src.rowStride;
+      std::byte *d = out->pixels.data() + static_cast<size_t>(y) * out->rowStride;
+      if (src.format == to)
+      {
+        std::memcpy(d, s, rowBytes);
+      }
+      else if (rescale)
+      {
+        const size_t count = static_cast<size_t>(src.width) * 4;
+        if (to == PixelFormat::RGBA16_UNORM) // 8 -> 16: exact x257
+        {
+          for (size_t i = 0; i < count; ++i)
+          {
+            const uint16_t v = static_cast<uint16_t>(static_cast<uint8_t>(s[i]) * 257u);
+            std::memcpy(d + i * 2, &v, 2);
+          }
+        }
+        else // 16 -> 8: round to nearest
+        {
+          for (size_t i = 0; i < count; ++i)
+          {
+            uint16_t v;
+            std::memcpy(&v, s + i * 2, 2);
+            d[i] = static_cast<std::byte>((v + 128u) / 257u);
+          }
+        }
+      }
+      else
+      {
+        for (uint32_t x0 = 0; x0 < src.width; x0 += detail::kChunk)
+        {
+          const uint32_t n = std::min(detail::kChunk, src.width - x0);
+          detail::loadLinear(src, y, x0, n, buf);
+          detail::storeLinear(*out, y, x0, n, buf);
+        }
+      }
+    }
+    dst = std::move(*out);
+    return true;
+  }
+
+  std::optional<ImageBuffer> makeDisplayImage(const ImageBuffer &src,
+                                              const DisplaySettings &settings,
+                                              const ImageRect &r)
+  {
+    if (!src.valid())
+      return std::nullopt;
+    if (r.x > src.width || r.width > src.width - r.x || r.y > src.height ||
+        r.height > src.height - r.y)
+      return std::nullopt;
+    return detail::displayRegion(src, r, settings);
+  }
+
+  std::optional<ImageBuffer> makeDisplayImage(const ImageBuffer &src,
+                                              const DisplaySettings &settings)
+  {
+    return makeDisplayImage(src, settings, ImageRect{0, 0, src.width, src.height});
+  }
+
+  std::optional<ImageBuffer> downscaleImage(const ImageBuffer &src,
+                                            uint32_t factor)
+  {
+    if (!src.valid() || factor == 0)
+      return std::nullopt;
+    if (src.empty() || factor == 1)
+    {
+      ImageBuffer out;
+      out.format = src.format;
+      if (!convertImage(src, out))
+        return std::nullopt;
+      return out;
+    }
+    const uint32_t nw = static_cast<uint32_t>((uint64_t{src.width} + factor - 1) / factor);
+    const uint32_t nh = static_cast<uint32_t>((uint64_t{src.height} + factor - 1) / factor);
+    auto out = ImageBuffer::create(nw, nh, src.format);
+    if (!out)
+      return std::nullopt;
+
+    std::vector<double> acc(static_cast<size_t>(nw) * 4);
+    std::vector<float> outRow(static_cast<size_t>(nw) * 4);
+    float buf[detail::kChunk * 4];
+    for (uint32_t oy = 0; oy < nh; ++oy)
+    {
+      std::fill(acc.begin(), acc.end(), 0.0);
+      const uint32_t sy0 = oy * factor;
+      const uint32_t sy1 = static_cast<uint32_t>(
+          std::min<uint64_t>(src.height, uint64_t{sy0} + factor));
+      for (uint32_t sy = sy0; sy < sy1; ++sy)
+        for (uint32_t x0 = 0; x0 < src.width; x0 += detail::kChunk)
+        {
+          const uint32_t n = std::min(detail::kChunk, src.width - x0);
+          detail::loadLinear(src, sy, x0, n, buf);
+          for (uint32_t i = 0; i < n; ++i)
+          {
+            const float *px = buf + static_cast<size_t>(i) * 4;
+            double *a = acc.data() + static_cast<size_t>((x0 + i) / factor) * 4;
+            const double w = px[3]; // alpha weights colour
+            a[0] += px[0] * w;
+            a[1] += px[1] * w;
+            a[2] += px[2] * w;
+            a[3] += w;
+          }
+        }
+      for (uint32_t ox = 0; ox < nw; ++ox)
+      {
+        const uint64_t cols = std::min<uint64_t>(src.width, uint64_t{ox} * factor + factor) -
+                              uint64_t{ox} * factor;
+        const double count = static_cast<double>(cols * (sy1 - sy0));
+        const double *a = acc.data() + static_cast<size_t>(ox) * 4;
+        float *o = outRow.data() + static_cast<size_t>(ox) * 4;
+        for (int c = 0; c < 3; ++c)
+          o[c] = a[3] > 0.0 ? static_cast<float>(a[c] / a[3]) : 0.0f;
+        o[3] = static_cast<float>(a[3] / count);
+      }
+      for (uint32_t x0 = 0; x0 < nw; x0 += detail::kChunk)
+        detail::storeLinear(*out, oy, x0, std::min(detail::kChunk, nw - x0),
+                            outRow.data() + static_cast<size_t>(x0) * 4);
+    }
+    return out;
+  }
+
+  std::optional<CanvasImage> toCanvasImage(const ImageBuffer &src)
+  {
+    return toCanvasImage(src, DisplaySettings{});
+  }
+
+  std::optional<CanvasImage> toCanvasImage(const ImageBuffer &src,
+                                           const DisplaySettings &settings)
+  {
+    constexpr uint32_t kMaxDim =
+        static_cast<uint32_t>(std::numeric_limits<int>::max());
+    if (src.width > kMaxDim || src.height > kMaxDim)
+      return std::nullopt;
+    auto disp = makeDisplayImage(src, settings);
+    if (!disp)
+      return std::nullopt;
+    ImageBuffer &rgba8 = *disp;
+    CanvasImage img;
+    img.width = static_cast<int>(rgba8.width);
+    img.height = static_cast<int>(rgba8.height);
+    img.pixels.resize(rgba8.pixels.size());
+    if (!rgba8.pixels.empty())
+      std::memcpy(img.pixels.data(), rgba8.pixels.data(), rgba8.pixels.size());
+    return img;
+  }
 
 } // namespace liteui_image
 
@@ -12039,9 +12977,38 @@ View View::toView(Image img)
   // resolved exactly once, right here, matching the old one-shot-decode
   // behavior.
   std::function<std::shared_ptr<CanvasImage>()> sourceFn;
+  std::function<std::shared_ptr<ImageBuffer>()> hdrFn;
   std::string err;
-  if (auto *fn = std::get_if<std::function<std::shared_ptr<CanvasImage>()>>(
-          &img.source))
+  std::shared_ptr<ImageBuffer> hdrFixed;
+  if (auto *hf = std::get_if<std::function<std::shared_ptr<ImageBuffer>()>>(
+          &img.hdrSource))
+    hdrFn = *hf;
+  else if (auto *hp = std::get_if<std::shared_ptr<ImageBuffer>>(&img.hdrSource))
+    hdrFixed = *hp;
+
+  // High-precision source: resolved to an RGBA8 display copy; the rest of
+  // this function (sizing, fit, paint, bitmap cache) is unchanged.
+  const bool hdrMode = static_cast<bool>(hdrFn) || hdrFixed;
+  std::function<DisplaySettings()> settingsFn;
+  if (auto *sf = std::get_if<std::function<DisplaySettings()>>(&img.displaySettings))
+    settingsFn = *sf;
+  if (hdrMode)
+  {
+    state->hdr = hdrFn ? hdrFn() : hdrFixed;
+    if (settingsFn)
+      state->settings = settingsFn();
+    else if (auto *fs = std::get_if<DisplaySettings>(&img.displaySettings))
+      state->settings = *fs;
+    if (state->hdr)
+    {
+      if (auto disp = liteui_image::toCanvasImage(*state->hdr, state->settings))
+        state->pixels = std::make_shared<CanvasImage>(std::move(*disp));
+      else
+        err = "liteui: could not convert the high-precision image for display";
+    }
+  }
+  else if (auto *fn = std::get_if<std::function<std::shared_ptr<CanvasImage>()>>(
+               &img.source))
   {
     sourceFn = *fn;
     state->pixels = sourceFn ? sourceFn() : nullptr;
@@ -12085,7 +13052,7 @@ View View::toView(Image img)
                     std::get<Size>(v.style.width).kind == Size::Kind::Fit;
   bool heightIsFit = std::get_if<Size>(&v.style.height) &&
                      std::get<Size>(v.style.height).kind == Size::Kind::Fit;
-  if (sourceFn)
+  if (sourceFn || hdrFn)
   {
     if (widthIsFit)
       v.style.width = std::function<Size()>([state]
@@ -12114,8 +13081,35 @@ View View::toView(Image img)
   // a different shared_ptr than last time, swaps it in, re-fires
   // onLoad/onError, and marks this canvas dirty. A no-op (one call, one
   // pointer compare) for a static source, since sourceFn is empty there.
-  v.canvasDirtySource = [state, sourceFn, onLoad, onError]
+  v.canvasDirtySource = [state, sourceFn, hdrFn, hdrMode, settingsFn, onLoad,
+                         onError]
   {
+    if (hdrMode && (hdrFn || settingsFn))
+    {
+      std::shared_ptr<ImageBuffer> next = hdrFn ? hdrFn() : state->hdr;
+      const DisplaySettings cur = settingsFn ? settingsFn() : state->settings;
+      const bool bufferChanged = next != state->hdr;
+      if (bufferChanged || !(cur == state->settings))
+      {
+        state->hdr = next;
+        state->settings = cur;
+        std::shared_ptr<CanvasImage> disp;
+        if (next)
+          if (auto d = liteui_image::toCanvasImage(*next, cur))
+            disp = std::make_shared<CanvasImage>(std::move(*d));
+        // The new copy is allocated while the old one is still alive; the
+        // old one is parked until the next paint (see ImageState::retired).
+        if (state->pixels)
+          state->retired.push_back(std::move(state->pixels));
+        state->pixels = std::move(disp);
+        state->dirty = true;
+        if (state->pixels && onLoad && bufferChanged)
+          onLoad(state->pixels->width, state->pixels->height);
+        else if (!state->pixels && onError)
+          onError(next ? "liteui: could not convert the high-precision image for display"
+                       : "liteui: dynamic image source returned null");
+      }
+    }
     if (sourceFn)
     {
       std::shared_ptr<CanvasImage> next = sourceFn();
@@ -12182,6 +13176,7 @@ View View::toView(Image img)
     }
     }
     ctx.drawImage(im, dx, dy, dw, dh);
+    state->retired.clear(); // the backend cache now refers to `im`
   };
 
   return v;

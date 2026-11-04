@@ -212,13 +212,22 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         # 2) Otherwise download a pinned release.
         if(NOT Catch2_FOUND)
             message(STATUS "liteui tests: Catch2 not installed, fetching v3.8.1")
+        
             FetchContent_Declare(
                 Catch2
                 GIT_REPOSITORY https://github.com/catchorg/Catch2.git
                 GIT_TAG        v3.8.1
             )
+        
             FetchContent_MakeAvailable(Catch2)
-            # Provides catch_discover_tests() when Catch2 is built from source.
+        
+            # Ensure Catch2 and its headers agree on C++23 features.
+            set_target_properties(Catch2 Catch2WithMain PROPERTIES
+                CXX_STANDARD 23
+                CXX_STANDARD_REQUIRED ON
+                CXX_EXTENSIONS OFF
+            )
+        
             list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
         endif()
         include(Catch)
