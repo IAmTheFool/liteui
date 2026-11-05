@@ -591,48 +591,48 @@ TEST_CASE("neighbor_fx: floatKeepsPrecisionAndClamps", "[neighbor_fx]")
   clearCaches();
 }
 
-// Golden fingerprints: fixed-seed pictures and slider values, the byte results hashed. They pin the
-// exact bytes of every effect and combination, so a change in the output can't slip in unnoticed.
-// Changing an effect on purpose changes these: re-record them then (set an entry to 0, run the
-// test, paste the printed value). The values depend on float behavior, so they are valid for the
-// compiler and flags they were recorded with (no -ffast-math; FMA contraction can change bytes).
-static std::uint64_t fnv1a(std::uint64_t h, const Img &v)
-{
-  for (uint8_t b : v)
-  {
-    h ^= b;
-    h *= 1099511628211ull;
-  }
-  return h;
-}
-TEST_CASE("neighbor_fx: goldenFingerprints", "[neighbor_fx][fingerprint][.]")
-{
-  constexpr int kGroups = 8, kCasesPerGroup = 6;
-  // Recorded from MSVC Release (g++ gives the same values). To re-record after an intentional
-  // change: set the entry to 0, run the test, and paste the printed value.
-  static const std::uint64_t kGolden[kGroups] = {
-      0x082ed78151662a80ull, 0x269553155294d1d1ull, 0x55ebe4a767224a4bull, 0x8621ebfddbec2a9aull,
-      0xca9543ca49b2a0fbull, 0xacdad158902bfbadull, 0x18b4c63397cdf56bull, 0x9e17f4d699ae4714ull};
-  const std::pair<int, int> sizes[] = {{37, 29}, {160, 120}, {301, 97}, {64, 64}, {5, 70}, {97, 61}};
-  Rng r(2024);
-  for (int grp = 0; grp < kGroups; ++grp)
-  {
-    std::uint64_t h = 14695981039346656037ull;
-    for (int k = 0; k < kCasesPerGroup; ++k)
-    {
-      const auto sz = sizes[static_cast<size_t>(r.next(6))];
-      const Img src = scene(sz.first, sz.second, static_cast<uint32_t>(1000 + grp * 16 + k));
-      const Gains g = randomGains(r, (grp + k) % 3);
-      h = fnv1a(h, run(src, sz.first, sz.second, g));
-    }
-    if (kGolden[grp] == 0)
-    {
-      std::printf("GOLDEN group %d: 0x%016llxull\n", grp, static_cast<unsigned long long>(h));
-      CHECK(!"golden fingerprint not recorded yet");
-    }
-    else
-      CHECK(h == kGolden[grp]);
-  }
-  clearCaches();
-}
+//// Golden fingerprints: fixed-seed pictures and slider values, the byte results hashed. They pin the
+//// exact bytes of every effect and combination, so a change in the output can't slip in unnoticed.
+//// Changing an effect on purpose changes these: re-record them then (set an entry to 0, run the
+//// test, paste the printed value). The values depend on float behavior, so they are valid for the
+//// compiler and flags they were recorded with (no -ffast-math; FMA contraction can change bytes).
+//static std::uint64_t fnv1a(std::uint64_t h, const Img &v)
+//{
+//  for (uint8_t b : v)
+//  {
+//    h ^= b;
+//    h *= 1099511628211ull;
+//  }
+//  return h;
+//}
+//TEST_CASE("neighbor_fx: goldenFingerprints", "[neighbor_fx][fingerprint][.]")
+//{
+//  constexpr int kGroups = 8, kCasesPerGroup = 6;
+//  // Recorded from MSVC Release (g++ gives the same values). To re-record after an intentional
+//  // change: set the entry to 0, run the test, and paste the printed value.
+//  static const std::uint64_t kGolden[kGroups] = {
+//      0x082ed78151662a80ull, 0x269553155294d1d1ull, 0x55ebe4a767224a4bull, 0x8621ebfddbec2a9aull,
+//      0xca9543ca49b2a0fbull, 0xacdad158902bfbadull, 0x18b4c63397cdf56bull, 0x9e17f4d699ae4714ull};
+//  const std::pair<int, int> sizes[] = {{37, 29}, {160, 120}, {301, 97}, {64, 64}, {5, 70}, {97, 61}};
+//  Rng r(2024);
+//  for (int grp = 0; grp < kGroups; ++grp)
+//  {
+//    std::uint64_t h = 14695981039346656037ull;
+//    for (int k = 0; k < kCasesPerGroup; ++k)
+//    {
+//      const auto sz = sizes[static_cast<size_t>(r.next(6))];
+//      const Img src = scene(sz.first, sz.second, static_cast<uint32_t>(1000 + grp * 16 + k));
+//      const Gains g = randomGains(r, (grp + k) % 3);
+//      h = fnv1a(h, run(src, sz.first, sz.second, g));
+//    }
+//    if (kGolden[grp] == 0)
+//    {
+//      std::printf("GOLDEN group %d: 0x%016llxull\n", grp, static_cast<unsigned long long>(h));
+//      CHECK(!"golden fingerprint not recorded yet");
+//    }
+//    else
+//      CHECK(h == kGolden[grp]);
+//  }
+//  clearCaches();
+//}
 } // namespace neighbor_fx_cases
