@@ -347,9 +347,7 @@ namespace color_tag
     return ok;
   }
 
-  // ---------------------------------------------------------------- ICC
-  // A readable name for an ICC profile: its 'desc' tag (v2 textDescription or v4 multiLocalizedUnicode,
-  // first record), printable ASCII only, at most kProfileNameMax characters. Empty if it can't be read.
+  // Printable ASCII only, at most kProfileNameMax characters, trimmed.
   inline std::string sanitizeName(const std::string &s)
   {
     std::string o;
@@ -366,6 +364,9 @@ namespace color_tag
     return b == std::string::npos ? std::string() : o.substr(b);
   }
 
+  // ---------------------------------------------------------------- ICC
+  // A readable name for an ICC profile: its 'desc' tag (v2 textDescription or v4 multiLocalizedUnicode,
+  // first record), printable ASCII only, at most kProfileNameMax characters. Empty if it can't be read.
   inline std::string iccDescription(const uint8_t *icc, size_t n)
   {
     if (!icc || n < 132 || std::memcmp(icc + 36, "acsp", 4) != 0)

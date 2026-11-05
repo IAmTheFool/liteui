@@ -104,8 +104,7 @@ struct GeoFrame
   }
   // Direction of an axis (degrees, clockwise) in the original -> in the
   // source. An axis has no head or tail, so the result is kept in [-90, 90].
-  // Any finite angle is accepted (a NaN/infinite one gives 0). This used to be
-  // a subtract-180 loop, which never terminated for huge or infinite angles.
+  // Any finite angle is accepted (a NaN/infinite one gives 0).
   static float wrapAxis(float a)
   {
     if (!std::isfinite(a))
@@ -117,7 +116,8 @@ struct GeoFrame
       a += 180.0f;
     return a == 0.0f ? 0.0f : a; // never -0
   }
-  // An arrow's direction kept in (-180, 180]; NaN/infinite gives 0.
+  // An arrow's direction from atan2 (already in [-180, 180]) kept in (-180, 180]:
+  // only -180 is mapped, to 180. Not a general wrap; NaN/infinite gives 0.
   static float wrapDir(float a)
   {
     if (!std::isfinite(a))

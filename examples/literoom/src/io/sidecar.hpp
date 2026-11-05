@@ -1,5 +1,5 @@
 // sidecar.hpp - The saved edits as JSON: sliders, curves, Color Mixer, Color Grading,
-// geometry and every mask, plus the picture's rating / flag / color label (the
+// the 3D LUT reference, geometry and every mask, plus the picture's rating / flag / color label (the
 // wrapper's "meta" object) and its named snapshots (the wrapper's "snapshots"
 // array). Pure functions on plain values; loading validates and clamps
 // everything.
@@ -857,7 +857,8 @@ inline const std::string &sidecarNeutralEditsDump()
 
 // What the filmstrip wants to know about a sidecar without opening the picture.
 //   edited  false only for a readable file whose `edits` are exactly the neutral
-//           ones (a file that exists only because the picture was rated); any
+//           ones (a file that exists only because the picture was rated or has
+//           snapshots); any
 //           other file, readable or not, counts as edited, as a file always did.
 //   meta    the rating / flag / label (default if there is none or the file
 //           can't be read).
@@ -880,13 +881,8 @@ inline SidecarScan sidecarScan(const std::string &text)
   return s;
 }
 
-// Sync Settings: puts a look (sliders, curves, Color Mixer, Color Grading) into
-// the sidecar text of ANOTHER picture without touching its geometry or masks.
-//   oldText   the picture's current sidecar file ("" if it has none)
-//   imgW/H    the picture's size. Needed only when oldText is empty (a new file
-//             must record it); otherwise the size recorded in the file is used,
-//             and if imgW/H are given too they must match it.
-// The picture's own rating / flag / color label is kept.
+
+// The picture's own rating / flag / color label and snapshots are kept.
 // Returns false, with a reason in *err and *outText untouched, when the old
 // file can't be trusted (unreadable, from a newer version, other size): the
 // caller skips that picture rather than overwrite edits it can't read.
@@ -945,6 +941,13 @@ inline bool sidecarReadForRewrite(const std::string &oldText, int imgW, int imgH
   *H = fh;
   return true;
 }
+
+// Sync Settings: puts a look (sliders, curves, Color Mixer, Color Grading, 3D LUT) into
+// the sidecar text of ANOTHER picture without touching its geometry or masks.
+//   oldText   the picture's current sidecar file ("" if it has none)
+//   imgW/H    the picture's size. Needed only when oldText is empty (a new file
+//             must record it); otherwise the size recorded in the file is used,
+//             and if imgW/H are given too they must match it.
 
 inline bool sidecarSyncLook(const std::string &oldText,
                             const std::string &imageName, int imgW, int imgH,

@@ -9,7 +9,7 @@
 //
 // The filmstrip (and every worker) identifies a picture by one string, its
 // "path". A virtual copy gets its own path by appending a marker that cannot be
-// part of a file name on any platform:
+// part of a file name on Windows (and is very rare elsewhere):
 //   /photos/photo.jpg|vc2
 // so everything that keys on the path (the filmstrip's name index, thumbnail and
 // sync results, the open picture) tells copies apart with no other change. The

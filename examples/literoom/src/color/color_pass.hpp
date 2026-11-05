@@ -13,11 +13,12 @@
 #include "core/pixel_math.hpp"
 
 constexpr float kHueShiftDegrees = 90.0f; // Hue slider +/-100 = +/- this many degrees
-constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction of the tint's chroma
+constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction of 255, times the luma-neutral tint
 
 // ---------------- Filters (the "look" block, last in the color pass) ----------------
 // Every filter is a strength 0..100 (0 = untouched). At strength s the result
-// is lerp(pixel, filtered(pixel), s / 100), so 0 is exactly the identity and
+// is lerp(pixel, filtered(pixel), s / 100), except Posterize, where s sets the
+// level count instead of a blend. Either way 0 is exactly the identity and
 // existing renders (and the golden fingerprints) cannot change. Fixed order:
 // Vintage -> Fade -> Greyscale -> Sepia -> (clamp) -> Solarize -> Bleach Bypass
 // -> Cross Process -> Threshold -> Posterize -> Negative.
@@ -32,7 +33,7 @@ constexpr float kThresholdLevel = 128.0f; // Threshold: luma at or above this go
 
 struct FilterPass
 {
-  bool any = false; // false = skip the filter block entirely
+  bool any = false;                                                             // false = skip the filter block entirely
   float grey = 0, sepia = 0, vintage = 0, fade = 0, negative = 0, solarize = 0; // 0..1
   float bleach = 0, threshold = 0, cross = 0;                                   // 0..1 (Bleach Bypass, Threshold, Cross Process)
   int posterLevels = 0;                                                         // 0 = off, else 2..255
@@ -99,8 +100,8 @@ inline float filterSCurve255(float v, float amt)
 }
 
 // One pixel, float in and out (0..255, may leave the range; the caller rounds
-// and clamps once). Plain code, no std:: helpers, for the Debug-build reason
-// stated at applyColorPassF.
+// and clamps once). Plain code, no std:: helpers, for the same Debug-build
+// reason as applyColorPassF (see AdjustmentSet::applyTo).
 inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
 {
   r = filterClamp255(r);
@@ -267,7 +268,7 @@ inline ColorPass makeColorPass(float temperature, float tint, float vibrance,
   cp.hue = hueShift != 0.0f;
   cp.colorize = colorizeAmount > 0.0f;
   cp.filters = makeFilterPass(filters); // sanitizes its own values
-  if (lut.any())                         // makeLutPass already vetted the table and the amount
+  if (lut.any())                        // makeLutPass already vetted the table and the amount
     cp.lut = lut;
   cp.active = cp.mix || cp.grade || cp.hue || cp.colorize || cp.filters.any ||
               cp.lut.any() ||
@@ -626,8 +627,7 @@ inline void applyColorPassF(const ColorPass &cp, float *p, std::size_t n)
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched; a trailing partial pixel is
 // left alone): the float pass above on blocks of pixels, each channel rounded and clamped to a
 // byte once at the end.
-// Its output is pinned by the golden fingerprints and the bulk-vs-per-pixel test in
-// tests/color_pass_test.cpp.
+// Its output is pinned by the golden fingerprints in tests/color_pass_test.cpp.
 inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
 {
   if (!cp.active)

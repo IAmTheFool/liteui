@@ -28,8 +28,8 @@ constexpr int kMixLutSize = 720;          // hue lookup resolution (0.5 degree)
 //
 // Because the result depends only on a pixel's hue, all of that blending is
 // baked into three small tables indexed by hue (MixLut), built once per
-// render request. The per-pixel work is then: RGB -> HSL, three table reads
-// (index via mixLutIndex), HSL -> RGB (see applyColorPass).
+// render request. The per-pixel work is then: RGB -> HSL, three table reads,
+// HSL -> RGB (see applyColorPassF, which computes the table index inline).
 //
 // Slider values are sanitized when the table is built (clamped to
 // kMixMin..kMixMax, NaN treated as 0), so the tables are always finite and
@@ -128,8 +128,10 @@ struct MixLut
 
 // The table index for a hue in degrees: nearest entry, wrapping around the
 // circle (359.9 -> 0, -0.1 -> 719), always in 0..kMixLutSize-1. A NaN or
-// infinite hue maps to 0. Always use this instead of rounding by hand, since
+// infinite hue maps to 0. Use this instead of rounding by hand, since
 // round(hue / 360 * kMixLutSize) reaches kMixLutSize for hues near 360.
+// (applyColorPassF inlines the same round-and-wrap, without std:: calls, since
+// its hue comes from RGB and is always finite.)
 inline std::size_t mixLutIndex(float hueDeg)
 {
   if (!std::isfinite(hueDeg))

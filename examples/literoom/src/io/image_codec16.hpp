@@ -168,9 +168,7 @@ inline bool validatePngChunks(const std::string &path, std::string *errorOut)
 #if defined(_WIN32)
 
 // ---------------- Windows: WIC ----------------
-// NOT built or run by the author of this port (it was written on Linux): it follows
-// liteui_image::decodeFile and encodePngFile line for line, with the 64bppRGBA format (16-bit
-// unsigned integer per channel, straight alpha) in place of 32bppRGBA.
+
 
 inline std::optional<Image16> decodePng16File(const std::string &path, std::string *errorOut)
 {

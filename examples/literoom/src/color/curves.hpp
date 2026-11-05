@@ -1,6 +1,7 @@
-// curves.hpp - Tone curves: control points, the monotone cubic (PCHIP) that turns
-// them into a 256-entry table, and the edit operations (insert, move,
-// remove) that keep the point list valid.
+// curves.hpp - Tone curves: control points, the monotone cubic (PCHIP) that
+// samples them into a table (curveSample at any step, curveToLut for the
+// 256-entry case), and the edit operations (insert, move, remove) that keep
+// the point list valid.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -46,9 +47,10 @@ inline CurveSet identityCurves()
 // control points (input level, output level), both in
 // 0..255, sorted by x. The first and last points sit at x = 0 and x = 255
 // (their y can move, e.g. to lift blacks). Interpolated with a monotone cubic
-// (Fritsch-Carlson / PCHIP): it passes through every point, never overshoots
-// between neighbors, and stays monotone wherever the points are — so dragging
-// a point can't make the curve ring or invert by accident.
+// (PCHIP: Fritsch-Butland slopes, one-sided shape-preserving end slopes): it passes through every point, never overshoots
+// between neighbors, and is monotone wherever the points are monotone (it
+// flattens at a local extremum) — so dragging a point can't make the curve
+// ring or overshoot by accident.
 
 // True if the points can be evaluated: at least two, all finite, x strictly
 // increasing. (The edit operations below and the sidecar loader keep stricter
@@ -156,8 +158,9 @@ inline std::array<float, 256> curveToLut(const CurvePoints &pts)
 }
 
 // True when rounding the curve to 8 bits gives the identity mapping — the
-// pipeline skips the curve stage entirely then. That is only exactly
-// equivalent if this uses the SAME rounding as the code that applies the
+// byte pipeline and the float one (makeToneSet, tone_table.hpp) skip the curve
+// stage entirely then. For the byte pipeline that is only exactly equivalent if
+// this uses the SAME rounding as the code that applies the
 // curve, so it uses toU8Clamped (pixel_math.hpp), the pipeline's one rounding
 // rule. Anything that turns a curve table into bytes must use it too.
 inline bool curveIsIdentity(const std::array<float, 256> &lut)
@@ -190,7 +193,7 @@ inline int curveInsert(CurvePoints &pts, float x, float y)
 }
 
 // Moves point `idx`. End points keep their x; interior points stay strictly
-// between their neighbors (kCurveMinGap apart), so order never changes.
+// between their neighbors (at least kCurveMinGap apart), so order never changes.
 // Non-finite coordinates are ignored.
 inline void curveMovePoint(CurvePoints &pts, int idx, float x, float y)
 {

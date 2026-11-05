@@ -1,6 +1,6 @@
 // render_params.hpp - Everything the per-pixel pipeline needs, frozen into one small value
 // (RenderParams), and the same for each mask (MaskPass). Built from the
-// edit state in O(256); no pixels, no UI.
+// edit state in time that doesn't depend on the picture's size; no pixels, no UI.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -141,15 +141,16 @@ inline std::vector<MaskPass> buildMaskPasses(const MaskSet &masks,
 
 // ---------------- Render parameters ----------------
 // Everything the per-pixel pipeline needs, frozen into one small value:
-// three 256-entry tables (tone sliders + tone curves, per channel) and the
-// float color pass. Building it is O(256) (AdjustmentSet::buildRenderParams),
+// the tone tables (byte `luts` and float `toneF`, per channel), the float
+// color pass (with the 3D LUT), the neighbor effects' gains, the masks and
+// the film effects. Building it is O(256) (AdjustmentSet::buildRenderParams),
 // so the UI thread builds one and hands a *copy* to the render worker — the
 // worker never touches the AdjustmentSet, which the UI thread keeps mutating.
 struct RenderParams
 {
   std::array<std::array<uint8_t, 256>, 3> luts{}; // R, G, B tables (the byte pipeline's, renderWithBytes)
   std::shared_ptr<const ToneSet> toneF;           // the same as float tables (renderWith); null = use `luts`
-  ColorPass color;                                // float pass, after the LUTs
+  ColorPass color;                                // float pass, after the tone tables (the 3D LUT is its last step)
   neighbor_fx::Gains fx;                          // Texture / Clarity / Sharpness / Dehaze / Noise / Blur (neighbor_fx.hpp), after the color pass
   std::vector<MaskPass> masks;                    // local adjustments, applied after all of it
   film_fx::Params film;                           // Vignette / Grain (film_fx.hpp): the very last step, after the masks

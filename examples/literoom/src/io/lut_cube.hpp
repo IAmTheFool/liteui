@@ -3,7 +3,8 @@
 //
 // Strict, like every other reader in Literoom: anything it does not understand
 // is an error with the line number, never a guess. Supported: LUT_3D_SIZE
-// (2..65), DOMAIN_MIN / DOMAIN_MAX, LUT_3D_INPUT_RANGE, TITLE, comments (#),
+// (2..65), DOMAIN_MIN / DOMAIN_MAX, LUT_3D_INPUT_RANGE, LUT_IN_VIDEO_RANGE /
+// LUT_OUT_VIDEO_RANGE (noted in LutCubeInfo, not applied), TITLE, comments (#),
 // blank lines, CRLF or LF. Refused: 1D LUTs (LUT_1D_SIZE), unknown keywords,
 // a wrong number of entries, non-finite or absurd (|v| > 16) values, a
 // keyword after the data. Numbers are read with std::from_chars, so the

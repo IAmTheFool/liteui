@@ -75,7 +75,7 @@ constexpr float kNrLumaTMax = 16.0f;        //   at slider 0 / 100
 constexpr float kNrColorT = 20.0f;          // chroma move that gets half weight
 
 constexpr int kVeilEdge = 384;           // long edge of the veil map, px
-constexpr int kVeilPatch = 3;            // erosion radius on that map
+constexpr int kVeilPatch = 3;            // erosion radius on that map (also the radius of its smoothing blur)
 constexpr float kDehazeStrength = 0.85f; // "omega": how much of the veil to remove
 constexpr float kDehazeMinT = 0.25f;     // transmission floor (limits blow-up)
 constexpr float kLightMin = 180.0f;      // estimated airlight is clamped to
@@ -281,7 +281,7 @@ inline bool buildChroma(const S *rgba, int w, int h, int which,
 
 // ---- veil map (dehaze) ----
 
-// Min filter, radius r, edges clamped, separable; on a small map (8 or 16-bit values).
+// Min filter, radius r, edges clamped, separable; on a small map (here always plane units, uint16_t).
 template <class V>
 inline void erode(std::vector<V> &m, int w, int h, int r)
 {

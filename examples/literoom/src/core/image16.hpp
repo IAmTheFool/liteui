@@ -35,7 +35,7 @@ struct Image16
 // ---- 8-bit <-> 16-bit ----
 // v * 257 spreads 0..255 over 0..65535 exactly (255 * 257 = 65535).
 inline uint16_t widen8(uint8_t v) { return static_cast<uint16_t>(v * 257u); }
-// Nearest 8-bit value (halfway rounds up); widen8 followed by narrow16 is the identity.
+// Nearest 8-bit value (257 is odd, so there are no exact ties); widen8 followed by narrow16 is the identity.
 inline uint8_t narrow16(uint16_t v) { return static_cast<uint8_t>((v + 128u) / 257u); }
 
 // `n` samples (not pixels).

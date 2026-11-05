@@ -1,12 +1,12 @@
 // minijson.hpp - a tiny JSON value, writer and parser (UTF-8, no dependencies),
-// plus base64 and byte run-length helpers. Used for literoom's edit sidecar.
+// plus base64 and byte run-length helpers. Used for the edit sidecar and presets.
 //
 // Numbers are written and read locale-independently: the C library's decimal
 // separator is swapped for '.' on write and back on read, so a comma-decimal
 // locale can neither corrupt a file nor make a valid one unreadable.
 //
-// Save files in binary mode (dump() uses '\n') and ideally write to a temp
-// file and rename over the original so a crash can't leave a partial sidecar.
+// Save files in binary mode (dump() uses '\n'): writeFileAtomic (file_utils.hpp)
+// does that, through a temp file + rename, so a crash can't leave a partial file.
 #pragma once
 #include <algorithm>
 #include <cassert>

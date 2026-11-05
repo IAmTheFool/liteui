@@ -32,9 +32,9 @@ constexpr size_t kMaxUndoSteps = 200;
 
 // Owns the live value of every slider, the committed crop and orientation,
 // their undo/redo history, and the logic to freeze them into RenderParams
-// (renderAdjusted in render.hpp turns those into pixels).
 // A slider drags continuously (many `set()` calls per second while held)
-// with no drag-end event from LiteUI to mark "the gesture is over" — so
+// with no drag-end event from LiteUI to mark "the gesture is over" (curves,
+// grading and masks have explicit end*Edit() calls) — so
 // `set` coalesces repeated calls for the *same* slider into one history
 // entry instead of growing it every frame; touching a different slider (or
 // an undo/redo, or a crop) starts a fresh entry. Dragging Exposure from -20
@@ -67,7 +67,7 @@ public:
     }
   }
 
-  // Commits a new crop (in original-image coordinates; an empty CropRect
+  // Commits a new crop (in pixels of the oriented, straightened image; an empty CropRect
   // removes the crop). Always its own undo step.
   void setCrop(const CropRect &c)
   {
@@ -316,7 +316,7 @@ public:
   }
 
   // ---- Presets ----
-  // The current look (sliders, curves, Color Mixer, Color Grading) as a Preset.
+  // The current look (sliders, curves, Color Mixer, Color Grading, 3D LUT) as a Preset.
   // Crop, orientation, straighten and masks are not part of a preset.
   Preset currentPreset(const std::string &name) const
   {
@@ -389,7 +389,7 @@ public:
 
   // ---- Named snapshots ----
   // Puts the picture back exactly as `e` describes it (every slider, curve, the
-  // Mixer, Color Grading, crop, rotation, straighten, corner mode and all masks)
+  // Mixer, Color Grading, 3D LUT, crop, rotation, straighten, corner mode and all masks)
   // as ONE undo step labelled "Snapshot: <name>" (or "Snapshot" for a blank
   // name). Unlike applyPreset this replaces the geometry and the masks too, so
   // the caller must refresh the picture the way it does after an undo. Returns
@@ -532,8 +532,9 @@ public:
     lastEdited_ = AdjId::Count; // next slider touch starts a new entry
   }
 
-  // Composes every non-zero adjustment's pointwise transform into a single
-  // 256-entry lookup table, applied identically to R/G/B. Building the
+  // The byte pipeline's tone table: every non-zero Tone adjustment composed into a
+  // single 256-entry lookup table, applied identically to R/G/B (the float pipeline
+  // uses makeToneSet, tone_table.hpp). Building the
   // table is O(256) regardless of image size — the expensive part of a
   // slider drag is applying it, and that's now one array lookup per
   // channel instead of a float multiply/add + lround + clamp per spec per
@@ -551,7 +552,7 @@ public:
   // Per-channel R/G/B tables: buildLut() (tone sliders + master curve), then
   // each channel's own curve on top. A channel whose curve is a straight line
   // just reuses the shared table, so with no per-channel curves all three
-  // tables are identical (see renderWith's fast path).
+  // tables are identical (see renderWithBytes' fast path).
   std::array<std::array<uint8_t, 256>, 3> buildChannelLuts() const
   {
     const auto base = buildLut();
@@ -571,7 +572,7 @@ public:
     return out;
   }
 
-  // Freezes the current slider/curve state into a self-contained value that
+  // Freezes the current edit state (sliders, curves, Mixer, Grading, 3D LUT, masks) into a self-contained value that
   // another thread can use (see RenderParams).
   RenderParams buildRenderParams() const
   {
@@ -602,7 +603,8 @@ public:
 
 private:
   // Everything one undo step restores: slider values, crop, orientation,
-  // straighten angle and corner mode.
+  // straighten angle and corner mode, curves, Color Mixer, Color Grading,
+  // masks and the 3D LUT.
   struct Snapshot
   {
     std::array<float, static_cast<size_t>(AdjId::Count)> values{};
@@ -616,7 +618,7 @@ private:
     MaskSet masks;
     LutRef lut;
     // Non-empty only for steps that carry their own History label (a preset,
-    // a white-balance pick, an Auto Tone, a snapshot restore);
+    // a white-balance pick, an Auto Tone, a LUT choice, a snapshot restore);
     // every other step is labelled by diffing it against the one before.
     std::string label;
   };
@@ -805,7 +807,7 @@ private:
   }
 
   // Pseudo-AdjId for `lastEdited_` marking an in-progress angle drag (the
-  // angle isn't one of the pointwise sliders in kAdjustmentSpecs).
+  // angle isn't a slider in kAdjustmentSpecs).
   static constexpr AdjId kEditAngle =
       static_cast<AdjId>(static_cast<int>(AdjId::Count) + 1);
   // ...and an in-progress tone-curve point drag.
@@ -835,7 +837,7 @@ private:
   ColorGrade grade_;
   int lastGradeKey_ = -1; // control of the open Color Grading drag
   MaskSet masks_;
-  LutRef lut_; // the 3D LUT (empty = none)
+  LutRef lut_;                // the 3D LUT (empty = none)
   int lastMaskKey_ = -1;      // control of the open mask drag
   int origW_ = 0, origH_ = 0; // see setOriginalSize
   std::vector<Snapshot> history_{Snapshot{}};

@@ -229,8 +229,10 @@ inline std::shared_ptr<Img> cropImage(const Img &src, const CropRect &r)
   using S = raster_detail::Sample<Img>;
   const int x0 = std::clamp(r.x, 0, src.width);
   const int y0 = std::clamp(r.y, 0, src.height);
-  const int x1 = std::clamp(r.x + r.w, x0, src.width);
-  const int y1 = std::clamp(r.y + r.h, y0, src.height);
+  const long long sx = static_cast<long long>(r.x) + r.w;
+  const long long sy = static_cast<long long>(r.y) + r.h;
+  const int x1 = static_cast<int>(std::min<long long>(std::max<long long>(sx, x0), src.width));
+  const int y1 = static_cast<int>(std::min<long long>(std::max<long long>(sy, y0), src.height));
   const int w = x1 - x0, h = y1 - y0;
   auto out = std::make_shared<Img>(w, h);
   for (int y = 0; y < h; ++y)
@@ -317,7 +319,7 @@ rotateArbitrary(const Img &src, float deg, bool expand,
 {
   using S = raster_detail::Sample<Img>;
   constexpr float kMaxF = static_cast<float>(raster_detail::kMaxSample<Img>);
-  if (deg == 0.0f)
+  if (deg == 0.0f || !std::isfinite(deg))
     return std::make_shared<Img>(src);
   constexpr int kRotateCheckRows = 64;
   const Dims d = rotatedDims(src.width, src.height, deg, expand);

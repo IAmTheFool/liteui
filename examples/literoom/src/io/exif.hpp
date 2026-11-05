@@ -546,7 +546,7 @@ namespace exif
         std::string make;      // IFD0 Make, e.g. "Canon"
         std::string model;     // IFD0 Model, e.g. "Canon EOS R5"
         std::string lens;      // LensModel (Exif tag 0xA434); empty if not recorded
-        std::string dateTaken; // "YYYY-MM-DD HH:MM:SS" (DateTimeOriginal), or empty
+std::string dateTaken; // "YYYY-MM-DD HH:MM:SS" (DateTimeOriginal, else DateTimeDigitized), or empty
         int iso = 0;           // 1..kInfoMaxIso, or 0
         double exposureTime = 0.0; // shutter, seconds (0, 86400], or 0
         double fNumber = 0.0;      // (0, 1000], or 0

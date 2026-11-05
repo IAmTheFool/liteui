@@ -285,7 +285,7 @@ inline bool vbox(const uint16_t *in, uint16_t *out, size_t W, size_t H, int r,
   return true;
 }
 
-// Blurs the luma of an RGBA8 picture (3 box passes each way). Returns false
+// Blurs the luma of an RGBA8 or 16-bit RGBA picture (3 box passes each way). Returns false
 // if `latest` stopped matching `gen` part-way (the same cancellation contract
 // as renderWith), or if the size or radius is invalid; `out` is then garbage
 // and must not be used.
@@ -337,8 +337,8 @@ inline bool blurLuma(const uint16_t *rgba, int w, int h, int r, Plane &out,
   return blurLumaT<uint16_t>(rgba, w, h, r, out, latest, gen);
 }
 
-// About 1024 bytes spread over the picture: cheap, and two different pictures
-// will almost surely differ at some sampled byte. It is NOT a full hash: a
+// About 1024 samples (bytes, or 16-bit values) spread over the picture: cheap, and two different
+// pictures will almost surely differ at some sampled value. It is NOT a full hash: a
 // small edit that falls between the samples goes unnoticed, which is why the
 // Cache below assumes pixels are never edited in place.
 template <class S>
@@ -369,8 +369,8 @@ inline uint64_t fingerprint(const S *rgba, int w, int h)
 // apart) and the layer kind; the radius follows from size + kind. Shared by
 // the UI thread (drag preview) and the render workers, hence the mutex.
 //
-// ASSUMPTION: a CanvasImage's pixels are not edited in place once it is being
-// rendered (the app builds a new image for every orient / straighten / crop).
+// ASSUMPTION: a picture's pixels (CanvasImage or Image16) are not edited in place once it is
+// being rendered (the app builds a new image for every orient / straighten / crop).
 // An in-place edit (a retouch brush, say) would leave stale planes: call
 // clear() after one.
 class Cache
@@ -560,7 +560,8 @@ inline bool acquire(Planes &out, const uint16_t *rgba, int w, int h, unsigned ne
 
 // Stores one channel of a finished pixel: a byte gets the value clamped to 0..255 and rounded
 // to nearest; a float gets it clamped to 0..255 and NOT rounded (the float pipeline rounds
-// once, at the very end). Plain comparisons, no std:: calls, same Debug-build reason as above.
+// once, at the very end). Plain comparisons, no std:: calls, same Debug-build reason as
+// applyColorPassF (color_pass.hpp).
 inline void putLevel(uint8_t *d, float v)
 {
   v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
@@ -579,7 +580,7 @@ inline void putLevel(float *d, float v)
 // `first` is the index, in the whole picture, of the first of them (the planes are indexed
 // y * width + x). A plane that doesn't cover [first, first + count) (built for a different
 // picture size, say) is skipped instead of being read out of range. Raw pointers and no
-// std:: helpers in the loop: same Debug-build reason as applyColorPass.
+// std:: helpers in the loop: same Debug-build reason as applyColorPassF.
 template <class Dst, class S>
 inline void addPixels(const Planes &pl, const Gains &gn, const S *src,
                       Dst *dst, size_t count, size_t first)

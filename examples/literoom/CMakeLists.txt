@@ -109,152 +109,109 @@ else()
     message(STATUS "literoom: built WITHOUT ONNX (basic object selection only)")
 endif()
 
-# ---- Unit tests for the header-only helpers (no UI needed) ----
+# ---- Unit tests (Catch2) ----
+# One executable, literoom_test, built from tests/literoom_test.cpp. That single
+# TU #includes every tests/cases/*.inc, like liteui's own tests/.
+# To add a test: create tests/cases/<name>.inc and #include it from
+# literoom_test.cpp. Nothing to change here.
 # Defaults to the root switch, so LITEUI_BUILD_TESTS=OFF turns these off too.
-# These use the app's own check.hpp harness, not Catch2; enable_testing() comes
-# from the root's include(CTest). Target names (literoom_<name>_test) and CTest
-# names (literoom_<name>) are prefixed because both are global to the whole
-# project.
+# Catch2, enable_testing() and the sanitizer helpers come from the root
+# (include(CTest), include(Catch), cmake/LiteuiTests.cmake).
+# golden_render and lut_pane are separate executables (they compile src/main.cpp
+# into their own TU and have their own main()); see the blocks at the end.
 option(LITEROOM_TESTS "literoom: build unit tests" ${LITEUI_BUILD_TESTS})
 if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
-    # Tests include headers by their src-relative path ("mask/mask.hpp") and the
-    # shared harness ("check.hpp") from tests/.
-    set(LITEROOM_TEST_INCLUDES ${LITEROOM_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    file(GLOB LITEROOM_CASES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cases/*.inc)
 
-    # literoom_add_test(<name> [LITEUI] [THREADS] [NO_SANITIZE]
-    #                   [LABEL <label>] [TIMEOUT <seconds>] [ARGS <args...>])
-    #   LITEUI       link liteui (test uses CanvasImage etc.)
-    #   THREADS      link the platform thread library (std::thread / std::jthread)
-    #   NO_SANITIZE  never sanitize (the golden test's float fingerprints)
-    #   LABEL        CTest label: `ctest -L <label>` selects it
-    #   TIMEOUT      seconds before CTest kills it (default 60)
-    #   ARGS         command-line arguments passed to the test executable
-    # With -DLITEUI_SANITIZE=ON every test except NO_SANITIZE ones is built with
-    # AddressSanitizer (see cmake/LiteuiTests.cmake).
-    function(literoom_add_test name)
-        cmake_parse_arguments(A "LITEUI;THREADS;NO_SANITIZE" "LABEL;TIMEOUT" "ARGS" ${ARGN})
-        if(NOT A_TIMEOUT)
-            set(A_TIMEOUT 60)
-        endif()
-        set(tgt literoom_${name}_test)
-        add_executable(${tgt} tests/${name}_test.cpp)
-        target_include_directories(${tgt} PRIVATE ${LITEROOM_TEST_INCLUDES})
-        target_compile_features(${tgt} PRIVATE cxx_std_23)
-        if(A_LITEUI)
-            target_link_libraries(${tgt} PRIVATE liteui::liteui)
-        endif()
-        if(A_THREADS)
-            target_link_libraries(${tgt} PRIVATE Threads::Threads)
-        endif()
-        if(MSVC)
-            target_compile_options(${tgt} PRIVATE /utf-8 /bigobj)
-        endif()
+    add_executable(literoom_test tests/literoom_test.cpp ${LITEROOM_CASES})
+    # Cases include headers by their src-relative path ("core/pixel_math.hpp")
+    # and each other's files from tests/ ("cases/pixel_math.inc").
+    target_include_directories(literoom_test PRIVATE ${LITEROOM_SRC}
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_features(literoom_test PRIVATE cxx_std_23)
+    # liteui::liteui: literoom_test.cpp defines LITEUI_IMPLEMENTATION once for all cases.
+    # Threads: the worker cases use std::jthread / std::thread.
+    target_link_libraries(literoom_test PRIVATE Catch2::Catch2WithMain liteui::liteui Threads::Threads)
+    if(MSVC)
+        target_compile_options(literoom_test PRIVATE /utf-8 /bigobj)
+    endif()
 
-        set(_env "")
-        if(NOT A_NO_SANITIZE)
-            if(A_LITEUI)
-                liteui_enable_sanitizers(${tgt} _env NO_LEAK_CHECK)
-            else()
-                liteui_enable_sanitizers(${tgt} _env)
-            endif()
-        endif()
+    # -DLITEUI_SANITIZE=ON builds it with AddressSanitizer (see
+    # cmake/LiteuiTests.cmake). NO_LEAK_CHECK because it links liteui.
+    set(_catch_env "")
+    liteui_enable_sanitizers(literoom_test _catch_env NO_LEAK_CHECK)
 
-        add_test(NAME literoom_${name} COMMAND ${tgt} ${A_ARGS})
-        set_tests_properties(literoom_${name} PROPERTIES TIMEOUT ${A_TIMEOUT})
-        if(A_LABEL)
-            set_tests_properties(literoom_${name} PROPERTIES LABELS ${A_LABEL})
-        endif()
-        if(_env)
-            set_tests_properties(literoom_${name} PROPERTIES ENVIRONMENT "${_env}")
-        endif()
-    endfunction()
+    # CTest names: literoom_<Catch2 test case name>, e.g.
+    # "literoom_pixel_math: toU8Clamped".  ctest -R pixel_math  selects them.
+    # ADD_TAGS_AS_LABELS turns every Catch2 tag into a CTest label, so the cases
+    # tagged [threaded] run with:  ctest -C Release -L threaded --repeat until-fail:50
+    # TIMEOUT is per test case (the threaded ones wait up to 10-20 s on purpose).
+    set(_catch_props TIMEOUT 120)
+    if(_catch_env)
+        list(APPEND _catch_props ENVIRONMENT "${_catch_env}")
+    endif()
+    # TEST_SPEC "~[.]" leaves out the hidden cases ([.] tag): the two golden-fingerprint tests
+    # (neighbor_fx, raster_ops) that were switched off in the old suite. Run one by hand with
+    #   literoom_test "neighbor_fx: goldenFingerprints"
+    catch_discover_tests(literoom_test TEST_PREFIX "literoom_"
+        TEST_SPEC "~[.]"
+        ADD_TAGS_AS_LABELS
+        PROPERTIES ${_catch_props})
 
-    # Pure header tests: no liteui, no threads.
-    #   color_pass holds hashed fingerprints recorded with MSVC Release
-    #   (testGoldenFingerprints): they depend on the compiler's float code, so if
-    #   it fails on another compiler or with -DLITEUI_SANITIZE=ON, re-record it
-    #   (see the test) before suspecting the pipeline.
-    #   sam_segmenter covers the no-ONNX stand-in and sam::preprocess only; the
-    #   real model path (LITEROOM_ONNX) has no test.
-    foreach(t minijson exif
-              pixel_math adjustments auto_tone color_mix color_grade color_pass color_tag geometry curves film_fx
-              mask_geom mask_raster mask_brush mask_range mask_object mask_rect mask_polygon mask
-              sidecar photo_meta render_params adjustment_set file_utils virtual_copy image_meta preset sam_segmenter
-              lut3d lut_cube 
-              image16 tone_table)
-        literoom_add_test(${t})
-    endforeach()
-
-    # Tests that start threads carry the "threaded" label, so loop them to
-    # shake out timing flakiness without naming each one:
-    #   ctest -C Release -L threaded --repeat until-fail:50
-    #
-    # detail_layer and neighbor_fx start std::threads (shared-cache race tests);
-    # neighbor_fx also holds hashed fingerprints recorded with MSVC Release (same
-    # caveat as color_pass above). Neither has a 16-bit unit test of the neighbor
-    # effects: that path is exercised by render_core (below).
-    # latest_worker runs a std::jthread. lut_library starts std::threads (several
-    # threads resolving one LUT at once).
-    foreach(t detail_layer neighbor_fx latest_worker lut_library)
-        literoom_add_test(${t} THREADS LABEL threaded TIMEOUT 120)
-    endforeach()
-
-    # thumb_worker decodes real files (liteui's decoder, the app's encoders in
-    # the test) on a std::jthread, so it needs both liteui and threads.
-    literoom_add_test(thumb_worker LITEUI THREADS LABEL threaded TIMEOUT 120)
-
-    # export_worker renders and encodes real files on a std::jthread (the whole
-    # batch-export pipeline), so like thumb_worker it needs liteui and threads.
-    literoom_add_test(export_worker LITEUI THREADS LABEL threaded TIMEOUT 120)
-
-    # lut_preview_worker renders LUT previews on a std::jthread (the LUTs pane's
-    # list), so like thumb_worker it needs liteui (CanvasImage) and threads.
-    literoom_add_test(lut_preview_worker LITEUI THREADS LABEL threaded TIMEOUT 120)
-
-    # lut_pane compiles src/main.cpp into the test (like golden_render, below)
-    # and drives the LUTs pane's logic without a window: refresh, previews,
-    # apply / remove, import, status texts.
-    literoom_add_test(lut_pane LITEUI THREADS LABEL threaded TIMEOUT 120)
-
-    # These take liteui's CanvasImage, so their tests link liteui like the app.
-    #   render_core compares the float pipeline with render/render_bytes.hpp (the
-    #   old byte pipeline, kept as the reference) and holds the only tests of the
-    #   16-bit render paths; deleting render_bytes.hpp removes that reference.
-    #   render and lut_render go through renderAdjusted (the LUT stage in the real
-    #   pipeline, numbers rather than fingerprints). image_codec16 also covers
-    #   core/image16_convert.hpp (widenImage / narrowImage); wide_chain covers
-    #   core/wide_chain.hpp.
-    foreach(t raster_ops seg_basic render render_core export_render wide_chain image_codec image_codec16 image_source histogram scopes lut_render)
-        literoom_add_test(${t} LITEUI)
-    endforeach()
-
-    # ---- Golden render test: the refactoring safety net ----
-    # Compiles src/main.cpp itself (main() renamed) and fingerprints every render
-    # scenario (the test prints the exact count when it runs). Scenarios render
-    # 8-bit CanvasImage pictures only: the 16-bit entry points (renderToDisplay /
-    # renderToImage16) are not pinned by it, render_core_test covers those.
-    # One golden file per compiler + configuration, because float results differ
-    # between compilers and flags:
+    # ---- Golden render test: the refactoring safety net (not Catch2) ----
+    # Its own executable: it compiles src/main.cpp itself (main() renamed) and has
+    # its own main() with --record / --dump, so it can't join literoom_test's
+    # shared TU. One golden file per compiler + configuration (float results
+    # differ between compilers and flags):
     #   cmake --build . --config Release --target literoom_golden_record  (once, BEFORE refactoring)
     #   ctest -C Release -R literoom_golden_render                        (after every step)
+    # Skipped (exit code 77) until a golden file for this compiler/config exists.
     # CI and scripts can leave it out with:  ctest -LE golden
-    #
-    # NOTE: if the golden file for this compiler/config doesn't exist yet, make
-    # golden_render_test.cpp exit with code 77 so CTest reports "skipped"
-    # instead of "failed" (SKIP_RETURN_CODE below).
-    #
-    # NO_SANITIZE: the fingerprints are float-exact, and sanitizer builds change
-    # code generation and stack use, so this one always builds plain.
+    # Never sanitized: the fingerprints are float-exact.
     set(GOLDEN_FILE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/render_${CMAKE_CXX_COMPILER_ID}_$<CONFIG>.txt)
-    literoom_add_test(golden_render LITEUI NO_SANITIZE LABEL golden TIMEOUT 300 ARGS ${GOLDEN_FILE})
-    set_tests_properties(literoom_golden_render PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(literoom_golden_render_test tests/golden_render_test.cpp)
+    target_include_directories(literoom_golden_render_test PRIVATE ${LITEROOM_SRC})  # also finds main.cpp
+    target_compile_features(literoom_golden_render_test PRIVATE cxx_std_23)
+    target_link_libraries(literoom_golden_render_test PRIVATE liteui::liteui Threads::Threads)
     if(MSVC)
+        target_compile_options(literoom_golden_render_test PRIVATE /utf-8 /bigobj)
         # Same large frame as the app's main() (see /STACK on literoom above).
         target_link_options(literoom_golden_render_test PRIVATE /STACK:8388608)
     endif()
+
+    add_test(NAME literoom_golden_render COMMAND literoom_golden_render_test ${GOLDEN_FILE})
+    set_tests_properties(literoom_golden_render PROPERTIES
+        LABELS golden TIMEOUT 300 SKIP_RETURN_CODE 77)
+
     add_custom_target(literoom_golden_record
         COMMAND literoom_golden_render_test --record ${GOLDEN_FILE}
         DEPENDS literoom_golden_render_test
         COMMENT "golden: recording ${GOLDEN_FILE}")
+
+    # ---- lut_pane: the LUTs pane's logic without a window (not Catch2) ----
+    # Its own executable, like golden_render: it compiles src/main.cpp itself
+    # (main() renamed) and has its own main() on the old check.hpp harness, so it
+    # can't join literoom_test's shared TU. Runs a real LUT library in a temp
+    # folder, the real preview worker and the real renderer on a std::jthread.
+    #   ctest -C Release -R literoom_lut_pane
+    #   ctest -C Release -L threaded --repeat until-fail:50      (timing flakiness)
+    add_executable(literoom_lut_pane_test tests/lut_pane_test.cpp)
+    target_include_directories(literoom_lut_pane_test PRIVATE ${LITEROOM_SRC}                    # also finds main.cpp
+                                                              ${CMAKE_CURRENT_SOURCE_DIR}/tests) # check.hpp
+    target_compile_features(literoom_lut_pane_test PRIVATE cxx_std_23)
+    target_link_libraries(literoom_lut_pane_test PRIVATE liteui::liteui Threads::Threads)
+    if(MSVC)
+        target_compile_options(literoom_lut_pane_test PRIVATE /utf-8 /bigobj)
+    endif()
+
+    set(_lut_pane_env "")
+    liteui_enable_sanitizers(literoom_lut_pane_test _lut_pane_env NO_LEAK_CHECK)
+
+    add_test(NAME literoom_lut_pane COMMAND literoom_lut_pane_test)
+    set_tests_properties(literoom_lut_pane PROPERTIES LABELS threaded TIMEOUT 120)
+    if(_lut_pane_env)
+        set_tests_properties(literoom_lut_pane PROPERTIES ENVIRONMENT "${_lut_pane_env}")
+    endif()
 endif()

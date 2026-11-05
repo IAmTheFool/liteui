@@ -1,6 +1,7 @@
 // adjustments.hpp - The Adjust sliders: AdjId, the AdjustmentSpec table (range + tone
 // function per slider) and AdjValues (one value per slider, used by the
-// global edit set and by every mask). No UI, no pixels.
+// global edit set and by every mask), plus toneLutFromValues, the 8-bit Tone table
+// built from them. No UI.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -31,7 +32,8 @@ constexpr int kBrightnessMax = 100;
 
 // The shared -100..+100 range (0 = untouched) used by Contrast, Highlights,
 // Shadows, Whites, Blacks, and also by Temperature, Tint, Vibrance, Saturation,
-// Hue, Texture, Clarity and Dehaze (and Gamma).
+// Hue, Texture, Clarity, Dehaze, Gamma, Vignette (and its Midpoint / Feather)
+// and Grain Roughness.
 constexpr int kBipolarMin = -100;
 constexpr int kBipolarMax = 100;
 // Older names for the same range; kept so existing code keeps compiling.
@@ -40,12 +42,12 @@ constexpr int kToneMax = kBipolarMax;
 
 // ---------------- Adjustments ----------------
 // Every slider in the "Adjust" pane is one entry in kAdjustmentSpecs below.
-// Adding a new one means adding an AdjId and one entry to that table 
+// Adding a new one means adding an AdjId and one entry to that table.
 // (That every Tone entry has an `apply` is checked at run time by
 // tests/adjustments_test.cpp, because GCC can't constant-evaluate the
 // null check under -fsanitize=address,undefined.)
-// AdjustmentSet, the sidebar loop and the Tone-stage LUT pick it up
-// automatically; a Color, Detail or Effects slider also needs its pass
+// AdjustmentSet, the sidebar loop and the Tone-stage tables (toneLutFromValues,
+// toneTableFromValues) pick it up automatically; a Color, Detail or Effects slider also needs its pass
 // (ColorPass, detail_layer, film_fx, ...) to read its value.
 
 // Order must match kAdjustmentSpecs below (it is indexed by AdjId).
@@ -115,19 +117,20 @@ constexpr size_t adjIndex(AdjId id) { return static_cast<size_t>(id); }
 // One slider's identity, range, and per-channel transform. `apply` takes a
 // single channel's 0..255 value (not the whole image) and returns the
 // transformed value, unclamped and unrounded — toneLutFromValues below rounds
-// and clamps after each spec while composing them into one lookup table. This
+// and clamps after each spec while composing them into one 8-bit table, and
+// toneTableFromValues (tone_table.hpp) clamps after each spec into a float one. This
 // means every Tone adjustment must be pointwise per-channel: it can't be
 // written this way if it needs neighbor-pixel access.
 //
 // Four stages:
 //   Stage::Tone   — pointwise per-channel; `apply` is composed into the shared
-//                   LUT (Exposure ... Blacks). Runs first.
+//                   tone table (Exposure ... Gamma). Runs first.
 //   Stage::Color  — needs per-channel gains or cross-channel math
-//                   (Temperature, Tint, Vibrance, Saturation, Hue, Colorize).
-//                   `apply` is unused (null); these are consumed by the float
-//                   per-pixel pass built in ColorPass / applyColorPass, which
-//                   runs after the LUT and rounds to 8 bits only once at the
-//                   end.
+//                   (Temperature, Tint, Vibrance, Saturation, Hue, Colorize,
+//                   the Filters, LUT Amount). `apply` is unused (null); these
+//                   are consumed by the float per-pixel pass built in
+//                   ColorPass (applyColorPassF), which runs after the tone
+//                   tables and rounds to 8 bits only once at the end.
 //   Stage::Detail — needs neighbor pixels (Texture, Clarity, Sharpness,
 //                   Dehaze, noise reduction, Blur). `apply` is unused (null)
 //                   here too: these are consumed by the neighbor-pixel passes
@@ -161,7 +164,7 @@ struct AdjustmentSpec
 
 // Declaration order here is the sidebar's display order. It is also the
 // processing order within the Tone stage — each Tone spec's `apply` runs on the
-// previous one's output. Across stages the order is fixed: Tone (via the LUT),
+// previous one's output. Across stages the order is fixed: Tone (via the tone table),
 // then Color, then Detail, then (after the masks) Effects. Exposure before Brightness mirrors Lightroom's own
 // Basic panel ordering, and keeps exposure's multiplicative scale from being
 // thrown off by an offset that was meant to be applied after it.
@@ -275,7 +278,8 @@ inline constexpr std::array<AdjustmentSpec, adjIndex(AdjId::Count)>
         {AdjId::ColorizeAmount, "Colorize Amount", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
         // Filters (see FilterPass in color_pass.hpp). Strength 0..100: the
-        // result is lerp(pixel, filtered pixel, value / 100). NOTE: these
+        // result is lerp(pixel, filtered pixel, value / 100), except Posterize, where
+        // the value sets the level count. NOTE: these
         // labels are sidecar keys; never rename them once released.
         {AdjId::Greyscale, "Greyscale", 0.0f, 100.0f, nullptr,
          AdjustmentSpec::Stage::Color},
@@ -356,8 +360,6 @@ static_assert(adjustmentSpecsValid(),
               "kAdjustmentSpecs must have one entry per AdjId, in AdjId order, "
               "with min < max");
 
-
-
 using AdjValues = std::array<float, adjIndex(AdjId::Count)>;
 
 // All sliders untouched (every slider's neutral value is 0).
@@ -374,7 +376,9 @@ inline float sanitizedValue(const AdjustmentSpec &spec, float v)
 
 // The Tone-stage sliders composed into one 256-entry table (per-channel, so
 // the same table serves R, G and B), with an optional curve table applied
-// last. Shared by the global pipeline (AdjustmentSet::buildLut) and masks.
+// last. The byte reference for the float Tone stage (toneTableFromValues in
+// tone_table.hpp); used by Auto Tone, the tests and the 8-bit path
+// (AdjustmentSet::buildLut) and masks.
 inline std::array<uint8_t, 256>
 toneLutFromValues(const AdjValues &values,
                   const std::array<float, 256> *curveLut)

@@ -10,14 +10,17 @@
 //   Exposure (gain)  ->  Contrast (stretch around 128)  ->  Whites  ->  Blacks
 //
 // and each rounds to a byte (see toneLutFromValues), so the solver follows the
-// same order and rounds the two gains the way the table does.
+// same order and rounds the two gains the way the table does. (The float
+// pipeline's table, tone_table.hpp, does not round between sliders, so a render
+// can land a fraction of a level off what is checked here.)
 //
 // Why not aim the median at mid-gray? A dark night scene or a bright snow scene
 // is *meant* to be dark or bright. Stretching the measured range keeps that
 // character and only uses the available room. A well-exposed picture comes out
 // almost untouched.
 //
-// Brightness, Highlights, Shadows and the curves are NOT read and NOT changed:
+// Brightness, Highlights, Shadows, the Levels sliders (Black Point, White Point,
+// Gamma) and the curves are NOT read and NOT changed:
 // the histogram it is given is the picture before any tone table, so the answer
 // does not depend on the sliders already set (it is the same every time).
 //
@@ -110,7 +113,8 @@ namespace auto_tone_detail
 
 // `luma`: counts per level 0..255 of the picture BEFORE the tone tables
 // (histogram::Counts::l of the source picture). Only the shape matters, so
-// the total number of pixels does not change the answer.
+// the total number of pixels does not change the answer (beyond the
+// kAutoToneMinPixels floor).
 inline AutoTone solveAutoTone(const std::array<uint32_t, 256> &luma)
 {
   AutoTone out; // status starts as NoPixels

@@ -18,8 +18,8 @@
 //
 // The result depends only on a pixel's luma, so all of it (weights, tint
 // vectors, luminance offsets of all four wheels) is baked into one small
-// per-luma table of RGB offsets (GradeLut). The per-pixel work is: luma,
-// one table read, three adds (see applyColorPass).
+// per-luma table of RGB offsets (GradeLut). The per-pixel work is: clamp,
+// luma, one table read, three adds (see applyColorPassF).
 //
 // All inputs are sanitized in buildGradeLut (clamped to their ranges, NaN
 // treated as neutral), and the luminance offsets are kept from inverting
@@ -40,7 +40,7 @@ constexpr float kGradeLumAmount = 0.30f; // lum +/-100 = +/-30% of 255
 
 // The luma weights (Rec. 601) the table is built around: the tint is made
 // luma-neutral with these, and the table is indexed by luma computed with
-// them. applyColorPass must use the SAME weights to pick the table row, or the
+// them. applyColorPassF must use the SAME weights to pick the table row, or the
 // tint will shift brightness and read the wrong entry.
 constexpr float kGradeLumaR = 0.299f;
 constexpr float kGradeLumaG = 0.587f;
@@ -159,8 +159,8 @@ inline GradeLut buildGradeLut(const ColorGrade &g)
   const float crossLo = pivot - 0.25f, crossHi = pivot + 0.25f;
   const float hw = 0.05f + 0.30f * (blending / 100.0f);
 
-  GradeLut lut{};                     // tint part of the offsets, per channel
-  std::array<float, 256> lumCurve{};  // luminance part (same for R, G, B)
+  GradeLut lut{};                    // per-channel offsets: tint here, luminance curve added at the end
+  std::array<float, 256> lumCurve{}; // luminance part (same for R, G, B)
   for (size_t i = 0; i < 256; ++i)
   {
     const float y = static_cast<float>(i) / 255.0f;

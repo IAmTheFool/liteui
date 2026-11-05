@@ -6,7 +6,8 @@
 //   * photoInfoOf         the camera data of a JPEG (make, model, lens, ISO,
 //                         shutter, ...) for the Info panel.
 // Glue between file_utils.hpp (reading a file's first bytes), exif.hpp (the
-// byte-level work) and geometry.hpp (Orient). No liteui and no editor state, so
+// byte-level work), virtual_copy.hpp (photoInfoOf accepts a copy's path) and
+// geometry.hpp (Orient). No liteui and no editor state, so
 // all three functions can be tested with synthetic JPEG files in a temp folder.
 #pragma once
 #include <cstddef>

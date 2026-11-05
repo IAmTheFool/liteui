@@ -1,0 +1,1006 @@
+// cases/adjustment_set.inc - included from literoom_test.cpp: no main(), no check.hpp, no
+// #define LITEUI_IMPLEMENTATION. Helpers and TEST_CASEs live in namespace adjustment_set_cases
+// so they cannot collide with other cases.
+
+#include "edit/adjustment_set.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <utility>
+#include <variant>
+
+namespace adjustment_set_cases
+{
+static void fresh(AdjustmentSet &s)
+{
+  s.reset();
+  s.setOriginalSize(400, 300);
+}
+static Mask radialMask()
+{
+  Mask m;
+  m.parts.push_back({RadialShape{}, MaskOp::Add});
+  m.adj[static_cast<size_t>(AdjId::Exposure)] = 20.0f;
+  return m;
+}
+static const std::string &label(const AdjustmentSet &s, size_t i) { return s.historyLabel(i); }
+static const std::string &lastLabel(const AdjustmentSet &s) { return s.historyLabel(s.historySize() - 1); }
+
+TEST_CASE("adjustment_set: freshState", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  for (size_t i = 0; i < static_cast<size_t>(AdjId::Count); ++i)
+    CHECK(s.get(static_cast<AdjId>(i)) == 0.0f);
+  CHECK((s.crop().empty() && s.orient().identity() && s.angle() == 0.0f && !s.expand()));
+  for (size_t c = 0; c < kCurveChannelCount; ++c)
+    CHECK(s.curve(static_cast<CurveChannel>(c)) == identityCurve());
+  CHECK((!mixAnyNonZero(s.mixValues()) && !s.grade().anyActive() && s.masks().empty()));
+  CHECK((s.historySize() == 1 && s.historyIndex() == 0 && !s.canUndo() && !s.canRedo()));
+  CHECK((label(s, 0) == "Original" && label(s, 1).empty() && label(s, 999).empty()));
+  s.undo();
+  s.redo(); // nothing to do, nothing breaks
+  CHECK(s.historySize() == 1);
+}
+
+TEST_CASE("adjustment_set: sliderStepsAndCoalescing", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 10.0f);
+  s.set(AdjId::Exposure, 20.0f);
+  s.set(AdjId::Exposure, 30.0f); // one drag: one step
+  CHECK((s.historySize() == 2 && s.get(AdjId::Exposure) == 30.0f && lastLabel(s) == "Exposure +30"));
+  s.set(AdjId::Contrast, -12.0f); // another slider: a new step
+  s.set(AdjId::Exposure, 40.0f);  // back to the first one: a new step too
+  CHECK((s.historySize() == 4 && label(s, 2) == "Contrast -12" && label(s, 3) == "Exposure +40"));
+  s.undo();
+  CHECK((s.get(AdjId::Exposure) == 30.0f && s.get(AdjId::Contrast) == -12.0f && s.historyIndex() == 2 && s.canRedo()));
+  s.set(AdjId::Exposure, 35.0f); // the first touch after an undo is a new step, dropping the redo tail
+  CHECK((s.historySize() == 4 && s.historyIndex() == 3 && !s.canRedo() && lastLabel(s) == "Exposure +35"));
+  s.set(AdjId::Tint, 2.5f);
+  CHECK(lastLabel(s) == "Tint +2.5"); // fractions show one decimal
+  s.set(AdjId::Temperature, -0.02f);
+  CHECK((lastLabel(s) == "Temperature +0" || lastLabel(s) == "Temperature -0")); // whole numbers show none
+  s.set(AdjId::Highlights, 3.1f);
+  CHECK(lastLabel(s) == "Highlights +3.1"); // 0.1 off a whole number is still shown
+  s.set(AdjId::Shadows, 3.04f);
+  CHECK(lastLabel(s) == "Shadows +3");      // 0.04 is not
+  s.set(AdjId::Sepia, 60.0f);
+  CHECK(lastLabel(s) == "Sepia +60");        // the Filters get History labels from the table too
+  s.set(AdjId::BleachBypass, 40.0f);
+  CHECK(lastLabel(s) == "Bleach Bypass +40");
+  s.set(AdjId::CrossProcess, 25.0f);
+  CHECK(lastLabel(s) == "Cross Process +25");
+  CHECK(kMaxUndoSteps == 200);
+}
+
+TEST_CASE("adjustment_set: undoRedoAndJumps", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 10.0f);
+  s.set(AdjId::Contrast, 20.0f);
+  s.set(AdjId::Tint, 30.0f);
+  s.set(AdjId::Hue, 40.0f);
+  CHECK((s.historySize() == 5 && s.historyIndex() == 4));
+  s.undo();
+  s.undo();
+  CHECK((s.historyIndex() == 2 && s.get(AdjId::Contrast) == 20.0f && s.get(AdjId::Tint) == 0.0f && s.get(AdjId::Hue) == 0.0f));
+  s.redo();
+  CHECK((s.get(AdjId::Hue) == 0.0f && s.historyIndex() == 3));
+  s.redo();
+  CHECK((s.get(AdjId::Hue) == 40.0f && !s.canRedo()));
+  s.redo(); // past the end: nothing
+  CHECK(s.historyIndex() == 4);
+  s.goToHistory(1);
+  CHECK((s.get(AdjId::Exposure) == 10.0f && s.get(AdjId::Contrast) == 0.0f && s.historyIndex() == 1));
+  s.goToHistory(1);  // already there
+  s.goToHistory(99); // past the end
+  CHECK((s.historyIndex() == 1 && s.historySize() == 5));
+  s.goToHistory(0);
+  CHECK((s.get(AdjId::Exposure) == 0.0f && !s.canUndo()));
+  s.goToHistory(4);
+  CHECK(s.get(AdjId::Hue) == 40.0f);
+  // After undo + redo (or a jump) the next touch of the SAME slider is a new step,
+  // not a continuation of the drag that came before.
+  AdjustmentSet r;
+  fresh(r);
+  r.set(AdjId::Exposure, 10.0f);
+  r.undo();
+  r.redo();
+  r.set(AdjId::Exposure, 20.0f);
+  CHECK((r.historySize() == 3 && label(r, 1) == "Exposure +10" && label(r, 2) == "Exposure +20"));
+  r.set(AdjId::Contrast, 5.0f);
+  r.goToHistory(r.historySize() - 1 - 1);
+  r.goToHistory(r.historySize() - 1);
+  r.set(AdjId::Contrast, 6.0f);
+  CHECK(r.historySize() == 5);
+  // Going back and editing replaces the future.
+  s.goToHistory(2);
+  s.set(AdjId::Whites, 5.0f);
+  CHECK((s.historySize() == 4 && !s.canRedo() && lastLabel(s) == "Whites +5"));
+}
+
+TEST_CASE("adjustment_set: historyIsCapped", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  const size_t n = kMaxUndoSteps + 25;
+  for (size_t i = 1; i <= n; ++i)
+    s.setCrop(CropRect{static_cast<int>(i), 0, 100, 100});
+  CHECK((s.historySize() == kMaxUndoSteps + 1 && s.historyIndex() == kMaxUndoSteps));
+  CHECK(label(s, 0) == "Original"); // the oldest kept step is always shown as the baseline
+  for (size_t i = 0; i < kMaxUndoSteps; ++i)
+    s.undo();
+  CHECK((!s.canUndo() && s.crop().x == static_cast<int>(n - kMaxUndoSteps))); // earliest reachable state, not the true original
+  s.goToHistory(s.historySize() - 1);
+  CHECK(s.crop().x == static_cast<int>(n));
+}
+
+TEST_CASE("adjustment_set: geometrySteps", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.setCrop(CropRect{10, 10, 100, 80});
+  CHECK((lastLabel(s) == "Crop" && s.historySize() == 2));
+  s.setCrop(CropRect{10, 10, 100, 80}); // same again: nothing
+  CHECK(s.historySize() == 2);
+  s.setCrop(CropRect{});
+  CHECK(lastLabel(s) == "Remove Crop");
+  s.setCrop(CropRect{5, 5, 50, 50});
+
+  // setGeometry: orientation, angle and crop together, one step; identical values: nothing.
+  const size_t before = s.historySize();
+  s.setGeometry(Orient{1, true}, 3.0f, CropRect{1, 2, 30, 40});
+  CHECK((s.historySize() == before + 1 && s.orient() == (Orient{1, true}) && s.angle() == 3.0f && s.crop() == (CropRect{1, 2, 30, 40})));
+  CHECK(lastLabel(s) == "Rotate / Flip");
+  s.setGeometry(Orient{1, true}, 3.0f, CropRect{1, 2, 30, 40});
+  CHECK(s.historySize() == before + 1);
+  s.undo();
+  CHECK((s.orient().identity() && s.angle() == 0.0f && s.crop() == (CropRect{5, 5, 50, 50})));
+
+  // The straighten angle: a new angle drops the crop (a new picture size); a drag folds into one step.
+  s.setAngle(1.0f, true);
+  s.setAngle(1.5f, true);
+  s.setAngle(2.0f, true);
+  CHECK((s.crop().empty() && s.angle() == 2.0f && lastLabel(s).rfind("Straighten +2.0", 0) == 0));
+  const size_t steps = s.historySize();
+  s.setAngle(2.0f, true); // unchanged: nothing
+  CHECK(s.historySize() == steps);
+  s.setAngle(-3.0f, false); // a discrete action: its own step each time
+  s.setAngle(-4.0f, false);
+  CHECK((s.historySize() == steps + 2 && lastLabel(s) == "Straighten -4.0\xC2\xB0"));
+  s.undo();
+  s.undo();
+  s.undo();
+  CHECK((s.crop() == (CropRect{5, 5, 50, 50}) && s.angle() == 0.0f)); // undo brings the crop back
+
+  // The corner mode: only a picture-changing event when the angle is not 0.
+  AdjustmentSet e;
+  fresh(e);
+  e.setCrop(CropRect{1, 1, 20, 20});
+  e.setExpand(true);
+  CHECK((e.expand() && e.crop() == (CropRect{1, 1, 20, 20}) && lastLabel(e) == "Straighten: Keep Canvas"));
+  e.setExpand(true); // same: nothing
+  CHECK(e.historySize() == 3);
+  e.setAngle(5.0f, false);
+  e.setCrop(CropRect{1, 1, 20, 20});
+  e.setExpand(false);
+  CHECK((!e.expand() && e.crop().empty() && lastLabel(e) == "Straighten: Auto-Crop"));
+}
+
+TEST_CASE("adjustment_set: curveSteps", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  const CurvePoints a{{0, 0}, {100, 140}, {255, 255}}, b{{0, 0}, {100, 150}, {255, 255}}, c{{0, 0}, {80, 60}, {255, 255}};
+  s.setCurve(a, true);
+  s.setCurve(b, true); // same channel, same gesture
+  CHECK((s.historySize() == 2 && s.curve() == b && lastLabel(s) == "Tone Curve: RGB"));
+  s.setCurve(CurveChannel::Red, c, true); // another channel: a new step
+  CHECK((s.historySize() == 3 && lastLabel(s) == "Tone Curve: Red" && s.curve(CurveChannel::Red) == c));
+  s.setCurve(CurveChannel::Red, c, true); // identical: nothing
+  CHECK(s.historySize() == 3);
+  s.endCurveEdit();
+  s.setCurve(CurveChannel::Red, a, true); // after the gesture ended: a new step
+  CHECK(s.historySize() == 4);
+  s.setCurve(CurveChannel::Green, a, false);
+  s.setCurve(CurveChannel::Blue, a, false);
+  CHECK((s.historySize() == 6 && lastLabel(s) == "Tone Curve: Blue"));
+  s.resetAllCurves(); // all four at once, one step
+  CHECK(s.historySize() == 7);
+  for (size_t i = 0; i < kCurveChannelCount; ++i)
+    CHECK(s.curve(static_cast<CurveChannel>(i)) == identityCurve());
+  s.resetAllCurves(); // nothing left to reset
+  CHECK(s.historySize() == 7);
+}
+
+TEST_CASE("adjustment_set: mixGradeAndMaskSteps", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.setMix(MixChan::Hue, 0, 10.0f);
+  s.setMix(MixChan::Hue, 0, 20.0f);
+  CHECK((s.historySize() == 2 && s.mix(MixChan::Hue, 0) == 20.0f && lastLabel(s) == "Color Mix: Red Hue +20"));
+  s.setMix(MixChan::Hue, 0, 20.0f); // unchanged
+  s.setMix(MixChan::Luminance, 3, -5.0f);
+  CHECK((s.historySize() == 3 && lastLabel(s) == "Color Mix: Green Luminance -5"));
+  s.setMix(MixChan::Saturation, 7, 9.0f);
+  CHECK(lastLabel(s) == "Color Mix: Magenta Saturation +9");
+  s.resetMix();
+  CHECK((!mixAnyNonZero(s.mixValues()) && lastLabel(s) == "Color Mix: Reset"));
+  const size_t n = s.historySize();
+  s.resetMix();
+  CHECK(s.historySize() == n);
+
+  ColorGrade g;
+  g.wheel[0].sat = 20.0f;
+  s.setGrade(g, 5);
+  g.wheel[0].sat = 30.0f;
+  s.setGrade(g, 5); // same control: folded
+  CHECK((s.historySize() == n + 1 && lastLabel(s) == "Color Grading: Shadows"));
+  g.wheel[2].lum = 10.0f;
+  s.setGrade(g, 6); // another control: new step
+  CHECK((s.historySize() == n + 2 && lastLabel(s) == "Color Grading: Highlights"));
+  s.endGradeEdit();
+  g.wheel[2].lum = 12.0f;
+  s.setGrade(g, 6);
+  CHECK(s.historySize() == n + 3);
+  g.blending = 40.0f;
+  s.setGrade(g, -1); // discrete
+  CHECK(lastLabel(s) == "Color Grading: Blending");
+  g.balance = 11.0f;
+  s.setGrade(g, -1);
+  CHECK(lastLabel(s) == "Color Grading: Balance");
+  s.setGrade(g, -1); // identical
+  CHECK(s.historySize() == n + 5);
+
+  AdjustmentSet m;
+  fresh(m);
+  MaskSet one{radialMask()};
+  m.setMasks(one, -1);
+  CHECK((lastLabel(m) == "Add Radial Mask" && m.masks().size() == 1));
+  m.setMasks(one, -1); // identical
+  CHECK(m.historySize() == 2);
+  one[0].adj[static_cast<size_t>(AdjId::Exposure)] = 30.0f;
+  m.setMasks(one, 4);
+  one[0].adj[static_cast<size_t>(AdjId::Exposure)] = 40.0f;
+  m.setMasks(one, 4); // a drag of mask control 4: one step
+  CHECK((m.historySize() == 3 && lastLabel(m) == "Mask 1: Exposure +40"));
+  m.endMaskEdit();
+  one[0].adj[static_cast<size_t>(AdjId::Exposure)] = 45.0f;
+  m.setMasks(one, 4);
+  CHECK(m.historySize() == 4);
+}
+
+TEST_CASE("adjustment_set: maskLabels", "[adjustment_set]")
+{
+  AdjustmentSet m;
+  fresh(m);
+  // "Add <kind> Mask" names the kind of the new mask, for every kind.
+  const MaskShape shapes[] = {RadialShape{}, LinearShape{}, BrushShape{}, LuminosityShape{}, ColorRangeShape{}, ObjectShape{}};
+  const char *names[] = {"Radial", "Linear", "Brush", "Luminosity", "Color Range", "Object"};
+  for (int i = 0; i < 6; ++i)
+  {
+    AdjustmentSet t;
+    fresh(t);
+    Mask k;
+    k.parts.push_back({shapes[i], MaskOp::Add});
+    t.setMasks(MaskSet{k}, -1);
+    CHECK(lastLabel(t) == std::string("Add ") + names[i] + " Mask");
+  }
+  {
+    AdjustmentSet t;
+    fresh(t);
+    Mask lin;
+    lin.parts.push_back({LinearShape{}, MaskOp::Add});
+    Mask brush;
+    brush.parts.push_back({BrushShape{}, MaskOp::Add});
+    t.setMasks(MaskSet{lin}, -1);
+    t.setMasks(MaskSet{lin, brush}, -1);
+    CHECK((label(t, 1) == "Add Linear Mask" && label(t, 2) == "Add Brush Mask")); // the one just added, the last
+  }
+  MaskSet set{radialMask()};
+  Mask second = radialMask();
+  second.adj[static_cast<size_t>(AdjId::Exposure)] = 5.0f;
+  set.push_back(second);
+  m.setMasks(set, -1);
+  CHECK(label(m, 1) == "Add Radial Mask");
+  auto edit = [&](auto &&fn, const char *expect)
+  {
+    MaskSet next = m.masks();
+    fn(next[0]);
+    m.setMasks(next, -1);
+    CHECK(lastLabel(m) == expect);
+  };
+  edit([](Mask &k) { k.name = "Sky"; }, "Mask 1: Rename");
+  edit([](Mask &k) { k.adj[static_cast<size_t>(AdjId::Contrast)] = 15.0f; }, "Mask 1: Contrast +15");
+  edit([](Mask &k) { k.amount = 50.0f; }, "Mask 1: Amount 50");
+  edit([](Mask &k) { k.mix[0] = 5.0f; }, "Mask 1: Color Mix");
+  edit([](Mask &k) { k.grade.wheel[0].sat = 5.0f; }, "Mask 1: Color Grading");
+  edit([](Mask &k) { k.curves[0] = CurvePoints{{0, 0}, {90, 110}, {255, 255}}; }, "Mask 1: Curve");
+  edit([](Mask &k) { k.enabled = false; }, "Mask 1: Off");
+  edit([](Mask &k) { k.enabled = true; }, "Mask 1: On");
+  edit([](Mask &k) { k.invert = true; }, "Mask 1: Invert");
+  edit([](Mask &k) { k.parts.push_back({LinearShape{}, MaskOp::Subtract}); }, "Mask 1: Parts");
+  edit([](Mask &k) { std::get<RadialShape>(k.parts[0].shape).cx = 0.9f; }, "Mask 1: Edit");
+  // Swapping two neighbors is "Reorder", not a change of the first one's sliders.
+  MaskSet swapped = m.masks();
+  std::swap(swapped[0], swapped[1]);
+  m.setMasks(swapped, -1);
+  CHECK(lastLabel(m) == "Reorder Masks");
+  MaskSet fewer = m.masks();
+  fewer.pop_back();
+  m.setMasks(fewer, -1);
+  CHECK(lastLabel(m) == "Delete Mask");
+}
+
+TEST_CASE("adjustment_set: versionAndLabelCache", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  const uint64_t v0 = s.version();
+  s.set(AdjId::Exposure, 10.0f);
+  const uint64_t v1 = s.version();
+  CHECK(v1 > v0);
+  s.set(AdjId::Exposure, 20.0f);
+  CHECK(s.version() > v1); // even a folded drag step is a change
+  const uint64_t v2 = s.version();
+  s.undo();
+  CHECK(s.version() > v2);
+  const uint64_t v3 = s.version();
+  s.redo();
+  CHECK(s.version() > v3);
+  const uint64_t v4 = s.version();
+  CHECK(lastLabel(s) == "Exposure +20"); // reading labels changes nothing
+  CHECK(s.version() == v4);
+  s.reset();
+  CHECK(s.version() > v4);
+  // A drag that overwrites a step leaves no stale label behind.
+  s.set(AdjId::Exposure, 10.0f);
+  CHECK(lastLabel(s) == "Exposure +10");
+  s.set(AdjId::Exposure, 55.0f);
+  CHECK((lastLabel(s) == "Exposure +55" && s.historySize() == 2));
+  // No-ops do not count as changes.
+  const uint64_t before = s.version();
+  s.setCrop(CropRect{});
+  s.setExpand(false);
+  s.setAngle(0.0f, false);
+  s.setGeometry(Orient{}, 0.0f, CropRect{});
+  s.resetMix();
+  s.resetAllCurves();
+  CHECK(s.version() == before);
+}
+
+TEST_CASE("adjustment_set: json", "[adjustment_set]")
+{
+  AdjustmentSet a;
+  fresh(a);
+  a.set(AdjId::Exposure, 25.0f);
+  a.set(AdjId::Texture, -30.0f);
+  a.set(AdjId::Vintage, 45.0f);
+  a.setGeometry(Orient{1, false}, 4.5f, CropRect{});
+  a.setCurve(CurveChannel::Blue, CurvePoints{{0, 0}, {120, 100}, {255, 255}}, false);
+  a.setMix(MixChan::Saturation, 2, -15.0f);
+  ColorGrade g;
+  g.wheel[1].hue = 200.0f;
+  g.wheel[1].sat = 33.0f;
+  a.setGrade(g, -1);
+  a.setMasks(MaskSet{radialMask()}, -1);
+  const std::string text = a.toJson().dump();
+  // A Filter is saved under its label, and one at 0 is left out like every other slider.
+  CHECK((text.find("\"Vintage\"") != std::string::npos && text.find("\"Sepia\"") == std::string::npos));
+
+  AdjustmentSet b;
+  fresh(b);
+  b.set(AdjId::Hue, 77.0f); // whatever was there is replaced
+  mj::Json j;
+  std::string err;
+  CHECK((mj::Json::parse(text, &j, &err) && b.loadJson(j)));
+  CHECK((b.get(AdjId::Exposure) == 25.0f && b.get(AdjId::Texture) == -30.0f && b.get(AdjId::Hue) == 0.0f));
+  CHECK((b.get(AdjId::Vintage) == 45.0f && b.get(AdjId::Sepia) == 0.0f));
+  CHECK((b.orient() == (Orient{1, false}) && b.angle() == 4.5f && b.curve(CurveChannel::Blue) == a.curve(CurveChannel::Blue)));
+  CHECK((b.mix(MixChan::Saturation, 2) == -15.0f && b.grade() == a.grade() && b.masks().size() == 1));
+  CHECK(b.toJson().dump() == text);
+  // The undo history starts again from what was loaded.
+  CHECK((b.historySize() == 1 && !b.canUndo() && label(b, 0) == "Original"));
+  b.set(AdjId::Hue, 5.0f);
+  b.undo();
+  CHECK((b.get(AdjId::Exposure) == 25.0f && b.get(AdjId::Hue) == 0.0f));
+  // An unusable file changes nothing and says so.
+  const std::string keep = b.toJson().dump();
+  mj::Json arr;
+  CHECK((mj::Json::parse("[1,2]", &arr, &err) && !b.loadJson(arr) && b.toJson().dump() == keep));
+  // Masks are loaded against the picture's size; a crop outside it is dropped.
+  AdjustmentSet c;
+  c.reset();
+  c.setOriginalSize(100, 100);
+  mj::Json cj;
+  CHECK((mj::Json::parse(R"({"geometry":{"crop":[0,0,300,300]}})", &cj, &err) && c.loadJson(cj) && c.crop().empty()));
+}
+
+TEST_CASE("adjustment_set: buildTables", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  const auto id = s.buildLut();
+  for (int i = 0; i < 256; ++i)
+    CHECK(id[static_cast<size_t>(i)] == i);
+  RenderParams rp = s.buildRenderParams();
+  CHECK((rp.luts[0] == id && rp.luts[1] == id && rp.luts[2] == id));
+  CHECK((!rp.color.active && !rp.fx.any() && rp.masks.empty()));
+  CHECK(!s.buildColorPass().active);
+
+  // Tone sliders, then the master curve, then each channel's curve.
+  s.set(AdjId::Exposure, 40.0f);
+  AdjValues tone{};
+  tone[static_cast<size_t>(AdjId::Exposure)] = 40.0f;
+  CHECK(s.buildLut() == toneLutFromValues(tone, nullptr));
+  const CurvePoints master{{0, 0}, {100, 160}, {255, 255}}, red{{0, 0}, {128, 90}, {255, 255}};
+  s.setCurve(CurveChannel::Master, master, false);
+  const auto masterLut = curveToLut(master);
+  CHECK(s.buildLut() == toneLutFromValues(tone, &masterLut));
+  s.setCurve(CurveChannel::Red, red, false);
+  const auto base = s.buildLut();
+  const auto ch = s.buildChannelLuts();
+  const auto redLut = curveToLut(red);
+  for (int i = 0; i < 256; ++i)
+  {
+    CHECK((ch[1][static_cast<size_t>(i)] == base[static_cast<size_t>(i)] && ch[2][static_cast<size_t>(i)] == base[static_cast<size_t>(i)]));
+    CHECK(ch[0][static_cast<size_t>(i)] == std::clamp(static_cast<int>(std::lround(redLut[base[static_cast<size_t>(i)]])), 0, 255));
+  }
+  CHECK(s.buildRenderParams().luts == ch);
+
+  // Color and detail sliders land in their own parts of the parameters.
+  AdjustmentSet t;
+  fresh(t);
+  t.set(AdjId::Temperature, 30.0f);
+  t.set(AdjId::Clarity, 40.0f);
+  const RenderParams r2 = t.buildRenderParams();
+  CHECK((r2.color.active && r2.fx.any() && r2.luts[0] == id && r2.masks.empty()));
+  CHECK(t.buildColorPass().active);
+  AdjustmentSet u;
+  fresh(u);
+  u.setMix(MixChan::Hue, 1, 20.0f);
+  CHECK((u.buildColorPass().mix && u.buildRenderParams().color.active));
+  u.setMasks(MaskSet{radialMask()}, -1);
+  CHECK(u.buildRenderParams().masks.size() == 1);
+}
+
+TEST_CASE("adjustment_set: filterSlidersReachTheColorPass", "[adjustment_set]")
+{
+  // A Filter alone makes the global color pass active, and touches no other stage.
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Greyscale, 100.0f);
+  const ColorPass cp = s.buildColorPass();
+  CHECK((cp.active && cp.filters.any && cp.filters.grey == 1.0f));
+  CHECK((!cp.mix && !cp.grade && !cp.hue && !cp.colorize));
+  const RenderParams rp = s.buildRenderParams();
+  CHECK((rp.color.active && rp.color.filters.any && !rp.fx.any() && rp.masks.empty()));
+  for (int i = 0; i < 256; ++i)
+    CHECK(rp.luts[0][static_cast<size_t>(i)] == i); // the tone tables are untouched
+  s.set(AdjId::Greyscale, 0.0f);
+  CHECK(!s.buildColorPass().active); // back to neutral: the fast path again
+
+  // The global edit and a mask must read the Filters the same way (two call sites of makeColorPass).
+  AdjustmentSet t;
+  fresh(t);
+  Mask m = radialMask();
+  m.adj = AdjValues{};
+  float v = 15.0f;
+  for (AdjId id : {AdjId::Greyscale, AdjId::Sepia, AdjId::Vintage, AdjId::Fade, AdjId::Negative, AdjId::Posterize, AdjId::Solarize,
+                   AdjId::BleachBypass, AdjId::Threshold, AdjId::CrossProcess})
+  {
+    t.set(id, v);
+    m.adj[static_cast<size_t>(id)] = v;
+    v += 8.0f; // 15 ... 87: ten different strengths, none clamped
+  }
+  t.setMasks(MaskSet{m}, -1);
+  const RenderParams r2 = t.buildRenderParams();
+  CHECK((r2.masks.size() == 1 && r2.masks[0].color.active));
+  const FilterPass &g = r2.color.filters, &l = r2.masks[0].color.filters;
+  CHECK((g.any && l.any && g.grey == l.grey && g.sepia == l.sepia && g.vintage == l.vintage && g.fade == l.fade));
+  CHECK((g.negative == l.negative && g.solarize == l.solarize && g.posterLevels == l.posterLevels));
+  CHECK((g.bleach == l.bleach && g.threshold == l.threshold && g.cross == l.cross));
+  CHECK((g.bleach > 0.0f && g.threshold > 0.0f && g.cross > 0.0f)); // really read at the global call site too
+}
+
+TEST_CASE("adjustment_set: masksFollowTheGeometry", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  Mask m = radialMask();
+  RadialShape r;
+  r.cx = 0.1f;
+  r.cy = 0.1f;
+  m.parts[0].shape = r;
+  s.setMasks(MaskSet{m}, -1);
+  const RadialShape flat = std::get<RadialShape>(s.buildRenderParams().masks[0].parts[0].shape);
+  CHECK((flat.cx == 0.1f && flat.cy == 0.1f)); // no geometry: stored as drawn
+  s.setGeometry(Orient{1, false}, 0.0f, CropRect{}); // a quarter turn clockwise: top-left -> top-right
+  const RadialShape turned = std::get<RadialShape>(s.buildRenderParams().masks[0].parts[0].shape);
+  CHECK((turned.cx > 0.8f && turned.cy < 0.2f));
+  CHECK((s.geoFrame().srcW == 300 && s.geoFrame().srcH == 400));
+}
+
+TEST_CASE("adjustment_set: maskTablesMatchTheGlobalOnes", "[adjustment_set]")
+{
+  // buildMaskPasses keeps its own copy of the table recipe ("same order as
+  // buildChannelLuts"): the same values and curves on a mask must give the same tables.
+  AdjustmentSet s;
+  fresh(s);
+  Mask m = radialMask();
+  m.adj = AdjValues{};
+  for (AdjId id : {AdjId::Exposure, AdjId::Contrast, AdjId::Highlights, AdjId::Shadows, AdjId::Whites, AdjId::Blacks, AdjId::Brightness})
+  {
+    const float v = kAdjustmentSpecs[static_cast<size_t>(id)].max * 0.35f;
+    s.set(id, v);
+    m.adj[static_cast<size_t>(id)] = v;
+  }
+  const CurvePoints master{{0, 0}, {90, 130}, {255, 255}}, green{{0, 10}, {255, 240}};
+  s.setCurve(CurveChannel::Master, master, false);
+  s.setCurve(CurveChannel::Green, green, false);
+  m.curves[0] = master;
+  m.curves[2] = green;
+  s.setMasks(MaskSet{m}, -1);
+  const RenderParams rp = s.buildRenderParams();
+  CHECK((rp.masks.size() == 1 && rp.masks[0].tone));
+  CHECK(rp.masks[0].luts == rp.luts);
+}
+
+TEST_CASE("adjustment_set: presets", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 5.0f);
+  s.setCrop(CropRect{10, 10, 100, 80});
+  s.setMasks({radialMask()}, -1);
+  const size_t before = s.historySize();
+
+  Preset p;
+  p.name = "Warm Film";
+  p.values[adjIndex(AdjId::Temperature)] = 30.0f;
+  p.values[adjIndex(AdjId::Sepia)] = 20.0f;
+  p.curves[0] = CurvePoints{{0, 10}, {255, 255}};
+  p.mix[mixIndex(MixChan::Hue, 0)] = 5.0f;
+  p.grade.blending = 70.0f;
+
+  CHECK(s.applyPreset(p));
+  CHECK((s.historySize() == before + 1 && lastLabel(s) == "Preset: Warm Film"));
+  CHECK((s.get(AdjId::Temperature) == 30.0f && s.get(AdjId::Sepia) == 20.0f));
+  CHECK(s.get(AdjId::Exposure) == 0.0f); // a preset replaces the whole look
+  CHECK((s.curve() == p.curves[0] && s.mix(MixChan::Hue, 0) == 5.0f && s.grade().blending == 70.0f));
+  CHECK((s.crop() == CropRect{10, 10, 100, 80} && s.masks().size() == 1)); // geometry + masks kept
+
+  CHECK(s.currentPreset("Again") == [&]{ Preset q = p; q.name = "Again"; return q; }());
+  const uint64_t v = s.version();
+  CHECK((!s.applyPreset(p) && s.version() == v && s.historySize() == before + 1)); // no-op: no step
+
+  s.set(AdjId::Exposure, 8.0f); // the next slider touch is its own, normally labelled step
+  CHECK((s.historySize() == before + 2 && lastLabel(s) == "Exposure +8"));
+  CHECK(label(s, before) == "Preset: Warm Film"); // the preset step keeps its label
+
+  s.undo();
+  s.undo();
+  CHECK((s.get(AdjId::Exposure) == 5.0f && s.get(AdjId::Temperature) == 0.0f && s.curve() == identityCurve()));
+  s.redo();
+  CHECK(s.get(AdjId::Temperature) == 30.0f);
+
+  Preset hostile; // hand-built, out of range
+  hostile.name = "";
+  hostile.values[adjIndex(AdjId::Exposure)] = 1e9f;
+  hostile.values[adjIndex(AdjId::Tint)] = std::nanf("");
+  CHECK(s.applyPreset(hostile));
+  CHECK((s.get(AdjId::Exposure) == 100.0f && s.get(AdjId::Tint) == 0.0f && lastLabel(s) == "Preset"));
+
+  // survives save + load of the edits (a preset leaves nothing special behind)
+  AdjustmentSet t;
+  fresh(t);
+  CHECK((t.loadJson(s.toJson()) && t.get(AdjId::Exposure) == 100.0f));
+}
+
+TEST_CASE("adjustment_set: whiteBalancePick", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 15.0f);
+  const size_t before = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One call, ONE step (two set() calls would be two), with its own label.
+  CHECK(s.setWhiteBalance(-67.0f, 14.0f));
+  CHECK(s.historySize() == before + 1);
+  CHECK((s.get(AdjId::Temperature) == -67.0f && s.get(AdjId::Tint) == 14.0f));
+  CHECK(s.get(AdjId::Exposure) == 15.0f); // nothing else moves
+  CHECK(lastLabel(s) == "White Balance -67 / +14");
+  CHECK(s.version() != v0);
+
+  // Same values again: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK(!s.setWhiteBalance(-67.0f, 14.0f));
+  CHECK((s.historySize() == before + 1 && s.version() == v1));
+
+  // Undo puts both sliders back together; redo restores them and the label.
+  s.undo();
+  CHECK((s.get(AdjId::Temperature) == 0.0f && s.get(AdjId::Tint) == 0.0f && s.get(AdjId::Exposure) == 15.0f));
+  s.redo();
+  CHECK((s.get(AdjId::Temperature) == -67.0f && s.get(AdjId::Tint) == 14.0f));
+  CHECK(lastLabel(s) == "White Balance -67 / +14");
+
+  // A later slider touch is a new step: it never overwrites the pick, even the same slider.
+  const size_t pickIdx = s.historySize() - 1;
+  s.set(AdjId::Temperature, -50.0f);
+  CHECK((s.historySize() == pickIdx + 2 && label(s, pickIdx) == "White Balance -67 / +14"));
+  CHECK(lastLabel(s) == "Temperature -50");
+  // ...and a pick ends a drag in progress: the next touch of that slider is a new step again.
+  s.set(AdjId::Exposure, 30.0f);
+  s.set(AdjId::Exposure, 31.0f); // coalesced drag
+  const size_t n = s.historySize();
+  CHECK(s.setWhiteBalance(10.0f, 0.0f));
+  s.set(AdjId::Exposure, 32.0f);
+  CHECK(s.historySize() == n + 2);
+
+  // Only one of the two changing still counts as a pick.
+  AdjustmentSet u;
+  fresh(u);
+  CHECK((u.setWhiteBalance(0.0f, 20.0f) && u.historySize() == 2 && lastLabel(u) == "White Balance +0 / +20"));
+
+  // Hand-built values are sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  CHECK(h.setWhiteBalance(1e9f, std::nanf("")));
+  CHECK((h.get(AdjId::Temperature) == 100.0f && h.get(AdjId::Tint) == 0.0f));
+  CHECK(!h.setWhiteBalance(500.0f, std::nanf(""))); // sanitizes to the same values: no step
+
+  // Saved with the edits like any slider values (the label is History-only and not saved).
+  AdjustmentSet r;
+  fresh(r);
+  CHECK((r.loadJson(s.toJson()) && r.get(AdjId::Temperature) == s.get(AdjId::Temperature)));
+  CHECK(r.historySize() == 1);
+}
+
+TEST_CASE("adjustment_set: autoTonePick", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Brightness, 7.0f);
+  s.set(AdjId::Highlights, -20.0f);
+  const size_t before = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One call, ONE step (four set() calls would be four), with its own label.
+  CHECK(s.setAutoTone(-5.0f, 40.0f, 12.0f, -30.0f));
+  CHECK(s.historySize() == before + 1);
+  CHECK((s.get(AdjId::Exposure) == -5.0f && s.get(AdjId::Contrast) == 40.0f));
+  CHECK((s.get(AdjId::Whites) == 12.0f && s.get(AdjId::Blacks) == -30.0f));
+  // Nothing else moves: not the other Tone sliders, not the color ones.
+  CHECK((s.get(AdjId::Brightness) == 7.0f && s.get(AdjId::Highlights) == -20.0f));
+  CHECK((s.get(AdjId::Shadows) == 0.0f && s.get(AdjId::Temperature) == 0.0f));
+  CHECK(lastLabel(s) == "Auto Tone");
+  CHECK(s.version() != v0);
+
+  // Same values again: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK(!s.setAutoTone(-5.0f, 40.0f, 12.0f, -30.0f));
+  CHECK((s.historySize() == before + 1 && s.version() == v1));
+
+  // Undo puts all four back together (and leaves the others); redo restores them and the label.
+  s.undo();
+  CHECK((s.get(AdjId::Exposure) == 0.0f && s.get(AdjId::Contrast) == 0.0f));
+  CHECK((s.get(AdjId::Whites) == 0.0f && s.get(AdjId::Blacks) == 0.0f));
+  CHECK((s.get(AdjId::Brightness) == 7.0f && s.get(AdjId::Highlights) == -20.0f));
+  s.redo();
+  CHECK((s.get(AdjId::Exposure) == -5.0f && s.get(AdjId::Blacks) == -30.0f));
+  CHECK(lastLabel(s) == "Auto Tone");
+
+  // A later slider touch is a new step: it never overwrites the Auto Tone step, even the same slider.
+  const size_t autoIdx = s.historySize() - 1;
+  s.set(AdjId::Exposure, -2.0f);
+  CHECK((s.historySize() == autoIdx + 2 && label(s, autoIdx) == "Auto Tone"));
+  CHECK(lastLabel(s) == "Exposure -2");
+  // ...and Auto Tone ends a drag in progress: the next touch of that slider is a new step again.
+  s.set(AdjId::Exposure, 30.0f);
+  s.set(AdjId::Exposure, 31.0f); // coalesced drag
+  const size_t n = s.historySize();
+  CHECK(s.setAutoTone(1.0f, 2.0f, 3.0f, 4.0f));
+  s.set(AdjId::Exposure, 32.0f);
+  CHECK(s.historySize() == n + 2);
+
+  // Only one of the four changing still counts.
+  AdjustmentSet u;
+  fresh(u);
+  CHECK(u.setAutoTone(0.0f, 0.0f, 0.0f, 10.0f));
+  CHECK((u.historySize() == 2 && lastLabel(u) == "Auto Tone" && u.get(AdjId::Blacks) == 10.0f));
+  // All zeros on an untouched set is a no-op.
+  AdjustmentSet z;
+  fresh(z);
+  CHECK((!z.setAutoTone(0.0f, 0.0f, 0.0f, 0.0f) && z.historySize() == 1));
+
+  // Hand-built values are sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  CHECK(h.setAutoTone(1e9f, -1e9f, std::nanf(""), 500.0f));
+  CHECK((h.get(AdjId::Exposure) == 100.0f && h.get(AdjId::Contrast) == -100.0f));
+  CHECK((h.get(AdjId::Whites) == 0.0f && h.get(AdjId::Blacks) == 100.0f));
+  CHECK(!h.setAutoTone(500.0f, -500.0f, std::nanf(""), 1000.0f)); // sanitizes to the same values: no step
+
+  // Saved with the edits like any slider values (the label is History-only and not saved).
+  AdjustmentSet r;
+  fresh(r);
+  CHECK((r.loadJson(s.toJson()) && r.get(AdjId::Whites) == s.get(AdjId::Whites)));
+  CHECK((r.get(AdjId::Blacks) == s.get(AdjId::Blacks) && r.historySize() == 1));
+}
+
+TEST_CASE("adjustment_set: snapshotRestore", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  s.set(AdjId::Exposure, 20.0f);
+  s.setCrop(CropRect{10, 10, 100, 80});
+  MaskSet ms;
+  ms.push_back(radialMask());
+  s.setMasks(ms, -1);
+  const SidecarEdits saved = s.currentEdits();
+  CHECK(sidecarEditsToJson(saved).dump() == s.toJson().dump()); // toJson is currentEdits
+
+  // Change everything the snapshot holds.
+  s.set(AdjId::Exposure, -30.0f);
+  s.setCrop(CropRect{});
+  s.setMasks(MaskSet{}, -1);
+  const size_t n = s.historySize();
+  const uint64_t v0 = s.version();
+
+  // One step, with its own label; geometry and masks come back too.
+  CHECK(s.restoreEdits(saved, "Golden"));
+  CHECK((s.historySize() == n + 1 && lastLabel(s) == "Snapshot: Golden"));
+  CHECK((s.get(AdjId::Exposure) == 20.0f && s.crop() == CropRect{10, 10, 100, 80}));
+  CHECK((s.masks().size() == 1 && s.version() != v0));
+  CHECK(sidecarEditsToJson(s.currentEdits()).dump() == sidecarEditsToJson(saved).dump());
+
+  // Undo puts all of it back in one press; redo restores it, label included.
+  s.undo();
+  CHECK((s.get(AdjId::Exposure) == -30.0f && s.crop().empty() && s.masks().empty()));
+  s.redo();
+  CHECK((s.get(AdjId::Exposure) == 20.0f && s.masks().size() == 1));
+  CHECK(lastLabel(s) == "Snapshot: Golden");
+
+  // The same state again is a no-op: no step, no version bump.
+  const uint64_t v1 = s.version();
+  CHECK((!s.restoreEdits(saved, "Golden") && s.historySize() == n + 1 && s.version() == v1));
+
+  // The next slider touch is its own step, not folded into the restore step.
+  s.set(AdjId::Exposure, 21.0f);
+  CHECK((s.historySize() == n + 2 && label(s, n) == "Snapshot: Golden" && lastLabel(s) == "Exposure +21"));
+
+  // Names are sanitized; a blank one is just "Snapshot".
+  AdjustmentSet t;
+  fresh(t);
+  CHECK((t.restoreEdits(saved, "  a\x01" "b  ") && lastLabel(t) == "Snapshot: ab"));
+  AdjustmentSet u;
+  fresh(u);
+  CHECK((u.restoreEdits(saved, "   ") && lastLabel(u) == "Snapshot"));
+
+  // A hand-built value is sanitized like a preset's: clamped, NaN becomes 0.
+  AdjustmentSet h;
+  fresh(h);
+  SidecarEdits wild = saved;
+  wild.values[static_cast<size_t>(AdjId::Exposure)] = 1e9f;
+  wild.values[static_cast<size_t>(AdjId::Contrast)] = std::nanf("");
+  CHECK(h.restoreEdits(wild, "wild"));
+  CHECK((h.get(AdjId::Exposure) == 100.0f && h.get(AdjId::Contrast) == 0.0f));
+
+  // Restoring onto an untouched picture and saving gives the snapshot's edits.
+  AdjustmentSet r;
+  fresh(r);
+  CHECK(r.restoreEdits(saved, "x"));
+  CHECK(r.toJson().dump() == sidecarEditsToJson(saved).dump());
+  AdjustmentSet z;
+  fresh(z);
+  CHECK((!z.restoreEdits(SidecarEdits{}, "neutral") && z.historySize() == 1)); // already neutral
+}
+
+TEST_CASE("adjustment_set: effectSliders", "[adjustment_set]")
+{
+  AdjustmentSet s;
+  fresh(s);
+  CHECK(!s.buildRenderParams().film.any());
+  s.set(AdjId::Vignette, -40.0f);
+  CHECK(lastLabel(s) == "Vignette -40");
+  RenderParams rp = s.buildRenderParams();
+  CHECK((rp.film.hasVignette() && !rp.film.hasGrain() && rp.film == film_fx::paramsFromValues(-40, 0, 0, 0, 0, 0)));
+  // They are global: nothing else in the parameters moves.
+  CHECK((!rp.color.active && !rp.fx.any() && rp.masks.empty()));
+  s.set(AdjId::Grain, 30.0f);
+  s.set(AdjId::GrainSize, 50.0f);
+  s.set(AdjId::GrainRoughness, -20.0f);
+  s.set(AdjId::VignetteMidpoint, 10.0f);
+  s.set(AdjId::VignetteFeather, -30.0f);
+  rp = s.buildRenderParams();
+  CHECK(rp.film == film_fx::paramsFromValues(-40, 10, -30, 30, 50, -20));
+  // Undo takes them back, one slider drag = one step.
+  const size_t n = s.historySize();
+  s.undo();
+  CHECK((s.historySize() == n && s.get(AdjId::VignetteFeather) == 0.0f && s.buildRenderParams().film.hasGrain()));
+  // They are saved in the sidecar under their label, and zero ones are left out.
+  AdjustmentSet t;
+  fresh(t);
+  t.set(AdjId::Vignette, 25.0f);
+  t.set(AdjId::Grain, 15.0f);
+  const std::string text = t.toJson().dump();
+  CHECK((text.find("\"Vignette\"") != std::string::npos && text.find("\"Grain\"") != std::string::npos));
+  CHECK((text.find("Grain Size") == std::string::npos && text.find("Vignette Feather") == std::string::npos));
+  mj::Json j;
+  std::string err;
+  AdjustmentSet u;
+  fresh(u);
+  CHECK((mj::Json::parse(text, &j, &err) && u.loadJson(j)));
+  CHECK((u.get(AdjId::Vignette) == 25.0f && u.get(AdjId::Grain) == 15.0f && u.buildRenderParams().film == t.buildRenderParams().film));
+  // A look (preset) carries them too, and applying it replaces the whole look.
+  const Preset p = t.currentPreset("Film");
+  AdjustmentSet v;
+  fresh(v);
+  v.set(AdjId::GrainSize, 70.0f);
+  CHECK(v.applyPreset(p));
+  CHECK((v.get(AdjId::Vignette) == 25.0f && v.get(AdjId::Grain) == 15.0f && v.get(AdjId::GrainSize) == 0.0f));
+}
+
+// ------------------------------------------------------------------- 3D LUT
+// Points the LUT library at a folder that does not exist (so nothing is ever read from disk) and
+// puts tables in the cache by hand; restores everything when it goes out of scope.
+struct LutEnv
+{
+  LutEnv()
+  {
+    lutDirOverride() = (std::filesystem::temp_directory_path() / "literoom_adjset_lut_nonexistent").string();
+    clearLutCache();
+  }
+  ~LutEnv()
+  {
+    lutDirOverride().clear();
+    clearLutCache();
+  }
+  static std::shared_ptr<const Lut3D> inverting()
+  {
+    Lut3D L = identityLut(2);
+    for (float &v : L.rgb)
+      v = 255.0f - v;
+    return std::make_shared<const Lut3D>(std::move(L));
+  }
+};
+
+TEST_CASE("adjustment_set: lut", "[adjustment_set]")
+{
+  LutEnv env;
+  AdjustmentSet s;
+  fresh(s);
+  const size_t kAmount = adjIndex(AdjId::LutAmount);
+  CHECK((s.lut().empty() && s.lutStatus() == LutStatus::None && s.get(AdjId::LutAmount) == 0.0f));
+  CHECK((!s.buildColorPass().lut.any() && !s.buildColorPass().active));
+  CHECK(s.toJson().find("lut") == nullptr); // a picture without a LUT writes no "lut" key
+  const size_t base = s.historySize();
+  CHECK((!s.setLut(LutRef{}) && s.historySize() == base)); // nothing to remove: no step
+
+  // Choosing a LUT is one undo step; with the amount at 0 it switches the amount to 100.
+  const auto inv = LutEnv::inverting();
+  lutCachePut("Warm", inv, 7);
+  CHECK(s.setLut(LutRef{"Warm", 7}));
+  CHECK((s.historySize() == base + 1 && lastLabel(s) == "LUT: Warm"));
+  CHECK((s.lut() == LutRef{"Warm", 7} && s.get(AdjId::LutAmount) == 100.0f && s.lutStatus() == LutStatus::Ok));
+  const uint64_t v1 = s.version();
+  CHECK((!s.setLut(LutRef{"Warm", 7}) && s.version() == v1 && s.historySize() == base + 1)); // same again: nothing
+
+  // It reaches the color pass (and so every render, preview and export) as the shared table.
+  {
+    const ColorPass cp = s.buildColorPass();
+    CHECK((cp.active && cp.lut.any() && cp.lut.lut == inv && cp.lut.amount == 1.0f));
+    const RenderParams rp = s.buildRenderParams();
+    CHECK((rp.color.lut.lut == inv && rp.masks.empty()));
+  }
+
+  // The amount is an ordinary slider: it drags as one coalesced step, then labels like the others.
+  s.set(AdjId::LutAmount, 20.0f);
+  s.set(AdjId::LutAmount, 40.0f);
+  s.set(AdjId::LutAmount, 60.0f);
+  CHECK((s.historySize() == base + 2 && lastLabel(s) == "LUT Amount +60"));
+  CHECK(s.buildColorPass().lut.amount == 0.6f);
+  s.set(AdjId::LutAmount, 0.0f); // amount 0: the LUT stays chosen but does nothing
+  CHECK((s.lut() == LutRef{"Warm", 7} && !s.buildColorPass().lut.any() && !s.buildColorPass().active));
+  s.set(AdjId::LutAmount, 60.0f);
+
+  // Another LUT while an amount is set keeps the amount.
+  lutCachePut("Cool", inv, 9);
+  CHECK((s.setLut(LutRef{"Cool", 9}) && lastLabel(s) == "LUT: Cool" && s.get(AdjId::LutAmount) == 60.0f));
+  s.set(AdjId::LutAmount, 50.0f); // a slider move right after a LUT pick is its own step
+  CHECK(lastLabel(s) == "LUT Amount +50");
+
+  // Removing it resets the amount, so the picture is untouched again.
+  const size_t n = s.historySize();
+  CHECK(s.setLut(LutRef{}));
+  CHECK((s.historySize() == n + 1 && lastLabel(s) == "Remove LUT"));
+  CHECK((s.lut().empty() && s.get(AdjId::LutAmount) == 0.0f && s.lutStatus() == LutStatus::None));
+  CHECK((!s.buildColorPass().active && s.toJson().find("lut") == nullptr));
+  s.undo(); // ...and undo brings both back
+  CHECK((s.lut() == LutRef{"Cool", 9} && s.get(AdjId::LutAmount) == 50.0f && s.buildColorPass().lut.any()));
+  s.redo();
+  CHECK((s.lut().empty() && s.get(AdjId::LutAmount) == 0.0f));
+  s.undo();
+  s.undo(); // "LUT Amount +50"
+  s.undo(); // "LUT: Cool"
+  CHECK((s.lut() == LutRef{"Warm", 7} && s.get(AdjId::LutAmount) == 60.0f));
+
+  // Names are cleaned to a safe file-name stem on the way in; nothing left of one removes the LUT.
+  AdjustmentSet c;
+  fresh(c);
+  CHECK(c.setLut(LutRef{"../../etc/x", 5}));
+  CHECK((c.lut().name.find('/') == std::string::npos && c.lut().name.find('\\') == std::string::npos && c.lut().hash == 5));
+  CHECK((c.setLut(LutRef{"   ", 5}) && c.lut().empty() && c.get(AdjId::LutAmount) == 0.0f));
+  CHECK(!c.setLut(LutRef{"   ", 5})); // already none
+
+  // A LUT the library can't supply: Missing (no effect, picture still opens), or a changed file (used).
+  AdjustmentSet m;
+  fresh(m);
+  CHECK((m.setLut(LutRef{"Gone", 1}) && m.lutStatus() == LutStatus::Missing));
+  CHECK((!m.buildColorPass().lut.any() && !m.buildColorPass().active));
+  CHECK((m.lut() == LutRef{"Gone", 1} && m.get(AdjId::LutAmount) == 100.0f)); // the reference is kept
+  lutCachePut("Warm", inv, 7);
+  CHECK((m.setLut(LutRef{"Warm", 8}) && m.lutStatus() == LutStatus::HashChanged && m.buildColorPass().lut.any()));
+  CHECK((m.setLut(LutRef{"Warm", 0}) && m.lutStatus() == LutStatus::Ok)); // hash 0 = unknown: accepts the file
+
+  // Save + load: the reference and the amount come back, history starts from them.
+  const mj::Json j = s.toJson();
+  const mj::Json *lj = j.find("lut");
+  CHECK((lj && lj->isObject() && lj->get("name").asStr() == "Warm" && lj->get("hash").asStr() == lutHashToHex(7)));
+  AdjustmentSet r;
+  fresh(r);
+  CHECK((r.loadJson(j) && r.lut() == LutRef{"Warm", 7} && r.get(AdjId::LutAmount) == 60.0f));
+  CHECK((r.historySize() == 1 && r.toJson().dump() == j.dump()));
+  CHECK(r.currentEdits().lut == LutRef{"Warm", 7});
+  r.reset();
+  CHECK((r.lut().empty() && r.get(AdjId::LutAmount) == 0.0f));
+
+  // Presets carry the LUT; applying one without a LUT clears it.
+  AdjustmentSet p;
+  fresh(p);
+  p.set(AdjId::Exposure, 5.0f);
+  Preset withLut;
+  withLut.name = "Teal Look";
+  withLut.values[kAmount] = 70.0f;
+  withLut.lut = LutRef{"Warm", 7};
+  const size_t pb = p.historySize();
+  CHECK((p.applyPreset(withLut) && p.historySize() == pb + 1 && lastLabel(p) == "Preset: Teal Look"));
+  CHECK((p.lut() == LutRef{"Warm", 7} && p.get(AdjId::LutAmount) == 70.0f && p.get(AdjId::Exposure) == 0.0f));
+  CHECK((p.currentPreset("x").lut == LutRef{"Warm", 7} && p.currentPreset("x").values[kAmount] == 70.0f));
+  CHECK((!p.applyPreset(withLut) && p.historySize() == pb + 1)); // identical: no step
+  Preset other = withLut; // only the LUT differs
+  other.lut = LutRef{"Cool", 9};
+  CHECK((p.applyPreset(other) && p.lut() == LutRef{"Cool", 9}));
+  Preset plain;
+  plain.name = "Plain";
+  plain.values[adjIndex(AdjId::Contrast)] = 10.0f;
+  CHECK((p.applyPreset(plain) && p.lut().empty() && p.get(AdjId::LutAmount) == 0.0f)); // cleared
+  p.undo();
+  CHECK((p.lut() == LutRef{"Cool", 9} && p.get(AdjId::LutAmount) == 70.0f));
+  Preset hostile = withLut; // a hand-built preset with an unsafe name
+  hostile.lut.name = "a/b\\c";
+  CHECK((p.applyPreset(hostile) && p.lut().name == "a_b_c"));
+
+  // Snapshots restore it too.
+  AdjustmentSet q;
+  fresh(q);
+  q.setLut(LutRef{"Warm", 7});
+  const SidecarEdits saved = q.currentEdits();
+  q.setLut(LutRef{});
+  q.set(AdjId::Exposure, 9.0f);
+  CHECK((q.restoreEdits(saved, "A") && q.lut() == LutRef{"Warm", 7} && q.get(AdjId::LutAmount) == 100.0f && q.get(AdjId::Exposure) == 0.0f));
+  CHECK(!q.restoreEdits(saved, "A")); // already exactly that
+  SidecarEdits onlyLut = q.currentEdits();
+  onlyLut.lut = LutRef{"Cool", 9}; // the LUT alone differs: that is a change
+  CHECK((q.restoreEdits(onlyLut, "B") && q.lut() == LutRef{"Cool", 9}));
+}
+} // namespace adjustment_set_cases

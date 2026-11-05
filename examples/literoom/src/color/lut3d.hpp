@@ -181,7 +181,7 @@ inline Lut3D identityLut(int n)
 // each, so the gray axis stays exactly gray (trilinear leaves color casts
 // there) and a LUT that is affine in the cell is reproduced exactly.
 // Requires L.valid(). Raw pointers and no std:: helpers in the body, same
-// Debug-build reason as applyColorPass.
+// Debug-build reason as applyColorPassF.
 inline void lutEval(const Lut3D &L, float r, float g, float b, float *out)
 {
   const int n = L.size;

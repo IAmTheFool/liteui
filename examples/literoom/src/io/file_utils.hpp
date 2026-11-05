@@ -54,7 +54,7 @@ inline bool isJpegPath(const std::string &path)
   return e == "jpg" || e == "jpeg";
 }
 
-// ASCII lower-casing; the filmstrip's case-insensitive name key.
+// ASCII lower-casing; the case-insensitive name key (filmstrip, virtual copies, LUT / preset libraries).
 inline std::string filmLower(std::string s)
 {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c)
@@ -105,7 +105,7 @@ inline bool naturalLess(const std::string &a, const std::string &b)
 }
 
 // ---------------- Reading and writing files ----------------
-// The first `maxBytes` of a file (all of it if smaller). False if unreadable.
+// The first `maxBytes` of a file (all of it if smaller). False if unreadable or empty.
 inline bool readFilePrefix(const std::string &path, size_t maxBytes,
                            std::vector<uint8_t> *out)
 {
@@ -120,7 +120,7 @@ inline bool readFilePrefix(const std::string &path, size_t maxBytes,
 }
 
 // Writes `bytes` to `path` via a temp file + rename, so an interrupted export
-// never leaves a half-written picture over a good one.
+// never leaves a half-written file (picture, preset, LUT) over a good one.
 inline bool writeFileAtomic(const std::string &path,
                             const std::vector<uint8_t> &bytes,
                             std::string *errorOut)

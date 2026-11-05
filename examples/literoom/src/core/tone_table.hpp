@@ -9,8 +9,8 @@
 // whoever consumes it. The old table stays as it is: it is the reference the tests compare
 // against, and Auto Tone still reasons with it.
 //
-// The table samples the composed curve every 1/kToneSub level, so a lookup is one multiply, one
-// float -> int and a linear interpolation, and an 8-bit input (an integer level) lands exactly
+// The table samples the composed curve every 1/kToneSub level, so a lookup (above the head,
+// below) is one multiply, one float -> int and a linear interpolation, and an 8-bit input
 // on a grid point and gets the exact value (no interpolation error at all for 8-bit pictures).
 //
 // 16-bit input: a 16-bit sample is v / 257 levels, and the 1/16-level grid is too coarse right above
@@ -21,7 +21,8 @@
 // head the worst error over all 65536 samples is about 0.002 level for Gamma +100 (under one 16-bit
 // step, 1/257 = 0.0039) and, for the other sliders, at most about 0.03 level (Blacks -100, whose
 // smoothstep band is the steepest). Integer levels stay exact: a level 0 or >= kToneHeadLevels is a
-// main-grid point, and 0 gives the same value in both.
+// main-grid point, and 0 gives the same value in both. Level 1 is read from the
+// head (entry 257) and is exact there too.
 //
 // Per channel: the master curve runs after the sliders, then each channel's own curve on top
 // (the order of AdjustmentSet::buildChannelLuts), so building the R, G and B tables is three
@@ -54,7 +55,8 @@ inline float toneClamp(float v)
 }
 
 // Linear interpolation in a kToneSize table at `x` levels (clamped to 0..255). Plain grid only: this
-// is what the curve tables (curveSample) use. A ToneTable is read with toneLookupWide.
+// is what toneTableFromValues uses to read the master / channel curve tables that
+// curveSample fills. A ToneTable is read with toneLookupWide.
 inline float toneLookup(const float *tbl, float x)
 {
   const float p = toneClamp(x) * static_cast<float>(kToneSub);

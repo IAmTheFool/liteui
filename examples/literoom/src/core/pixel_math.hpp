@@ -5,7 +5,8 @@
 #include <cstdint>
 
 // Hermite smoothstep on [e0, e1]: 0 below e0, 1 above e1, smooth between.
-// Used to build the tonal-range weights for Highlights/Shadows/Whites/Blacks.
+// Used to build the tonal-range weights for Highlights/Shadows/Whites/Blacks,
+// the Color Mixer's band blending and the Color Grading ranges.
 // Requires e1 > e0. NaN x maps to 0.
 inline float smoothStep01(float e0, float e1, float x)
 {
@@ -48,4 +49,5 @@ inline uint16_t toU16Clamped(float v)
 // division makes every widened 8-bit value come back as the exact integer.
 inline float u16ToLevels(uint16_t v) { return static_cast<float>(v) / kU16PerLevel; }
 
+// ---- Angles ----
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;

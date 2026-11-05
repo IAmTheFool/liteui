@@ -1,0 +1,390 @@
+// cases/render.inc - included from literoom_test.cpp: no main(), no check.hpp, no
+// #define LITEUI_IMPLEMENTATION. Helpers and TEST_CASEs live in namespace render_cases
+// so they cannot collide with other cases.
+//
+// render.hpp takes liteui's CanvasImage, so in CMake this test links liteui.
+//
+// renderWith is the float pipeline (render_core.hpp): it rounds ONCE, when a block is stored, where the old
+// byte pipeline rounded after every stage. So: a single stage is still an exact lookup / blend, written here
+// against the float tables; stacked stages are compared with what the byte tables say to within the rounding
+// that is no longer done (render_core_test.cpp measures that against the old pipeline over random edits).
+
+#include "render/render.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <memory>
+#include <random>
+
+namespace render_cases
+{
+using Img = CanvasImage;
+
+static Img scene(int w, int h, uint32_t seed = 1)
+{
+  Img im(w, h);
+  std::mt19937 rng(seed);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x)
+    {
+      uint8_t *p = &im.pixels[(static_cast<size_t>(y) * w + x) * 4];
+      p[0] = static_cast<uint8_t>((x * 255) / std::max(1, w - 1));
+      p[1] = static_cast<uint8_t>((y * 255) / std::max(1, h - 1));
+      p[2] = static_cast<uint8_t>(rng() & 255);
+      p[3] = static_cast<uint8_t>(200 + (rng() & 31));
+    }
+  return im;
+}
+static AdjustmentSet setFor(int w, int h)
+{
+  AdjustmentSet s;
+  s.reset();
+  s.setOriginalSize(w, h);
+  return s;
+}
+static int luma(const uint8_t *p) { return (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8; }
+
+TEST_CASE("render: identity", "[render]")
+{
+  const Img src = scene(40, 30);
+  AdjustmentSet s = setFor(40, 30);
+  const Img before = src;
+  const auto out = renderAdjusted(s, src);
+  CHECK((out && out.get() != &src && out->pixels == src.pixels && out->width == 40 && out->height == 30));
+  CHECK((src.pixels == before.pixels)); // the source is never touched
+  // The same for a heavily edited set: size kept, alpha kept, source untouched.
+  s.set(AdjId::Exposure, 60.0f);
+  s.set(AdjId::Saturation, 40.0f);
+  s.set(AdjId::Temperature, 30.0f);
+  s.setCurve(CurveChannel::Red, CurvePoints{{0, 20}, {255, 230}}, false);
+  const auto edited = renderAdjusted(s, src);
+  CHECK((edited && edited->width == 40 && edited->height == 30 && edited->pixels != src.pixels));
+  for (size_t i = 3; i < src.pixels.size(); i += 4)
+    CHECK((edited->pixels[i] == src.pixels[i]));
+  CHECK((src.pixels == before.pixels));
+  // renderAdjusted is renderWith on the frozen parameters.
+  CHECK((renderWith(src, s.buildRenderParams())->pixels == edited->pixels));
+}
+
+TEST_CASE("render: toneTablesAreExactLookups", "[render]")
+{
+  const Img src = scene(33, 21, 4);
+  AdjustmentSet s = setFor(33, 21);
+  s.set(AdjId::Contrast, 35.0f);
+  s.setCurve(CurveChannel::Master, CurvePoints{{0, 0}, {100, 140}, {255, 255}}, false);
+  s.setCurve(CurveChannel::Blue, CurvePoints{{0, 30}, {255, 200}}, false); // per-channel tables differ
+  const RenderParams rp = s.buildRenderParams();
+  CHECK((!(rp.luts[0] == rp.luts[2]) && !rp.color.active && !rp.fx.any() && rp.masks.empty()));
+  CHECK((rp.toneF && !rp.toneF->shared)); // the float tables: a per-channel curve gives that channel its own table
+  const auto out = renderWith(src, rp);
+  int gap = 0;
+  for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
+  {
+    for (size_t c = 0; c < 3; ++c)
+    {
+      const uint8_t in = src.pixels[i + c];
+      // The tone stage alone is an exact lookup in the float table (rounded once)...
+      CHECK((out->pixels[i + c] == toU8Clamped(rp.toneF->at(static_cast<int>(c)).at(static_cast<float>(in)))));
+      // ...and is close to the byte table, which rounded between the sliders and the curves.
+      gap = std::max(gap, std::abs(static_cast<int>(out->pixels[i + c]) - static_cast<int>(rp.luts[c][in])));
+    }
+    CHECK((out->pixels[i + 3] == src.pixels[i + 3]));
+  }
+  CHECK(gap <= 3);
+  // One stage on its own is exactly the byte table too, through the shared-table fast path.
+  AdjustmentSet same = setFor(33, 21);
+  same.set(AdjId::Contrast, 35.0f);
+  const RenderParams shared = same.buildRenderParams();
+  CHECK((shared.toneF && shared.toneF->shared));
+  const auto a = renderWith(src, shared);
+  for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
+    for (size_t c = 0; c < 3; ++c)
+      CHECK((a->pixels[i + c] == shared.luts[0][src.pixels[i + c]]));
+}
+
+TEST_CASE("render: blocksDoNotChangeTheResult", "[render]")
+{
+  // Rows are processed in blocks; pixels are independent, so a picture of any
+  // height equals its rows rendered one by one, and the whole-buffer passes.
+  AdjustmentSet s = setFor(9, 300);
+  s.set(AdjId::Exposure, 25.0f);
+  s.set(AdjId::Saturation, -30.0f);
+  s.set(AdjId::Tint, 20.0f);
+  s.setCurve(CurveChannel::Green, CurvePoints{{0, 0}, {128, 150}, {255, 255}}, false);
+  const RenderParams rp = s.buildRenderParams();
+  CHECK((rp.color.active && !rp.fx.any() && rp.masks.empty()));
+  for (int h : {1, 2, 127, 128, 129, 255, 256, 257, 300})
+  {
+    const Img src = scene(9, h, static_cast<uint32_t>(h));
+    const auto whole = renderWith(src, rp);
+    // The passes by hand, in float, over the whole buffer: tables, color pass, one rounding at the end.
+    std::vector<float> lv(src.pixels.size());
+    samplesToLevels(src.pixels.data(), lv.data(), lv.size());
+    render_core::applyTone(*rp.toneF, lv.data(), lv.size());
+    applyColorPassF(rp.color, lv.data(), lv.size());
+    render_core::clampRgb(lv.data(), lv.size());
+    std::vector<uint8_t> manual(lv.size());
+    levelsToSamples(lv.data(), manual.data(), lv.size());
+    CHECK((whole->pixels == manual));
+    std::vector<uint8_t> rows;
+    for (int y = 0; y < h; ++y)
+    {
+      Img row(9, 1);
+      std::copy(src.pixels.begin() + static_cast<std::ptrdiff_t>(y) * 36, src.pixels.begin() + static_cast<std::ptrdiff_t>(y + 1) * 36, row.pixels.begin());
+      const auto r = renderWith(row, rp);
+      rows.insert(rows.end(), r->pixels.begin(), r->pixels.end());
+    }
+    CHECK((whole->pixels == rows));
+  }
+}
+
+TEST_CASE("render: cancellation", "[render]")
+{
+  const Img src = scene(50, 400);
+  AdjustmentSet s = setFor(50, 400);
+  s.set(AdjId::Exposure, 30.0f);
+  const RenderParams rp = s.buildRenderParams();
+  std::atomic<uint64_t> latest{5};
+  const auto ok = renderWith(src, rp, &latest, 5);
+  CHECK((ok && ok->pixels == renderWith(src, rp)->pixels)); // the current request runs to the end, same bytes
+  CHECK(renderWith(src, rp, &latest, 4) == nullptr);      // an older request gives up at once
+  latest.store(6);
+  CHECK(renderWith(src, rp, &latest, 5) == nullptr);
+  // Also when the neighbor planes have to be built first.
+  AdjustmentSet f = setFor(50, 400);
+  f.set(AdjId::Clarity, 50.0f);
+  const RenderParams fx = f.buildRenderParams();
+  CHECK(fx.fx.any());
+  CHECK(renderWith(src, fx, &latest, 5) == nullptr);
+  CHECK(renderWith(src, fx, &latest, 6) != nullptr);
+}
+
+TEST_CASE("render: emptyPicture", "[render]")
+{
+  AdjustmentSet s = setFor(1, 1);
+  s.set(AdjId::Exposure, 30.0f);
+  s.setMasks(MaskSet{[]
+                     {
+                       Mask m;
+                       m.parts.push_back({RadialShape{}, MaskOp::Add});
+                       m.adj[static_cast<size_t>(AdjId::Exposure)] = 20.0f;
+                       return m;
+                     }()},
+             -1);
+  const auto out = renderAdjusted(s, Img(0, 0));
+  CHECK((out && out->width == 0 && out->height == 0 && out->pixels.empty()));
+}
+
+// --------------------------------------------------------------------- masks
+static Mask radialExposure(float exposure, float amount = 100.0f, bool invert = false)
+{
+  Mask m;
+  RadialShape r;
+  r.cx = 0.5f;
+  r.cy = 0.5f;
+  r.rx = r.ry = 0.3f;
+  r.feather = 0.5f;
+  m.parts.push_back({r, MaskOp::Add});
+  m.adj[static_cast<size_t>(AdjId::Exposure)] = exposure;
+  m.amount = amount;
+  m.invert = invert;
+  return m;
+}
+
+// What a mask with only an Exposure change must do, written out per pixel:
+// out = src + (exposed - src) * weight, where the weight comes from the shape alone.
+static void checkExposureMask(const Mask &mask, int W, int H, const char *tag)
+{
+  const Img src = scene(W, H, 9);
+  AdjustmentSet s = setFor(W, H);
+  s.setMasks(MaskSet{mask}, -1);
+  const RenderParams rp = s.buildRenderParams();
+  CHECK(rp.masks.size() == 1);
+  const auto out = renderWith(src, rp);
+  const RadialShape shape = std::get<RadialShape>(mask.parts[0].shape);
+  const RadialEval e = shape.prepare(W, H);
+  const float amount = std::clamp(mask.amount, 0.0f, 100.0f) / 100.0f;
+  AdjValues v{};
+  v[static_cast<size_t>(AdjId::Exposure)] = mask.adj[static_cast<size_t>(AdjId::Exposure)];
+  const ToneTable tone = toneTableFromValues(v, nullptr, nullptr); // the mask's own tone stage, in float
+  int changed = 0, untouched = 0;
+  for (int y = 0; y < H; ++y)
+  {
+    std::vector<float> w(static_cast<size_t>(W));
+    e.rowWeights(y, 0, W, w.data());
+    for (int x = 0; x < W; ++x)
+    {
+      float wt = w[static_cast<size_t>(x)];
+      if (mask.invert)
+        wt = 1.0f - wt;
+      wt *= amount;
+      const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+      for (int c = 0; c < 3; ++c)
+      {
+        const int s0 = src.pixels[i + static_cast<size_t>(c)];
+        const float f0 = static_cast<float>(s0);
+        // The blend is done on the unrounded adjusted value and rounded once.
+        const int want = wt <= 0.0f ? s0 : static_cast<int>(toU8Clamped(f0 + (tone.at(f0) - f0) * wt));
+        if (out->pixels[i + static_cast<size_t>(c)] != want)
+        {
+          std::printf("  [%s] pixel (%d,%d) channel %d: got %d, want %d (weight %g)\n", tag, x, y, c, out->pixels[i + static_cast<size_t>(c)], want, wt);
+          CHECK(false);
+          return;
+        }
+        changed += out->pixels[i + static_cast<size_t>(c)] != s0;
+      }
+      untouched += wt <= 0.0f && out->pixels[i] == src.pixels[i];
+      CHECK((out->pixels[i + 3] == src.pixels[i + 3]));
+    }
+  }
+  CHECK((changed > 0 && untouched > 0)); // the mask does something, and not everywhere
+}
+
+TEST_CASE("render: radialMaskBlends", "[render]")
+{
+  checkExposureMask(radialExposure(60.0f), 80, 60, "radial");
+  checkExposureMask(radialExposure(-50.0f), 80, 60, "darker");
+  checkExposureMask(radialExposure(60.0f, 40.0f), 80, 60, "amount 40");
+  checkExposureMask(radialExposure(60.0f, 100.0f, true), 80, 60, "inverted");
+  checkExposureMask(radialExposure(60.0f), 130, 140, "two blocks"); // 140 rows: crosses the block boundary
+  // Pixels outside the mask are bit-identical to the source; a disabled mask changes nothing.
+  const Img src = scene(60, 40, 3);
+  AdjustmentSet s = setFor(60, 40);
+  Mask off = radialExposure(60.0f);
+  off.enabled = false;
+  s.setMasks(MaskSet{off}, -1);
+  CHECK((renderAdjusted(s, src)->pixels == src.pixels));
+}
+
+TEST_CASE("render: masksSeeTheRowTheyAreGiven", "[render]")
+{
+  // A Luminosity mask picks pixels by the row as it is BEFORE that mask edits it...
+  const int W = 20, H = 4;
+  Img src(W, H);
+  for (size_t i = 0; i < src.pixels.size(); i += 4)
+  {
+    const int g = static_cast<int>((i / 4) % W) * 12 + 5; // 5 .. 233, a ramp
+    src.pixels[i] = src.pixels[i + 1] = src.pixels[i + 2] = static_cast<uint8_t>(g);
+    src.pixels[i + 3] = 255;
+  }
+  Mask dark;
+  LuminosityShape lum;
+  lum.lo = 0.0f;
+  lum.hi = 0.5f;
+  lum.feather = 0.0f;
+  dark.parts.push_back({lum, MaskOp::Add});
+  dark.adj[static_cast<size_t>(AdjId::Brightness)] = 100.0f; // dark pixels jump up by 100, past the 0.5 limit
+  AdjustmentSet s = setFor(W, H);
+  s.setMasks(MaskSet{dark}, -1);
+  const auto out = renderAdjusted(s, src);
+  for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
+  {
+    const int g = src.pixels[i];
+    const bool selected = luma(&src.pixels[i]) <= 127;
+    CHECK((out->pixels[i] == (selected ? std::min(255, g + 100) : g)));
+  }
+  // ...and a LATER mask sees what the earlier ones made of it.
+  Mask second;
+  LuminosityShape bright;
+  bright.lo = 0.4f;
+  bright.hi = 1.0f;
+  bright.feather = 0.0f;
+  second.parts.push_back({bright, MaskOp::Add});
+  second.adj[static_cast<size_t>(AdjId::Brightness)] = -50.0f;
+  AdjustmentSet t = setFor(W, H);
+  t.setMasks(MaskSet{dark, second}, -1);
+  const auto both = renderAdjusted(t, src);
+  for (size_t i = 0; i + 3 < src.pixels.size(); i += 4)
+  {
+    int g = src.pixels[i];
+    if (luma(&src.pixels[i]) <= 127)
+      g = std::min(255, g + 100);
+    const int gv = g;
+    if (gv * 1.0 / 255.0 >= 0.4 && gv <= 255)
+      g = std::max(0, g - 50);
+    CHECK((both->pixels[i] == g));
+  }
+}
+
+// ------------------------------------------------------- vignette and grain
+TEST_CASE("render: filmEffects", "[render]")
+{
+  // Vignette and Grain are the last step: the picture the other passes make,
+  // run through film_fx on the whole buffer.
+  for (int h : {1, 2, 127, 128, 129, 300})
+  {
+    const Img src = scene(61, h, static_cast<uint32_t>(h));
+    AdjustmentSet s = setFor(61, h);
+    s.set(AdjId::Vignette, -70.0f);
+    s.set(AdjId::Grain, 40.0f);
+    s.set(AdjId::GrainSize, 30.0f);
+    s.set(AdjId::GrainRoughness, 25.0f);
+    const RenderParams rp = s.buildRenderParams();
+    CHECK((rp.film.any() && !rp.color.active && !rp.fx.any() && rp.masks.empty()));
+    const auto out = renderWith(src, rp);
+    std::vector<uint8_t> want = src.pixels; // identity tables: only the film is left
+    film_fx::apply(film_fx::prepare(rp.film, 61, h), want.data(), want.size() / 4, 0);
+    CHECK((out->pixels == want && out->width == 61 && out->height == h));
+    CHECK(((h < 5) || out->pixels != src.pixels));
+    for (size_t i = 3; i < src.pixels.size(); i += 4)
+      CHECK((out->pixels[i] == src.pixels[i])); // alpha untouched
+    // Rendering again, or on the background path, gives the same bytes.
+    CHECK((renderWith(src, rp)->pixels == out->pixels));
+    std::atomic<uint64_t> latest{3};
+    CHECK((renderWith(src, rp, &latest, 3)->pixels == out->pixels));
+  }
+  // Applied AFTER the masks and the other passes, to what they made.
+  const Img src = scene(80, 140, 6);
+  auto edited = [](bool withFilm)
+  {
+    AdjustmentSet a = setFor(80, 140);
+    a.set(AdjId::Exposure, 20.0f);
+    a.set(AdjId::Saturation, -25.0f);
+    a.setMasks(MaskSet{radialExposure(50.0f)}, -1);
+    if (withFilm)
+    {
+      a.set(AdjId::Vignette, 60.0f);
+      a.set(AdjId::Grain, 25.0f);
+    }
+    return a.buildRenderParams();
+  };
+  const RenderParams rpBase = edited(false), rpBoth = edited(true);
+  CHECK((!rpBase.film.any() && rpBoth.film.any() && rpBoth.masks.size() == 1));
+  // The picture the other passes make is kept at 16 bits here (so almost nothing is lost to rounding), run
+  // through film_fx, and rounded to a byte once. The render does the same in float: the two can differ
+  // only where the 16-bit intermediate (1/257 of a level) tips a value across a rounding boundary.
+  const auto base16 = renderToImage16(src, rpBase);
+  CHECK((base16 && base16->pixels.size() == src.pixels.size()));
+  std::vector<float> lv(src.pixels.size());
+  samplesToLevels(base16->pixels.data(), lv.data(), lv.size());
+  film_fx::applyF(film_fx::prepare(rpBoth.film, 80, 140), lv.data(), lv.size() / 4, 0);
+  std::vector<uint8_t> want(lv.size());
+  levelsToSamples(lv.data(), want.data(), lv.size());
+  const auto got = renderWith(src, rpBoth);
+  size_t differ = 0;
+  int worst = 0;
+  for (size_t i = 0; i < want.size(); ++i)
+  {
+    const int d = std::abs(static_cast<int>(got->pixels[i]) - static_cast<int>(want[i]));
+    worst = std::max(worst, d);
+    differ += d != 0;
+  }
+  CHECK((worst <= 1 && differ * 100 <= want.size())); // at most 1 % of the samples, by one level
+  // ...and film really did come last: the result is not the film-less picture.
+  CHECK((got->pixels != renderWith(src, rpBase)->pixels));
+  // A transparent pixel (the empty corner of a straightened picture) stays as it was.
+  Img clear = scene(30, 20);
+  for (size_t i = 0; i < 4 * 30; i += 4)
+    clear.pixels[i] = clear.pixels[i + 1] = clear.pixels[i + 2] = clear.pixels[i + 3] = 0;
+  AdjustmentSet f = setFor(30, 20);
+  f.set(AdjId::Vignette, -100.0f);
+  f.set(AdjId::Grain, 100.0f);
+  const auto fc = renderAdjusted(f, clear);
+  for (size_t i = 0; i < 4 * 30; ++i)
+    CHECK((fc->pixels[i] == 0));
+  // A superseded render still gives up first.
+  std::atomic<uint64_t> latest{9};
+  CHECK(renderWith(src, rpBoth, &latest, 8) == nullptr);
+}
+} // namespace render_cases
