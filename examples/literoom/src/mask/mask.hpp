@@ -1,5 +1,5 @@
-// mask.hpp - Masks: one alternative per kind (MaskShape / MaskEval), how a mask's
-// parts combine (Add / Subtract / Intersect), and Mask / MaskSet, the
+// mask.hpp - Masks: one alternative per kind (MaskShape / MaskEval), how a
+// mask's parts combine (Add / Subtract / Intersect), and Mask / MaskSet, the
 // user-facing list. Includes every shape header.
 #pragma once
 #include <array>
@@ -9,10 +9,10 @@
 #include <variant>
 #include <vector>
 
-#include "core/adjustments.hpp"
 #include "color/color_grade.hpp"
 #include "color/color_mix.hpp"
 #include "color/curves.hpp"
+#include "core/adjustments.hpp"
 #include "core/geometry.hpp"
 #include "mask/mask_brush.hpp"
 #include "mask/mask_geom.hpp"
@@ -41,34 +41,40 @@
 // touch a mask, undo and redo stay consistent, and removing a crop brings
 // back a mask that was outside it. Being normalized also makes the same mask
 // render identically on the small drag-preview image and the full-size one.
-// The shape structs below have two forms: the stored one, and a "source"
-// one (same struct, same fields) already mapped into the current picture,
-// which is what rendering and the on-canvas editing work with.
+// The shape structs (mask_geom.hpp, mask_brush.hpp, ...) have two forms: the
+// stored one, and a "source" one (same struct, same fields) already mapped into
+// the current picture, which is what rendering and the on-canvas editing work
+// with.
 //
 // COMBINING: a mask is a list of PARTS (shapes) folded left to right with
 // Add / Subtract / Intersect (see MaskComposite). A new kind of shape needs
 // nothing for that: it only has to be one more MaskShape alternative.
 //
-// ADDING ANOTHER KIND OF MASK (color range, depth range...):
-//   1. a shape struct with its parameters (like RadialShape) and its three
-//      GeoFrame conversions (toSource, fromSource, applySourceEdit),
+// ADDING ANOTHER KIND OF MASK (depth range, ...):
+//   1. a shape struct with its parameters (like RadialShape) and
+//      toSource(GeoFrame) (a mask that isn't spatial just returns *this); a
+//      shape that is edited on the canvas also needs fromSource /
+//      applySourceEdit,
 //   2. an "Eval" struct (like RadialEval): the shape resolved against one
 //      concrete image size, able to say which part of a row it touches
-//      (rowSpan) and to fill in that row's weights (rowWeights; it is also
-//      handed the row's current pixels, for masks that depend on them),
-//   3. one more alternative in MaskShape and MaskEval (same order as MaskType)
-//      and one more line in maskTypeName and maskShapeToSource,
+//      (rowSpan) and to fill in that row's weights (rowWeights). A mask that
+//      depends on the picture's pixels is handed them there, and also needs
+//      rowWeightsF (float levels, for the float pipeline) and a branch for it
+//      in maskRowWeightsF,
+//   3. one more alternative in MaskShape and MaskEval (same order as MaskType),
+//      a line in maskTypeName, and an entry in maskTypeUsesPixels if it reads
+//      the picture (maskShapeToSource and prepareMask are std::visit: no edit),
 //   4. its overlay + handles in the UI (paintMaskOverlay / maskPress / ...).
-// The pixel pipeline, undo, the preview path, both worker threads, export and
-// the per-mask sliders all work on the variants and need no changes.
+// For a mask that doesn't read the picture, the pixel pipeline, undo, the
+// preview path, both worker threads, export and the per-mask sliders all work
+// on the variants and need no changes.
 
 // Limits of the Masks pane's list.
-constexpr size_t kMaxMasks = 16;        // rows in the Masks pane's list
-constexpr size_t kMaxMaskParts = 6;     // shapes combined inside one mask
+constexpr size_t kMaxMasks = 16;    // rows in the Masks pane's list
+constexpr size_t kMaxMaskParts = 6; // shapes combined inside one mask
 
 // Same order as the alternatives of MaskShape / MaskEval below.
-enum class MaskType : int
-{
+enum class MaskType : int {
   Radial,
   Linear,
   Brush,
@@ -80,10 +86,8 @@ enum class MaskType : int
   Count
 };
 
-inline const char *maskTypeName(MaskType t)
-{
-  switch (t)
-  {
+inline const char *maskTypeName(MaskType t) {
+  switch (t) {
   case MaskType::Radial:
     return "Radial";
   case MaskType::Linear:
@@ -107,59 +111,48 @@ inline const char *maskTypeName(MaskType t)
 
 // ---- Shape variants: one alternative per MaskType ----
 // The alternatives are in the order of MaskType: MaskPart::type() is the index.
-using MaskShape = std::variant<RadialShape, LinearShape, BrushShape,
-                               LuminosityShape, ColorRangeShape, ObjectShape,
-                               RectShape, PolygonShape>;
-using MaskEval = std::variant<RadialEval, LinearEval, BrushEval,
-                              LuminosityEval, ColorRangeEval, ObjectEval,
-                              RectEval, PolygonEval>;
+using MaskShape =
+    std::variant<RadialShape, LinearShape, BrushShape, LuminosityShape,
+                 ColorRangeShape, ObjectShape, RectShape, PolygonShape>;
+using MaskEval =
+    std::variant<RadialEval, LinearEval, BrushEval, LuminosityEval,
+                 ColorRangeEval, ObjectEval, RectEval, PolygonEval>;
 
 // Masks whose weights read the picture's pixels (so the overlay must be built
 // from the picture just before them).
-inline bool maskTypeUsesPixels(MaskType t)
-{
+inline bool maskTypeUsesPixels(MaskType t) {
   return t == MaskType::Luminosity || t == MaskType::ColorRange;
 }
 
-inline MaskShape maskShapeToSource(const MaskShape &shape,
-                                   const GeoFrame &f)
-{
-  return std::visit([&](const auto &s) -> MaskShape
-                    { return s.toSource(f); },
+inline MaskShape maskShapeToSource(const MaskShape &shape, const GeoFrame &f) {
+  return std::visit([&](const auto &s) -> MaskShape { return s.toSource(f); },
                     shape);
 }
-inline MaskEval prepareMask(const MaskShape &shape, int W, int H)
-{
-  return std::visit(
-      [&](const auto &s) -> MaskEval
-      { return s.prepare(W, H); }, shape);
+inline MaskEval prepareMask(const MaskShape &shape, int W, int H) {
+  return std::visit([&](const auto &s) -> MaskEval { return s.prepare(W, H); },
+                    shape);
 }
-inline bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1)
-{
-  return std::visit(
-      [&](const auto &ev)
-      { return ev.rowSpan(y, W, x0, x1); }, e);
+inline bool maskRowSpan(const MaskEval &e, int y, int W, int &x0, int &x1) {
+  return std::visit([&](const auto &ev) { return ev.rowSpan(y, W, x0, x1); },
+                    e);
 }
 // `pix` = the RGBA pixels of the row from x0 on, as they are when the mask
 // is reached (after the global adjustments and the masks before it). Only the
 // masks that depend on the picture's own values read it.
-inline void maskRowWeights(const MaskEval &e, int y, int x0, int x1,
-                           float *out, const uint8_t *pix)
-{
-  std::visit([&](const auto &ev)
-             { ev.rowWeights(y, x0, x1, out, pix); }, e);
+inline void maskRowWeights(const MaskEval &e, int y, int x0, int x1, float *out,
+                           const uint8_t *pix) {
+  std::visit([&](const auto &ev) { ev.rowWeights(y, x0, x1, out, pix); }, e);
 }
 
-// The same from a row of FLOAT levels (0..255, 4 per pixel), as the float pipeline holds it. The two
-// masks that read the picture (Luminosity, Color Range) use their rowWeightsF, so a 16-bit picture is
-// not rounded to bytes before it is selected; every other kind ignores the pixels and is called as
+// The same from a row of FLOAT levels (0..255, 4 per pixel), as the float
+// pipeline holds it. The two masks that read the picture (Luminosity, Color
+// Range) use their rowWeightsF, so a 16-bit picture is not rounded to bytes
+// before it is selected; every other kind ignores the pixels and is called as
 // before. `pix` may be null for a mask that doesn't read the picture.
 inline void maskRowWeightsF(const MaskEval &e, int y, int x0, int x1,
-                            float *out, const float *pix)
-{
+                            float *out, const float *pix) {
   std::visit(
-      [&](const auto &ev)
-      {
+      [&](const auto &ev) {
         using E = std::decay_t<decltype(ev)>;
         if constexpr (std::is_same_v<E, LuminosityEval> ||
                       std::is_same_v<E, ColorRangeEval>)
@@ -179,17 +172,10 @@ inline void maskRowWeightsF(const MaskEval &e, int y, int x0, int x1,
 // where c is that part's own weight at the pixel. The order matters (it is a
 // fold, not a set operation), exactly like the mask's own Invert, which is
 // applied last to the result.
-enum class MaskOp : int
-{
-  Add,
-  Subtract,
-  Intersect
-};
+enum class MaskOp : int { Add, Subtract, Intersect };
 
-inline const char *maskOpName(MaskOp op)
-{
-  switch (op)
-  {
+inline const char *maskOpName(MaskOp op) {
+  switch (op) {
   case MaskOp::Add:
     return "Add";
   case MaskOp::Subtract:
@@ -201,52 +187,41 @@ inline const char *maskOpName(MaskOp op)
 }
 
 // A part with its shape already mapped into the picture being rendered.
-struct MaskPassPart
-{
+struct MaskPassPart {
   MaskShape shape;
   MaskOp op = MaskOp::Add;
 };
 
 // The parts of one mask resolved for one image size.
-struct MaskComposite
-{
+struct MaskComposite {
   std::vector<MaskEval> evals;
   std::vector<MaskOp> ops; // ops[0] is ignored: part 0 starts the mask
 
   // Which pixels [x0, x1) of row `y` can have a non-zero weight? A superset.
   // Add widens the span, Intersect narrows it, Subtract can only remove
   // weight so it leaves it alone. False if nothing is left.
-  bool rowSpan(int y, int W, int &x0, int &x1) const
-  {
+  bool rowSpan(int y, int W, int &x0, int &x1) const {
     bool have = false;
     int a = 0, b = 0;
-    for (size_t k = 0; k < evals.size(); ++k)
-    {
+    for (size_t k = 0; k < evals.size(); ++k) {
       int s0 = 0, s1 = 0;
       const bool ok = maskRowSpan(evals[k], y, W, s0, s1);
       const MaskOp op = k == 0 ? MaskOp::Add : ops[k];
-      if (op == MaskOp::Add)
-      {
+      if (op == MaskOp::Add) {
         if (!ok)
           continue;
-        if (!have)
-        {
+        if (!have) {
           a = s0;
           b = s1;
           have = true;
-        }
-        else
-        {
+        } else {
           a = a < s0 ? a : s0;
           b = b > s1 ? b : s1;
         }
-      }
-      else if (op == MaskOp::Intersect)
-      {
+      } else if (op == MaskOp::Intersect) {
         if (!have)
           continue; // nothing to keep a part of
-        if (!ok)
-        {
+        if (!ok) {
           have = false;
           continue;
         }
@@ -266,40 +241,37 @@ struct MaskComposite
   // weights. Plain loops, no std helpers (same Debug-build reason as
   // RadialEval).
   void rowWeights(int y, int x0, int x1, float *out, const uint8_t *pix,
-                  float *tmp) const
-  {
-    fold(y, x0, x1, out, tmp,
-         [&](const MaskEval &e, float *dst)
-         { maskRowWeights(e, y, x0, x1, dst, pix); });
+                  float *tmp) const {
+    fold(y, x0, x1, out, tmp, [&](const MaskEval &e, float *dst) {
+      maskRowWeights(e, y, x0, x1, dst, pix);
+    });
   }
 
-  // The same, with the row as float levels (see maskRowWeightsF): what the float pipeline uses.
+  // The same, with the row as float levels (see maskRowWeightsF): what the
+  // float pipeline uses.
   void rowWeightsF(int y, int x0, int x1, float *out, const float *pix,
-                   float *tmp) const
-  {
-    fold(y, x0, x1, out, tmp,
-         [&](const MaskEval &e, float *dst)
-         { maskRowWeightsF(e, y, x0, x1, dst, pix); });
+                   float *tmp) const {
+    fold(y, x0, x1, out, tmp, [&](const MaskEval &e, float *dst) {
+      maskRowWeightsF(e, y, x0, x1, dst, pix);
+    });
   }
 
 private:
-  // The fold itself; `weigh(eval, dst)` fills dst with one part's weights for the row.
+  // The fold itself; `weigh(eval, dst)` fills dst with one part's weights for
+  // the row.
   template <class Weigh>
-  void fold(int /*y*/, int x0, int x1, float *out, float *tmp, Weigh &&weigh) const
-  {
+  void fold(int /*y*/, int x0, int x1, float *out, float *tmp,
+            Weigh &&weigh) const {
     const int len = x1 - x0;
-    if (evals.empty())
-    {
+    if (evals.empty()) {
       for (int i = 0; i < len; ++i)
         out[i] = 0.0f;
       return;
     }
     weigh(evals[0], out);
-    for (size_t k = 1; k < evals.size(); ++k)
-    {
+    for (size_t k = 1; k < evals.size(); ++k) {
       weigh(evals[k], tmp);
-      switch (ops[k])
-      {
+      switch (ops[k]) {
       case MaskOp::Add:
         for (int i = 0; i < len; ++i)
           out[i] = out[i] + tmp[i] - out[i] * tmp[i];
@@ -318,13 +290,11 @@ private:
 };
 
 inline MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts,
-                                      int W, int H)
-{
+                                      int W, int H) {
   MaskComposite c;
   c.evals.reserve(parts.size());
   c.ops.reserve(parts.size());
-  for (const MaskPassPart &p : parts)
-  {
+  for (const MaskPassPart &p : parts) {
     c.evals.push_back(prepareMask(p.shape, W, H));
     c.ops.push_back(p.op);
   }
@@ -332,8 +302,7 @@ inline MaskComposite prepareComposite(const std::vector<MaskPassPart> &parts,
 }
 
 // One part of a mask: a shape and how it joins the parts before it.
-struct MaskPart
-{
+struct MaskPart {
   MaskShape shape;
   MaskOp op = MaskOp::Add; // ignored on the first part
   MaskType type() const { return static_cast<MaskType>(shape.index()); }
@@ -342,8 +311,7 @@ struct MaskPart
 
 // One mask as the user sees it: its parts, whether it is on / inverted, and
 // its own slider values (indexed by AdjId, 0 = untouched).
-struct Mask
-{
+struct Mask {
   std::vector<MaskPart> parts; // never empty for a mask made by addMask
   std::string name;            // the user's name for it; empty = show its kind
   bool enabled = true;
@@ -354,8 +322,7 @@ struct Mask
   ColorGrade grade;                   // ...Color Grading
   CurveSet curves = identityCurves(); // ...and tone curves (RGB, R, G, B)
   // The first part's kind: what a one-part mask is (the list names the rest).
-  MaskType type() const
-  {
+  MaskType type() const {
     return parts.empty() ? MaskType::Radial : parts.front().type();
   }
   bool operator==(const Mask &) const = default;
@@ -364,26 +331,22 @@ using MaskSet = std::vector<Mask>;
 
 constexpr size_t kMaskNameMax = 32;
 // Printable ASCII only (the TextInput widget is ASCII / byte-cursor), capped.
-inline std::string sanitizeMaskName(const std::string &s)
-{
+inline std::string sanitizeMaskName(const std::string &s) {
   std::string out;
-  for (const char ch : s)
-  {
+  for (const char ch : s) {
     const unsigned char c = static_cast<unsigned char>(ch);
     if (c >= 0x20 && c < 0x7F && out.size() < kMaskNameMax)
       out.push_back(ch);
   }
   return out;
 }
-inline bool maskNameBlank(const std::string &s)
-{
+inline bool maskNameBlank(const std::string &s) {
   return s.find_first_not_of(' ') == std::string::npos;
 }
 
 // Empties every mask cache (brush maps, polygon maps, warped / grown object
 // maps).
-inline void clearMaskCaches()
-{
+inline void clearMaskCaches() {
   brushCache().clear();
   polygonCache().clear();
   objectWarpCache().clear();

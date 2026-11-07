@@ -12,14 +12,14 @@
 // generations - setQueue() replaces what is still to do, the item in flight
 // finishes, and results accumulate until collect() drains them.
 #pragma once
+#include "core/geometry.hpp"   // Orient
+#include "core/raster_ops.hpp" // orientImage
+#include "io/file_utils.hpp"   // fsPath
+#include "io/image_source.hpp" // decodeForThumb
+#include "io/photo_meta.hpp"   // PhotoMeta
+#include "io/sidecar.hpp"      // sidecarFileOf, sidecarScan
+#include "io/virtual_copy.hpp" // vcImageOf, vcCopyOf
 #include "liteui.hpp"
-#include "core/geometry.hpp"      // Orient
-#include "core/raster_ops.hpp"    // orientImage
-#include "io/file_utils.hpp"      // fsPath
-#include "io/image_source.hpp"    // decodeForThumb
-#include "io/photo_meta.hpp"     // PhotoMeta
-#include "io/sidecar.hpp"         // sidecarFileOf, sidecarScan
-#include "io/virtual_copy.hpp"    // vcImageOf, vcCopyOf
 
 #include <algorithm>
 #include <cmath>
@@ -45,8 +45,7 @@ constexpr std::streamoff kThumbMaxSidecarBytes = std::streamoff{64} << 20;
 // The sidecar's text; false if there is no file, it is empty, too big or
 // unreadable. *exists says whether the file was there at all.
 inline bool readSidecarForThumb(const std::string &imagePath, std::string *text,
-                                bool *exists)
-{
+                                bool *exists) {
   const std::filesystem::path p = fsPath(sidecarFileOf(imagePath));
   std::error_code ec;
   *exists = std::filesystem::exists(p, ec) && !ec;
@@ -66,8 +65,7 @@ inline bool readSidecarForThumb(const std::string &imagePath, std::string *text,
 
 // `src` scaled down (box average) to fit kFilmThumbW x kFilmThumbH; never
 // enlarged. Null for an empty picture.
-inline std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)
-{
+inline std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src) {
   if (src.width <= 0 || src.height <= 0 ||
       src.pixels.size() < static_cast<size_t>(src.width) * src.height * 4)
     return nullptr;
@@ -76,24 +74,20 @@ inline std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)
   const int nw = std::max(1, static_cast<int>(std::lround(src.width * s)));
   const int nh = std::max(1, static_cast<int>(std::lround(src.height * s)));
   auto out = std::make_shared<CanvasImage>(nw, nh);
-  for (int y = 0; y < nh; ++y)
-  {
+  for (int y = 0; y < nh; ++y) {
     const int64_t y0 = static_cast<int64_t>(y) * src.height / nh;
     const int64_t y1 =
         std::max(y0 + 1, static_cast<int64_t>(y + 1) * src.height / nh);
-    for (int x = 0; x < nw; ++x)
-    {
+    for (int x = 0; x < nw; ++x) {
       const int64_t x0 = static_cast<int64_t>(x) * src.width / nw;
       const int64_t x1 =
           std::max(x0 + 1, static_cast<int64_t>(x + 1) * src.width / nw);
       uint32_t sum[4] = {0, 0, 0, 0};
-      for (int64_t yy = y0; yy < y1; ++yy)
-      {
+      for (int64_t yy = y0; yy < y1; ++yy) {
         const uint8_t *p = &src.pixels[(static_cast<size_t>(yy) * src.width +
                                         static_cast<size_t>(x0)) *
                                        4];
-        for (int64_t xx = x0; xx < x1; ++xx, p += 4)
-        {
+        for (int64_t xx = x0; xx < x1; ++xx, p += 4) {
           sum[0] += p[0];
           sum[1] += p[1];
           sum[2] += p[2];
@@ -112,11 +106,9 @@ inline std::shared_ptr<const CanvasImage> makeThumb(const CanvasImage &src)
 // Makes the thumbnails off the UI thread. setQueue() replaces what is still
 // to do (it is called again whenever the open picture changes, so the work
 // always starts next to it); collect() hands back what has been made.
-class ThumbWorker
-{
+class ThumbWorker {
 public:
-  struct Result
-  {
+  struct Result {
     std::string path;
     std::shared_ptr<const CanvasImage> thumb; // null: couldn't be decoded
     bool thumbSkipped = false;                // a virtual copy: not decoded on
@@ -137,24 +129,20 @@ public:
 
   void setNotify(std::function<void()> fn) { notify_ = std::move(fn); }
 
-  void shutdown()
-  {
+  void shutdown() {
     {
       std::lock_guard lk(m_);
       queue_.clear();
     }
-    if (thread_.joinable())
-    {
+    if (thread_.joinable()) {
       thread_.request_stop();
       thread_.join();
     }
   }
 
-  void setQueue(std::vector<std::string> paths)
-  {
+  void setQueue(std::vector<std::string> paths) {
     if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
+      thread_ = std::jthread([this](std::stop_token st) { run(st); });
     {
       std::lock_guard lk(m_);
       queue_.assign(std::make_move_iterator(paths.begin()),
@@ -163,8 +151,7 @@ public:
     cv_.notify_one();
   }
 
-  std::vector<Result> collect()
-  {
+  std::vector<Result> collect() {
     std::lock_guard lk(m_);
     std::vector<Result> out;
     out.swap(results_);
@@ -172,15 +159,12 @@ public:
   }
 
 private:
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
+  void run(std::stop_token st) {
+    for (;;) {
       std::string path;
       {
         std::unique_lock lk(m_);
-        if (!cv_.wait(lk, st, [this]
-                      { return !queue_.empty(); }))
+        if (!cv_.wait(lk, st, [this] { return !queue_.empty(); }))
           return;
         path = std::move(queue_.front());
         queue_.pop_front();
@@ -188,16 +172,15 @@ private:
       Result r;
       r.path = path;
       std::string err;
-      const std::string real = vcImageOf(path); // the picture file behind a copy
+      const std::string real =
+          vcImageOf(path); // the picture file behind a copy
       if (vcCopyOf(path) > 0)
         r.thumbSkipped = true; // only its sidecar is read, below
-      else if (auto img = image_source::decodeForThumb(real, &err))
-      {
+      else if (auto img = image_source::decodeForThumb(real, &err)) {
         const Orient o = orientOf_(real); // upright, like the editor
         if (o.identity())
           r.thumb = makeThumb(*img);
-        else
-        {
+        else {
           auto turned =
               orientImage(std::make_shared<CanvasImage>(std::move(*img)), o);
           r.thumb = makeThumb(*turned);
@@ -206,14 +189,13 @@ private:
       {
         std::string text;
         bool exists = false;
-        if (readSidecarForThumb(path, &text, &exists))
-        {
+        if (readSidecarForThumb(path, &text, &exists)) {
           const SidecarScan s = sidecarScan(text);
           r.edited = s.edited;
           r.meta = s.meta;
-        }
-        else
-          r.edited = exists; // present but unreadable / too big: as before
+        } else
+          r.edited =
+              exists; // present but unreadable / too big: counts as edited
       }
       {
         std::lock_guard lk(m_);

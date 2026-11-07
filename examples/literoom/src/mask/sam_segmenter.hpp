@@ -20,9 +20,7 @@ struct Point {
   bool fg = true;
 };
 
-// What encode() feeds the encoder, as a plain function so it can be tested
-// without ONNX Runtime or a model. Returns an empty result (nw == nh == 0) for
-// a null picture or a size <= 0.
+
 inline constexpr int kInputSize = 1024; // SAM's longest-side input size
 
 struct Prepared {
@@ -31,6 +29,9 @@ struct Prepared {
   bool ok() const { return nw > 0 && nh > 0; }
 };
 
+// What encode() feeds the encoder, as a plain function so it can be tested
+// without ONNX Runtime or a model. Returns an empty result (nw == nh == 0) for
+// a null picture or a size <= 0.
 //   rank 4: normalized NCHW 1x3xkInputSize x kInputSize, zero-padded at the
 //           bottom / right (data.size() == 3 * kInputSize^2);
 //   anything else: raw 0-255 RGB, HWC at nh x nw (data.size() == nh * nw * 3).

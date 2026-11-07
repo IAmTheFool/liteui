@@ -17,6 +17,7 @@
 #include "cases/image_convert.inc"
 #include "cases/image_display.inc"
 #include "cases/image_formats16.inc"
+#include "cases/image_codec.inc"
 #include "cases/image_widget.inc"
 #include "cases/xml.inc"
 #include "cases/svg_primitives.inc"

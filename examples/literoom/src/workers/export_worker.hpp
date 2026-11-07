@@ -5,10 +5,11 @@
 // inputs: it decodes the file itself, reads the picture's sidecar from disk,
 // loads the edits into a LOCAL AdjustmentSet (never the editor's), and runs the
 // same chain the geometry worker runs (orient -> straighten -> crop -> render,
-// all from the untouched original), then resizes and encodes. It never reads
-// `state`, so it is safe on a worker thread (see threading.md). The open picture
-// is exported like any other: the app flushes its sidecar to disk before the
-// batch is queued.
+// all from the untouched original; the pixel half is renderForExport in
+// export_render.hpp), then resizes and encodes. It never reads
+// `state`, so it is safe on a worker thread (see threading.md). The open
+// picture is exported like any other: the app flushes its sidecar to disk
+// before the batch is queued.
 //
 // ExportWorker is a FIFO queue like ThumbWorker (no generations: you want ALL
 // of them), plus cancel(): it drops what is still queued and abandons the
@@ -16,22 +17,22 @@
 // 24 MP picture stops within a few rows). Every dropped picture still gets an
 // outcome (cancelled = true) so the UI can say how many were not exported.
 //
-// Thread model: start(), cancel(), busy(), collect(), shutdown() are called from
-// the UI thread only. setNotify() must be called before the first start().
+// Thread model: start(), cancel(), busy(), collect(), shutdown() are called
+// from the UI thread only. setNotify() must be called before the first start().
 #pragma once
-#include "liteui.hpp"
 #include "core/geometry.hpp"
 #include "core/raster_ops.hpp"
 #include "edit/adjustment_set.hpp"
+#include "io/color_tag.hpp"
 #include "io/file_utils.hpp"
 #include "io/image_codec.hpp"
 #include "io/image_codec16.hpp"
 #include "io/image_meta.hpp"
-#include "io/color_tag.hpp"
 #include "io/image_source.hpp"
 #include "io/minijson.hpp"
 #include "io/sidecar.hpp"
 #include "io/virtual_copy.hpp"
+#include "liteui.hpp"
 #include "render/render.hpp"
 #include "workers/export_render.hpp"
 
@@ -54,33 +55,32 @@
 // Largest sidecar a batch will read: the same limit the editor puts on one.
 constexpr std::streamoff kExportMaxSidecarBytes = std::streamoff{64} << 20;
 
-// Encodes `img` as a JPEG at `quality` (1..100). The ICC profile of the photo at
-// `sourcePath` always rides along: the editor converts no pixels, so without it
-// a Display P3 or Adobe RGB picture would be read as sRGB. With `keepMetadata`
-// the EXIF block comes too (orientation reset to "upright", because the pixels
-// already are; picture size updated; see embedSourceMetadata). With `removeGps`
-// as well, the GPS location is cut out of that EXIF block. A picture JPEG can't
-// hold (see jpegSizeOk) is refused by
-// encodeJpegMemory. (Moved here from main.cpp so the editor's single Export and
-// the batch share one function.)
+// Encodes `img` as a JPEG at `quality` (1..100). The ICC profile of the photo
+// at `sourcePath` always rides along: the editor converts no pixels, so without
+// it a Display P3 or Adobe RGB picture would be read as sRGB. With
+// `keepMetadata` the EXIF block comes too (orientation reset to "upright",
+// because the pixels already are; picture size updated; see
+// embedSourceMetadata). With `removeGps` as well, the GPS location is cut out
+// of that EXIF block. A picture JPEG can't hold (see jpegSizeOk) is refused by
+// encodeJpegMemory.
 inline bool saveJpegFile(const std::string &path, const CanvasImage &img,
                          int quality, bool keepMetadata, bool removeGps,
-                         const std::string &sourcePath, std::string *errorOut)
-{
+                         const std::string &sourcePath, std::string *errorOut) {
   std::vector<uint8_t> jpeg;
   if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
     return false;
-  // The color profile is not personal data: it is carried even without keepMetadata.
+  // The color profile is not personal data: it is carried even without
+  // keepMetadata.
   embedSourceMetadata(&jpeg, sourcePath, img.width, img.height,
                       removeGps && keepMetadata, /*iccOnly=*/!keepMetadata);
   return writeFileAtomic(path, jpeg, errorOut);
 }
 
 // What one batch writes. A copy of the Export pane's settings plus the folder.
-struct ExportSettings
-{
+struct ExportSettings {
   bool jpeg = true;
-  bool png16 = false; // PNG only (ignored for JPEG): write 16 bits per channel instead of 8
+  bool png16 = false; // PNG only (ignored for JPEG): write 16 bits per channel
+                      // instead of 8
   int quality = 92;
   bool keepMetadata = true;
   bool removeGps = false;
@@ -90,21 +90,20 @@ struct ExportSettings
   bool overwrite = false; // false: a taken name gets "-2", "-3", ...
 };
 
-struct ExportOutcome
-{
-  std::string path;     // the picture's path (a virtual copy's path included)
+struct ExportOutcome {
+  std::string path; // the picture's path (a virtual copy's path included)
   bool ok = false;
-  bool cancelled = false; // dropped or abandoned by cancel(): not a failure
-  std::string outFile;  // the file written (ok only)
-  std::string error;    // why it was skipped (not ok, not cancelled)
+  bool cancelled = false;    // dropped or abandoned by cancel(): not a failure
+  std::string outFile;       // the file written (ok only)
+  std::string error;         // why it was skipped (not ok, not cancelled)
   int width = 0, height = 0; // size written (ok only)
 };
 
 // "photo" for "photo.jpg"; "photo-copy2" for the virtual copy "photo.jpg|vc2".
-inline std::string exportStemOf(const std::string &path)
-{
+inline std::string exportStemOf(const std::string &path) {
   std::string stem = baseName(vcImageOf(path));
-  if (const auto dot = stem.find_last_of('.'); dot != std::string::npos && dot > 0)
+  if (const auto dot = stem.find_last_of('.');
+      dot != std::string::npos && dot > 0)
     stem.resize(dot);
   if (stem.empty())
     stem = "export";
@@ -120,10 +119,8 @@ inline std::string exportStemOf(const std::string &path)
 inline std::string exportTargetPath(const std::string &folder,
                                     const std::string &stem,
                                     const std::string &ext, bool overwrite,
-                                    std::set<std::string> &used)
-{
-  for (int k = 1; k <= 9999; ++k)
-  {
+                                    std::set<std::string> &used) {
+  for (int k = 1; k <= 9999; ++k) {
     const std::string name =
         stem + "-edit" + (k == 1 ? "" : "-" + std::to_string(k)) + "." + ext;
     const std::filesystem::path p = fsPath(folder) / fsPath(name);
@@ -143,74 +140,65 @@ inline std::string exportTargetPath(const std::string &folder,
 // setOriginalSize(w, h)). No sidecar at all is normal: the picture exports
 // unedited. A sidecar that exists but can't be used (damaged, newer, too big,
 // written for a different size, or using a LUT the library no longer has) is an
-// ERROR here, unlike in the editor, which opens such a picture clean: silently exporting an unedited picture in the
-// middle of a batch would be worse than skipping it with a reason.
+// ERROR here, unlike in the editor, which opens such a picture clean: silently
+// exporting an unedited picture in the middle of a batch would be worse than
+// skipping it with a reason.
 inline bool exportLoadEdits(const std::string &path, int w, int h,
-                            AdjustmentSet *adj, std::string *err)
-{
+                            AdjustmentSet *adj, std::string *err) {
   const std::filesystem::path p = fsPath(sidecarFileOf(path));
   std::error_code ec;
   if (!std::filesystem::exists(p, ec) || ec)
     return true;
   std::ifstream f(p, std::ios::binary | std::ios::ate);
-  if (!f)
-  {
+  if (!f) {
     *err = "couldn't read its saved edits";
     return false;
   }
   const std::streamoff n = f.tellg();
-  if (n <= 0 || n > kExportMaxSidecarBytes)
-  {
+  if (n <= 0 || n > kExportMaxSidecarBytes) {
     *err = "its saved edits have an unexpected size";
     return false;
   }
   std::string text(static_cast<size_t>(n), '\0');
   f.seekg(0);
   f.read(text.data(), n);
-  if (!f)
-  {
+  if (!f) {
     *err = "couldn't read its saved edits";
     return false;
   }
   mj::Json root;
   std::string perr;
-  if (!mj::Json::parse(text, &root, &perr))
-  {
+  if (!mj::Json::parse(text, &root, &perr)) {
     *err = "its saved edits are unreadable";
     return false;
   }
   const mj::Json *ver = root.find("version");
-  if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion)
-  {
+  if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion) {
     *err = "its saved edits are from a newer Literoom";
     return false;
   }
   const mj::Json *img = root.find("image");
   if (!img || !img->isObject() || !img->find("width") || !img->find("height") ||
-      img->find("width")->asNum(-1) != w || img->find("height")->asNum(-1) != h)
-  {
+      img->find("width")->asNum(-1) != w ||
+      img->find("height")->asNum(-1) != h) {
     *err = "the picture's size has changed since it was edited";
     return false;
   }
   const mj::Json *edits = root.find("edits");
-  if (!edits || !adj->loadJson(*edits))
-  {
+  if (!edits || !adj->loadJson(*edits)) {
     *err = "its saved edits are unreadable";
     return false;
   }
   // The same strictness for its LUT: a LUT that is in use (amount above 0) but
-  // gone from the library (or damaged) would export the picture without its look.
-  // A file that has changed since the LUT was chosen is used as it is.
-  if (!adj->lut().empty() && adj->get(AdjId::LutAmount) > 0.0f)
-  {
+  // gone from the library (or damaged) would export the picture without its
+  // look. A file that has changed since the LUT was chosen is used as it is.
+  if (!adj->lut().empty() && adj->get(AdjId::LutAmount) > 0.0f) {
     const LutStatus st = adj->lutStatus();
-    if (st == LutStatus::Missing)
-    {
+    if (st == LutStatus::Missing) {
       *err = "its LUT \"" + adj->lut().name + "\" is not in the LUT library";
       return false;
     }
-    if (st == LutStatus::Unreadable)
-    {
+    if (st == LutStatus::Unreadable) {
       *err = "its LUT \"" + adj->lut().name + "\" can't be read";
       return false;
     }
@@ -222,23 +210,18 @@ inline bool exportLoadEdits(const std::string &path, int w, int h,
 // pair (both may be null / 0 for a synchronous call); once superseded the
 // outcome is `cancelled` and nothing is written. `used` holds the output names
 // already taken by this batch.
-inline ExportOutcome exportPicture(const std::string &path,
-                                   const ExportSettings &s,
-                                   std::set<std::string> &used,
-                                   const std::atomic<uint64_t> *latest = nullptr,
-                                   uint64_t gen = 0)
-{
+inline ExportOutcome
+exportPicture(const std::string &path, const ExportSettings &s,
+              std::set<std::string> &used,
+              const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0) {
   ExportOutcome o;
   o.path = path;
-  const auto gone = [&]
-  { return latest && latest->load() != gen; };
-  const auto cancel = [&]() -> ExportOutcome
-  {
+  const auto gone = [&] { return latest && latest->load() != gen; };
+  const auto cancel = [&]() -> ExportOutcome {
     o.cancelled = true;
     return o;
   };
-  const auto fail = [&](std::string m) -> ExportOutcome
-  {
+  const auto fail = [&](std::string m) -> ExportOutcome {
     o.error = std::move(m);
     return o;
   };
@@ -246,19 +229,24 @@ inline ExportOutcome exportPicture(const std::string &path,
     return cancel();
 
   const std::string real = vcImageOf(path);
-  // A 16-bit PNG is read at full precision and stays 16-bit through the whole chain; every other picture
-  // (JPEG, 8-bit PNG) is 8-bit as before. Either can be written as 8-bit or, for PNG, 16-bit.
+  // A 16-bit PNG is read at full precision and stays 16-bit through the whole
+  // chain; every other picture
+  // (JPEG, 8-bit PNG) is 8-bit. Either can be written as 8-bit or, for PNG,
+  // 16-bit.
   const bool want16 = !s.jpeg && s.png16;
   std::string derr;
-  // The "original" the saved edits are stored against: upright (EXIF applied). A wide file gives only
-  // `original16` (no 8-bit copy is needed here). The editor opens files the same way (image_source.hpp),
-  // so a file the editor reads through its 8-bit fallback is exported the same way.
-  auto opened = image_source::openUpright(real, exifOrientationOf(real), /*want8=*/false, &derr);
+  // The "original" the saved edits are stored against: upright (EXIF applied).
+  // A wide file gives only `original16` (no 8-bit copy is needed here). The
+  // editor opens files the same way (image_source.hpp), so a file the editor
+  // reads through its 8-bit fallback is exported the same way.
+  auto opened = image_source::openUpright(real, exifOrientationOf(real),
+                                          /*want8=*/false, &derr);
   if (!opened)
     return fail("couldn't open it: " + derr);
   std::shared_ptr<CanvasImage> original8 = std::move(opened->image);
   std::shared_ptr<Image16> original16 = std::move(opened->wide);
-  opened.reset(); // the originals below are handed over to the render, so nothing else may keep them alive
+  opened.reset(); // the originals below are handed over to the render, so
+                  // nothing else may keep them alive
   const bool wideSource = original16 != nullptr;
   const int ow = wideSource ? original16->width : original8->width;
   const int oh = wideSource ? original16->height : original8->height;
@@ -271,21 +259,27 @@ inline ExportOutcome exportPicture(const std::string &path,
   if (!exportLoadEdits(path, ow, oh, &adj, &eerr))
     return fail(eerr);
 
-  // The geometry worker's chain (orient -> straighten -> crop) from the untouched original, then the
-  // render: export_render.hpp. The original is handed over, so only what is still needed stays alive.
+  // The geometry worker's chain (orient -> straighten -> crop) from the
+  // untouched original, then the render: export_render.hpp. The original is
+  // handed over, so only what is still needed stays alive.
   const ExportGeometry geo{adj.orient(), adj.angle(), adj.expand(), adj.crop()};
   const RenderParams rp = adj.buildRenderParams();
   ExportPixels px;
-  const bool rendered =
-      wideSource ? renderForExport(std::move(original16), geo, rp, want16, latest, gen, &px)
-                 : renderForExport(std::move(original8), geo, rp, want16, latest, gen, &px);
+  const bool rendered = wideSource
+                            ? renderForExport(std::move(original16), geo, rp,
+                                              want16, latest, gen, &px)
+                            : renderForExport(std::move(original8), geo, rp,
+                                              want16, latest, gen, &px);
   if (!rendered)
     return cancel();
 
-  const Dims size = fitLongEdge(px.width(), px.height(), s.resize ? s.longEdge : 0);
+  const Dims size =
+      fitLongEdge(px.width(), px.height(), s.resize ? s.longEdge : 0);
   if (s.jpeg && !jpegSizeOk(size.w, size.h))
     return fail("too large for JPEG (turn on Resize, or export as PNG)");
-  px.resizeToLongEdge(s.resize ? s.longEdge : 0); // < 1 or already small enough: nothing changes
+  px.resizeToLongEdge(s.resize
+                          ? s.longEdge
+                          : 0); // < 1 or already small enough: nothing changes
   if (gone())
     return cancel();
 
@@ -301,7 +295,8 @@ inline ExportOutcome exportPicture(const std::string &path,
                 : encodePngFile(target, *px.img8, &err);
   if (!wrote)
     return fail(err.empty() ? "couldn't write " + baseName(target) : err);
-  if (!s.jpeg) // a PNG carries its source's color tags (nothing is converted; see io/color_tag.hpp)
+  if (!s.jpeg) // a PNG carries its source's color tags (nothing is converted;
+               // see io/color_tag.hpp)
     color_tag::carryColorToPng(target, real);
   o.ok = true;
   o.outFile = target;
@@ -311,8 +306,7 @@ inline ExportOutcome exportPicture(const std::string &path,
 }
 
 // One batch at a time, one picture at a time, in the order given.
-class ExportWorker
-{
+class ExportWorker {
 public:
   ExportWorker() = default;
   ExportWorker(const ExportWorker &) = delete;
@@ -323,13 +317,11 @@ public:
 
   // Queues `paths` with `settings`. False (nothing changed) while a batch is
   // still running or when `paths` is empty.
-  bool start(std::vector<std::string> paths, ExportSettings settings)
-  {
+  bool start(std::vector<std::string> paths, ExportSettings settings) {
     if (paths.empty() || busy())
       return false;
     if (!thread_.joinable())
-      thread_ = std::jthread([this](std::stop_token st)
-                             { run(st); });
+      thread_ = std::jthread([this](std::stop_token st) { run(st); });
     {
       std::lock_guard lk(m_);
       settings_ = std::move(settings);
@@ -346,12 +338,10 @@ public:
   // Drops what is still queued (each gets a `cancelled` outcome) and abandons
   // the picture in flight. Returns at once; busy() turns false when the worker
   // has let go of the picture it was on.
-  void cancel()
-  {
+  void cancel() {
     std::lock_guard lk(m_);
     epoch_.fetch_add(1); // the render / straighten in flight sees this
-    for (std::string &p : queue_)
-    {
+    for (std::string &p : queue_) {
       ExportOutcome o;
       o.path = std::move(p);
       o.cancelled = true;
@@ -369,8 +359,7 @@ public:
   // Every outcome made since the last call, in the order they finished.
   // Check busy() BEFORE calling this: if it was already false, nothing more
   // can arrive, so these are the last ones.
-  std::vector<ExportOutcome> collect()
-  {
+  std::vector<ExportOutcome> collect() {
     std::lock_guard lk(m_);
     std::vector<ExportOutcome> out;
     out.swap(results_);
@@ -378,32 +367,27 @@ public:
   }
 
   // Stops and joins. The picture in flight is abandoned, the queue dropped.
-  void shutdown()
-  {
+  void shutdown() {
     {
       std::lock_guard lk(m_);
       queue_.clear();
       epoch_.store(~uint64_t{0});
     }
-    if (thread_.joinable())
-    {
+    if (thread_.joinable()) {
       thread_.request_stop();
       thread_.join();
     }
   }
 
 private:
-  void run(std::stop_token st)
-  {
-    for (;;)
-    {
+  void run(std::stop_token st) {
+    for (;;) {
       std::string path;
       ExportSettings s;
       uint64_t gen = 0;
       {
         std::unique_lock lk(m_);
-        if (!cv_.wait(lk, st, [this]
-                      { return !queue_.empty(); }))
+        if (!cv_.wait(lk, st, [this] { return !queue_.empty(); }))
           return;
         path = std::move(queue_.front());
         queue_.pop_front();

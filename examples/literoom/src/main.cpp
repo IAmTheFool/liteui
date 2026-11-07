@@ -1,4 +1,4 @@
-// Simple Photo Editor.
+// Literoom - the photo editor: UI and glue around the engine headers below.
 
 #define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
@@ -264,8 +264,8 @@ struct RenderJob
 {
   std::shared_ptr<const CanvasImage> src;
   RenderParams params;
-  // The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it
-  // and `src` is then only its 8-bit view for the neighbor effects.
+// The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it
+// and reads it for the neighbor effects too; `src` is then only its 8-bit view (what the tools measure).
   std::shared_ptr<const Image16> src16;
 };
 struct RenderResult
@@ -484,9 +484,9 @@ struct EditorState
   CropRect sourceCrop;                  // the crop `source` was built with
   // The 16-bit twin of original / oriented / rotated / source, for a picture that really has more than 8
   // bits (a 16-bit PNG); all null for any other file. Built from `original16` by the same operations, so
-  // each stage has the size of its 8-bit namesake (core/wide_chain.hpp). The 8-bit chain above is unchanged
-  // and is still what every tool measures and what the neighbor effects read; only the full-resolution
-  // render (and 16-bit export) starts from the twin. The drag preview stays on the 8-bit chain.
+// each stage has the size of its 8-bit namesake (core/wide_chain.hpp). The 8-bit chain above is unchanged
+// and is still what every tool measures; the full-resolution render (and 16-bit export) starts from the
+// twin, and the neighbor effects read it directly. The drag preview starts from previewBase16 when there is one.
   std::shared_ptr<Image16> original16, oriented16, rotated16, source16;
   std::shared_ptr<CanvasImage> image;   // source + adjustments applied —
                                         // this is what's drawn and exported
@@ -539,8 +539,8 @@ struct EditorState
   std::shared_ptr<CanvasImage> previewBase;
   // The 16-bit twin of `previewBase` (box-downsampled from `source16` by the same factor, so the same
   // size), for a picture that has a 16-bit twin; null otherwise. A drag renders it, so the preview
-  // starts from the same precision as the full-resolution render that follows it. `previewBase` is
-  // then its 8-bit view for the neighbor effects.
+// starts from the same precision as the full-resolution render that follows it. `previewBase` is
+// then only its 8-bit view.
   std::shared_ptr<Image16> previewBase16;
   std::shared_ptr<CanvasImage> previewImage;
   bool dragging = false;
@@ -926,7 +926,7 @@ static void syncSource(bool force)
 // pipeline from `original` — even a job that only changed the crop redoes
 // an unchanged straighten. That wastes some work when angle is non-zero and
 // only the crop is edited afterwards, but keeps a job a pure function of
-// its five inputs, with nothing that can drift out of sync — and the extra
+// its inputs, with nothing that can drift out of sync
 // work only costs latency on a background thread, never a UI freeze.
 // The thread and the generation protocol live in latest_worker.hpp; this is
 // the job. `original` must never be modified afterwards (the editor's images
@@ -1529,7 +1529,7 @@ struct SegmentRequest
   bool prefetch = false;                    // encode only (warm the model), no result map
 };
 
-// ---- Stand-in segmenter: see seg_basic.hpp ----
+// ---- Segmentation engine info (SAM model, with the color-grow wand of seg_basic.hpp as fallback) ----
 
 // Which engine is active, shown in the Object panel (written by the worker,
 // read by the UI thread's label poll).
@@ -5149,7 +5149,7 @@ static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
   state.markDirty();
 }
 
-// Step-1 stand-in for a segmenter: pixels brighter than the picture's mean.
+// The "Set test map" button's selection (not a segmenter): pixels brighter than the picture's mean.
 static std::shared_ptr<const ObjectMap> makeTestObjectMap()
 {
   if (!state.original)
@@ -8968,7 +8968,7 @@ static View buildMaskCurveCanvas()
   return c;
 }
 
-// The pipeline indexes kAdjustmentSpecs by AdjId (AdjustmentSet::buildLut, the
+// The pipeline indexes kAdjustmentSpecs by AdjId (the tone tables, the
 // sidebar loop, the color pass), so entry i must describe AdjId i. This can't
 // be a static_assert: the table holds std::function and std::string members,
 // which aren't usable in constant expressions. So it's checked once at

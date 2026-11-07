@@ -1,7 +1,9 @@
-// render_bytes.hpp - The ORIGINAL byte pipeline (RGBA8 in, a byte table per slider stage, every pass
-// rounding to a byte), kept verbatim as `renderWithBytes`. The app does not use it any more
-// (renderWith in render_core.hpp is the float pipeline); it stays as the reference the tests compare
-// the float pipeline against, and can be deleted once the new golden file has been recorded.
+// render_bytes.hpp - The ORIGINAL byte pipeline (RGBA8 in, one byte tone table
+// per channel, every pass rounding to a byte), kept verbatim as
+// `renderWithBytes`. The app does not use it any more (renderWith in
+// render_core.hpp is the float pipeline); it stays as the reference the tests
+// compare the float pipeline against, and can be deleted once the new golden
+// file has been recorded.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -32,18 +34,16 @@
 // by weight like everything else. `ref` holds the SOURCE pixels of the same
 // rows as `q`; the effects measure themselves against those.
 inline void applyMaskToBlockBytes(const MaskPass &mp, const MaskComposite &ev,
-                             uint8_t *q, size_t n, int y0, int W,
-                             uint8_t *scratch, float *wbuf, float *wbuf2,
-                             const uint8_t *ref,
-                             const neighbor_fx::Planes &dp)
-{
+                                  uint8_t *q, size_t n, int y0, int W,
+                                  uint8_t *scratch, float *wbuf, float *wbuf2,
+                                  const uint8_t *ref,
+                                  const neighbor_fx::Planes &dp) {
   const size_t rowBytes = static_cast<size_t>(W) * 4;
   const int rows = static_cast<int>(n / rowBytes);
   const uint8_t *lr = mp.luts[0].data();
   const uint8_t *lg = mp.luts[1].data();
   const uint8_t *lb = mp.luts[2].data();
-  for (int r = 0; r < rows; ++r)
-  {
+  for (int r = 0; r < rows; ++r) {
     int x0 = 0, x1 = W;
     // Inverted masks affect the whole row (weight = 1 - w), so no span cut.
     if (!mp.invert && !ev.rowSpan(y0 + r, W, x0, x1))
@@ -51,31 +51,29 @@ inline void applyMaskToBlockBytes(const MaskPass &mp, const MaskComposite &ev,
     const int len = x1 - x0;
     if (len <= 0)
       continue;
-    uint8_t *row = q + static_cast<size_t>(r) * rowBytes +
-                   static_cast<size_t>(x0) * 4;
+    uint8_t *row =
+        q + static_cast<size_t>(r) * rowBytes + static_cast<size_t>(x0) * 4;
     // The weights see the row BEFORE this mask edits it, so a mask's own
     // adjustment never changes what it selects.
     ev.rowWeights(y0 + r, x0, x1, wbuf, row, wbuf2);
     const size_t bytes = static_cast<size_t>(len) * 4;
     std::copy_n(row, bytes, scratch);
     if (mp.tone)
-      for (size_t i = 0; i + 3 < bytes; i += 4)
-      {
+      for (size_t i = 0; i + 3 < bytes; i += 4) {
         scratch[i] = lr[scratch[i]];
         scratch[i + 1] = lg[scratch[i + 1]];
         scratch[i + 2] = lb[scratch[i + 2]];
       }
     applyColorPass(mp.color, scratch, bytes);
     if (mp.fx.any())
-      neighbor_fx::apply(
-          dp, mp.fx,
-          ref + static_cast<size_t>(r) * rowBytes + static_cast<size_t>(x0) * 4,
-          scratch, static_cast<size_t>(len),
-          static_cast<size_t>(y0 + r) * static_cast<size_t>(W) +
-              static_cast<size_t>(x0),
-          W);
-    for (int i = 0; i < len; ++i)
-    {
+      neighbor_fx::apply(dp, mp.fx,
+                         ref + static_cast<size_t>(r) * rowBytes +
+                             static_cast<size_t>(x0) * 4,
+                         scratch, static_cast<size_t>(len),
+                         static_cast<size_t>(y0 + r) * static_cast<size_t>(W) +
+                             static_cast<size_t>(x0),
+                         W);
+    for (int i = 0; i < len; ++i) {
       float w = wbuf[i];
       if (mp.invert)
         w = 1.0f - w;
@@ -84,8 +82,7 @@ inline void applyMaskToBlockBytes(const MaskPass &mp, const MaskComposite &ev,
         continue;
       uint8_t *p = row + static_cast<size_t>(i) * 4;
       const uint8_t *t = scratch + static_cast<size_t>(i) * 4;
-      for (int k = 0; k < 3; ++k)
-      {
+      for (int k = 0; k < 3; ++k) {
         const float a = static_cast<float>(p[k]);
         const float b = static_cast<float>(t[k]);
         p[k] = toU8Clamped(a + (b - a) * w);
@@ -104,24 +101,23 @@ inline void applyMaskToBlockBytes(const MaskPass &mp, const MaskComposite &ev,
 //
 // Order per pixel: tone LUTs -> color pass -> neighbor effects (Dehaze,
 // Texture / Clarity / Sharpness, Noise Reduction, Blur) -> masks, each mask
-// doing the same three steps on its own copy -> Vignette and Grain (film_fx.hpp,
-// global only, on the finished pixel).
-// Vignette and Grain depend on the pixel's position in THIS picture, so they are
-// handed the index of the block's first pixel; a block of rows therefore gives the
-// same bytes as the whole picture at once, and the preview, the background render
-// and the batch export agree (the preview picture is smaller, so its grain is the
-// same kind but not the same pixels).
-// The detail layers need neighbors, which the 128-row blocks don't have, so
-// they come from whole-image blurred planes built once per picture (see
-// detail_layer.hpp) instead of from halo rows; `src` stays untouched, which
-// is what keeps those planes valid.
+// doing the same three steps on its own copy -> Vignette and Grain
+// (film_fx.hpp, global only, on the finished pixel). Vignette and Grain depend
+// on the pixel's position in THIS picture, so they are handed the index of the
+// block's first pixel; a block of rows therefore gives the same bytes as the
+// whole picture at once, and the preview, the background render and the batch
+// export agree (the preview picture is smaller, so its grain is the same kind
+// but not the same pixels). The detail layers need neighbors, which the 128-row
+// blocks don't have, so they come from whole-image blurred planes built once
+// per picture (see detail_layer.hpp) instead of from halo rows; `src` stays
+// untouched, which is what keeps those planes valid.
 //
 // Raw pointers and no std:: helpers in the inner loops, same Debug-build
 // reason as applyColorPass.
 inline std::shared_ptr<CanvasImage>
 renderWithBytes(const CanvasImage &src, const RenderParams &rp,
-           const std::atomic<uint64_t> *latest = nullptr, uint64_t gen = 0)
-{
+                const std::atomic<uint64_t> *latest = nullptr,
+                uint64_t gen = 0) {
   auto img = std::make_shared<CanvasImage>(src);
   uint8_t *p = img->pixels.data();
   const size_t total = img->pixels.size();
@@ -138,8 +134,7 @@ renderWithBytes(const CanvasImage &src, const RenderParams &rp,
   std::vector<MaskComposite> maskEvals;
   std::vector<uint8_t> maskScratch;
   std::vector<float> maskWeights, maskWeights2;
-  if (!rp.masks.empty() && img->width > 0)
-  {
+  if (!rp.masks.empty() && img->width > 0) {
     maskEvals.reserve(rp.masks.size());
     for (const MaskPass &m : rp.masks)
       maskEvals.push_back(prepareComposite(m.parts, img->width, img->height));
@@ -159,28 +154,24 @@ renderWithBytes(const CanvasImage &src, const RenderParams &rp,
                             fxNeed, latest, gen))
     return nullptr;
 
-  // Vignette and Grain are resolved against THIS picture's size, like the masks.
-  const film_fx::Prepared film = film_fx::prepare(rp.film, img->width, img->height);
+  // Vignette and Grain are resolved against THIS picture's size, like the
+  // masks.
+  const film_fx::Prepared film =
+      film_fx::prepare(rp.film, img->width, img->height);
 
-  for (size_t off = 0; off < total; off += blockBytes)
-  {
+  for (size_t off = 0; off < total; off += blockBytes) {
     if (latest && latest->load(std::memory_order_relaxed) != gen)
       return nullptr; // superseded: abandon
     const size_t n = total - off < blockBytes ? total - off : blockBytes;
     uint8_t *q = p + off;
-    if (sharedLut)
-    { // fast path (no per-channel curves): one shared table
-      for (size_t i = 0; i + 3 < n; i += 4)
-      {
+    if (sharedLut) { // fast path (no per-channel curves): one shared table
+      for (size_t i = 0; i + 3 < n; i += 4) {
         q[i] = lr[q[i]];
         q[i + 1] = lr[q[i + 1]];
         q[i + 2] = lr[q[i + 2]];
       }
-    }
-    else
-    {
-      for (size_t i = 0; i + 3 < n; i += 4)
-      {
+    } else {
+      for (size_t i = 0; i + 3 < n; i += 4) {
         q[i] = lr[q[i]];
         q[i + 1] = lg[q[i + 1]];
         q[i + 2] = lb[q[i + 2]];
@@ -191,14 +182,13 @@ renderWithBytes(const CanvasImage &src, const RenderParams &rp,
       neighbor_fx::apply(fxPlanes, rp.fx, src.pixels.data() + off, q, n / 4,
                          off / 4, img->width);
     for (size_t k = 0; k < maskEvals.size(); ++k)
-      applyMaskToBlockBytes(rp.masks[k], maskEvals[k], q, n,
-                       static_cast<int>(off / rowBytes), img->width,
-                       maskScratch.data(), maskWeights.data(),
-                       maskWeights2.data(), src.pixels.data() + off,
-                       fxPlanes);
-    if (film.any()) // last: after the masks, on whole rows (off / 4 = first pixel)
+      applyMaskToBlockBytes(
+          rp.masks[k], maskEvals[k], q, n, static_cast<int>(off / rowBytes),
+          img->width, maskScratch.data(), maskWeights.data(),
+          maskWeights2.data(), src.pixels.data() + off, fxPlanes);
+    if (film.any()) // last: after the masks, on whole rows (off / 4 = first
+                    // pixel)
       film_fx::apply(film, q, n / 4, off / 4);
   }
   return img;
 }
-

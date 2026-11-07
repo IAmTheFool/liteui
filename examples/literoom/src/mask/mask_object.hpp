@@ -1,6 +1,6 @@
-// mask_object.hpp - The Object mask: a coverage bitmap (from a segmentation) stored against
-// the original picture, warped into the current one, grown / shrunk and
-// feathered. Maps are immutable and shared; the warp and the grown /
+// mask_object.hpp - The Object mask: a coverage bitmap (from a segmentation)
+// stored against the original picture, warped into the current one, grown /
+// shrunk and feathered. Maps are immutable and shared; the warp and the grown /
 // feathered result are memoized.
 #pragma once
 #include <algorithm>
@@ -23,31 +23,27 @@ constexpr float kObjectMaxFeather = 0.02f; // feather = 1 -> 2% of long side
 constexpr size_t kObjectCacheSize = 6;
 
 // ---- Object mask ----
-// A coverage bitmap produced by a segmentation (hand-made test map now, a
-// SAM-style model later). STORED against the ORIGINAL picture; toSource()
-// warps it into the picture on screen. Maps are immutable and shared, and
-// equality compares their id, so undo snapshots and setMasks' `m == masks_`
-// stay cheap.
-struct ObjectMap
-{
+// A coverage bitmap produced by a segmentation (the SAM model,
+// sam_segmenter.hpp, or the magic-wand stand-in, seg_basic.hpp). STORED against
+// the ORIGINAL picture; toSource() warps it into the picture on screen. Maps
+// are immutable and shared, and equality compares their id, so undo snapshots
+// and setMasks' `m == masks_` stay cheap.
+struct ObjectMap {
   int w = 0, h = 0;
   std::vector<uint8_t> a; // coverage 0..255, row-major
   uint64_t id = 0;        // unique per result (and per warp, see below)
 };
-struct ObjectPrompt
-{
+struct ObjectPrompt {
   float x = 0, y = 0; // fraction of the picture
   bool fg = true;
   bool operator==(const ObjectPrompt &) const = default;
 };
 
-inline uint64_t nextObjectMapId()
-{
+inline uint64_t nextObjectMapId() {
   static std::atomic<uint64_t> n{1};
   return n++;
 }
-inline uint64_t hashMix(uint64_t h, double v)
-{
+inline uint64_t hashMix(uint64_t h, double v) {
   uint64_t b;
   std::memcpy(&b, &v, sizeof b);
   return h ^ (b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
@@ -57,23 +53,19 @@ inline uint64_t hashMix(uint64_t h, double v)
 // reason as the other per-pixel code.
 inline void objAxisMorph(const std::vector<uint8_t> &in,
                          std::vector<uint8_t> &out, int w, int h, int r,
-                         bool dilate, bool horizontal)
-{
+                         bool dilate, bool horizontal) {
   out.resize(in.size());
   const int len = horizontal ? w : h, lines = horizontal ? h : w;
   const size_t step = horizontal ? 1 : static_cast<size_t>(w);
   const size_t lineStep = horizontal ? static_cast<size_t>(w) : 1;
-  for (int l = 0; l < lines; ++l)
-  {
+  for (int l = 0; l < lines; ++l) {
     const uint8_t *s = in.data() + static_cast<size_t>(l) * lineStep;
     uint8_t *d = out.data() + static_cast<size_t>(l) * lineStep;
-    for (int i = 0; i < len; ++i)
-    {
+    for (int i = 0; i < len; ++i) {
       const int lo = i - r < 0 ? 0 : i - r;
       const int hi = i + r > len - 1 ? len - 1 : i + r;
       uint8_t v = dilate ? 0 : 255;
-      for (int k = lo; k <= hi; ++k)
-      {
+      for (int k = lo; k <= hi; ++k) {
         const uint8_t p = s[static_cast<size_t>(k) * step];
         v = dilate ? (p > v ? p : v) : (p < v ? p : v);
       }
@@ -83,27 +75,23 @@ inline void objAxisMorph(const std::vector<uint8_t> &in,
 }
 inline void objAxisBlur(const std::vector<uint8_t> &in,
                         std::vector<uint8_t> &out, int w, int h, int r,
-                        bool horizontal)
-{
+                        bool horizontal) {
   out.resize(in.size());
   const int len = horizontal ? w : h, lines = horizontal ? h : w;
   const size_t step = horizontal ? 1 : static_cast<size_t>(w);
   const size_t lineStep = horizontal ? static_cast<size_t>(w) : 1;
   const int cnt = 2 * r + 1;
-  for (int l = 0; l < lines; ++l)
-  {
+  for (int l = 0; l < lines; ++l) {
     const uint8_t *s = in.data() + static_cast<size_t>(l) * lineStep;
     uint8_t *d = out.data() + static_cast<size_t>(l) * lineStep;
-    const auto at = [&](int i)
-    {
+    const auto at = [&](int i) {
       i = i < 0 ? 0 : (i > len - 1 ? len - 1 : i);
       return static_cast<int>(s[static_cast<size_t>(i) * step]);
     };
     int sum = 0;
     for (int k = -r; k <= r; ++k)
       sum += at(k);
-    for (int i = 0; i < len; ++i)
-    {
+    for (int i = 0; i < len; ++i) {
       d[static_cast<size_t>(i) * step] =
           static_cast<uint8_t>((sum + cnt / 2) / cnt);
       sum += at(i + r + 1) - at(i - r);
@@ -115,31 +103,25 @@ inline void objAxisBlur(const std::vector<uint8_t> &in,
 // The result's id mixes in the frame, so anything that caches on the in-view
 // shape (compositeTintImage's `compParts == view`) is invalidated by a
 // rotate / flip / straighten / crop, not just by a new segmentation.
-struct ObjectWarpCache
-{
+struct ObjectWarpCache {
   std::mutex mutex;
   std::vector<std::shared_ptr<const ObjectMap>> entries; // most recent first
-  void clear()
-  {
+  void clear() {
     const std::lock_guard<std::mutex> lock(mutex);
     entries.clear();
   }
-  size_t size()
-  {
+  size_t size() {
     const std::lock_guard<std::mutex> lock(mutex);
     return entries.size();
   }
 };
-inline ObjectWarpCache &objectWarpCache()
-{
+inline ObjectWarpCache &objectWarpCache() {
   static ObjectWarpCache c;
   return c;
 }
 
 inline std::shared_ptr<const ObjectMap>
-warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
-              const GeoFrame &f)
-{
+warpObjectMap(const std::shared_ptr<const ObjectMap> &src, const GeoFrame &f) {
   ObjectWarpCache &cache = objectWarpCache();
   uint64_t id = src->id;
   for (double v : {f.m00, f.m01, f.m10, f.m11, f.tx, f.ty, f.origW, f.origH,
@@ -151,9 +133,8 @@ warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
       if (c->id == id)
         return c;
   }
-  const double sc =
-      std::min(1.0, static_cast<double>(kObjectMapEdge) /
-                        std::max(f.srcW, f.srcH));
+  const double sc = std::min(1.0, static_cast<double>(kObjectMapEdge) /
+                                      std::max(f.srcW, f.srcH));
   const int dw = std::max(1, static_cast<int>(std::lround(f.srcW * sc)));
   const int dh = std::max(1, static_cast<int>(std::lround(f.srcH * sc)));
   auto out = std::make_shared<ObjectMap>();
@@ -162,8 +143,7 @@ warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
   out->id = id;
   out->a.assign(static_cast<size_t>(dw) * static_cast<size_t>(dh), 0);
   const int sw = src->w, sh = src->h;
-  const auto at = [&](int x, int y)
-  {
+  const auto at = [&](int x, int y) {
     x = x < 0 ? 0 : (x > sw - 1 ? sw - 1 : x);
     y = y < 0 ? 0 : (y > sh - 1 ? sh - 1 : y);
     return static_cast<float>(
@@ -171,8 +151,7 @@ warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
                static_cast<size_t>(x)]);
   };
   for (int y = 0; y < dh; ++y)
-    for (int x = 0; x < dw; ++x)
-    {
+    for (int x = 0; x < dw; ++x) {
       double ox, oy;
       f.toOrig((x + 0.5) * f.srcW / dw, (y + 0.5) * f.srcH / dh, ox, oy);
       if (ox < 0 || oy < 0 || ox >= f.origW || oy >= f.origH)
@@ -195,55 +174,45 @@ warpObjectMap(const std::shared_ptr<const ObjectMap> &src,
   return out;
 }
 
-struct ObjectEval : RasterEval
-{
-};
+struct ObjectEval : RasterEval {};
 
-struct ObjectCacheEntry
-{
+struct ObjectCacheEntry {
   uint64_t id;
   float grow, feather;
   ObjectEval eval;
 };
-struct ObjectEvalCache
-{
+struct ObjectEvalCache {
   std::mutex mutex;
   std::vector<ObjectCacheEntry> entries; // most recent first
-  void clear()
-  {
+  void clear() {
     const std::lock_guard<std::mutex> lock(mutex);
     entries.clear();
   }
-  size_t size()
-  {
+  size_t size() {
     const std::lock_guard<std::mutex> lock(mutex);
     return entries.size();
   }
 };
-inline ObjectEvalCache &objectEvalCache()
-{
+inline ObjectEvalCache &objectEvalCache() {
   static ObjectEvalCache c;
   return c;
 }
 
-struct ObjectShape
-{
+struct ObjectShape {
   std::shared_ptr<const ObjectMap> map; // stored: original orientation;
                                         // in-view form: warped
-  std::vector<ObjectPrompt> prompts;    // for refinement (step 2)
-  float feather = 0.0f;                 // 0..1
-  float grow = 0.0f;                    // -1 (shrink) .. +1 (grow)
-  bool operator==(const ObjectShape &o) const
-  {
+  std::vector<ObjectPrompt>
+      prompts; // the click prompts the map came from (re-run to refine)
+  float feather = 0.0f; // 0..1
+  float grow = 0.0f;    // -1 (shrink) .. +1 (grow)
+  bool operator==(const ObjectShape &o) const {
     return (map ? map->id : 0) == (o.map ? o.map->id : 0) &&
            prompts == o.prompts && feather == o.feather && grow == o.grow;
   }
 
-  ObjectShape toSource(const GeoFrame &f) const
-  {
+  ObjectShape toSource(const GeoFrame &f) const {
     ObjectShape s = *this;
-    for (ObjectPrompt &p : s.prompts)
-    {
+    for (ObjectPrompt &p : s.prompts) {
       double px, py;
       f.toSrc(p.x * f.origW, p.y * f.origH, px, py);
       p.x = static_cast<float>(px / f.srcW);
@@ -255,9 +224,8 @@ struct ObjectShape
   }
   // Only the sliders edit an object; the bitmap and prompts are replaced
   // wholesale by setSelectedObjectMap.
-  void applySourceEdit(const ObjectShape & /*before*/,
-                       const ObjectShape &after, const GeoFrame &)
-  {
+  void applySourceEdit(const ObjectShape & /*before*/, const ObjectShape &after,
+                       const GeoFrame &) {
     feather = after.feather;
     grow = after.grow;
   }
@@ -265,8 +233,7 @@ struct ObjectShape
   // Resolves for one image size: grow/shrink, then feather, then per-row
   // spans. Independent of W/H except for the stored sizes, so the preview
   // and full-size renders share one cached result.
-  ObjectEval prepare(int W, int H) const
-  {
+  ObjectEval prepare(int W, int H) const {
     ObjectEvalCache &cache = objectEvalCache();
     ObjectEval e;
     e.W = W;
@@ -276,8 +243,7 @@ struct ObjectShape
     {
       const std::lock_guard<std::mutex> lock(cache.mutex);
       for (const auto &c : cache.entries)
-        if (c.id == map->id && c.grow == grow && c.feather == feather)
-        {
+        if (c.id == map->id && c.grow == grow && c.feather == feather) {
           ObjectEval hit = c.eval;
           hit.W = W;
           hit.H = H;
@@ -288,34 +254,29 @@ struct ObjectShape
     std::vector<uint8_t> a = map->a, tmp;
     const int rg = static_cast<int>(
         std::lround(std::fabs(grow) * kObjectMaxGrow * longSide));
-    if (rg > 0)
-    {
+    if (rg > 0) {
       objAxisMorph(a, tmp, mw, mh, rg, grow > 0, true);
       objAxisMorph(tmp, a, mw, mh, rg, grow > 0, false);
     }
-    const int rf = static_cast<int>(
-        std::lround(feather * kObjectMaxFeather * longSide));
+    const int rf =
+        static_cast<int>(std::lround(feather * kObjectMaxFeather * longSide));
     if (rf > 0)
-      for (int pass = 0; pass < 2; ++pass)
-      { // two box passes ~ gaussian
+      for (int pass = 0; pass < 2; ++pass) { // two box passes ~ gaussian
         objAxisBlur(a, tmp, mw, mh, rf, true);
         objAxisBlur(tmp, a, mw, mh, rf, false);
       }
     auto lo = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), mw);
     auto hi = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), 0);
-    for (int y = 0; y < mh; ++y)
-    {
+    for (int y = 0; y < mh; ++y) {
       const uint8_t *row = a.data() + static_cast<size_t>(y) * mw;
       int first = -1, last = -1;
       for (int x = 0; x < mw; ++x)
-        if (row[x])
-        {
+        if (row[x]) {
           if (first < 0)
             first = x;
           last = x;
         }
-      if (first >= 0)
-      {
+      if (first >= 0) {
         (*lo)[static_cast<size_t>(y)] = first;
         (*hi)[static_cast<size_t>(y)] = last + 1;
       }

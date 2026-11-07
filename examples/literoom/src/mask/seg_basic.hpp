@@ -1,7 +1,7 @@
-// seg_basic.hpp - The stand-in segmenter: a magic wand that grows over similar colors. It
-// has the contract the real model has (picture + prompts in, coverage map
-// out, cancellable), so everything around it can be built and tested
-// without a model.
+// seg_basic.hpp - The stand-in segmenter: a magic wand that grows over similar
+// colors. It has the contract the real model has (picture + prompts in,
+// coverage map out, cancellable), so everything around it can be built and
+// tested without a model.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -17,33 +17,30 @@
 constexpr int kSegPrepEdge = 512; // long side the stand-in segmenter works at
 constexpr int kSegTolerance = 40; // stand-in: RGB distance for "same color"
 
-// ---- Stand-in segmenter (replaced by MobileSAM in step 3) ----
-// Magic wand: grow from each foreground point over pixels whose color is
+// ---- Stand-in segmenter (the fallback when no SAM model is installed; see segmentObject in main.cpp) ----
+// ---- Magic wand: grow from each foreground point over pixels whose color is
 // within kSegTolerance of the seed's color; background points grow the same
 // way and are subtracted. Same contract the real model will have: image +
 // prompts in, coverage map out, cancellable, runs on the worker thread.
-struct SegPrepared
-{ // what a model would cache per image (an embedding)
+struct SegPrepared { // what a model would cache per image (an embedding)
   int w = 0, h = 0;
   std::vector<uint8_t> rgb; // w*h*3
 };
 
-inline std::shared_ptr<const SegPrepared> prepareSegImage(const CanvasImage &s)
-{
-  const int k = std::max(
-      1, (std::max(s.width, s.height) + kSegPrepEdge - 1) / kSegPrepEdge);
+inline std::shared_ptr<const SegPrepared>
+prepareSegImage(const CanvasImage &s) {
+  const int k = std::max(1, (std::max(s.width, s.height) + kSegPrepEdge - 1) /
+                                kSegPrepEdge);
   auto out = std::make_shared<SegPrepared>();
   out->w = std::max(1, s.width / k);
   out->h = std::max(1, s.height / k);
   out->rgb.resize(static_cast<size_t>(out->w) * out->h * 3);
   const int area = k * k;
   for (int y = 0; y < out->h; ++y)
-    for (int x = 0; x < out->w; ++x)
-    {
+    for (int x = 0; x < out->w; ++x) {
       int sum[3] = {0, 0, 0};
       for (int dy = 0; dy < k; ++dy)
-        for (int dx = 0; dx < k; ++dx)
-        {
+        for (int dx = 0; dx < k; ++dx) {
           const uint8_t *p =
               &s.pixels[(static_cast<size_t>(y * k + dy) * s.width +
                          static_cast<size_t>(x * k + dx)) *
@@ -62,13 +59,11 @@ inline std::shared_ptr<const SegPrepared> prepareSegImage(const CanvasImage &s)
 // False if cancelled.
 inline bool segGrow(const SegPrepared &im, int sx, int sy,
                     std::vector<uint8_t> &mark,
-                    const std::atomic<uint64_t> *latest, uint64_t gen)
-{
+                    const std::atomic<uint64_t> *latest, uint64_t gen) {
   const int w = im.w, h = im.h;
   int ref[3] = {0, 0, 0}, n = 0; // seed color: mean of a 5x5 patch
   for (int y = std::max(0, sy - 2); y <= std::min(h - 1, sy + 2); ++y)
-    for (int x = std::max(0, sx - 2); x <= std::min(w - 1, sx + 2); ++x)
-    {
+    for (int x = std::max(0, sx - 2); x <= std::min(w - 1, sx + 2); ++x) {
       const uint8_t *p = &im.rgb[(static_cast<size_t>(y) * w + x) * 3];
       ref[0] += p[0];
       ref[1] += p[1];
@@ -79,8 +74,7 @@ inline bool segGrow(const SegPrepared &im, int sx, int sy,
     ref[c] /= n;
   const int tolSq = kSegTolerance * kSegTolerance;
   std::vector<int> stack;
-  const auto tryPush = [&](int x, int y)
-  {
+  const auto tryPush = [&](int x, int y) {
     if (x < 0 || y < 0 || x >= w || y >= h)
       return;
     const size_t i = static_cast<size_t>(y) * w + x;
@@ -95,8 +89,7 @@ inline bool segGrow(const SegPrepared &im, int sx, int sy,
   };
   tryPush(sx, sy);
   size_t pops = 0;
-  while (!stack.empty())
-  {
+  while (!stack.empty()) {
     if ((++pops & 4095) == 0 && latest &&
         latest->load(std::memory_order_relaxed) != gen)
       return false;
@@ -116,20 +109,17 @@ inline bool segGrow(const SegPrepared &im, int sx, int sy,
 inline std::shared_ptr<const ObjectMap>
 segmentObjectWand(const CanvasImage &img, uint64_t key,
                   const std::vector<ObjectPrompt> &prompts, std::string *err,
-                  const std::atomic<uint64_t> *latest, uint64_t gen)
-{
+                  const std::atomic<uint64_t> *latest, uint64_t gen) {
   static uint64_t cachedKey = 0;
   static std::shared_ptr<const SegPrepared> cached;
-  if (!cached || cachedKey != key)
-  {
+  if (!cached || cachedKey != key) {
     cached = prepareSegImage(img);
     cachedKey = key;
   }
   const SegPrepared &im = *cached;
   const size_t n = static_cast<size_t>(im.w) * im.h;
   std::vector<uint8_t> fg(n, 0), bg(n, 0);
-  for (const ObjectPrompt &p : prompts)
-  {
+  for (const ObjectPrompt &p : prompts) {
     const int sx = std::clamp(static_cast<int>(p.x * im.w), 0, im.w - 1);
     const int sy = std::clamp(static_cast<int>(p.y * im.h), 0, im.h - 1);
     if (!segGrow(im, sx, sy, p.fg ? fg : bg, latest, gen))

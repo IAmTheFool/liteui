@@ -12,7 +12,7 @@
 //   * the UI thread is woken by notify() OUTSIDE the lock;
 //   * shutdown() joins the thread.
 //
-// Thread model (unchanged): everything public is called from ONE thread (the
+// Thread model: everything public is called from ONE thread (the
 // UI thread). The worker thread, started lazily by the first submit(), only
 // runs the job function and touches the parked slot. setNotify() must be
 // called before the first submit().
@@ -31,7 +31,7 @@
 
 // What a running job gets to see of the generation protocol. `latest` is the
 // raw atomic so existing cancellable routines (renderWith, rotateArbitrary,
-// segmentObject) keep their (const std::atomic<uint64_t>* latest, uint64_t gen)
+// segmentObjectWand) keep their (const std::atomic<uint64_t>* latest, uint64_t gen)
 // parameters unchanged: pass c.latest, c.gen.
 struct WorkerCancel
 {

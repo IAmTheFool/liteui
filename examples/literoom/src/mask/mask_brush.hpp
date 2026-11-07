@@ -1,6 +1,6 @@
-// mask_brush.hpp - The Brush mask: strokes of dabs rasterized into a coverage map, with a
-// memo of the last few maps so a slider drag or one more stroke does not
-// start over.
+// mask_brush.hpp - The Brush mask: strokes of dabs rasterized into a coverage
+// map, with a memo of the last few maps so a slider drag or one more stroke
+// does not start over.
 #pragma once
 #include <algorithm>
 #include <array>
@@ -55,44 +55,36 @@ constexpr size_t kBrushCacheSize = 6;      // memoized coverage maps
 // with bilinear interpolation; a mask is smooth anyway, and a 24 MP image
 // costs no more than a 3 MP one. The result is memoized (see prepare), so
 // dragging an Adjust slider re-rasterizes nothing.
-struct BrushPt
-{
+struct BrushPt {
   float x = 0, y = 0; // fraction of the picture's width / height
   bool operator==(const BrushPt &) const = default;
 };
 
-struct BrushStroke
-{
+struct BrushStroke {
   bool erase = false;
   float size = kBrushDefaultSize; // radius, fraction of the SHORTER side
   float feather = 0.5f;           // 0 = hard edge .. 1 = fades from the center
   float density = 1.0f;           // 0..1, the most a stroke can add / remove
-  float flow = 1.0f;              // 0..1: 1 = a dab sets coverage (max), lower =
-                                  // dabs build up toward `density` (one pass ~ flow)
+  float flow = 1.0f; // 0..1: 1 = a dab sets coverage (max), lower =
+                     // dabs build up toward `density` (one pass ~ flow)
   std::vector<BrushPt> pts;
   bool operator==(const BrushStroke &) const = default;
 };
 
-struct BrushEval : RasterEval
-{
-};
+struct BrushEval : RasterEval {};
 
-struct BrushShape
-{
+struct BrushShape {
   std::vector<BrushStroke> strokes;
   bool operator==(const BrushShape &) const = default;
 
   // Stored (against the original picture) -> as it sits in the current one.
   // Positions go through the frame, sizes scale with it.
-  BrushShape toSource(const GeoFrame &f) const
-  {
+  BrushShape toSource(const GeoFrame &f) const {
     BrushShape s = *this;
     const double k = f.radiusScale();
-    for (BrushStroke &st : s.strokes)
-    {
+    for (BrushStroke &st : s.strokes) {
       st.size = static_cast<float>(st.size * k);
-      for (BrushPt &p : st.pts)
-      {
+      for (BrushPt &p : st.pts) {
         double px, py;
         f.toSrc(p.x * f.origW, p.y * f.origH, px, py);
         p.x = static_cast<float>(px / f.srcW);
@@ -105,15 +97,13 @@ struct BrushShape
   // drawn on the current picture -> stored form. (No applySourceEdit: strokes
   // are only ever appended, never edited in place, so nothing needs to fold
   // an edit of the in-view form back field by field.)
-  static BrushPt pointFromSource(const BrushPt &p, const GeoFrame &f)
-  {
+  static BrushPt pointFromSource(const BrushPt &p, const GeoFrame &f) {
     double ox, oy;
     f.toOrig(p.x * f.srcW, p.y * f.srcH, ox, oy);
     return BrushPt{static_cast<float>(ox / f.origW),
                    static_cast<float>(oy / f.origH)};
   }
-  static float sizeFromSource(float size, const GeoFrame &f)
-  {
+  static float sizeFromSource(float size, const GeoFrame &f) {
     return static_cast<float>(size / f.radiusScale());
   }
 
@@ -126,8 +116,7 @@ struct BrushShape
   // strokes after those are stamped on top of a copy of it: strokes fold in
   // order, so the result is identical to rasterizing them all.
   BrushEval rasterize(int W, int H, const BrushEval *base = nullptr,
-                      size_t first = 0) const
-  {
+                      size_t first = 0) const {
     BrushEval e;
     e.W = W;
     e.H = H;
@@ -147,17 +136,14 @@ struct BrushShape
     const size_t sw = static_cast<size_t>(mw);
     std::shared_ptr<std::vector<uint8_t>> map;
     std::shared_ptr<std::vector<int>> lo, hi;
-    if (base && base->map && base->mw == mw && base->mh == mh)
-    {
+    if (base && base->map && base->mw == mw && base->mh == mh) {
       map = std::make_shared<std::vector<uint8_t>>(*base->map);
       lo = std::make_shared<std::vector<int>>(*base->lo);
       hi = std::make_shared<std::vector<int>>(*base->hi);
-    }
-    else
-    {
+    } else {
       first = 0; // no usable base: start from an empty map
-      map = std::make_shared<std::vector<uint8_t>>(
-          sw * static_cast<size_t>(mh), uint8_t{0});
+      map = std::make_shared<std::vector<uint8_t>>(sw * static_cast<size_t>(mh),
+                                                   uint8_t{0});
       lo = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), mw);
       hi = std::make_shared<std::vector<int>>(static_cast<size_t>(mh), 0);
     }
@@ -165,11 +151,10 @@ struct BrushShape
     const float fW = static_cast<float>(mw), fH = static_cast<float>(mh);
     std::vector<uint8_t> cov; // one stroke's coverage, over its bbox only
     std::array<uint8_t, kBrushLutSize + 1> lut{};
-    std::vector<float> covF;                     // Flow < 1: the same box, accumulated in float
+    std::vector<float> covF; // Flow < 1: the same box, accumulated in float
     std::array<float, kBrushLutSize + 1> lutA{}; // falloff * per-dab opacity
 
-    for (size_t si = first; si < strokes.size(); ++si)
-    {
+    for (size_t si = first; si < strokes.size(); ++si) {
       const BrushStroke &st = strokes[si];
       if (st.pts.empty())
         continue;
@@ -191,21 +176,15 @@ struct BrushShape
       const float inner = std::clamp(1.0f - st.feather, 0.0f, 0.99f);
       const float dens = std::clamp(st.density, 0.0f, 1.0f);
       const float cap = 255.0f * dens; // accumulation ceiling (flow < 1)
-      for (size_t i = 0; i <= kBrushLutSize; ++i)
-      {
+      for (size_t i = 0; i <= kBrushLutSize; ++i) {
         const float d = std::sqrt(static_cast<float>(i) /
                                   static_cast<float>(kBrushLutSize));
         float w;
-        if (d <= inner)
-        {
+        if (d <= inner) {
           w = 1.0f;
-        }
-        else if (d >= 1.0f)
-        {
+        } else if (d >= 1.0f) {
           w = 0.0f;
-        }
-        else
-        {
+        } else {
           const float t = (d - inner) / (1.0f - inner);
           w = 1.0f - t * t * (3.0f - 2.0f * t);
         }
@@ -216,8 +195,7 @@ struct BrushShape
       // The stroke's bounding box (points +- radius), clamped to the map.
       float minX = st.pts[0].x * fW, maxX = minX;
       float minY = st.pts[0].y * fH, maxY = minY;
-      for (const BrushPt &p : st.pts)
-      {
+      for (const BrushPt &p : st.pts) {
         const float x = p.x * fW, y = p.y * fH;
         minX = x < minX ? x : minX;
         maxX = x > maxX ? x : maxX;
@@ -241,10 +219,10 @@ struct BrushShape
       if (accum)
         covF.assign(cov.size(), 0.0f);
 
-      // Stamp one round dab: coverage = max(existing, falloff), or accumulate when flow < 1.
+      // Stamp one round dab: coverage = max(existing, falloff), or accumulate
+      // when flow < 1.
       const float lutScale = static_cast<float>(kBrushLutSize) / r2;
-      const auto stamp = [&](float cx, float cy)
-      {
+      const auto stamp = [&](float cx, float cy) {
         if (cx + rad < static_cast<float>(cx0) ||
             cx - rad > static_cast<float>(cx1) ||
             cy + rad < static_cast<float>(cy0) ||
@@ -258,24 +236,21 @@ struct BrushShape
         iy0 = iy0 < cy0 ? cy0 : iy0;
         ix1 = ix1 > cx1 ? cx1 : ix1;
         iy1 = iy1 > cy1 ? cy1 : iy1;
-        for (int y = iy0; y < iy1; ++y)
-        {
+        for (int y = iy0; y < iy1; ++y) {
           const float dy = (static_cast<float>(y) + 0.5f) - cy;
           const float dy2 = dy * dy;
           uint8_t *crow = cov.data() + static_cast<size_t>(y - cy0) *
                                            static_cast<size_t>(bw);
-          for (int x = ix0; x < ix1; ++x)
-          {
+          for (int x = ix0; x < ix1; ++x) {
             const float dx = (static_cast<float>(x) + 0.5f) - cx;
             const float d2 = dx * dx + dy2;
             if (d2 >= r2)
               continue;
             const size_t li = static_cast<size_t>(d2 * lutScale);
-            if (accum)
-            {
-              float &f = covF[static_cast<size_t>(y - cy0) *
-                                  static_cast<size_t>(bw) +
-                              static_cast<size_t>(x - cx0)];
+            if (accum) {
+              float &f =
+                  covF[static_cast<size_t>(y - cy0) * static_cast<size_t>(bw) +
+                       static_cast<size_t>(x - cx0)];
               f += (cap - f) * lutA[li];
               continue;
             }
@@ -288,8 +263,7 @@ struct BrushShape
       };
 
       float px = st.pts[0].x * fW, py = st.pts[0].y * fH;
-      if (accum)
-      {
+      if (accum) {
         // Dabs at an exact spacing along the path, carried across segments,
         // so the build-up does not depend on how often points were recorded.
         // A stationary click gets one pass worth of dabs.
@@ -298,15 +272,12 @@ struct BrushShape
         for (int r = 0; r < reps; ++r)
           stamp(px, py);
         float next = step; // distance from the last dab to the next one
-        for (size_t k = 1; k < st.pts.size(); ++k)
-        {
+        for (size_t k = 1; k < st.pts.size(); ++k) {
           const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
           const float len = std::hypot(qx - px, qy - py);
-          if (len > 0.0f)
-          {
+          if (len > 0.0f) {
             float pos = next;
-            for (int guard = 0; pos <= len && guard < (1 << 16); ++guard)
-            {
+            for (int guard = 0; pos <= len && guard < (1 << 16); ++guard) {
               const float t = pos / len;
               stamp(px + (qx - px) * t, py + (qy - py) * t);
               pos += step;
@@ -318,19 +289,15 @@ struct BrushShape
         }
         for (size_t i = 0; i < cov.size(); ++i)
           cov[i] = static_cast<uint8_t>(covF[i] + 0.5f);
-      }
-      else
-      {
-        // Walk the polyline in steps of a fraction of the radius (as before).
+      } else {
+        // Walk the polyline in steps of a fraction of the radius.
         stamp(px, py);
-        for (size_t k = 1; k < st.pts.size(); ++k)
-        {
+        for (size_t k = 1; k < st.pts.size(); ++k) {
           const float qx = st.pts[k].x * fW, qy = st.pts[k].y * fH;
           const float len = std::hypot(qx - px, qy - py);
           const int n =
               std::min(static_cast<int>(std::ceil(len / step)), 1 << 16);
-          for (int j = 1; j <= n; ++j)
-          {
+          for (int j = 1; j <= n; ++j) {
             const float t = static_cast<float>(j) / static_cast<float>(n);
             stamp(px + (qx - px) * t, py + (qy - py) * t);
           }
@@ -339,33 +306,27 @@ struct BrushShape
         }
       }
       // Fold this stroke into the mask, and widen the rows' spans.
-      for (int y = 0; y < bh; ++y)
-      {
-        const uint8_t *crow = cov.data() + static_cast<size_t>(y) *
-                                               static_cast<size_t>(bw);
+      for (int y = 0; y < bh; ++y) {
+        const uint8_t *crow =
+            cov.data() + static_cast<size_t>(y) * static_cast<size_t>(bw);
         uint8_t *mrow = map->data() + static_cast<size_t>(cy0 + y) * sw +
                         static_cast<size_t>(cx0);
         int first = -1, last = -1;
-        for (int x = 0; x < bw; ++x)
-        {
+        for (int x = 0; x < bw; ++x) {
           const int c = crow[x];
           if (c == 0)
             continue;
           const int cur = mrow[x];
-          if (st.erase)
-          {
+          if (st.erase) {
             mrow[x] = static_cast<uint8_t>(cur - (cur * c + 127) / 255);
-          }
-          else
-          {
+          } else {
             mrow[x] = static_cast<uint8_t>(cur + ((255 - cur) * c + 127) / 255);
             if (first < 0)
               first = x;
             last = x;
           }
         }
-        if (first >= 0)
-        {
+        if (first >= 0) {
           int &l = (*lo)[static_cast<size_t>(cy0 + y)];
           int &h = (*hi)[static_cast<size_t>(cy0 + y)];
           l = std::min(l, cx0 + first);
@@ -389,49 +350,41 @@ struct BrushShape
 // Keyed on the strokes themselves and the size; the render threads and the UI
 // thread all come through here, hence the lock. Maps are immutable once
 // built, so sharing them is safe.
-struct BrushCacheEntry
-{
+struct BrushCacheEntry {
   BrushShape shape;
   int W = 0, H = 0;
   BrushEval eval;
 };
-struct BrushCache
-{
+struct BrushCache {
   std::mutex mutex;
   std::vector<BrushCacheEntry> entries; // most recent first
-  void clear()
-  {
+  void clear() {
     const std::lock_guard<std::mutex> lock(mutex);
     entries.clear();
   }
-  size_t size()
-  {
+  size_t size() {
     const std::lock_guard<std::mutex> lock(mutex);
     return entries.size();
   }
 };
 // The one cache of the process; tests empty it between cases.
-inline BrushCache &brushCache()
-{
+inline BrushCache &brushCache() {
   static BrushCache c;
   return c;
 }
 
-inline BrushEval BrushShape::prepare(int W, int H) const
-{
+inline BrushEval BrushShape::prepare(int W, int H) const {
   BrushCache &cache = brushCache();
   BrushEval base; // the longest cached run of our leading strokes, if any
   size_t baseCount = 0;
   bool haveBase = false;
   {
     const std::lock_guard<std::mutex> lock(cache.mutex);
-    for (size_t i = 0; i < cache.entries.size(); ++i)
-    {
+    for (size_t i = 0; i < cache.entries.size(); ++i) {
       const BrushCacheEntry &c = cache.entries[i];
       if (c.W != W || c.H != H)
         continue;
-      if (c.shape == *this)
-      {
+      if (c.shape == *this) {
         BrushEval hit = c.eval;
         if (i != 0) // keep the most recently used first
           std::rotate(cache.entries.begin(), cache.entries.begin() + i,
@@ -441,8 +394,7 @@ inline BrushEval BrushShape::prepare(int W, int H) const
       const size_t n = c.shape.strokes.size();
       if (n < strokes.size() && (!haveBase || n > baseCount) &&
           std::equal(c.shape.strokes.begin(), c.shape.strokes.end(),
-                     strokes.begin()))
-      {
+                     strokes.begin())) {
         base = c.eval; // cheap: shares the maps
         baseCount = n;
         haveBase = true;
