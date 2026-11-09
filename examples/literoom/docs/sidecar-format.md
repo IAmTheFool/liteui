@@ -8,9 +8,9 @@ This page describes what is in that file, when it is written and read, and how l
 
 | Piece | File |
 |---|---|
-| Turning the edits into JSON and back (pure functions on plain values), and the constant `kSidecarVersion` | `sidecar.hpp` |
+| Turning the edits into JSON and back (pure functions on plain values), the whole-file wrapper (`sidecarFileText`: `app`, `version`, `image`, then `meta`, `edits`, `snapshots`) and the constant `kSidecarVersion` | `sidecar.hpp` |
 | The JSON value, writer and parser | `minijson.hpp` |
-| File handling and the top-level wrapper (`app`, `version`, `image`): when to save, the temp-file-and-rename write, the version, size and picture-size checks on load | `main.cpp`, next to `openImage` (`saveSidecar`, `loadSidecar`, `autosaveSidecar`, `flushSidecar`) |
+| File handling: when to save, the temp-file-and-rename write, and the version, size and picture-size checks on load | `main.cpp`, next to `openImage` (`saveSidecar`, `loadSidecar`, `autosaveSidecar`, `flushSidecar`) |
 | `AdjustmentSet::toJson()` / `loadJson()` | `adjustment_set.hpp` (thin wrappers around `sidecar.hpp`) |
 | Rating, flag and color label (the `meta` object) and the filmstrip filter | `photo_meta.hpp` (values, JSON, `MetaFilter`); `sidecarFileText`, `sidecarMetaFromRoot` and `sidecarScan` in `sidecar.hpp`; the commands (`ratePhoto`, `flagPhoto`, `labelPhoto`) and the filter bar in `main.cpp` |
 | **Named snapshots** (the `snapshots` array, see [below](#named-snapshots)) | `NamedSnapshot`, `SnapshotList`, `sidecarSnapshotsToJson` / `FromJson` and `sanitizeSnapshotName` in `sidecar.hpp`; `AdjustmentSet::currentEdits()` / `restoreEdits()` in `adjustment_set.hpp`; the pane and its commands (`addSnapshot`, `applySnapshotEntry`, `deleteSelectedSnapshot`) in `main.cpp` |
@@ -46,9 +46,9 @@ Inside `edits`:
 | Key | Content |
 |---|---|
 | `adjust` | The slider values, keyed by each slider's **label** (for example `"Exposure"`, `"Noise Reduction"`, `"LUT Amount"`). Sliders at 0 are left out. |
-| `curves` | Four tone curves under the keys `rgb`, `r`, `g`, `b`, each a list of control points. |
-| `colorMix` | The 24 Color Mixer values, as three lists of 8 numbers (one per color band) under the keys `hue`, `sat` and `lum`. |
-| `colorGrading` | The four wheels, plus blending and balance. |
+| `curves` | Tone curves under the keys `rgb`, `r`, `g`, `b`, each a list of `[x, y]` control points. A curve that is the straight line is left out (all four straight: `{}`). |
+| `colorMix` | The 24 Color Mixer values, as three lists of 8 numbers (one per color band) under the keys `hue`, `sat` and `lum`. `{}` when every value is 0. |
+| `colorGrading` | `wheels`: a list of four objects (shadows, midtones, highlights, global), each with `hue`, `sat`, `lum` and `visible`; plus `blending` and `balance`. `{}` when everything is at its default. |
 | `lut` | Optional: the picture's 3D LUT as `{ "name", "hash" }` (see [The 3D LUT](#the-3d-lut)). **Absent when the picture has none**, like `meta`, so a picture that never had a LUT keeps exactly the file it had before LUTs existed. |
 | `geometry` | `flip`, `rotate` (clockwise quarter turns, 0 to 3), `angle` (degrees), `keepFullCanvas`, and, only if there is one, `crop` as `[x, y, w, h]` measured on the turned and straightened picture. |
 | `masks` | A list of masks (see below). |
@@ -89,7 +89,7 @@ A picture's LUT is stored as a **reference**, never as a table:
 
 - `name` is the LUT's name in the LUT library (the file `<name>.cube` in the library folder, see `lut_library.hpp`). It is cleaned on load like every name: printable ASCII only, the characters Windows does not allow in file names (`< > : " / \ | ? *`) become `_`, at most 48 characters, no trailing dot or space. A name can therefore never point outside the library folder, whatever a hand-edited file says.
 - `hash` is the hash (FNV-1a, 64 bit) of the file's bytes **when the LUT was chosen**, as exactly 16 hex digits. It is optional; a missing or malformed one is read as "unknown", which accepts any file by that name. It exists so that replacing a `.cube` under the same name is noticed (the picture still uses the new file, and says so when it is opened).
-- **How strongly** the LUT is used is the ordinary slider `LUT Amount` (0 to 100) in `adjust`, like every other slider. A picture can hold a LUT at amount 0 (chosen, but off); removing a LUT sets the amount back to 0.
+- **How strongly** the LUT is used is the ordinary slider `LUT Amount` (0 to 100) in `adjust`, like every other slider. A picture can hold a LUT at amount 0 (chosen, but off); removing a LUT sets the amount back to 0, and choosing a LUT while the amount is 0 sets it to 100 so the new look is visible at once.
 - The table is **never** stored: a 65³ table is about 7 MB of numbers, and a sidecar's snapshots, undo steps (in memory) and presets would each repeat it. A name and a hash are about 60 bytes. The price is that the file must still be in the library when the picture is opened: if it is missing or unreadable, the picture opens **without** the look (the reference and the amount are kept, so putting the file back restores it), the status bar says so, and a batch export skips the picture with a reason. See [3D LUTs in architecture.md](architecture.md#3d-luts).
 - The `lut` object is part of the *look*: presets, Copy / Paste Settings and Sync Settings carry it, and a look without a LUT **clears** the target's LUT (the look is replaced, not merged).
 
@@ -112,7 +112,7 @@ A sidecar can be damaged, hand-edited, written by a newer version, or written fo
 - A tone curve must keep the editor's own rules (2 to 16 points, end points at x = 0 and 255, the rest at least a minimum gap apart). Anything else becomes a straight line.
 - The crop is checked against the size of the turned and straightened picture, and dropped if it does not fit.
 - At most 16 masks are read (`kMaxMasks`) and at most 6 parts per mask (`kMaxMaskParts`). Further ones are ignored. A mask with no valid part is dropped.
-- Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped. A polygon keeps at most `kPolyMaxPoints` points (one with fewer than 3 is kept and simply selects nothing), and a rectangle's size and angle are clamped like a radial one's.
+- Brush masks keep at most 512 strokes and 20,000 points per stroke; a stroke with no points is dropped. A polygon keeps at most `kPolyMaxPoints` (2048) points (one with fewer than 3 is kept and simply selects nothing), and a rectangle's size and angle are clamped like a radial one's.
 - **A bad `lut` never makes a file bad.** If it is not an object, has no string `name`, or has a name with nothing left after cleaning, the picture simply has no LUT (the rest of the file loads normally). A `hash` that is not exactly 16 hex digits is dropped. Whether the named file exists is not checked at load time: that is the library's business, reported when the LUT is first used.
 - Object masks are limited: at most 256 prompts per selection, and a stored bitmap must be 1 to 16,384 pixels on each side, no more than about 67 million pixels in total (`kSidecarMaxMapPixels`), and decode to exactly `w × h` bytes.
 - **Snapshots never make a file bad.** `snapshots` that isn't an array gives none. Each entry is skipped if it isn't an object or its `edits` can't be loaded, and each one that is kept goes through `sidecarEditsFromJson` like the live edits (sliders clamped, the crop checked against the picture's size, at most 16 masks, and so on). At most `kMaxSnapshots` (20) are kept, and the name is cleaned (printable ASCII, trimmed, at most 32 characters; a blank one becomes `Snapshot`).
@@ -227,7 +227,7 @@ photo.jpg.vc2.literoom.json    virtual copy 2   (copies 1 to 9; kMaxVirtualCopie
 
 A copy's sidecar is an ordinary sidecar (same wrapper, same `edits`, its own `meta` and `snapshots`), so everything on this page applies to it. `image.name` holds the real picture's name. There is no list of copies anywhere: they are found by scanning the folder for names of the form `<picture>.vc<n>.literoom.json` (`listVirtualCopies`) when the filmstrip is built. A copy whose picture isn't in the strip is not shown, and its file is left alone.
 
-**One string identifies a picture in the program**, its path (the filmstrip's name index, thumbnail and sync results, the open picture). A copy gets its own path by appending a marker that no file name can contain: `/photos/photo.jpg|vc2`. Everything that keys on the path then tells copies apart for free. The few places that need the real file call `vcImageOf()` first: decoding, EXIF, the Sync worker's size lookup, the export's metadata copy. `sidecarFileOf()` understands the marker and returns the copy's own file name. See [headers.md](headers.md#virtual_copyhpp).
+**One string identifies a picture in the program**, its path (the filmstrip's name index, thumbnail and sync results, the open picture). A copy gets its own path by appending a marker that Windows forbids in file names and that is very rare elsewhere: `/photos/photo.jpg|vc2`. Everything that keys on the path then tells copies apart for free. The few places that need the real file call `vcImageOf()` first: decoding, EXIF, the Sync worker's size lookup, the export's metadata copy. `sidecarFileOf()` understands the marker and returns the copy's own file name. See [headers.md](headers.md#virtual_copyhpp).
 
 How the UI treats them (`main.cpp`):
 
@@ -236,12 +236,12 @@ How the UI treats them (`main.cpp`):
 - **Image > Delete Virtual Copy** (choose it twice) deletes the open copy's sidecar and returns to the original. The picture and its other copies are untouched. The original cannot be deleted this way.
 - **Each copy has its own rating, flag, color label and "has edits" dot**, read from its own sidecar by the thumbnail worker. The worker does not decode a copy; a copy's thumbnail is its original's until the copy has been opened and left.
 - **Sync Settings and batch ratings** treat a selected copy as any other picture: its own sidecar is rewritten. The open copy is never in the batch, but the original and the other copies are.
-- **Export** names the file `<picture>-copy2-edit.jpg` by default and copies the real picture's metadata (for a JPEG its EXIF and ICC profile, with the GPS cut out if the export option says so; XMP and IPTC are not carried over, and a PNG gets none).
+- **Export** names the file `<picture>-copy2-edit.jpg` by default and carries the real picture's metadata as any export does: the ICC profile always, the EXIF block only with Keep Metadata (with the GPS cut out if the export option says so). XMP and IPTC are not carried over, and a PNG gets the source's color tags instead of EXIF.
 - **Limits of the design.** Renaming or deleting the picture in a file manager leaves its `.vc` files behind (they simply stop being shown). A copy's sidecar is checked against the picture's size like any other.
 
 ## Changing the format
 
-- `kSidecarVersion` (currently 1) is written to every file by `saveSidecar` and checked by `loadSidecar`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
+- `kSidecarVersion` (currently 1) is written to every file by `sidecarFileText` (so by every writer) and checked by `loadSidecar` and, for other pictures' files, by `sidecarReadForRewrite`. A build whose own `kSidecarVersion` is lower than the file's ignores the **whole** file ("made by a newer Literoom"), so older builds cannot read newer sidecars. Bump it only for a change an older reader could not handle safely; additive changes (see below) usually don't need one.
 - The `adjust` keys are slider **labels**. Renaming a label in `kAdjustmentSpecs` would orphan existing values in sidecars **and in saved presets** (see [extending.md](extending.md)).
 - Adding a field is safe if the loader gives it a default and clamps it.
 - **The 3D LUT was added without a version bump**: `lut` is a new optional key and `LUT Amount` a new `adjust` key. An older build ignores both (it opens the picture without the LUT) and its next save drops them, which is the usual cost of an additive change; a newer build reads every older file unchanged.

@@ -39,7 +39,7 @@ static constexpr float FilterValues::*kFilterFields[] = {&FilterValues::greyscal
                                                          &FilterValues::crossProcess};
 static int luma(const Px &p) { return static_cast<int>(std::lround(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])); }
 
-// ---- random passes (used by the float / bulk / fingerprint tests at the end) ----
+// ---- random passes (used by the float / bulk tests at the end) ----
 static float rnd(std::mt19937 &g, float lo, float hi)
 {
   return lo + (hi - lo) * static_cast<float>(g() & 0xFFFFFF) / 16777215.0f;
@@ -873,47 +873,5 @@ TEST_CASE("color_pass: bulkEqualsPerPixel", "[color_pass]")
     }
 }
 
-//// Golden fingerprints: a fixed-seed set of random passes over fixed random pixels, hashed.
-//// Changing the pipeline on purpose changes these; update them then. Changing them by accident
-//// is exactly what this test is for. The values depend on float behavior, so they are valid for
-//// the compiler/flags you record them with (no -ffast-math; FMA contraction can change bytes).
-//static std::uint64_t fnv1a(std::uint64_t h, const Px &v)
-//{
-//  for (uint8_t b : v)
-//  {
-//    h ^= b;
-//    h *= 1099511628211ull;
-//  }
-//  return h;
-//}
-//TEST_CASE("color_pass: goldenFingerprints", "[color_pass][fingerprint]")
-//{
-//  constexpr int kGroups = 8, kPassesPerGroup = 8;
-//  // Recorded from MSVC Release. If you change the pipeline on purpose, re-record them:
-//  // set the entry to 0, run the test, and paste the printed value.
-//  static const std::uint64_t kGolden[kGroups] = {
-//      0x9e8e9e4de2178db1ull, 0x72264c1fb7b3b28eull, 0x1af4da7b2f08391eull, 0xb51a04329cd552a1ull,
-//      0xaadea4010b57cebcull, 0x0c798b587c0529c3ull, 0x132cde7980658a07ull, 0x0555d21b5369cc6aull};
-//  std::mt19937 g(2024);
-//  for (int grp = 0; grp < kGroups; ++grp)
-//  {
-//    std::uint64_t h = 14695981039346656037ull;
-//    for (int k = 0; k < kPassesPerGroup; ++k)
-//    {
-//      const ColorPass cp = randomPass(g);
-//      Px img(4 * 997);
-//      for (uint8_t &v : img)
-//        v = static_cast<uint8_t>(g());
-//      applyColorPass(cp, img.data(), img.size());
-//      h = fnv1a(h, img);
-//    }
-//    if (kGolden[grp] == 0)
-//    {
-//      std::printf("GOLDEN group %d: 0x%016llxull\n", grp, static_cast<unsigned long long>(h));
-//      CHECK(!"golden fingerprint not recorded yet");
-//    }
-//    else
-//      CHECK(h == kGolden[grp]);
-//  }
-//}
+
 } // namespace color_pass_cases

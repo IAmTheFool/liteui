@@ -165,7 +165,7 @@ inline bool writeFileAtomic(const std::string &path,
 // `maxFiles` caps how many names are collected, and the cap is applied BEFORE
 // sorting: a folder with more matching files than that yields an arbitrary
 // (directory-order) subset, sorted. This is exactly what the filmstrip always
-// did; it is kept as is (file_utils_test pins it).
+// did; it is kept as is (tests/cases/file_utils.inc pins it).
 inline std::vector<std::string> listImageFiles(const std::string &folder,
                                                size_t maxFiles)
 {

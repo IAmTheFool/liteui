@@ -1,7 +1,7 @@
 // film_fx.hpp - Vignette and Grain: two effects that depend on WHERE a pixel is,
 // not on its neighbors (detail layers) or on its color alone (color pass).
 // No UI, no editor state; plain functions on plain values, so it is tested
-// without a window (tests/film_fx_test.cpp).
+// without a window (tests/cases/film_fx.inc).
 //
 // Both are the LAST step of the pixel pipeline, after the masks (see
 // renderWith), and global only: masks do not get them.
@@ -253,8 +253,7 @@ inline void applyF(const Prepared &f, float *p, size_t count, size_t first)
 }
 
 // The same on `count` consecutive RGBA8 pixels: applyF on blocks of pixels, rounded and
-// clamped to bytes once at the end, so it gives the bytes the old byte loop gave
-// (tests/color_pass_float_test.cpp keeps that loop as a reference). Alpha is never changed.
+// clamped to bytes once at the end. Alpha is never changed.
 inline void apply(const Prepared &f, uint8_t *p, size_t count, size_t first)
 {
   if (!f.any())

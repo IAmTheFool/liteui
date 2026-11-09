@@ -127,7 +127,7 @@ struct MixLut
 };
 
 // The table index for a hue in degrees: nearest entry, wrapping around the
-// circle (359.9 -> 0, -0.1 -> 719), always in 0..kMixLutSize-1. A NaN or
+// circle (359.9 -> 0, -0.1 -> 0, -0.3 -> 719), always in 0..kMixLutSize-1. A NaN or
 // infinite hue maps to 0. Use this instead of rounding by hand, since
 // round(hue / 360 * kMixLutSize) reaches kMixLutSize for hues near 360.
 // (applyColorPassF inlines the same round-and-wrap, without std:: calls, since

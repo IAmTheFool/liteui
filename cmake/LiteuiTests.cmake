@@ -15,7 +15,9 @@
 #   liteui_enable_sanitizers(<target> <env_var_out> [NO_LEAK_CHECK])
 #       Applies the sanitizer flags to <target> and stores the ASAN_OPTIONS
 #       string for its tests in <env_var_out> (empty when sanitizers are off).
-#       Used by liteui_add_test and by literoom's plain (non-Catch2) tests.
+#       Used by liteui_add_test and by literoom's hand-written test targets
+#       (literoom_test, which is Catch2 but not made by liteui_add_test, and
+#       literoom_lut_pane_test).
 #
 #   liteui_add_test(<name> SOURCES <files...>
 #                   [INCLUDES <dirs...>] [LITEUI] [THREADS] [NO_SANITIZE]

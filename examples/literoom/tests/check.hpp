@@ -1,4 +1,5 @@
-// check.hpp - the tiny test harness shared by the unit tests in this folder.
+// check.hpp - the tiny test harness of the tests that are not Catch2 (lut_pane_test.cpp).
+// The unit tests in cases/*.inc use Catch2 instead.
 //   CHECK(cond)                 records a failure (with file:line) and goes on
 //   CHECK_NEAR(a, b, tol)       |a - b| <= tol
 //   return finish();            prints "all ok" or "N FAILED"; the exit code

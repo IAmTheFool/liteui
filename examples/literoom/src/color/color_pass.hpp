@@ -19,7 +19,7 @@ constexpr float kColorizeStrength = 0.6f; // Colorize Amount 100 = this fraction
 // Every filter is a strength 0..100 (0 = untouched). At strength s the result
 // is lerp(pixel, filtered(pixel), s / 100), except Posterize, where s sets the
 // level count instead of a blend. Either way 0 is exactly the identity and
-// existing renders (and the golden fingerprints) cannot change. Fixed order:
+// existing renders cannot change. Fixed order:
 // Vintage -> Fade -> Greyscale -> Sepia -> (clamp) -> Solarize -> Bleach Bypass
 // -> Cross Process -> Threshold -> Posterize -> Negative.
 struct FilterValues
@@ -99,9 +99,9 @@ inline float filterSCurve255(float v, float amt)
   return (x + (s - x) * amt) * 255.0f;
 }
 
-// One pixel, float in and out (0..255, may leave the range; the caller rounds
+// One pixel, float in and out (0..255, <range wording: pending #4>; the caller rounds
 // and clamps once). Plain code, no std:: helpers, for the same Debug-build
-// reason as applyColorPassF (see AdjustmentSet::applyTo).
+// reason as applyColorPassF.
 inline void applyFilterPixel(const FilterPass &f, float &r, float &g, float &b)
 {
   r = filterClamp255(r);
@@ -424,8 +424,8 @@ inline ColorPass colorPassWithLut(const ColorPass &cp, const LutPass &lut)
 // The color pass on float levels: applies `cp` in place to `n` floats of RGBA (4 per pixel,
 // R, G, B in levels 0..255; alpha untouched). The result is NOT rounded and NOT clamped, so
 // it can lie outside 0..255 (the caller decides what happens to that; applyColorPass below
-// rounds and clamps). Raw pointers and no std::clamp/min/max calls in the loop, for the
-// same Debug-build reason as AdjustmentSet::applyTo.
+// rounds and clamps). Raw pointers and no std::clamp/min/max calls in the loop, for
+// Debug-build speed.
 inline void applyColorPassF(const ColorPass &cp, float *p, std::size_t n)
 {
   if (!cp.active)
@@ -627,7 +627,8 @@ inline void applyColorPassF(const ColorPass &cp, float *p, std::size_t n)
 // Applies `cp` in place to `n` bytes of RGBA8 (alpha untouched; a trailing partial pixel is
 // left alone): the float pass above on blocks of pixels, each channel rounded and clamped to a
 // byte once at the end.
-// Its output is pinned by the golden fingerprints in tests/color_pass_test.cpp.
+// Its bytes are tied to the float core above by tests/cases/color_pass.inc
+// (colorPassFloatAgrees, bulkEqualsPerPixel).
 inline void applyColorPass(const ColorPass &cp, std::uint8_t *p, std::size_t n)
 {
   if (!cp.active)

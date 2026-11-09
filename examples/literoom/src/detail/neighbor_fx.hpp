@@ -46,7 +46,7 @@
 // NaN/inf treated as 0), so the per-pixel code only ever sees finite values.
 //
 // Like detail_layer.hpp this has no UI dependency and is unit-tested alone
-// (tests/neighbor_fx_test.cpp).
+// (tests/cases/neighbor_fx.inc).
 
 #pragma once
 

@@ -37,7 +37,7 @@
 //
 // This header has no dependency on the UI library: it works on plain RGBA8
 // (or RGBA 16-bit) pointers, so it can be unit-tested on its own
-// (tests/detail_layer_test.cpp).
+// (tests/cases/detail_layer.inc).
 //
 // SOURCE SAMPLE TYPES. The planes and the per-pixel passes read the source picture as
 // uint8_t samples (RGBA8) or uint16_t samples (a 16-bit picture, core/image16.hpp); SrcTraits<S>

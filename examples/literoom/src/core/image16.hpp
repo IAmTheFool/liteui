@@ -1,7 +1,7 @@
 // image16.hpp - Image16: the 16-bit-per-channel RGBA picture the float pipeline starts from,
 // and the row conversions between it, the 8-bit RGBA that liteui's CanvasImage holds, and
 // the float "levels" (0..255) the pixel passes work in. No liteui, no editor state: plain
-// buffers, so it is tested without a window (tests/image16_test.cpp).
+// buffers, so it is tested without a window (tests/cases/image16.inc).
 //
 // Why 16 bits and not float for storage: a 24 MP picture is 192 MB at 16 bits and 384 MB as
 // float, and the photo editor keeps several stages of it (original, oriented, rotated,

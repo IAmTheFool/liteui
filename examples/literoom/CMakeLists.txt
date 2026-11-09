@@ -31,7 +31,9 @@ source_group(TREE ${LITEROOM_SRC} FILES ${LITEROOM_SRC}/main.cpp ${LITEROOM_HEAD
 
 if(MSVC)
     target_compile_options(literoom PRIVATE /utf-8 /bigobj)
-    # Need to split main in small build functions this is temporary but works
+    # main() builds the whole UI in one large stack frame (src/main.cpp is ~12k
+    # lines); until it is split into smaller build functions, raise the MSVC
+    # default stack from 1 MB to 8 MB. The golden and lut_pane tests need the same.
     target_link_options(literoom PRIVATE /STACK:8388608)
 endif()
 
@@ -150,11 +152,7 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     if(_catch_env)
         list(APPEND _catch_props ENVIRONMENT "${_catch_env}")
     endif()
-    # TEST_SPEC "~[.]" leaves out the hidden cases ([.] tag): the two golden-fingerprint tests
-    # (neighbor_fx, raster_ops) that were switched off in the old suite. Run one by hand with
-    #   literoom_test "neighbor_fx: goldenFingerprints"
     catch_discover_tests(literoom_test TEST_PREFIX "literoom_"
-        TEST_SPEC "~[.]"
         ADD_TAGS_AS_LABELS
         PROPERTIES ${_catch_props})
 
@@ -188,7 +186,7 @@ if(LITEUI_BUILD_TESTS AND LITEROOM_TESTS)
     add_custom_target(literoom_golden_record
         COMMAND literoom_golden_render_test --record ${GOLDEN_FILE}
         DEPENDS literoom_golden_render_test
-        COMMENT "golden: recording ${GOLDEN_FILE}")
+        COMMENT "golden: recording render_${CMAKE_CXX_COMPILER_ID}_<config>.txt")
 
     # ---- lut_pane: the LUTs pane's logic without a window (not Catch2) ----
     # Its own executable, like golden_render: it compiles src/main.cpp itself

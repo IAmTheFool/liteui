@@ -10,7 +10,7 @@
 // read it directly (see render_core.hpp). A twin stage is null when the file is 8-bit.
 //
 // These functions mirror, line for line, what EditorState::syncSource and runGeometryJob do for the 8-bit
-// chain, so the two cannot drift apart: tests/wide_chain_test.cpp checks sizes and content against it.
+// chain, so the two cannot drift apart: tests/cases/wide_chain.inc checks sizes and content against it.
 #pragma once
 #include <atomic>
 #include <cstdint>

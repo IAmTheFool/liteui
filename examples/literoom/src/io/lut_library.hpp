@@ -14,7 +14,8 @@
 // one per slider frame). It is a global guarded by a mutex because the UI
 // thread and the export worker both resolve LUTs. A table is parsed on the
 // calling thread the first time it is needed. Call clearLutCache() whenever the
-// folder's content may have changed (import, refresh, opening a picture).
+// folder's content may have changed (after an import, when a picture is opened).
+// Listing the folder again does not touch the cache.
 // Previews of every LUT in the list use loadLutFile() instead, which never
 // touches the cache, so they cannot push out the LUT that is in use.
 #pragma once

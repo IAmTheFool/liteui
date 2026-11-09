@@ -100,7 +100,7 @@ Batch export (File > Export Selected... / Export All Shown..., or the same butto
 1. Open `vcImageOf(path)` through `image_source::openUpright` with its EXIF rotation (what the decode worker does: a truncated PNG is refused, and a 16-bit PNG is read at full precision), so the picture is the same upright "original" the saved edits were made against.
 2. Read the picture's sidecar from disk into a **local** `AdjustmentSet` (`setOriginalSize`, then `loadJson`). The editor's set is never touched. A missing sidecar is normal (the picture exports unedited); one that exists but can't be used (damaged, newer, too big, written for a different size, or using a LUT that the LUT library no longer has) **skips that picture with a reason**, where the editor would open it clean. Silently exporting an unedited picture in the middle of a batch would be worse.
 3. The geometry worker's chain from the original: `orientImage`, `rotateArbitrary`, `cropImage`, then `renderForExport()` (`workers/export_render.hpp`) with `buildRenderParams()`: `renderWith` for an 8-bit original, `renderToDisplay` for a 16-bit one, or `renderToImage16` when 16-bit output is wanted (a PNG with the 16-bit option on, from either kind of original). Intermediate pictures are released before the render so the peak stays near one picture.
-4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile`, `encodePngFile`, or `encodePng16File` for a 16-bit PNG). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
+4. Resize to the long edge (never enlarging), check the JPEG size limit, pick a free file name, encode (`saveJpegFile`, `encodePngFile`, or `encodePng16File` for a 16-bit PNG). A JPEG gets the source's ICC profile always and its EXIF only with Keep Metadata; after a PNG is written, `carryColorToPng` copies the source's color tags into it (see [Color-space tags](architecture.md#color-space-tags)). Names are `<stem>-edit.<ext>` (a virtual copy is `<stem>-copy2-edit.<ext>`); a taken name gets `-2`, `-3`, ... unless Overwrite is on, and a name already used *in this batch* is never reused.
 
 `ExportWorker` queues the pictures in strip order:
 
@@ -152,4 +152,4 @@ Nothing runs while nothing is outstanding, so an idle editor costs nothing.
 4. Call `setNotify(...)` with `ui.wake()` in `main()`, before the first `submit()`.
 5. Poll with `collect()` each frame, and drop results that no longer apply.
 6. Call its `shutdown()` in `main()` after `ui.run()` returns, before `ui` is destroyed.
-7. Test timing with the repeat loop in [testing.md](testing.md).
+7. Test it, and tag its Catch2 cases `[threaded]` so that `ctest -C Release -L threaded --repeat until-fail:50` shakes out timing flakiness (see [testing.md](testing.md)).

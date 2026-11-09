@@ -1,6 +1,6 @@
 // export_render.hpp - The pixel half of exporting one picture: from the decoded ORIGINAL to the rendered
 // picture the encoders write. A pure function of its inputs (no files, no editor state, no sidecar), so it
-// is tested without any of those (tests/export_render_test.cpp); exportPicture (export_worker.hpp) does the
+// is tested without any of those (tests/cases/export_render.inc); exportPicture (export_worker.hpp) does the
 // file work around it.
 //
 // The chain is the geometry worker's: orient -> straighten -> crop, from the untouched original, then the

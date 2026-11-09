@@ -74,6 +74,8 @@ if(WIN32)
     target_link_libraries(liteui INTERFACE
         user32
         gdi32
+        d3d11
+        dxgi
         d2d1
         dwrite
         windowscodecs
