@@ -16,6 +16,8 @@ The edit state is everything needed to reproduce the picture from the original:
 
 A picture's **rating, flag and color label** are not edits either. They are kept beside the edit state (see [sidecar-format.md](sidecar-format.md#rating-flag-color-label-and-the-filmstrip-filter)), have no undo step and no History label, and never bump `version()`.
 
+What the file says about its **color space** (`state.colorTag`, read from the picture file) is not an edit either: it has no step, no History label and is never saved (see [architecture.md](architecture.md#color-space-tags)).
+
 **Named snapshots** are not edits either: they are kept beside the edit state, saved in the sidecar, and adding or deleting one has no undo step. Restoring one *is* an edit (see [Named snapshots](#named-snapshots)).
 
 A **preset** is not another kind of edit. It is a way of setting the look (sliders, curves, Color Mixer, Color Grading and the LUT) in one go; see [Presets](#presets) below.
