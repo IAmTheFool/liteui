@@ -376,7 +376,7 @@ The pane and its buttons have no automated test (see "Known gaps"). Open a photo
 
 The filmstrip code, the menu items and the pixel reuse have no automated test (see "Known gaps"). Use a folder with at least three photos, one of them a portrait phone photo (EXIF rotation), and edit the first one.
 
-1. **Create.** Open `a`, press Ctrl+Shift+N (Image > Create Virtual Copy). A new cell with a `C1` badge appears right after `a`, it opens at once without a visible decode, and it has `a`'s edits. `a.jpg.vc1.literoom.json` exists next to the picture. The status bar says "Created virtual copy 1".
+1. **Create.** Open `a` and choose Image > Create Virtual Copy (the menu shows Ctrl+Shift+N, but that key is not bound). A new cell with a `C1` badge appears right after `a`, it opens at once without a visible decode, and it has `a`'s edits. `a.jpg.vc1.literoom.json` exists next to the picture. The status bar says "Created virtual copy 1".
 2. **Independence.** Change the copy (for example make it black and white). Click `a`: it still has its own look, and the copy keeps its. Both keep their thumbnails' "has edits" dots; the copy's thumbnail is `a`'s until it has been opened and left.
 3. **Own rating and snapshots.** Rate the copy 4 stars and save a snapshot in it. `a` has neither. Restart the app: the copy is still next to `a`, with its rating and its snapshot.
 4. **Undo history** starts at "Original" every time you switch, in both directions, and Ctrl+Z never crosses from one copy to the other.

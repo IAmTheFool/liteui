@@ -231,7 +231,7 @@ A copy's sidecar is an ordinary sidecar (same wrapper, same `edits`, its own `me
 
 How the UI treats them (`main.cpp`):
 
-- **Image > Create Virtual Copy** (Ctrl+Shift+N) writes a new sidecar holding the open picture's *current* edits (not its snapshots or rating), puts a cell after the picture's (badge `C2`), and opens it. The lowest free number is used. A tenth copy is refused.
+- **Image > Create Virtual Copy** writes a new sidecar holding the open picture's *current* edits (not its snapshots or rating), puts a cell after the picture's (badge `C2`), and opens it. The lowest free number is used. A tenth copy is refused. (The menu item shows "Ctrl+Shift+N", but no code binds that key, so the menu is the only way to create a copy.)
 - **Switching is instant.** Opening another copy of the picture already on screen reuses its pixels (`filmOpenIndex` hands `adoptDecoded` a copy of `state.original`) instead of decoding the file again. Everything else is the normal open: the old copy's edits are saved first, workers are invalidated, the new copy's sidecar is loaded.
 - **Image > Delete Virtual Copy** (choose it twice) deletes the open copy's sidecar and returns to the original. The picture and its other copies are untouched. The original cannot be deleted this way.
 - **Each copy has its own rating, flag, color label and "has edits" dot**, read from its own sidecar by the thumbnail worker. The worker does not decode a copy; a copy's thumbnail is its original's until the copy has been opened and left.
