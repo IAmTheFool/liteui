@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 4
+#define LITEUI_VERSION_MINOR 5
 
 #include <algorithm>
 #include <array>
@@ -45,9 +45,8 @@
 // the public part of this header never needs the platform SDK headers.
 #if defined(_WIN32)
 struct IDWriteTextLayout;
-struct ID2D1RenderTarget;
-struct IWICBitmap;
 struct ID2D1Bitmap;
+struct ID2D1Bitmap1;
 #else
 typedef struct _cairo_surface cairo_surface_t;
 #endif
@@ -411,33 +410,45 @@ struct Text {
 //    Linux, WIC on Windows); CanvasImage just wraps decoded RGBA8 pixels.
 //    Other formats are up to the app.
 //  - getImageData and clearRect are fully supported on BOTH platforms.
-//    On Windows this works because each canvas node's offscreen render
-//    target is backed by a WIC bitmap (D2D1CreateWicBitmapRenderTarget)
-//    rather than an opaque GPU-compatible bitmap — that bitmap is directly
-//    lockable, so getImageData reads real pixels and clearRect writes true
-//    (0,0,0,0) into a device-space quad derived from the current
-//    transform, exactly like the Linux/Cairo backend, rather than going
-//    through Direct2D's Clear() (which ignores clip/transform and wipes
-//    the whole target) or a FillRectangle (which can only ever
-//    source-over blend, never actually zero existing alpha). One
-//    difference from Cairo remains: the WIC-backed clear is a hard
-//    pixel-center test with no antialiasing at a rotated/skewed edge,
-//    where Cairo's CAIRO_OPERATOR_CLEAR fill is antialiased.
+//    On Windows every canvas node renders on the GPU: its backing store is
+//    an ID2D1Bitmap1 render-target texture on the window's Direct3D 11
+//    device (Direct2D 1.1 drawing through that device). clearRect is a
+//    clipped, antialiased D2D1_PRIMITIVE_BLEND_COPY fill of transparent
+//    black, so it honours the current transform exactly like Cairo's
+//    CAIRO_OPERATOR_CLEAR. getImageData copies the requested region into a
+//    CPU-readable staging texture and maps it: that is a GPU->CPU readback
+//    (it flushes pending work), so avoid calling it many times per frame.
 //    putImageData and drawImage work on both platforms as before.
-//  - globalCompositeOperation maps onto the full range of Cairo operators
-//    on Linux; a plain ID2D1RenderTarget (v1) has no Porter-Duff blend
-//    control at all, so on Windows it's stored but has no visible effect
-//    — everything always draws with normal source-over alpha blending
-//    there.
-//  - Radial gradients use Cairo's native two-circle model exactly on
-//    Linux; Direct2D only models a single circle plus a focal point, so
+//  - Linux Canvas rendering runs on the GPU: every canvas node is an
+//    OpenGL ES 3.0 texture (EGL context, MSAA when available) drawn with
+//    batched shaders, stencil-based fills/clips, and a shared glyph atlas
+//    for text. It is the default; configure with -DLITEUI_CANVAS_GL=OFF to
+//    use the previous Cairo-based backend instead. On the GL backend:
+//      * globalCompositeOperation supports all twelve operators (Multiply
+//        reads back the canvas drawn so far, so it costs one copy of the
+//        canvas per shape; the others are plain GPU blending).
+//      * strokeText strokes the true glyph outlines (the Cairo and Windows
+//        backends approximate it with offset copies).
+//      * colour (emoji) glyphs keep their own colours in fillText when the
+//        fill is a solid colour; with a gradient fill they draw as
+//        silhouettes tinted by the gradient.
+//      * a lost GL context (EGL_CONTEXT_LOST) is recovered automatically:
+//        the context, programs and every canvas/text texture are rebuilt.
+//    With the Cairo backend, globalCompositeOperation maps onto the full
+//    range of Cairo operators.
+//  - On Windows, Direct2D's primitive blend modes only cover SourceOver,
+//    Copy and Lighter (additive), so those three work and every other
+//    globalCompositeOperation falls back to SourceOver.
+//  - Radial gradients use the full two-circle model exactly on Linux (Cairo
+//    natively, or the GL backend's shader); Direct2D only models a single circle plus a focal point, so
 //    the inner-radius stop is approximated there by rescaling stop
 //    offsets rather than drawn exactly.
 //  - Shadows are a simple flat-color, unblurred offset copy (no Gaussian
 //    blur).
-//  - strokeText approximates a stroked glyph outline by drawing the fill
-//    text in the stroke color, nudged in a ring of directions — it is not
-//    a true outline of the glyph contours.
+//  - On Windows and with the Cairo backend, strokeText approximates a
+//    stroked glyph outline by drawing the fill text in the stroke color,
+//    nudged in a ring of directions — it is not a true outline of the
+//    glyph contours. (The GL backend does trace the real outlines.)
 //  - fillText/strokeText's maxWidth parameter is accepted for API
 //    familiarity but currently unused (no horizontal squeeze-to-fit).
 class CanvasContext;
@@ -1627,24 +1638,19 @@ public:
     mutable float textLayoutBuiltForFontSize = -1.0f;
     mutable FontWeight textLayoutBuiltForFontWeight = FontWeight::Regular;
     mutable FontStyle textLayoutBuiltForFontStyle = FontStyle::Normal;
-    // An offscreen render target the size of this canvas node's inner
-    // (padding-excluded) content box, drawn into by onPaint and then
-    // blitted into the window's own render target every paint pass (see
-    // LiteUI::ensureCanvasTarget/paintCanvas). Rebuilt whenever the
-    // content box resizes. Unlike a CreateCompatibleRenderTarget bitmap
-    // (opaque, GPU-side), this is backed by canvasWicBitmap below via
-    // D2D1CreateWicBitmapRenderTarget, so CanvasContext can lock real
-    // pixels for getImageData/clearRect — see the Canvas limitations
-    // note.
-    mutable ID2D1RenderTarget *canvasTarget = nullptr;
-    // The WIC bitmap backing canvasTarget above. Kept alongside it (not
-    // just a local inside ensureCanvasTarget) because CanvasContext needs
-    // it directly for getImageData/clearRect, and because a WIC-backed
-    // ID2D1RenderTarget has no GetBitmap() of its own the way
-    // ID2D1BitmapRenderTarget does — paintCanvas instead builds a fresh
-    // ID2D1Bitmap from this WIC bitmap on the window's own render target
-    // each time it blits.
-    mutable IWICBitmap *canvasWicBitmap = nullptr;
+    // The GPU texture this canvas node renders into: a render-target
+    // bitmap (ID2D1Bitmap1, B8G8R8A8 premultiplied) on the window's
+    // Direct3D 11 device, the size of the node's inner (padding-excluded)
+    // content box. onPaint draws into it through a Direct2D device
+    // context, and the renderer then draws it into the window every paint
+    // pass (see LiteUI::ensureCanvasTarget/paintCanvas) — it never leaves
+    // video memory unless the app calls getImageData. Rebuilt whenever the
+    // content box resizes, and dropped (then lazily rebuilt) when the
+    // device is lost.
+    mutable ID2D1Bitmap1 *canvasBitmap = nullptr;
+    // CPU-readable twin of canvasBitmap, created on the first getImageData
+    // and reused for later calls (a GPU texture can't be mapped directly).
+    mutable ID2D1Bitmap1 *canvasStaging = nullptr;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
     // Caches the ID2D1Bitmap most recently uploaded by this canvas node's
     // own CanvasContext::drawImage() (see that method's comment), keyed on
@@ -1652,10 +1658,9 @@ public:
     // repeat draw of the SAME image content — e.g. re-painting at a new
     // zoom level, or a window resize that leaves the image itself
     // untouched — reuses this instead of reconverting+reuploading every
-    // pixel again. Tied to canvasTarget (the bitmap was created against
-    // it), so it's released whenever canvasTarget is, both on resize
-    // (ensureCanvasTarget) and on teardown (freeTextResources) — a bitmap
-    // created against one render target can't be reused on another.
+    // pixel again. It is a plain device resource (any context on the same
+    // Direct2D device can draw it), so it survives a canvas resize; it is
+    // released on teardown and on device loss (freeTextResources).
     mutable ID2D1Bitmap *cachedImageBitmap = nullptr;
     mutable const void *cachedImagePixels = nullptr;
     mutable size_t cachedImagePixelsSize = 0;
@@ -1679,6 +1684,15 @@ public:
     // the very same pixels already sitting in `canvasSurface`.
     mutable cairo_surface_t *canvasSurface = nullptr;
     mutable unsigned int canvasTexture = 0;
+    // GPU canvas backend (LITEUI_CANVAS_GL): canvasTexture above is then the
+    // node's RGBA8 target; canvasFbo wraps it. With multisampling available,
+    // drawing goes to canvasMsaaFbo (colour+depth/stencil renderbuffers) and
+    // is resolved into canvasTexture; otherwise canvasDsRb is attached to
+    // canvasFbo itself. All zero (and unused) with the Cairo backend.
+    mutable unsigned int canvasFbo = 0;
+    mutable unsigned int canvasMsaaFbo = 0;
+    mutable unsigned int canvasMsaaColorRb = 0;
+    mutable unsigned int canvasDsRb = 0;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
     // Caches the cairo_surface_t most recently uploaded by this canvas
     // node's own CanvasContext::drawImage() (see that method's comment),
@@ -1694,6 +1708,10 @@ public:
     // released in freeTextResources, or replaced when drawImage sees a
     // different pixel buffer.
     mutable cairo_surface_t *cachedImageSurface = nullptr;
+    // GPU canvas backend (LITEUI_CANVAS_GL): the same one-slot cache, holding
+    // the premultiplied RGBA8 texture of the image drawn last (the fields
+    // below key it, exactly as for the Cairo surface). Zero otherwise.
+    mutable unsigned int cachedImageTexture = 0;
     mutable const void *cachedImagePixels = nullptr;
     mutable size_t cachedImagePixelsSize = 0;
     mutable int cachedImageW = -1, cachedImageH = -1;
@@ -1836,7 +1854,11 @@ private:
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <d2d1.h>
+#include <d2d1_1.h>
+#include <d2d1_1helper.h>
 #include <dwrite.h>
 #include <dwrite_1.h>
 #include <dxgiformat.h> // DXGI_FORMAT_R8G8B8A8_UNORM, used by Canvas::drawImage/putImageData
@@ -1847,6 +1869,8 @@ private:
 #pragma comment(lib, "user32")
 #pragma comment(lib, "gdi32")
 #pragma comment(lib, "d2d1")
+#pragma comment(lib, "d3d11")
+#pragma comment(lib, "dxgi")
 #pragma comment(lib, "dwrite")
 #pragma comment(lib, "windowscodecs")
 #pragma comment(lib, "ole32")
@@ -1855,7 +1879,7 @@ private:
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h> // OpenGL ES 3.0 (superset of the ES 2.0 entry points used so far)
 #include <cairo/cairo.h>
 #include <cstdio> // popen, pclose, fgets
 #include <fcntl.h>
@@ -6348,41 +6372,40 @@ size_t caretIndexForX(const std::string &text, const TextStyle &style,
 
 class CanvasContextImpl : public CanvasContext {
 public:
-  // `rt` is a render target sized exactly to the canvas node's inner
-  // (padding-excluded) content box, already BeginDraw()'d and cleared to
-  // transparent by the caller (see LiteUI::ensureCanvasTarget). `width`/
-  // `height` mirror that box's size so the app can query it back via
-  // width()/height() without hand-computing it. `wicBitmap`, when
-  // non-null, is the WIC bitmap backing `rt` (see LiteUI::
-  // ensureCanvasTarget) — it's what makes getImageData/clearRect able to
-  // touch real pixels instead of just going through Direct2D's own
-  // (limited) Clear()/FillRectangle. Left null when this CanvasContext
-  // isn't backed by a lockable bitmap, in which case getImageData/
-  // clearRect fall back to their old (fully-wipe / unsupported) behavior.
-  // `imageCacheOwner`, when non-null, is the canvas node's own
-  // View::Computed (see LiteUI::ensureCanvasTarget) — drawImage() below
-  // uses its cachedImageBitmap slot to skip reconverting+reuploading the
-  // same CanvasImage on a repeat draw (see drawImage's own comment). Left
+  // `dc` is a Direct2D device context (from the window's Direct3D 11
+  // device) whose target the caller has already set to `target` — a GPU
+  // texture sized exactly to the canvas node's inner (padding-excluded)
+  // content box — and BeginDraw()'d and cleared to transparent (see
+  // LiteUI::ensureCanvasTarget). `width`/`height` mirror that box's size
+  // so the app can query it back via width()/height() without
+  // hand-computing it. `imageCacheOwner`, when non-null, is the canvas
+  // node's own View::Computed: drawImage() uses its cachedImageBitmap slot
+  // to skip re-uploading the same CanvasImage on a repeat draw, and
+  // getImageData() keeps its CPU readback texture in canvasStaging. Left
   // null for any CanvasContext not backed by a persistent per-node
-  // Computed, in which case drawImage falls back to its old (uncached,
-  // always reupload) behavior.
-  CanvasContextImpl(ID2D1RenderTarget *rt, float width, float height,
-                    IWICBitmap *wicBitmap = nullptr,
+  // Computed, in which case both fall back to uncached, per-call
+  // resources.
+  CanvasContextImpl(ID2D1DeviceContext *dc, ID2D1Bitmap1 *target, float width,
+                    float height,
                     const View::Computed *imageCacheOwner = nullptr)
-      : rt_(rt), width_(width), height_(height), wicBitmap_(wicBitmap),
+      : rt_(dc), dc_(dc), target_(target), width_(width), height_(height),
         imageCacheOwner_(imageCacheOwner) {
     rt_->GetFactory(&factory_);
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
+    applyBlend();
   }
   ~CanvasContextImpl() {
-    // Leave the render target's layer stack balanced even if onPaint
+    // Leave the device context's layer stack balanced even if onPaint
     // forgot to restore() every save()/clip() — an imbalanced PushLayer
-    // would corrupt every subsequent frame drawn into this same target.
+    // would make the caller's EndDraw() fail.
     while (!clipLayers_.empty()) {
       rt_->PopLayer();
       clipLayers_.back()->Release();
       clipLayers_.pop_back();
     }
+    // The device context is shared by every canvas node, so don't leak
+    // this canvas's blend mode into the next one.
+    dc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
     if (factory_)
       factory_->Release();
   }
@@ -6436,6 +6459,7 @@ public:
     dashOffset_ = s.dashOffset;
     globalAlpha_ = s.globalAlpha;
     composite_ = s.composite;
+    applyBlend();
     shadowColor_ = s.shadowColor;
     shadowOffsetX_ = s.shadowOffsetX;
     shadowOffsetY_ = s.shadowOffsetY;
@@ -6478,11 +6502,13 @@ public:
   void setLineDash(const std::vector<float> &dashes) { dashes_ = dashes; }
   void setLineDashOffset(float offset) { dashOffset_ = offset; }
   void setGlobalAlpha(float a) { globalAlpha_ = std::clamp(a, 0.0f, 1.0f); }
-  // See the Canvas limitations note: Windows always draws with normal
-  // (source-over) alpha blending regardless of what's set here — a plain
-  // ID2D1RenderTarget (v1) has no Porter-Duff blend control, unlike
-  // Cairo on Linux, which honors the full operator range.
-  void setGlobalCompositeOperation(CompositeOp op) { composite_ = op; }
+  // See the Canvas limitations note: Direct2D's primitive blend modes
+  // only cover SourceOver, Copy and Lighter (additive); every other
+  // operator draws as SourceOver on Windows.
+  void setGlobalCompositeOperation(CompositeOp op) {
+    composite_ = op;
+    applyBlend();
+  }
   void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
                  float offsetX, float offsetY) {
     shadowColor_ = color;
@@ -6685,78 +6711,23 @@ public:
     startY_ = savedSY;
   }
   // A true, transform-aware sub-rectangle clear (see the Canvas
-  // limitations note at the top of this section). Direct2D (v1) offers no
-  // way to do this through its own drawing calls — Clear() always wipes
-  // the ENTIRE target regardless of clip/transform, and FillRectangle can
-  // only ever source-over blend, never actually zero out existing alpha —
-  // so this writes straight into the WIC bitmap backing this canvas's
-  // render target instead. rt_->Flush() first, mirroring the Linux/Cairo
-  // backend's cairo_surface_flush(): without it, drawing already issued
-  // earlier in this same onPaint might not have been committed to the WIC
-  // bitmap yet, and we'd clear stale (or garbage) pixels. The rectangle
-  // is mapped through the current transform (matching HTML canvas
-  // semantics and this header's own Cairo backend) by testing each
-  // candidate destination pixel's center against the transform's inverse,
-  // so rotation/skew are honored exactly — not just translation/scale.
-  // Falls back to a no-op if there's no backing WIC bitmap (shouldn't
-  // happen for a real canvas node) or the transform isn't invertible.
+  // limitations note at the top of this section). Done on the GPU as a
+  // fill of transparent black with the COPY primitive blend, which
+  // replaces the destination instead of blending with it: the rectangle
+  // goes through the current transform and clip like any other shape, and
+  // a rotated/skewed edge is antialiased.
   void clearRect(float x, float y, float w, float h) {
-    if (!wicBitmap_)
-      return;
-    rt_->Flush(nullptr, nullptr);
     float x0 = std::min(x, x + w), x1 = std::max(x, x + w);
     float y0 = std::min(y, y + h), y1 = std::max(y, y + h);
-    // ReinterpretBaseType returns a Matrix3x2F* over transform_'s own
-    // memory (same layout, zero-copy) — dereference it to get a value we
-    // can safely Invert() without mutating transform_ itself.
-    D2D1::Matrix3x2F fwd = *D2D1::Matrix3x2F::ReinterpretBaseType(&transform_);
-    D2D1::Matrix3x2F inv = fwd;
-    if (!inv.Invert())
+    ID2D1SolidColorBrush *brush = nullptr;
+    rt_->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f), &brush);
+    if (!brush)
       return;
-    // Bounding box of the transformed rect in device space, clamped to
-    // the canvas, so we only lock/touch pixels that could possibly change.
-    D2D1_POINT_2F corners[4] = {
-        fwd.TransformPoint(D2D1::Point2F(x0, y0)),
-        fwd.TransformPoint(D2D1::Point2F(x1, y0)),
-        fwd.TransformPoint(D2D1::Point2F(x1, y1)),
-        fwd.TransformPoint(D2D1::Point2F(x0, y1)),
-    };
-    float minX = corners[0].x, maxX = corners[0].x;
-    float minY = corners[0].y, maxY = corners[0].y;
-    for (int i = 1; i < 4; ++i) {
-      minX = std::min(minX, corners[i].x);
-      maxX = std::max(maxX, corners[i].x);
-      minY = std::min(minY, corners[i].y);
-      maxY = std::max(maxY, corners[i].y);
-    }
-    int ix0 = std::max(0, static_cast<int>(std::floor(minX)));
-    int iy0 = std::max(0, static_cast<int>(std::floor(minY)));
-    int ix1 =
-        std::min(static_cast<int>(width_), static_cast<int>(std::ceil(maxX)));
-    int iy1 =
-        std::min(static_cast<int>(height_), static_cast<int>(std::ceil(maxY)));
-    if (ix1 <= ix0 || iy1 <= iy0)
-      return;
-    WICRect lockRect{ix0, iy0, ix1 - ix0, iy1 - iy0};
-    IWICBitmapLock *lock = nullptr;
-    if (FAILED(wicBitmap_->Lock(&lockRect, WICBitmapLockWrite, &lock)))
-      return;
-    UINT stride = 0, bufSize = 0;
-    BYTE *data = nullptr;
-    lock->GetStride(&stride);
-    lock->GetDataPointer(&bufSize, &data);
-    for (int py = iy0; py < iy1; ++py) {
-      BYTE *row = data + static_cast<size_t>(py - iy0) * stride;
-      for (int px = ix0; px < ix1; ++px) {
-        D2D1_POINT_2F local =
-            inv.TransformPoint(D2D1::Point2F(px + 0.5f, py + 0.5f));
-        if (local.x >= x0 && local.x < x1 && local.y >= y0 && local.y < y1) {
-          BYTE *p = row + static_cast<size_t>(px - ix0) * 4;
-          p[0] = p[1] = p[2] = p[3] = 0; // premultiplied BGRA: alpha 0 => all 0
-        }
-      }
-    }
-    lock->Release();
+    rt_->SetTransform(transform_);
+    dc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+    rt_->FillRectangle(D2D1::RectF(x0, y0, x1, y1), brush);
+    applyBlend(); // back to whatever globalCompositeOperation asked for
+    brush->Release();
   }
 
   // ---- text ----
@@ -6841,20 +6812,18 @@ public:
   }
 
   // ---- pixel data ----
-  // Fully supported (see the Canvas limitations note): reads straight out
-  // of the WIC bitmap backing this canvas's own render target. rt_->
-  // Flush() first for the same reason clearRect does — commit any drawing
-  // from earlier in this onPaint before reading raw pixels. Like the
-  // Cairo/Linux backend, and per the HTML canvas spec, this ignores the
-  // current transform and reads raw device pixels; pixels are stored
-  // premultiplied BGRA in the WIC bitmap and are un-premultiplied into
-  // CanvasImage's straight RGBA here, mirroring the Cairo path exactly.
-  // Returns std::nullopt only if there's no backing WIC bitmap at all
-  // (shouldn't happen for a real canvas node).
+  // Fully supported (see the Canvas limitations note). The canvas lives in
+  // a GPU texture, which can't be mapped directly, so this flushes the
+  // drawing issued so far, copies the requested region into a CPU-readable
+  // staging texture and maps that. Like the Cairo/Linux backend, and per
+  // the HTML canvas spec, this ignores the current transform and reads raw
+  // device pixels; pixels are premultiplied BGRA on the GPU and are
+  // un-premultiplied into CanvasImage's straight RGBA here, mirroring the
+  // Cairo path exactly. Returns std::nullopt only if there's no backing
+  // texture at all (shouldn't happen for a real canvas node).
   std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
-    if (!wicBitmap_)
+    if (!target_)
       return std::nullopt;
-    rt_->Flush(nullptr, nullptr);
     int ix = static_cast<int>(std::floor(x));
     int iy = static_cast<int>(std::floor(y));
     int iw = std::max(0, static_cast<int>(std::round(w)));
@@ -6862,37 +6831,76 @@ public:
     CanvasImage out(iw, ih);
     if (iw == 0 || ih == 0)
       return out;
-    UINT bw = 0, bh = 0;
-    wicBitmap_->GetSize(&bw, &bh);
+    D2D1_SIZE_U sz = target_->GetPixelSize();
     int clipX0 = std::max(0, ix), clipY0 = std::max(0, iy);
-    int clipX1 = std::min(static_cast<int>(bw), ix + iw);
-    int clipY1 = std::min(static_cast<int>(bh), iy + ih);
+    int clipX1 = std::min(static_cast<int>(sz.width), ix + iw);
+    int clipY1 = std::min(static_cast<int>(sz.height), iy + ih);
     if (clipX1 <= clipX0 || clipY1 <= clipY0)
       return out; // entirely off-canvas: transparent black, like Cairo path
-    WICRect rect{clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0};
-    IWICBitmapLock *lock = nullptr;
-    if (FAILED(wicBitmap_->Lock(&rect, WICBitmapLockRead, &lock)))
-      return out;
-    UINT stride = 0, bufSize = 0;
-    BYTE *data = nullptr;
-    lock->GetStride(&stride);
-    lock->GetDataPointer(&bufSize, &data);
-    for (int row = 0; row < rect.Height; ++row) {
-      const BYTE *src = data + static_cast<size_t>(row) * stride;
-      int destRow = (clipY0 + row) - iy;
-      for (int col = 0; col < rect.Width; ++col) {
-        const BYTE *p = src + static_cast<size_t>(col) * 4;
-        int destCol = (clipX0 + col) - ix;
-        unsigned char b = p[0], g = p[1], r = p[2], a = p[3];
-        unsigned char *dst = out.pixels.data() +
-                             (static_cast<size_t>(destRow) * iw + destCol) * 4;
-        dst[0] = a ? static_cast<unsigned char>(std::min(255, r * 255 / a)) : 0;
-        dst[1] = a ? static_cast<unsigned char>(std::min(255, g * 255 / a)) : 0;
-        dst[2] = a ? static_cast<unsigned char>(std::min(255, b * 255 / a)) : 0;
-        dst[3] = a;
+
+    // Commit everything drawn earlier in this onPaint before copying.
+    rt_->Flush(nullptr, nullptr);
+
+    // Reuse the node's cached staging texture when it matches the canvas
+    // size; otherwise make a new one (kept on the node if there is one,
+    // else freed again below).
+    ID2D1Bitmap1 *staging = nullptr;
+    bool ownsStaging = false;
+    if (imageCacheOwner_ && imageCacheOwner_->canvasStaging) {
+      D2D1_SIZE_U ss = imageCacheOwner_->canvasStaging->GetPixelSize();
+      if (ss.width == sz.width && ss.height == sz.height)
+        staging = imageCacheOwner_->canvasStaging;
+    }
+    if (!staging) {
+      D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+          D2D1_BITMAP_OPTIONS_CANNOT_DRAW | D2D1_BITMAP_OPTIONS_CPU_READ,
+          D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED),
+          96.0f, 96.0f);
+      if (FAILED(dc_->CreateBitmap(sz, nullptr, 0, &props, &staging)) ||
+          !staging)
+        return out;
+      if (imageCacheOwner_) {
+        if (imageCacheOwner_->canvasStaging)
+          imageCacheOwner_->canvasStaging->Release();
+        imageCacheOwner_->canvasStaging = staging;
+      } else {
+        ownsStaging = true;
       }
     }
-    lock->Release();
+    D2D1_POINT_2U dstPt =
+        D2D1::Point2U(static_cast<UINT32>(clipX0), static_cast<UINT32>(clipY0));
+    D2D1_RECT_U srcRect =
+        D2D1::RectU(static_cast<UINT32>(clipX0), static_cast<UINT32>(clipY0),
+                    static_cast<UINT32>(clipX1), static_cast<UINT32>(clipY1));
+    D2D1_MAPPED_RECT mapped = {};
+    if (SUCCEEDED(staging->CopyFromBitmap(&dstPt, target_, &srcRect)) &&
+        SUCCEEDED(staging->Map(D2D1_MAP_OPTIONS_READ, &mapped))) {
+      for (int row = clipY0; row < clipY1; ++row) {
+        const BYTE *src = mapped.bits +
+                          static_cast<size_t>(row) * mapped.pitch +
+                          static_cast<size_t>(clipX0) * 4;
+        int destRow = row - iy;
+        for (int col = clipX0; col < clipX1; ++col) {
+          const BYTE *p = src + static_cast<size_t>(col - clipX0) * 4;
+          int destCol = col - ix;
+          unsigned char b = p[0], g = p[1], r = p[2], a = p[3];
+          unsigned char *dst =
+              out.pixels.data() +
+              (static_cast<size_t>(destRow) * iw + destCol) * 4;
+          dst[0] =
+              a ? static_cast<unsigned char>(std::min(255, r * 255 / a)) : 0;
+          dst[1] =
+              a ? static_cast<unsigned char>(std::min(255, g * 255 / a)) : 0;
+          dst[2] =
+              a ? static_cast<unsigned char>(std::min(255, b * 255 / a)) : 0;
+          dst[3] = a;
+        }
+      }
+      staging->Unmap();
+    }
+    if (ownsStaging)
+      staging->Release();
     return out;
   }
   // putImageData ignores the current transform and paints the pixels
@@ -7010,7 +7018,10 @@ private:
     float ang = a0;
     for (int i = 0; i < segCount; ++i) {
       float ang1 = ang + segAngle;
-      float t = std::tan((ang1 - ang) / 4.0f);
+      // Control-point length for a circular arc of angle (ang1 - ang): the
+      // formula needs tan of HALF the sweep (a quarter made arcs and rounded
+      // corners come out visibly too small).
+      float t = std::tan((ang1 - ang) / 2.0f);
       float alpha =
           std::sin(ang1 - ang) * (std::sqrt(4.0f + 3.0f * t * t) - 1.0f) / 3.0f;
       float e0x = std::cos(ang), e0y = std::sin(ang);
@@ -7306,12 +7317,27 @@ private:
     layout->Release();
   }
 
+  // Maps globalCompositeOperation onto Direct2D's primitive blend modes
+  // (the only three it has that correspond to a canvas operator).
+  void applyBlend() {
+    D2D1_PRIMITIVE_BLEND b = D2D1_PRIMITIVE_BLEND_SOURCE_OVER;
+    if (composite_ == CompositeOp::Copy)
+      b = D2D1_PRIMITIVE_BLEND_COPY;
+    else if (composite_ == CompositeOp::Lighter)
+      b = D2D1_PRIMITIVE_BLEND_ADD;
+    dc_->SetPrimitiveBlend(b);
+  }
+
+  // Not owned. rt_ and dc_ are the same object: rt_ is its
+  // ID2D1RenderTarget face (what all the v1-style drawing calls above go
+  // through), dc_ its ID2D1DeviceContext face (primitive blend, 1.1
+  // bitmaps).
   ID2D1RenderTarget *rt_;
+  ID2D1DeviceContext *dc_;
+  // Not owned — the canvas node's GPU texture (Computed::canvasBitmap),
+  // which outlives any single CanvasContext.
+  ID2D1Bitmap1 *target_;
   ID2D1Factory *factory_ = nullptr;
-  // Not owned — lifetime is the canvas node's Computed field
-  // (canvasWicBitmap), which outlives any single CanvasContext. Null when
-  // this context isn't backed by a lockable bitmap.
-  IWICBitmap *wicBitmap_ = nullptr;
   float width_, height_;
   // Not owned — lifetime is the canvas node's own Computed (see the
   // constructor's comment). Null when there's no per-node cache to use.
@@ -7341,6 +7367,2654 @@ private:
   std::vector<ID2D1Layer *> clipLayers_;
   std::vector<State> stack_;
 };
+
+#elif defined(LITEUI_CANVAS_GL)
+
+// ---------------- Canvas 2D context: OpenGL ES 3.0 (Linux, opt-in) ----------
+//
+// Compiled instead of the Cairo backend below when LITEUI_CANVAS_GL is
+// defined (CMake: -DLITEUI_CANVAS_GL=ON). Every Canvas node renders into its
+// own GPU texture through an FBO; nothing is rasterized on the CPU and no
+// pixels are uploaded. Work in progress — see the status list in
+// liteui_canvas_gl::Renderer's comment. Operations that are not implemented
+// yet print a one-time warning to stderr and draw nothing; they never
+// silently pretend to work.
+namespace liteui_canvas_gl {
+
+// One vertex. Position is in canvas pixels (y down, already transformed by
+// the CTM on the CPU so that draws with different transforms can share one
+// batch). The fragment colour is  paint * (r,g,b,a):  for a solid paint the
+// paint is 1 and (r,g,b,a) is the premultiplied colour; for textures and
+// gradients (r,g,b,a) is just the premultiplied globalAlpha. u,v are
+// texture coordinates (0,0 = first row of the image), unused by other paints.
+struct Vertex {
+  float x, y;
+  float r, g, b, a;
+  float u = 0, v = 0;
+};
+
+// ---- pure CPU helpers (no GL; unit-testable) ----------------------------
+
+// Inverse of the affine map x' = a*x + c*y + e, y' = b*x + d*y + f, written
+// as a column-major 3x3 for glUniformMatrix3fv. False if it is singular.
+inline bool invert2x3(float a, float b, float c, float d, float e, float f,
+                      float out[9]) {
+  float det = a * d - b * c;
+  if (!(std::fabs(det) > 1e-12f))
+    return false;
+  float id = 1.0f / det;
+  float ia = d * id, ib = -b * id, ic = -c * id, idd = a * id;
+  float ie = -(ia * e + ic * f), iff = -(ib * e + idd * f);
+  const float m[9] = {ia, ib, 0, ic, idd, 0, ie, iff, 1};
+  std::copy(m, m + 9, out);
+  return true;
+}
+
+// Gradient colour ramp: kRampSize premultiplied RGBA8 texels sampled by the
+// shader with t in [0,1]. Colours interpolate in straight (non-premultiplied)
+// RGBA and are premultiplied afterwards, like Cairo/pixman. Before the first
+// stop and after the last the end colours extend. No stops -> transparent.
+constexpr int kRampSize = 1024;
+inline void buildRamp(const CanvasGradient &g, uint8_t *out) {
+  std::vector<CanvasGradientStop> s = g.stops;
+  for (auto &st : s)
+    st.offset = std::clamp(st.offset, 0.0f, 1.0f);
+  std::stable_sort(s.begin(), s.end(),
+                   [](const CanvasGradientStop &a, const CanvasGradientStop &b) {
+                     return a.offset < b.offset;
+                   });
+  for (int i = 0; i < kRampSize; ++i) {
+    float t = static_cast<float>(i) / (kRampSize - 1);
+    float c[4] = {0, 0, 0, 0};
+    if (!s.empty()) {
+      size_t j = 0; // first stop with offset > t
+      while (j < s.size() && s[j].offset <= t)
+        ++j;
+      auto col = [](const Color &k, float *o) {
+        o[0] = k.r;
+        o[1] = k.g;
+        o[2] = k.b;
+        o[3] = k.a;
+      };
+      if (j == 0) {
+        col(s.front().color, c);
+      } else if (j == s.size()) {
+        col(s.back().color, c);
+      } else {
+        float l[4], r[4];
+        col(s[j - 1].color, l);
+        col(s[j].color, r);
+        float span = s[j].offset - s[j - 1].offset;
+        float k = span > 0 ? (t - s[j - 1].offset) / span : 1.0f;
+        for (int q = 0; q < 4; ++q)
+          c[q] = l[q] + (r[q] - l[q]) * k;
+      }
+    }
+    float a = c[3] / 255.0f;
+    out[i * 4 + 0] = static_cast<uint8_t>(std::lround(c[0] * a));
+    out[i * 4 + 1] = static_cast<uint8_t>(std::lround(c[1] * a));
+    out[i * 4 + 2] = static_cast<uint8_t>(std::lround(c[2] * a));
+    out[i * 4 + 3] = static_cast<uint8_t>(std::lround(c[3]));
+  }
+}
+
+// Straight RGBA8 -> premultiplied RGBA8 (what the GPU textures hold).
+inline void premultiplyImage(const CanvasImage &img,
+                             std::vector<uint8_t> &out) {
+  size_t n = static_cast<size_t>(img.width) * img.height;
+  out.resize(n * 4);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t *s = &img.pixels[i * 4];
+    uint8_t *d = &out[i * 4];
+    d[0] = static_cast<uint8_t>((s[0] * s[3] + 127) / 255);
+    d[1] = static_cast<uint8_t>((s[1] * s[3] + 127) / 255);
+    d[2] = static_cast<uint8_t>((s[2] * s[3] + 127) / 255);
+    d[3] = s[3];
+  }
+}
+
+// Blend factors for each globalCompositeOperation (premultiplied alpha;
+// "source" = the shape being drawn, "destination" = the canvas so far).
+// Kept as plain data so the algebra can be unit-tested against the W3C
+// compositing formulas without a GL context; the Renderer maps them to GL.
+// Multiply is not expressible with blend factors (it needs both the source
+// and destination colour in one product plus extra terms), so the shader
+// computes it from a copy of the destination and blending just replaces.
+enum class BlendFactor {
+  Zero,
+  One,
+  SrcAlpha,
+  OneMinusSrcAlpha,
+  DstAlpha,
+  OneMinusDstAlpha,
+  DstColor,
+  OneMinusDstColor
+};
+struct BlendFactors {
+  BlendFactor srcRgb, dstRgb, srcA, dstA;
+};
+inline BlendFactors blendFactorsFor(CompositeOp op) {
+  using F = BlendFactor;
+  auto same = [](F s, F d) { return BlendFactors{s, d, s, d}; };
+  switch (op) {
+  case CompositeOp::SourceIn:
+    return same(F::DstAlpha, F::Zero);
+  case CompositeOp::SourceOut:
+    return same(F::OneMinusDstAlpha, F::Zero);
+  case CompositeOp::SourceAtop:
+    return same(F::DstAlpha, F::OneMinusSrcAlpha);
+  case CompositeOp::DestinationOver:
+    return same(F::OneMinusDstAlpha, F::One);
+  case CompositeOp::DestinationIn:
+    return same(F::Zero, F::SrcAlpha);
+  case CompositeOp::DestinationOut:
+    return same(F::Zero, F::OneMinusSrcAlpha);
+  case CompositeOp::DestinationAtop:
+    return same(F::OneMinusDstAlpha, F::SrcAlpha);
+  case CompositeOp::Lighter:
+    return same(F::One, F::One);
+  case CompositeOp::Copy:
+  case CompositeOp::Multiply: // shader writes the finished colour: replace
+    return same(F::One, F::Zero);
+  case CompositeOp::Xor:
+    return same(F::OneMinusDstAlpha, F::OneMinusSrcAlpha);
+  case CompositeOp::Screen:
+    // Cs + Cb - Cs*Cb = Cs*(1-Cb) + Cb;  alpha: as + ab - as*ab likewise.
+    return {F::OneMinusDstColor, F::One, F::OneMinusDstAlpha, F::One};
+  case CompositeOp::SourceOver:
+  default:
+    return same(F::One, F::OneMinusSrcAlpha);
+  }
+}
+
+// True if `text` contains characters that commonly render as colour glyphs
+// (emoji, pictographs, flags, variation selector-16, zero-width joiner).
+// Only such strings pay for the colour (RGBA) rasterization path. A false
+// positive is harmless: the result looks identical to the normal path.
+inline bool mayHaveColorGlyphs(const std::string &s) {
+  const size_t n = s.size();
+  for (size_t i = 0; i < n;) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    uint32_t cp = c;
+    size_t len = 1;
+    if (c >= 0xF0 && c < 0xF8)
+      len = 4, cp = c & 0x07;
+    else if (c >= 0xE0)
+      len = 3, cp = c & 0x0F;
+    else if (c >= 0xC0)
+      len = 2, cp = c & 0x1F;
+    if (c >= 0x80 && (len == 1 || i + len > n)) { // malformed: skip a byte
+      ++i;
+      continue;
+    }
+    for (size_t k = 1; k < len; ++k)
+      cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+    i += len;
+    if ((cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) ||
+        (cp >= 0x2300 && cp <= 0x23FF) || (cp >= 0x2B00 && cp <= 0x2BFF) ||
+        cp == 0xFE0F || cp == 0x200D || cp == 0x00A9 || cp == 0x00AE ||
+        cp == 0x203C || cp == 0x2049 || cp == 0x2122 || cp == 0x2139)
+      return true;
+  }
+  return false;
+}
+
+// ---- text ---------------------------------------------------------------
+// A shaped string rasterized to an 8-bit coverage bitmap by Pango/Cairo.
+// The bitmap includes a transparent border so bilinear sampling can't pick
+// up a neighbour's pixels. (offX, offY) is the bitmap's top-left corner in
+// user units relative to the layout origin (the layout's own top-left);
+// advance/height/baseline are the layout's size and baseline in user units
+// (the same numbers the other backends use to place text).
+struct RasterText {
+  int w = 0, h = 0; // 0 x 0: the string inks nothing (e.g. only spaces)
+  // Exactly one of these is filled. a8: 8-bit coverage, tinted by the paint
+  // when drawn. rgba (color == true): premultiplied RGBA8 with the fill
+  // colour already baked in, so colour glyphs (emoji) keep their own colours.
+  std::vector<uint8_t> a8;
+  bool color = false;
+  std::vector<uint8_t> rgba;
+  float offX = 0, offY = 0;
+  float advance = 0, height = 0, baseline = 0;
+};
+// Where a RasterText lives in the atlas, plus the placement numbers above.
+struct TextEntry {
+  float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+  int w = 0, h = 0;
+  bool color = false; // lives in the colour atlas
+  float offX = 0, offY = 0, advance = 0, height = 0, baseline = 0;
+};
+struct OutlineContour {
+  std::vector<float> xy; // x0,y0,x1,y1,... relative to the layout origin
+  bool closed = false;
+};
+struct TextBox {
+  float advance = 0, height = 0, baseline = 0;
+};
+
+// Shelf packer for the glyph atlas: rectangles go left to right along the
+// current shelf; when one doesn't fit a new shelf starts below the tallest
+// rectangle of the previous one. Simple, and wasteful only when heights vary
+// wildly. reset() makes the whole area free again.
+struct ShelfPacker {
+  int size = 0, cursorX = 0, shelfY = 0, shelfH = 0;
+  void reset() { cursorX = shelfY = shelfH = 0; }
+  bool allocate(int w, int h, int &x, int &y) {
+    if (w <= 0 || h <= 0 || w > size || h > size)
+      return false;
+    if (cursorX + w > size) {
+      shelfY += shelfH;
+      shelfH = 0;
+      cursorX = 0;
+    }
+    if (shelfY + h > size)
+      return false;
+    x = cursorX;
+    y = shelfY;
+    cursorX += w;
+    shelfH = std::max(shelfH, h);
+    return true;
+  }
+};
+
+// BEGIN-PANGO-CAIRO — the only code that talks to Pango/Cairo for canvas
+// text; everything else sees RasterText/OutlineContour.
+
+// Shapes and rasterizes `text` at `scale` device pixels per user unit
+// (scale 1 = unscaled). Layout, fonts and metrics come from the same
+// liteui_text::makeLayout as every other text in the library, so shaping,
+// fallback fonts and line metrics match. With bake == nullptr the result is
+// an 8-bit coverage mask; with a colour it is a premultiplied RGBA bitmap in
+// which ordinary glyphs are drawn in that colour and colour glyphs (emoji)
+// in their own. False if the bitmap would be unreasonably large.
+inline bool rasterizeText(const std::string &text, const TextStyle &ts,
+                          float scale, const Color *bake, RasterText &out) {
+  constexpr int kPad = 2, kMaxDim = 1024;
+  cairo_surface_t *probeSurf = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
+  cairo_t *probe = cairo_create(probeSurf);
+  cairo_scale(probe, scale, scale);
+  PangoLayout *layout = liteui_text::makeLayout(
+      text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+      resolveStatic(ts.fontStyle), -1, probe);
+  PangoRectangle ink, logical;
+  pango_layout_get_extents(layout, &ink, &logical);
+  int pw = 0, ph = 0;
+  pango_layout_get_pixel_size(layout, &pw, &ph);
+  PangoLayoutIter *iter = pango_layout_get_iter(layout);
+  int baseline = pango_layout_iter_get_baseline(iter) / PANGO_SCALE;
+  pango_layout_iter_free(iter);
+  out = RasterText{};
+  out.advance = static_cast<float>(pw);
+  out.height = static_cast<float>(ph);
+  out.baseline = static_cast<float>(baseline);
+  bool ok = true;
+  if (ink.width > 0 && ink.height > 0) {
+    // Whole-pixel box around the ink, in device pixels. The layout origin is
+    // placed on a whole device pixel inside the bitmap so glyphs keep the
+    // same pixel alignment they would have when drawn directly.
+    const float k = 1.0f / PANGO_SCALE;
+    int x0 = static_cast<int>(std::floor(ink.x * k * scale));
+    int y0 = static_cast<int>(std::floor(ink.y * k * scale));
+    int x1 = static_cast<int>(std::ceil((ink.x + ink.width) * k * scale));
+    int y1 = static_cast<int>(std::ceil((ink.y + ink.height) * k * scale));
+    int bw = x1 - x0 + 2 * kPad, bh = y1 - y0 + 2 * kPad;
+    if (bw > kMaxDim || bh > kMaxDim) {
+      ok = false;
+    } else {
+      const bool color = bake != nullptr;
+      cairo_surface_t *surf = cairo_image_surface_create(
+          color ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_A8, bw, bh);
+      cairo_t *cr = cairo_create(surf);
+      if (color) {
+        // Greyscale antialiasing only: LCD subpixel fringes would be baked
+        // into the bitmap as coloured edges.
+        cairo_font_options_t *fo = cairo_font_options_create();
+        cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+        cairo_set_font_options(cr, fo);
+        cairo_font_options_destroy(fo);
+      }
+      cairo_translate(cr, kPad - x0, kPad - y0);
+      cairo_scale(cr, scale, scale);
+      pango_cairo_update_layout(cr, layout);
+      if (color)
+        cairo_set_source_rgba(cr, bake->r / 255.0, bake->g / 255.0,
+                              bake->b / 255.0, bake->a / 255.0);
+      else
+        cairo_set_source_rgba(cr, 1, 1, 1, 1); // alpha only: A8 stores coverage
+      cairo_move_to(cr, 0, 0);
+      pango_cairo_show_layout(cr, layout);
+      cairo_surface_flush(surf);
+      const unsigned char *data = cairo_image_surface_get_data(surf);
+      const int stride = cairo_image_surface_get_stride(surf);
+      out.w = bw;
+      out.h = bh;
+      out.color = color;
+      if (color) {
+        // Cairo ARGB32 is premultiplied, stored B,G,R,A on little-endian
+        // machines (a native 32-bit word otherwise); read it as a word and
+        // write RGBA bytes.
+        out.rgba.resize(static_cast<size_t>(bw) * bh * 4);
+        for (int r = 0; r < bh; ++r) {
+          const uint32_t *row = reinterpret_cast<const uint32_t *>(
+              data + static_cast<size_t>(r) * stride);
+          uint8_t *dst = &out.rgba[static_cast<size_t>(r) * bw * 4];
+          for (int x = 0; x < bw; ++x) {
+            uint32_t px = row[x];
+            dst[x * 4 + 0] = static_cast<uint8_t>((px >> 16) & 0xFF);
+            dst[x * 4 + 1] = static_cast<uint8_t>((px >> 8) & 0xFF);
+            dst[x * 4 + 2] = static_cast<uint8_t>(px & 0xFF);
+            dst[x * 4 + 3] = static_cast<uint8_t>((px >> 24) & 0xFF);
+          }
+        }
+      } else {
+        out.a8.resize(static_cast<size_t>(bw) * bh);
+        for (int r = 0; r < bh; ++r)
+          std::copy_n(data + static_cast<size_t>(r) * stride, bw,
+                      out.a8.begin() + static_cast<size_t>(r) * bw);
+      }
+      out.offX = static_cast<float>(x0 - kPad) / scale;
+      out.offY = static_cast<float>(y0 - kPad) / scale;
+      cairo_destroy(cr);
+      cairo_surface_destroy(surf);
+    }
+  }
+  g_object_unref(layout);
+  cairo_destroy(probe);
+  cairo_surface_destroy(probeSurf);
+  return ok;
+}
+
+// The glyph outlines of `text` as polylines (curves flattened to within
+// `tolerance` user units), relative to the layout origin, plus the layout's
+// size and baseline. This is what strokeText strokes.
+inline bool outlineText(const std::string &text, const TextStyle &ts,
+                        float tolerance, std::vector<OutlineContour> &out,
+                        TextBox &box) {
+  cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
+  cairo_t *cr = cairo_create(surf);
+  cairo_set_tolerance(cr, std::max(0.001f, tolerance));
+  PangoLayout *layout = liteui_text::makeLayout(
+      text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+      resolveStatic(ts.fontStyle), -1, cr);
+  int pw = 0, ph = 0;
+  pango_layout_get_pixel_size(layout, &pw, &ph);
+  PangoLayoutIter *iter = pango_layout_get_iter(layout);
+  int baseline = pango_layout_iter_get_baseline(iter) / PANGO_SCALE;
+  pango_layout_iter_free(iter);
+  box.advance = static_cast<float>(pw);
+  box.height = static_cast<float>(ph);
+  box.baseline = static_cast<float>(baseline);
+  out.clear();
+  cairo_move_to(cr, 0, 0);
+  pango_cairo_layout_path(cr, layout);
+  cairo_path_t *path = cairo_copy_path_flat(cr);
+  for (int i = 0; i < path->num_data; i += path->data[i].header.length) {
+    cairo_path_data_t *d = &path->data[i];
+    switch (d->header.type) {
+    case CAIRO_PATH_MOVE_TO:
+      out.emplace_back();
+      out.back().xy.push_back(static_cast<float>(d[1].point.x));
+      out.back().xy.push_back(static_cast<float>(d[1].point.y));
+      break;
+    case CAIRO_PATH_LINE_TO:
+      if (!out.empty()) {
+        out.back().xy.push_back(static_cast<float>(d[1].point.x));
+        out.back().xy.push_back(static_cast<float>(d[1].point.y));
+      }
+      break;
+    case CAIRO_PATH_CLOSE_PATH:
+      if (!out.empty())
+        out.back().closed = true;
+      break;
+    default: // CURVE_TO can't occur in a flattened path
+      break;
+    }
+  }
+  cairo_path_destroy(path);
+  g_object_unref(layout);
+  cairo_destroy(cr);
+  cairo_surface_destroy(surf);
+  return true;
+}
+// END-PANGO-CAIRO
+
+// Owns the GL objects shared by every canvas node (one program, one VAO,
+// one streaming vertex buffer) and the per-frame batching state. Lives in
+// LiteUIImpl, created after the EGL context is current and destroyed before
+// it is released. Per-node GPU objects (texture + FBOs) live in the node's
+// View::Computed and are created/freed by buildTarget/freeTarget.
+//
+// Implemented: per-node RGBA8 target (MSAA when available) + resolve,
+// flat-colour triangle batching, CTM, globalAlpha, Porter-Duff blend modes,
+// fillRect/clearRect/strokeRect, path recording, fill (NonZero/EvenOdd),
+// stroke (caps, joins, miter limit, dashes), clip, flat shadows,
+// measureText.
+// gradients (linear, and radial with the full two-circle model),
+// drawImage (cropped, bilinear, cached per node), putImageData,
+// getImageData (GPU readback on request), fillText (Pango-shaped glyph
+// bitmaps in a shared GPU atlas, tinted by any paint), strokeText (true
+// glyph outlines through the GPU stroker).
+// all twelve globalCompositeOperation modes (Screen and the Porter-Duff
+// operators with blend factors; Multiply by reading back the canvas so far),
+// colour (emoji) glyphs for solid fill colours.
+// Notes: with a gradient fill, emoji draw as silhouettes tinted by the
+// gradient (colour glyphs are baked with a solid colour).
+//
+// Stencil layout (8 bits per canvas target):
+//   bits 7..4  clip level L (0 = unclipped, up to 15 nested clip() calls)
+//   bits 3..0  scratch, used while rasterizing one fill/stroke/clip shape
+// A shape is drawn in two passes ("stencil, then cover"): first its
+// triangles update the scratch bits only where the clip level matches
+// (winding count, parity, or plain coverage for strokes); then a covering
+// quad paints (or raises the clip level) wherever the scratch bits are
+// non-zero, and zeroes them again. This gives exact NonZero/EvenOdd fills
+// and overlap-free strokes (no double blending at joins) with no CPU
+// scan conversion. Limits: NonZero winding is counted in the 4-bit scratch
+// nibble, modulo 16, so a point wound around 16 (or 32...) times by one path
+// would drop out of a NonZero fill or clip; EvenOdd uses parity and strokes
+// use a set-flag, so neither can wrap.
+class Renderer {
+public:
+  static constexpr size_t kMaxVerts = 60000; // multiple of 3
+
+  // Needs a current GLES 3.0 context. False (after printing the compiler
+  // log) if the shader fails to build; the caller decides how to react.
+  bool init() {
+    if (prog_)
+      return true;
+    static constexpr const char *kVS = R"GLSL(#version 300 es
+      layout(location = 0) in vec2 a_pos;
+      layout(location = 1) in vec4 a_color;
+      layout(location = 2) in vec2 a_uv;
+      uniform vec2 u_size;   // canvas size in pixels
+      out vec4 v_color;
+      out vec2 v_uv;
+      out vec2 v_pos;        // canvas pixels, for gradient evaluation
+      void main() {
+        v_color = a_color;
+        v_uv = a_uv;
+        v_pos = a_pos;
+        // y is NOT flipped: canvas row 0 lands on framebuffer row 0, which
+        // is texture row 0, which the window pass samples as the top.
+        gl_Position = vec4(a_pos.x / u_size.x * 2.0 - 1.0,
+                           a_pos.y / u_size.y * 2.0 - 1.0, 0.0, 1.0);
+      }
+    )GLSL";
+    // One program for every paint. out = paint * v_color, where paint is 1
+    // (solid), the texture sample (image) or the gradient ramp sample.
+    static constexpr const char *kFS = R"GLSL(#version 300 es
+      precision highp float;
+      in vec4 v_color;
+      in vec2 v_uv;
+      in vec2 v_pos;
+      uniform int u_mode;        // 0 solid, 1 image, 2 linear, 3 radial
+      uniform sampler2D u_tex;   // premultiplied image
+      uniform sampler2D u_ramp;  // premultiplied gradient ramp, 1 x N
+      uniform mat3 u_inv;        // device pixels -> gradient (user) space
+      uniform vec4 u_g;          // x0, y0, x1, y1
+      uniform vec2 u_r;          // r0, r1 (radial)
+      uniform int u_mask;        // 0 off, 1 mono glyph, 2 colour glyph, 3 colour glyph silhouette
+      uniform sampler2D u_atlas; // 8-bit glyph coverage
+      uniform sampler2D u_catlas; // premultiplied RGBA colour glyphs
+      uniform int u_blend;       // 1: Multiply (needs the backdrop)
+      uniform sampler2D u_backdrop; // copy of the canvas so far (Multiply)
+      out vec4 o_color;
+      void main() {
+        vec4 s = vec4(1.0);
+        if (u_mode == 1) {
+          s = texture(u_tex, v_uv);
+        } else if (u_mode >= 2) {
+          vec2 p = (u_inv * vec3(v_pos, 1.0)).xy;
+          float t = 0.0;
+          bool ok = false;
+          if (u_mode == 2) {
+            vec2 d = u_g.zw - u_g.xy;
+            float dd = dot(d, d);
+            if (dd > 0.0) {
+              t = dot(p - u_g.xy, d) / dd;
+              ok = true;
+            }
+          } else {
+            // Two-circle gradient: the largest s with r(s) >= 0 such that p
+            // lies on the circle centre c0 + s*(c1-c0), radius r0 + s*dr.
+            vec2 cd = u_g.zw - u_g.xy;
+            float dr = u_r.y - u_r.x;
+            vec2 pd = p - u_g.xy;
+            float a = dot(cd, cd) - dr * dr;
+            float b = dot(pd, cd) + u_r.x * dr;
+            float c = dot(pd, pd) - u_r.x * u_r.x;
+            if (abs(a) < 1e-6) {
+              if (abs(b) > 1e-6) {
+                t = c / (2.0 * b);
+                ok = (u_r.x + t * dr >= 0.0);
+              }
+            } else {
+              float disc = b * b - a * c;
+              if (disc >= 0.0) {
+                float sq = sqrt(disc);
+                float s1 = (b + sq) / a, s2 = (b - sq) / a;
+                float hi = max(s1, s2), lo = min(s1, s2);
+                if (u_r.x + hi * dr >= 0.0) { t = hi; ok = true; }
+                else if (u_r.x + lo * dr >= 0.0) { t = lo; ok = true; }
+              }
+            }
+          }
+          if (ok) {
+            float n = float(textureSize(u_ramp, 0).x);
+            s = texture(u_ramp, vec2((clamp(t, 0.0, 1.0) * (n - 1.0) + 0.5) / n, 0.5));
+          } else {
+            s = vec4(0.0);
+          }
+        }
+        if (u_mask == 1)
+          s *= texture(u_atlas, v_uv).r;
+        else if (u_mask == 2)
+          s = texture(u_catlas, v_uv);       // own colours: paint is ignored
+        else if (u_mask == 3)
+          s *= texture(u_catlas, v_uv).a;    // shadow of a colour glyph
+        vec4 o = s * v_color;
+        if (u_blend == 1) {
+          // Multiply, premultiplied: Cs(1-ab) + Cb(1-as) + Cs*Cb. Blending is
+          // set to replace, so what we output is the final pixel.
+          vec4 bd = texelFetch(u_backdrop, ivec2(gl_FragCoord.xy), 0);
+          o = vec4(o.rgb * (1.0 - bd.a) + bd.rgb * (1.0 - o.a) + o.rgb * bd.rgb,
+                   o.a + bd.a - o.a * bd.a);
+        }
+        o_color = o;
+      }
+    )GLSL";
+    GLuint vs = compile(GL_VERTEX_SHADER, kVS);
+    GLuint fs = vs ? compile(GL_FRAGMENT_SHADER, kFS) : 0;
+    if (!vs || !fs) {
+      if (vs)
+        glDeleteShader(vs);
+      return false;
+    }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+      char log[512];
+      glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+      fprintf(stderr, "liteui canvas: program link error: %s\n", log);
+      glDeleteProgram(p);
+      return false;
+    }
+    prog_ = p;
+    uSize_ = glGetUniformLocation(prog_, "u_size");
+    uMode_ = glGetUniformLocation(prog_, "u_mode");
+    uMask_ = glGetUniformLocation(prog_, "u_mask");
+    uBlend_ = glGetUniformLocation(prog_, "u_blend");
+    uInv_ = glGetUniformLocation(prog_, "u_inv");
+    uG_ = glGetUniformLocation(prog_, "u_g");
+    uR_ = glGetUniformLocation(prog_, "u_r");
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex_);
+    {
+      // Texture units: 0 = image, 1 = gradient ramp (never changes).
+      GLint prevProg = 0, prevActive = 0, prevTex1 = 0;
+      glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
+      glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
+      glUseProgram(prog_);
+      glUniform1i(glGetUniformLocation(prog_, "u_tex"), 0);
+      glUniform1i(glGetUniformLocation(prog_, "u_ramp"), 1);
+      glUniform1i(glGetUniformLocation(prog_, "u_atlas"), 2);
+      glUniform1i(glGetUniformLocation(prog_, "u_catlas"), 3);
+      glUniform1i(glGetUniformLocation(prog_, "u_backdrop"), 4);
+      glActiveTexture(GL_TEXTURE1);
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex1);
+      glGenTextures(1, &ramp_);
+      glBindTexture(GL_TEXTURE_2D, ramp_);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, kRampSize, 1);
+      // Unit 2: the glyph atlas (8-bit coverage), shared by every canvas.
+      atlasSize_ = std::min<GLint>(2048, maxTex_);
+      packer_.size = atlasSize_;
+      GLint prevTex2 = 0;
+      glActiveTexture(GL_TEXTURE2);
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+      glGenTextures(1, &atlas_);
+      glBindTexture(GL_TEXTURE_2D, atlas_);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, atlasSize_, atlasSize_);
+      glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex2));
+      // Unit 3: the colour glyph atlas (premultiplied RGBA), smaller since
+      // colour glyphs are rare.
+      colorAtlasSize_ = std::min<GLint>(1024, maxTex_);
+      cpacker_.size = colorAtlasSize_;
+      GLint prevTex3 = 0;
+      glActiveTexture(GL_TEXTURE3);
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex3);
+      glGenTextures(1, &colorAtlas_);
+      glBindTexture(GL_TEXTURE_2D, colorAtlas_);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, colorAtlasSize_, colorAtlasSize_);
+      glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex3));
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex1));
+      glActiveTexture(static_cast<GLenum>(prevActive));
+      glUseProgram(static_cast<GLuint>(prevProg));
+    }
+
+    glGenVertexArrays(1, &vao_);
+    glGenBuffers(1, &vbo_);
+    GLint prevVao = 0, prevBuf = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+    glBindVertexArray(vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glBufferData(GL_ARRAY_BUFFER, kMaxVerts * sizeof(Vertex), nullptr,
+                 GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                          reinterpret_cast<const void *>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                          reinterpret_cast<const void *>(2 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                          reinterpret_cast<const void *>(6 * sizeof(float)));
+    glBindVertexArray(static_cast<GLuint>(prevVao));
+    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(prevBuf));
+    batch_.reserve(kMaxVerts);
+    return true;
+  }
+
+  // Must run while the context is still current.
+  void destroy() {
+    if (vbo_)
+      glDeleteBuffers(1, &vbo_);
+    if (vao_)
+      glDeleteVertexArrays(1, &vao_);
+    if (ramp_)
+      glDeleteTextures(1, &ramp_);
+    if (atlas_)
+      glDeleteTextures(1, &atlas_);
+    if (colorAtlas_)
+      glDeleteTextures(1, &colorAtlas_);
+    if (backdrop_)
+      glDeleteTextures(1, &backdrop_);
+    if (prog_)
+      glDeleteProgram(prog_);
+    vbo_ = vao_ = prog_ = ramp_ = atlas_ = colorAtlas_ = backdrop_ = 0;
+    backdropW_ = backdropH_ = 0;
+    texts_.clear();
+  }
+
+  // The context is gone and every name with it: forget them WITHOUT touching
+  // GL (a stale name could collide with an object of the replacement
+  // context), then init() can run again on the new context.
+  void abandon() {
+    prog_ = vao_ = vbo_ = ramp_ = atlas_ = colorAtlas_ = backdrop_ = 0;
+    backdropW_ = backdropH_ = 0;
+    uSize_ = uMode_ = uInv_ = uG_ = uR_ = uMask_ = uBlend_ = -1;
+    paintKind_ = PaintKind::None;
+    maskMode_ = -1;
+    cur_ = nullptr;
+    tex_ = 0;
+    trash_.clear();
+    batch_.clear();
+    texts_.clear();
+    packer_.reset();
+    cpacker_.reset();
+  }
+
+  bool ready() const { return prog_ != 0; }
+
+  // ---- per-node GPU target ------------------------------------------
+  // The node's pixels live in c.canvasTexture (RGBA8, premultiplied). It is
+  // wrapped by c.canvasFbo. If the driver offers multisampling, drawing goes
+  // to c.canvasMsaaFbo (4x MSAA colour + depth/stencil renderbuffers) and is
+  // resolved into the texture by end(); otherwise drawing goes straight to
+  // c.canvasFbo, which then owns the depth/stencil renderbuffer.
+  static void freeTarget(const View::Computed &c) {
+    GLuint v;
+    if ((v = c.canvasFbo)) {
+      glDeleteFramebuffers(1, &v);
+      c.canvasFbo = 0;
+    }
+    if ((v = c.canvasMsaaFbo)) {
+      glDeleteFramebuffers(1, &v);
+      c.canvasMsaaFbo = 0;
+    }
+    if ((v = c.canvasMsaaColorRb)) {
+      glDeleteRenderbuffers(1, &v);
+      c.canvasMsaaColorRb = 0;
+    }
+    if ((v = c.canvasDsRb)) {
+      glDeleteRenderbuffers(1, &v);
+      c.canvasDsRb = 0;
+    }
+    if ((v = c.canvasTexture)) {
+      glDeleteTextures(1, &v);
+      c.canvasTexture = 0;
+    }
+  }
+
+  static bool buildTarget(const View::Computed &c, int w, int h) {
+    freeTarget(c);
+    GLint maxRb = 0, maxSamples = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRb);
+    glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+    if (w < 1 || h < 1 || w > maxRb || h > maxRb)
+      return false;
+    int samples = std::min<GLint>(4, maxSamples);
+
+    GLint prevFbo = 0, prevTex = 0;
+    GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLfloat prevClear[4];
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h); // immutable storage
+    c.canvasTexture = tex;
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           tex, 0);
+    c.canvasFbo = fbo;
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+              GL_FRAMEBUFFER_COMPLETE;
+
+    bool msaa = false;
+    if (ok && samples >= 2) {
+      GLuint mfbo = 0, mcolor = 0, mds = 0;
+      glGenFramebuffers(1, &mfbo);
+      glGenRenderbuffers(1, &mcolor);
+      glGenRenderbuffers(1, &mds);
+      glBindRenderbuffer(GL_RENDERBUFFER, mcolor);
+      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, w,
+                                       h);
+      glBindRenderbuffer(GL_RENDERBUFFER, mds);
+      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples,
+                                       GL_DEPTH24_STENCIL8, w, h);
+      glBindFramebuffer(GL_FRAMEBUFFER, mfbo);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                GL_RENDERBUFFER, mcolor);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                GL_RENDERBUFFER, mds);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+          GL_FRAMEBUFFER_COMPLETE) {
+        c.canvasMsaaFbo = mfbo;
+        c.canvasMsaaColorRb = mcolor;
+        c.canvasDsRb = mds;
+        msaa = true;
+      } else {
+        glDeleteFramebuffers(1, &mfbo);
+        glDeleteRenderbuffers(1, &mcolor);
+        glDeleteRenderbuffers(1, &mds);
+      }
+    }
+    if (ok && !msaa) {
+      GLuint ds = 0;
+      glGenRenderbuffers(1, &ds);
+      glBindRenderbuffer(GL_RENDERBUFFER, ds);
+      glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                GL_RENDERBUFFER, ds);
+      c.canvasDsRb = ds;
+      ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    }
+    if (ok) {
+      // New storage has undefined contents: start transparent so a canvas
+      // without an onPaint shows nothing instead of garbage.
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+      glDisable(GL_SCISSOR_TEST);
+      glClearColor(0, 0, 0, 0);
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex));
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+    if (prevScissor)
+      glEnable(GL_SCISSOR_TEST);
+    if (!ok)
+      freeTarget(c);
+    return ok;
+  }
+
+  // ---- one canvas redraw -------------------------------------------
+  // Saves the window renderer's GL state, binds `c`'s draw FBO, clears it to
+  // transparent and prepares for batched drawing. Pair with end().
+  void begin(const View::Computed &c, int w, int h) {
+    saved_.scissor = glIsEnabled(GL_SCISSOR_TEST);
+    saved_.blend = glIsEnabled(GL_BLEND);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_.fbo);
+    glGetIntegerv(GL_VIEWPORT, saved_.viewport);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &saved_.program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &saved_.vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_.arrayBuf);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &saved_.srcRgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &saved_.dstRgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &saved_.srcA);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &saved_.dstA);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, saved_.clear);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_.activeTex);
+    glActiveTexture(GL_TEXTURE1);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex1);
+    glBindTexture(GL_TEXTURE_2D, ramp_);
+    glActiveTexture(GL_TEXTURE2);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex2);
+    glBindTexture(GL_TEXTURE_2D, atlas_);
+    glActiveTexture(GL_TEXTURE3);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex3);
+    glBindTexture(GL_TEXTURE_2D, colorAtlas_);
+    glActiveTexture(GL_TEXTURE4);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex4);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex0);
+    cur_ = &c;
+
+    w_ = w;
+    h_ = h;
+    batch_.clear();
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      c.canvasMsaaFbo ? c.canvasMsaaFbo : c.canvasFbo);
+    glViewport(0, 0, w, h);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilMask(0xFF); // so the clear below also wipes the stencil
+    mode_ = Mode::Off;
+    level_ = 0;
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glUseProgram(prog_);
+    glUniform2f(uSize_, static_cast<float>(w), static_cast<float>(h));
+    glBindVertexArray(vao_);
+    op_ = CompositeOp::SourceOver;
+    applyBlend(op_);
+    glUniform1i(uBlend_, 0);
+    paintKind_ = PaintKind::None;
+    setPaintSolid();
+    maskMode_ = -1; // force the uniform to be written
+    setMask(0);
+  }
+
+  // Flushes, resolves MSAA into the node's texture and restores the window
+  // renderer's GL state exactly as begin() found it.
+  void end(const View::Computed &c) {
+    flush();
+    if (!trash_.empty()) { // textures retired during this pass (safe now)
+      glDeleteTextures(static_cast<GLsizei>(trash_.size()), trash_.data());
+      trash_.clear();
+    }
+    if (c.canvasMsaaFbo) {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasMsaaFbo);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c.canvasFbo);
+      glBlitFramebuffer(0, 0, w_, h_, 0, 0, w_, h_, GL_COLOR_BUFFER_BIT,
+                        GL_NEAREST);
+    }
+    // The window renderer never uses stencil or colour masks; leave them in
+    // their defaults.
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilMask(0xFF);
+    cur_ = nullptr;
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex4));
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex3));
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex2));
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex1));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex0));
+    glActiveTexture(static_cast<GLenum>(saved_.activeTex));
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(saved_.fbo));
+    glViewport(saved_.viewport[0], saved_.viewport[1], saved_.viewport[2],
+               saved_.viewport[3]);
+    glUseProgram(static_cast<GLuint>(saved_.program));
+    glBindVertexArray(static_cast<GLuint>(saved_.vao));
+    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(saved_.arrayBuf));
+    glBlendFuncSeparate(static_cast<GLenum>(saved_.srcRgb),
+                        static_cast<GLenum>(saved_.dstRgb),
+                        static_cast<GLenum>(saved_.srcA),
+                        static_cast<GLenum>(saved_.dstA));
+    glClearColor(saved_.clear[0], saved_.clear[1], saved_.clear[2],
+                 saved_.clear[3]);
+    if (saved_.blend)
+      glEnable(GL_BLEND);
+    else
+      glDisable(GL_BLEND);
+    if (saved_.scissor)
+      glEnable(GL_SCISSOR_TEST);
+    else
+      glDisable(GL_SCISSOR_TEST);
+  }
+
+  // ---- drawing (between begin() and end()) -------------------------
+  // `n` must be a multiple of 3 (independent triangles).
+  // Large submissions are split into batch-sized pieces (always on triangle
+  // boundaries), so one big path can't overflow the vertex buffer.
+  void draw(const Vertex *v, size_t n) {
+    while (n > 0) {
+      size_t room = kMaxVerts - batch_.size();
+      room -= room % 3;
+      if (room == 0) {
+        flush();
+        continue;
+      }
+      size_t take = std::min(n, room);
+      batch_.insert(batch_.end(), v, v + take);
+      v += take;
+      n -= take;
+      // Multiply reads the canvas back per draw call, so every shape must be
+      // its own call or later shapes would not see earlier ones.
+      if (op_ == CompositeOp::Multiply && writesColor(mode_))
+        flush();
+    }
+  }
+
+  // What the stencil/colour state is currently set up to do (see the stencil
+  // layout in the class comment). Changing it ends the current batch.
+  enum class Mode {
+    Off,          // plain colour drawing, no stencil
+    ClipTest,     // colour drawing, only where the clip level == `level`
+    CountWinding, // scratch bits += winding of front/back faces (NonZero)
+    CountEvenOdd, // scratch bits ^= 1 per triangle (EvenOdd)
+    CountUnion,   // scratch flag set by any triangle (strokes: union of pieces)
+    CoverFill,    // colour where scratch != 0, then zero the scratch
+    CoverClip,    // raise level -> level+1 where scratch != 0
+    ReduceClip    // lower every pixel above `level` back to `level`
+  };
+
+  void setMode(Mode m, int level) {
+    // ClipTest at level 0 is the same state as Off.
+    if (m == Mode::ClipTest && level == 0)
+      m = Mode::Off;
+    if (m == mode_ && level == level_)
+      return;
+    flush();
+    mode_ = m;
+    level_ = level;
+    const GLint ref = static_cast<GLint>(level) << 4;
+    switch (m) {
+    case Mode::Off:
+      glDisable(GL_STENCIL_TEST);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      break;
+    case Mode::ClipTest:
+      glEnable(GL_STENCIL_TEST);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glStencilMask(0x00);
+      glStencilFunc(GL_EQUAL, ref, 0xF0);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+      break;
+    case Mode::CountWinding:
+    case Mode::CountEvenOdd:
+    case Mode::CountUnion: {
+      glEnable(GL_STENCIL_TEST);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+      glStencilMask(0x0F);
+      // Only touch pixels inside the clip. For the union mode the reference
+      // value's low nibble (1) is what REPLACE writes, while the compare mask
+      // 0xF0 ignores it.
+      glStencilFunc(GL_EQUAL, m == Mode::CountUnion ? (ref | 1) : ref, 0xF0);
+      GLenum front = GL_INCR_WRAP, back = GL_INCR_WRAP;
+      if (m == Mode::CountWinding)
+        back = GL_DECR_WRAP;
+      else if (m == Mode::CountEvenOdd)
+        front = back = GL_INVERT;
+      else // CountUnion: set a flag; never counts, so it can never wrap
+        front = back = GL_REPLACE;
+      glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, front);
+      glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, back);
+      break;
+    }
+    case Mode::CoverFill:
+      glEnable(GL_STENCIL_TEST);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glStencilMask(0x0F);
+      glStencilFunc(GL_NOTEQUAL, 0, 0x0F);
+      glStencilOp(GL_KEEP, GL_ZERO, GL_ZERO);
+      break;
+    case Mode::CoverClip:
+      glEnable(GL_STENCIL_TEST);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+      glStencilMask(0xFF);
+      // Test looks at the scratch nibble only (ref's low nibble is 0);
+      // REPLACE then writes the whole byte: new level, scratch cleared.
+      glStencilFunc(GL_NOTEQUAL, (level + 1) << 4, 0x0F);
+      glStencilOp(GL_KEEP, GL_REPLACE, GL_REPLACE);
+      break;
+    case Mode::ReduceClip:
+      glEnable(GL_STENCIL_TEST);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+      glStencilMask(0xFF);
+      glStencilFunc(GL_LESS, ref, 0xF0); // level bits > `level`
+      glStencilOp(GL_KEEP, GL_REPLACE, GL_REPLACE);
+      break;
+    }
+  }
+
+  // ---- paint ---------------------------------------------------------
+  // Selects what colour the following triangles get (see Vertex). Changing
+  // the paint ends the current batch.
+  void setPaintSolid() {
+    if (paintKind_ == PaintKind::Solid)
+      return;
+    flush();
+    paintKind_ = PaintKind::Solid;
+    glUniform1i(uMode_, 0);
+  }
+  void setPaintTexture(GLuint tex) {
+    if (paintKind_ == PaintKind::Texture && tex_ == tex)
+      return;
+    flush();
+    paintKind_ = PaintKind::Texture;
+    tex_ = tex;
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(uMode_, 1);
+  }
+  // `inv` = column-major device->user matrix (see invert2x3).
+  void setPaintGradient(const CanvasGradient &g, const float inv[9]) {
+    if (paintKind_ == PaintKind::Gradient && sameGradient(g, inv))
+      return;
+    flush();
+    paintKind_ = PaintKind::Gradient;
+    grad_ = g;
+    std::copy(inv, inv + 9, inv_);
+    rampBuf_.resize(static_cast<size_t>(kRampSize) * 4);
+    buildRamp(g, rampBuf_.data());
+    glActiveTexture(GL_TEXTURE1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kRampSize, 1, GL_RGBA,
+                    GL_UNSIGNED_BYTE, rampBuf_.data());
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(uMode_, g.kind == CanvasGradient::Kind::Linear ? 2 : 3);
+    glUniformMatrix3fv(uInv_, 1, GL_FALSE, inv);
+    glUniform4f(uG_, g.x0, g.y0, g.x1, g.y1);
+    glUniform2f(uR_, g.r0, g.r1);
+  }
+
+  // ---- images --------------------------------------------------------
+  // Uploads `img` (straight RGBA8) as a premultiplied RGBA8 texture, so
+  // bilinear filtering doesn't bleed colour out of transparent pixels.
+  // 0 if it is too large for the GPU or its pixel buffer is too short.
+  GLuint uploadImage(const CanvasImage &img) {
+    if (img.width <= 0 || img.height <= 0 || img.width > maxTex_ ||
+        img.height > maxTex_ ||
+        img.pixels.size() < static_cast<size_t>(img.width) * img.height * 4)
+      return 0;
+    flush(); // binding a texture below must not affect queued draws
+    premultiplyImage(img, upBuf_);
+    GLuint t = 0;
+    glGenTextures(1, &t);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.width, img.height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, upBuf_.data());
+    paintKind_ = PaintKind::None; // unit 0's binding changed under us
+    return t;
+  }
+  // Frees a texture once the current pass has been flushed (it may still be
+  // referenced by queued draws until then).
+  void deferDelete(GLuint t) { trash_.push_back(t); }
+
+  // Copies the w x h region at (x, y) of the node's finished pixels into
+  // `dst` (premultiplied RGBA8, row 0 = canvas row y). Flushes queued work,
+  // resolves just that region from the MSAA target, and reads it back: the
+  // only point where pixels leave the GPU.
+  void readback(const View::Computed &c, int x, int y, int w, int h,
+                uint8_t *dst) {
+    flush();
+    if (c.canvasMsaaFbo) {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasMsaaFbo);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c.canvasFbo);
+      glBlitFramebuffer(x, y, x + w, y + h, x, y, x + w, y + h,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasFbo);
+    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+    // Back to drawing into the node's draw target.
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      c.canvasMsaaFbo ? c.canvasMsaaFbo : c.canvasFbo);
+  }
+
+  // ---- text ----------------------------------------------------------
+  // Selects how fragments use the glyph atlases at their (u,v): turns
+  // textured quads into tinted glyph masks or full-colour glyphs.
+  // 0 off, 1 mono glyph (coverage x paint), 2 colour glyph (own colours),
+  // 3 colour glyph silhouette (its alpha x paint — used for shadows).
+  void setMask(int mode) {
+    if (mode == maskMode_)
+      return;
+    flush();
+    maskMode_ = mode;
+    glUniform1i(uMask_, mode);
+  }
+
+  // Hooks the canvas context calls through its renderer type, so a test
+  // renderer can substitute fake glyph bitmaps and outlines.
+  static bool rasterizeText(const std::string &text, const TextStyle &ts,
+                            float scale, const Color *bake, RasterText &out) {
+    return liteui_canvas_gl::rasterizeText(text, ts, scale, bake, out);
+  }
+  static bool outlineText(const std::string &text, const TextStyle &ts,
+                          float tolerance, std::vector<OutlineContour> &out,
+                          TextBox &box) {
+    return liteui_canvas_gl::outlineText(text, ts, tolerance, out, box);
+  }
+
+  bool findText(const std::string &key, TextEntry &out) const {
+    auto it = texts_.find(key);
+    if (it == texts_.end())
+      return false;
+    out = it->second;
+    return true;
+  }
+
+  // Packs `rt` into the shared atlas (shelf packing) and remembers it under
+  // `key`. When the atlas is full everything is discarded and re-created on
+  // demand — after flushing, because queued draws may still sample the old
+  // contents. False if the bitmap can't fit even in an empty atlas.
+  bool addText(const std::string &key, const RasterText &rt, TextEntry &out) {
+    TextEntry e;
+    e.color = rt.color;
+    e.w = rt.w;
+    e.h = rt.h;
+    e.offX = rt.offX;
+    e.offY = rt.offY;
+    e.advance = rt.advance;
+    e.height = rt.height;
+    e.baseline = rt.baseline;
+    if (texts_.size() > 8192) { // bound the map even for ink-less strings
+      flush();
+      resetAtlas();
+    }
+    if (rt.w > 0 && rt.h > 0) {
+      ShelfPacker &pk = rt.color ? cpacker_ : packer_;
+      int x = 0, y = 0;
+      if (!pk.allocate(rt.w, rt.h, x, y)) {
+        flush();
+        resetAtlas();
+        if (!pk.allocate(rt.w, rt.h, x, y))
+          return false;
+      }
+      glPixelStorei(GL_UNPACK_ALIGNMENT, rt.color ? 4 : 1);
+      if (rt.color) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, colorAtlas_);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, rt.w, rt.h, GL_RGBA,
+                        GL_UNSIGNED_BYTE, rt.rgba.data());
+      } else {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, atlas_);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, rt.w, rt.h, GL_RED,
+                        GL_UNSIGNED_BYTE, rt.a8.data());
+      }
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      glActiveTexture(GL_TEXTURE0);
+      const float inv = 1.0f / static_cast<float>(rt.color ? colorAtlasSize_
+                                                           : atlasSize_);
+      e.u0 = x * inv;
+      e.v0 = y * inv;
+      e.u1 = (x + rt.w) * inv;
+      e.v1 = (y + rt.h) * inv;
+    }
+    texts_[key] = e;
+    out = e;
+    return true;
+  }
+
+  // Drops the clip back to `level` (used by restore()).
+  void reduceClip(int level) {
+    setMode(Mode::ReduceClip, level);
+    const float W = static_cast<float>(w_), H = static_cast<float>(h_);
+    const Vertex q[6] = {{0, 0, 0, 0, 0, 0}, {W, 0, 0, 0, 0, 0},
+                         {W, H, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0},
+                         {W, H, 0, 0, 0, 0}, {0, H, 0, 0, 0, 0}};
+    draw(q, 6);
+  }
+
+  // Changing the blend mode ends the current batch: the GPU applies one
+  // blend state per draw call, and order must be preserved.
+  void setBlend(CompositeOp op) {
+    if (op == op_)
+      return;
+    flush();
+    op_ = op;
+    applyBlend(op);
+    glUniform1i(uBlend_, op == CompositeOp::Multiply ? 1 : 0);
+  }
+
+  void flush() {
+    if (batch_.empty())
+      return;
+    if (op_ == CompositeOp::Multiply && writesColor(mode_))
+      captureBackdrop();
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    // Re-specifying the whole store ("orphaning") lets the driver hand us
+    // fresh memory instead of stalling on the previous frame's draw.
+    glBufferData(GL_ARRAY_BUFFER, kMaxVerts * sizeof(Vertex), nullptr,
+                 GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                    static_cast<GLsizeiptr>(batch_.size() * sizeof(Vertex)),
+                    batch_.data());
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(batch_.size()));
+    batch_.clear();
+  }
+
+private:
+  // Modes whose draws write colour (as opposed to stencil-only passes).
+  static bool writesColor(Mode m) {
+    return m == Mode::Off || m == Mode::ClipTest || m == Mode::CoverFill;
+  }
+
+  // Copies the node's pixels drawn so far into backdrop_ so the shader can
+  // read them (Multiply). A multisampled target can't be copied directly,
+  // so it is resolved into the node's texture first; the single-sample FBO
+  // is then the copy source either way. Sampling a separate texture (never
+  // the one being drawn into) avoids a feedback loop.
+  void captureBackdrop() {
+    if (!cur_)
+      return;
+    const View::Computed &c = *cur_;
+    if (!backdrop_ || backdropW_ != w_ || backdropH_ != h_) {
+      if (backdrop_)
+        glDeleteTextures(1, &backdrop_);
+      glGenTextures(1, &backdrop_);
+      glActiveTexture(GL_TEXTURE4);
+      glBindTexture(GL_TEXTURE_2D, backdrop_);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w_, h_);
+      backdropW_ = w_;
+      backdropH_ = h_;
+    }
+    if (c.canvasMsaaFbo) {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasMsaaFbo);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c.canvasFbo);
+      glBlitFramebuffer(0, 0, w_, h_, 0, 0, w_, h_, GL_COLOR_BUFFER_BIT,
+                        GL_NEAREST);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasFbo);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, backdrop_);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w_, h_);
+    glActiveTexture(GL_TEXTURE0);
+    // Back to drawing into the node's draw target (read + draw).
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      c.canvasMsaaFbo ? c.canvasMsaaFbo : c.canvasFbo);
+  }
+
+  static GLuint compile(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+      char log[512];
+      glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+      fprintf(stderr, "liteui canvas: shader compile error: %s\n", log);
+      glDeleteShader(s);
+      return 0;
+    }
+    return s;
+  }
+
+  static GLenum glFactor(BlendFactor f) {
+    switch (f) {
+    case BlendFactor::Zero:
+      return GL_ZERO;
+    case BlendFactor::One:
+      return GL_ONE;
+    case BlendFactor::SrcAlpha:
+      return GL_SRC_ALPHA;
+    case BlendFactor::OneMinusSrcAlpha:
+      return GL_ONE_MINUS_SRC_ALPHA;
+    case BlendFactor::DstAlpha:
+      return GL_DST_ALPHA;
+    case BlendFactor::OneMinusDstAlpha:
+      return GL_ONE_MINUS_DST_ALPHA;
+    case BlendFactor::DstColor:
+      return GL_DST_COLOR;
+    case BlendFactor::OneMinusDstColor:
+      return GL_ONE_MINUS_DST_COLOR;
+    }
+    return GL_ONE;
+  }
+  static void applyBlend(CompositeOp op) {
+    const BlendFactors f = blendFactorsFor(op);
+    glBlendFuncSeparate(glFactor(f.srcRgb), glFactor(f.dstRgb),
+                        glFactor(f.srcA), glFactor(f.dstA));
+  }
+
+  struct Saved {
+    GLboolean scissor = GL_FALSE, blend = GL_FALSE;
+    GLint fbo = 0, program = 0, vao = 0, arrayBuf = 0;
+    GLint srcRgb = GL_ONE, dstRgb = GL_ZERO, srcA = GL_ONE, dstA = GL_ZERO;
+    GLint activeTex = GL_TEXTURE0, tex0 = 0, tex1 = 0, tex2 = 0, tex3 = 0,
+          tex4 = 0;
+    GLint viewport[4] = {0, 0, 0, 0};
+    GLfloat clear[4] = {0, 0, 0, 0};
+  } saved_;
+
+  enum class PaintKind { None, Solid, Texture, Gradient };
+  bool sameGradient(const CanvasGradient &g, const float inv[9]) const {
+    if (g.kind != grad_.kind || g.x0 != grad_.x0 || g.y0 != grad_.y0 ||
+        g.x1 != grad_.x1 || g.y1 != grad_.y1 || g.r0 != grad_.r0 ||
+        g.r1 != grad_.r1 || g.stops.size() != grad_.stops.size())
+      return false;
+    for (int i = 0; i < 9; ++i)
+      if (inv[i] != inv_[i])
+        return false;
+    for (size_t i = 0; i < g.stops.size(); ++i) {
+      const auto &a = g.stops[i], &c = grad_.stops[i];
+      if (a.offset != c.offset || a.color.r != c.color.r ||
+          a.color.g != c.color.g || a.color.b != c.color.b ||
+          a.color.a != c.color.a)
+        return false;
+    }
+    return true;
+  }
+
+  GLuint prog_ = 0, vao_ = 0, vbo_ = 0, ramp_ = 0;
+  GLint uSize_ = -1, uMode_ = -1, uInv_ = -1, uG_ = -1, uR_ = -1;
+  GLint maxTex_ = 2048;
+  PaintKind paintKind_ = PaintKind::None;
+  GLuint tex_ = 0;
+  CanvasGradient grad_;
+  float inv_[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  std::vector<uint8_t> rampBuf_, upBuf_;
+  std::vector<GLuint> trash_;
+
+  // Glyph atlas bookkeeping.
+  void resetAtlas() {
+    texts_.clear();
+    packer_.reset();
+    cpacker_.reset();
+  }
+  GLuint atlas_ = 0, colorAtlas_ = 0, backdrop_ = 0;
+  GLint atlasSize_ = 1024, colorAtlasSize_ = 512;
+  GLint uMask_ = -1, uBlend_ = -1;
+  int maskMode_ = 0;
+  int backdropW_ = 0, backdropH_ = 0;
+  const View::Computed *cur_ = nullptr; // node being drawn (between begin/end)
+  ShelfPacker packer_, cpacker_;
+  std::unordered_map<std::string, TextEntry> texts_;
+  int w_ = 0, h_ = 0;
+  CompositeOp op_ = CompositeOp::SourceOver;
+  Mode mode_ = Mode::Off;
+  int level_ = 0;
+  std::vector<Vertex> batch_;
+};
+
+} // namespace liteui_canvas_gl
+
+// The canvas context is a template over the renderer it draws through. The
+// production instantiation (CanvasContextImpl, below) uses the real GL
+// Renderer; the unit tests instantiate it with a software renderer so the
+// path, stroke, clip, gradient, image and text logic can be checked without a
+// GPU (see tests/cases/canvas_gl_context.inc). A renderer type `Gl` must
+// provide: an enum `Mode`; setMode/reduceClip/setBlend/draw; setPaintSolid/
+// setPaintTexture/setPaintGradient; setMask/findText/addText; uploadImage/
+// deferDelete/readback; and static rasterizeText/outlineText.
+template <class Gl> class GlCanvasContext : public CanvasContext {
+public:
+  using Mode = typename Gl::Mode;
+  // `imageCacheOwner` is the canvas node's own View::Computed: its GPU
+  // target is what getImageData() reads back, and its cachedImage* slot is
+  // where drawImage() keeps the last uploaded texture. Null for a context
+  // not backed by a node (images are then uploaded per call and
+  // getImageData() returns nullopt).
+  GlCanvasContext(Gl &gl, float width, float height,
+                    const View::Computed *imageCacheOwner = nullptr)
+      : gl_(gl), width_(width), height_(height),
+        imageCacheOwner_(imageCacheOwner) {}
+  ~GlCanvasContext() = default;
+  GlCanvasContext(const GlCanvasContext &) = delete;
+  GlCanvasContext &operator=(const GlCanvasContext &) = delete;
+
+  float width() const { return width_; }
+  float height() const { return height_; }
+
+  // ---- state stack ----
+  void save() {
+    State s;
+    s.ctm = ctm_;
+    s.fill = fillPaint_;
+    s.stroke = strokePaint_;
+    s.lineWidth = lineWidth_;
+    s.lineCap = lineCap_;
+    s.lineJoin = lineJoin_;
+    s.miterLimit = miterLimit_;
+    s.dashes = dashes_;
+    s.dashOffset = dashOffset_;
+    s.globalAlpha = globalAlpha_;
+    s.composite = composite_;
+    s.shadowColor = shadowColor_;
+    s.shadowOffsetX = shadowOffsetX_;
+    s.shadowOffsetY = shadowOffsetY_;
+    s.font = font_;
+    s.textAlign = textAlign_;
+    s.textBaseline = textBaseline_;
+    s.clipLevel = clipLevel_;
+    stack_.push_back(std::move(s));
+  }
+  void restore() {
+    if (stack_.empty())
+      return;
+    State s = std::move(stack_.back());
+    stack_.pop_back();
+    ctm_ = s.ctm;
+    fillPaint_ = s.fill;
+    strokePaint_ = s.stroke;
+    lineWidth_ = s.lineWidth;
+    lineCap_ = s.lineCap;
+    lineJoin_ = s.lineJoin;
+    miterLimit_ = s.miterLimit;
+    dashes_ = s.dashes;
+    dashOffset_ = s.dashOffset;
+    globalAlpha_ = s.globalAlpha;
+    composite_ = s.composite;
+    shadowColor_ = s.shadowColor;
+    shadowOffsetX_ = s.shadowOffsetX;
+    shadowOffsetY_ = s.shadowOffsetY;
+    font_ = s.font;
+    textAlign_ = s.textAlign;
+    textBaseline_ = s.textBaseline;
+    if (s.clipLevel < clipLevel_) { // clips made since save() end here
+      gl_.reduceClip(s.clipLevel);
+      clipLevel_ = s.clipLevel;
+    }
+  }
+
+  // ---- transform ----
+  // HTML semantics: each call post-multiplies the current matrix, i.e. the
+  // new operation happens in the already-transformed coordinate system.
+  void translate(float x, float y) { ctm_ = ctm_.mul({1, 0, 0, 1, x, y}); }
+  void rotate(float radians) {
+    float c = std::cos(radians), s = std::sin(radians);
+    ctm_ = ctm_.mul({c, s, -s, c, 0, 0});
+  }
+  void scale(float sx, float sy) { ctm_ = ctm_.mul({sx, 0, 0, sy, 0, 0}); }
+  void transformBy(float a, float b, float c, float d, float e, float f) {
+    ctm_ = ctm_.mul({a, b, c, d, e, f});
+  }
+  void setTransform(float a, float b, float c, float d, float e, float f) {
+    ctm_ = Mat{a, b, c, d, e, f};
+  }
+  void resetTransform() { ctm_ = Mat{}; }
+
+  // ---- paint/style ----
+  void setFillColor(Color c) { fillPaint_ = Paint::solid(c); }
+  void setFillGradient(const CanvasGradient &g) { fillPaint_ = Paint::grad(g); }
+  void setStrokeColor(Color c) { strokePaint_ = Paint::solid(c); }
+  void setStrokeGradient(const CanvasGradient &g) {
+    strokePaint_ = Paint::grad(g);
+  }
+  void setLineWidth(float w) { lineWidth_ = std::max(0.0f, w); }
+  void setLineCap(LineCap c) { lineCap_ = c; }
+  void setLineJoin(LineJoin j) { lineJoin_ = j; }
+  void setMiterLimit(float m) { miterLimit_ = m; }
+  void setLineDash(const std::vector<float> &dashes) { dashes_ = dashes; }
+  void setLineDashOffset(float offset) { dashOffset_ = offset; }
+  void setGlobalAlpha(float a) { globalAlpha_ = std::clamp(a, 0.0f, 1.0f); }
+  void setGlobalCompositeOperation(CompositeOp op) { composite_ = op; }
+  void setShadow(Color color, float /*blurPx: unblurred, as on Windows*/,
+                 float offsetX, float offsetY) {
+    shadowColor_ = color;
+    shadowOffsetX_ = offsetX;
+    shadowOffsetY_ = offsetY;
+  }
+  void setFont(const std::string &family, float sizePx,
+               FontWeight weight = FontWeight::Regular,
+               FontStyle style = FontStyle::Normal) {
+    font_.fontFamily = family;
+    font_.fontSize = sizePx;
+    font_.fontWeight = weight;
+    font_.fontStyle = style;
+  }
+  void setTextAlign(TextAlign a) { textAlign_ = a; }
+  void setTextBaseline(TextBaseline b) { textBaseline_ = b; }
+
+  // ---- path building ----
+  // Recorded exactly like the Windows backend (cubic segments, one flag per
+  // figure); fill()/stroke()/clip() will consume it in the next step.
+  void beginPath() {
+    segs_.clear();
+    figureClosed_.clear();
+    curX_ = curY_ = startX_ = startY_ = 0;
+  }
+  void closePath() {
+    if (!figureClosed_.empty())
+      figureClosed_.back() = true;
+    curX_ = startX_;
+    curY_ = startY_;
+  }
+  void moveTo(float x, float y) {
+    segs_.push_back(Seg::move(x, y));
+    figureClosed_.push_back(false);
+    curX_ = startX_ = x;
+    curY_ = startY_ = y;
+  }
+  void lineTo(float x, float y) {
+    ensureFigure();
+    segs_.push_back(Seg::line(x, y));
+    curX_ = x;
+    curY_ = y;
+  }
+  void quadraticCurveTo(float cpx, float cpy, float x, float y) {
+    ensureFigure();
+    float c1x = curX_ + 2.0f / 3.0f * (cpx - curX_);
+    float c1y = curY_ + 2.0f / 3.0f * (cpy - curY_);
+    float c2x = x + 2.0f / 3.0f * (cpx - x);
+    float c2y = y + 2.0f / 3.0f * (cpy - y);
+    segs_.push_back(Seg::cubic(c1x, c1y, c2x, c2y, x, y));
+    curX_ = x;
+    curY_ = y;
+  }
+  void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x,
+                     float y) {
+    ensureFigure();
+    segs_.push_back(Seg::cubic(c1x, c1y, c2x, c2y, x, y));
+    curX_ = x;
+    curY_ = y;
+  }
+  void arc(float cx, float cy, float r, float startAngle, float endAngle,
+           bool ccw = false) {
+    appendArc(cx, cy, r, r, 0, startAngle, endAngle, ccw,
+              figureClosed_.empty());
+  }
+  void ellipse(float cx, float cy, float rx, float ry, float rotation,
+               float startAngle, float endAngle, bool ccw = false) {
+    appendArc(cx, cy, rx, ry, rotation, startAngle, endAngle, ccw,
+              figureClosed_.empty());
+  }
+  void arcTo(float x1, float y1, float x2, float y2, float radius) {
+    float x0 = curX_, y0 = curY_;
+    float dx1 = x0 - x1, dy1 = y0 - y1;
+    float dx2 = x2 - x1, dy2 = y2 - y1;
+    float len1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
+    float len2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
+    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0) {
+      lineTo(x1, y1);
+      return;
+    }
+    dx1 /= len1;
+    dy1 /= len1;
+    dx2 /= len2;
+    dy2 /= len2;
+    float cosA = std::clamp(dx1 * dx2 + dy1 * dy2, -1.0f, 1.0f);
+    float angle = std::acos(cosA);
+    if (angle < 1e-6f) {
+      lineTo(x1, y1);
+      return;
+    }
+    float dist = radius / std::tan(angle / 2.0f);
+    float t1x = x1 + dx1 * dist, t1y = y1 + dy1 * dist;
+    float t2x = x1 + dx2 * dist, t2y = y1 + dy2 * dist;
+    lineTo(t1x, t1y);
+    float bisx = dx1 + dx2, bisy = dy1 + dy2;
+    float bisLen = std::sqrt(bisx * bisx + bisy * bisy);
+    if (bisLen < 1e-6f) {
+      lineTo(x1, y1);
+      return;
+    }
+    bisx /= bisLen;
+    bisy /= bisLen;
+    float centerDist = std::sqrt(radius * radius + dist * dist);
+    float ccx = x1 + bisx * centerDist, ccy = y1 + bisy * centerDist;
+    float a0 = std::atan2(t1y - ccy, t1x - ccx);
+    float a1 = std::atan2(t2y - ccy, t2x - ccx);
+    float cross = dx1 * dy2 - dy1 * dx2; // winding sign, picks short way
+    appendArc(ccx, ccy, radius, radius, 0, a0, a1, cross > 0, false);
+  }
+  void rect(float x, float y, float w, float h) {
+    moveTo(x, y);
+    lineTo(x + w, y);
+    lineTo(x + w, y + h);
+    lineTo(x, y + h);
+    closePath();
+  }
+  void roundRect(float x, float y, float w, float h, float radius) {
+    constexpr float kPi = 3.14159265358979f;
+    radius = std::max(0.0f, std::min(radius, std::min(w, h) / 2.0f));
+    moveTo(x + radius, y);
+    lineTo(x + w - radius, y);
+    appendArc(x + w - radius, y + radius, radius, radius, 0, -kPi / 2, 0, false,
+              false);
+    lineTo(x + w, y + h - radius);
+    appendArc(x + w - radius, y + h - radius, radius, radius, 0, 0, kPi / 2,
+              false, false);
+    lineTo(x + radius, y + h);
+    appendArc(x + radius, y + h - radius, radius, radius, 0, kPi / 2, kPi,
+              false, false);
+    lineTo(x, y + radius);
+    appendArc(x + radius, y + radius, radius, radius, 0, kPi, kPi * 1.5f, false,
+              false);
+    closePath();
+  }
+
+  // ---- drawing ----
+  void fill(FillRule rule = FillRule::NonZero) {
+    std::vector<Contour> cs = flattenPath();
+    if (cs.empty())
+      return;
+    gl_.setBlend(composite_);
+    if (hasShadow())
+      fillContours(cs, rule, Paint::solid(shadowColor_), shadowOffsetX_,
+                   shadowOffsetY_);
+    fillContours(cs, rule, fillPaint_, 0, 0);
+  }
+  void stroke() { strokeContours(flattenPath()); }
+
+  // Intersects the clip with the current path (through the current
+  // transform). Clips nest up to 15 deep; restore() undoes them.
+  void clip(FillRule rule = FillRule::NonZero) {
+    if (clipLevel_ >= 15) {
+      warnOnce("clip(): more than 15 nested clips; the extra clips are ignored");
+      return;
+    }
+    std::vector<liteui_canvas_gl::Vertex> fan;
+    Bounds bb;
+    buildFan(flattenPath(), 0, 0, fan, bb);
+    // An empty path clips everything away: the level still goes up, but no
+    // pixel is promoted to it, so nothing matches the new level any more.
+    if (!fan.empty() && bb.clampTo(width_, height_)) {
+      gl_.setMode(rule == FillRule::EvenOdd ? Mode::CountEvenOdd
+                                            : Mode::CountWinding,
+                  clipLevel_);
+      gl_.draw(fan.data(), fan.size());
+      gl_.setMode(Mode::CoverClip, clipLevel_);
+      emitDeviceQuad(bb, {0, 0, 0, 0});
+    }
+    ++clipLevel_;
+  }
+
+  void fillRect(float x, float y, float w, float h) {
+    prepareNormal();
+    gl_.setBlend(composite_);
+    if (hasShadow()) {
+      gl_.setPaintSolid();
+      emitQuad(x + shadowOffsetX_, y + shadowOffsetY_, w, h,
+               premul(shadowColor_));
+    }
+    emitQuad(x, y, w, h, bindPaint(fillPaint_));
+  }
+  // Strokes a rectangle without touching the current path, like the other
+  // backends.
+  void strokeRect(float x, float y, float w, float h) {
+    Contour c;
+    c.pts = {{x, y}, {x + w, y}, {x + w, y + h}, {x, y + h}};
+    c.closed = true;
+    std::vector<Contour> cs;
+    cs.push_back(std::move(c));
+    strokeContours(cs);
+  }
+  // Clears through the current transform to transparent black. Done as a
+  // Copy-blended quad, so the rectangle is antialiased by MSAA like any
+  // other shape and honours rotation/skew.
+  void clearRect(float x, float y, float w, float h) {
+    prepareNormal();
+    gl_.setBlend(CompositeOp::Copy);
+    gl_.setPaintSolid();
+    emitQuad(x, y, w, h, {0, 0, 0, 0});
+    gl_.setBlend(composite_);
+  }
+
+  // ---- text ----
+  TextMetricsResult measureText(const std::string &text) {
+    TextStyle ts = fontToTextStyle();
+    liteui_text::Measurement m = liteui_text::measure(
+        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
+        resolveStatic(ts.fontStyle), -1);
+    return {m.width};
+  }
+  // maxWidth is accepted for API familiarity but not applied, as in the
+  // other backends. Text is a single unwrapped line.
+  void fillText(const std::string &text, float x, float y, float = -1) {
+    drawTextImpl(text, x, y, false);
+  }
+  void strokeText(const std::string &text, float x, float y, float = -1) {
+    drawTextImpl(text, x, y, true);
+  }
+
+  // ---- images / pixel data ----
+  void drawImage(const CanvasImage &img, float dx, float dy) {
+    drawImage(img, 0, 0, static_cast<float>(img.width),
+              static_cast<float>(img.height), dx, dy,
+              static_cast<float>(img.width), static_cast<float>(img.height));
+  }
+  void drawImage(const CanvasImage &img, float dx, float dy, float dw,
+                 float dh) {
+    drawImage(img, 0, 0, static_cast<float>(img.width),
+              static_cast<float>(img.height), dx, dy, dw, dh);
+  }
+  // Draws the (sx,sy,sw,sh) part of `img` into (dx,dy,dw,dh), bilinearly
+  // filtered, through the CTM, clip, globalAlpha and composite operation.
+  // Like the HTML spec and the Windows backend (and unlike the Cairo one),
+  // the source rectangle really crops: it is first clipped to the image and
+  // the destination shrinks in proportion. The image lives in a GPU texture
+  // cached on the canvas node (same identity heuristic as the other
+  // backends: same pixel buffer address, size and dimensions — mutating
+  // pixels in place without changing the buffer is not noticed).
+  void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
+                 float dx, float dy, float dw, float dh) {
+    if (img.width <= 0 || img.height <= 0 || sw <= 0 || sh <= 0 || dw == 0 ||
+        dh == 0)
+      return;
+    const float iw = static_cast<float>(img.width),
+                ih = static_cast<float>(img.height);
+    float cx0 = std::max(sx, 0.0f), cy0 = std::max(sy, 0.0f);
+    float cx1 = std::min(sx + sw, iw), cy1 = std::min(sy + sh, ih);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      return; // nothing of the image is inside the source rectangle
+    float rx = dw / sw, ry = dh / sh;
+    GLuint tex = imageTexture(img);
+    if (!tex)
+      return;
+    prepareNormal();
+    gl_.setBlend(composite_);
+    gl_.setPaintTexture(tex);
+    emitTexQuad(ctm_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
+                (cx1 - cx0) * rx, (cy1 - cy0) * ry, cx0 / iw, cy0 / ih,
+                cx1 / iw, cy1 / ih, {globalAlpha_, globalAlpha_, globalAlpha_,
+                                     globalAlpha_});
+  }
+
+  // Reads the canvas's finished pixels back from the GPU (the only place
+  // they leave it). Ignores the transform, like the HTML spec; pixels come
+  // back as straight (un-premultiplied) RGBA, mirroring the other backends.
+  // Needs the node's GPU target, so it returns nullopt for a context that
+  // isn't backed by one.
+  std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
+    if (!imageCacheOwner_ || !imageCacheOwner_->canvasFbo)
+      return std::nullopt;
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int iw = std::max(0, static_cast<int>(std::round(w)));
+    int ih = std::max(0, static_cast<int>(std::round(h)));
+    CanvasImage out(iw, ih);
+    if (iw == 0 || ih == 0)
+      return out;
+    int x0 = std::max(0, ix), y0 = std::max(0, iy);
+    int x1 = std::min(static_cast<int>(width_), ix + iw);
+    int y1 = std::min(static_cast<int>(height_), iy + ih);
+    if (x1 <= x0 || y1 <= y0)
+      return out; // entirely off-canvas: transparent black
+    const int rw = x1 - x0, rh = y1 - y0;
+    std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4);
+    gl_.readback(*imageCacheOwner_, x0, y0, rw, rh, px.data());
+    for (int row = 0; row < rh; ++row) {
+      for (int col = 0; col < rw; ++col) {
+        const uint8_t *p = &px[(static_cast<size_t>(row) * rw + col) * 4];
+        uint8_t *d = out.pixels.data() +
+                     ((static_cast<size_t>(y0 + row - iy)) * iw +
+                      (x0 + col - ix)) *
+                         4;
+        int a = p[3];
+        d[0] = a ? static_cast<uint8_t>(std::min(255, p[0] * 255 / a)) : 0;
+        d[1] = a ? static_cast<uint8_t>(std::min(255, p[1] * 255 / a)) : 0;
+        d[2] = a ? static_cast<uint8_t>(std::min(255, p[2] * 255 / a)) : 0;
+        d[3] = static_cast<uint8_t>(a);
+      }
+    }
+    return out;
+  }
+
+  // Replaces the destination pixels with `img` (straight RGBA, alpha
+  // included), at (dx,dy) rounded to whole pixels. Per the spec it ignores
+  // the transform, clip, globalAlpha and composite operation, which is what
+  // the Cairo backend does too.
+  void putImageData(const CanvasImage &img, float dx, float dy) {
+    if (img.width <= 0 || img.height <= 0)
+      return;
+    GLuint tex = gl_.uploadImage(img);
+    if (!tex) {
+      warnOnce("putImageData(): the image is larger than the GPU supports; nothing drawn");
+      return;
+    }
+    gl_.deferDelete(tex);
+    gl_.setMode(Mode::Off, 0); // ignore the clip
+    gl_.setBlend(CompositeOp::Copy);
+    gl_.setPaintTexture(tex);
+    emitTexQuad(Mat{}, std::round(dx), std::round(dy),
+                static_cast<float>(img.width), static_cast<float>(img.height),
+                0, 0, 1, 1, {1, 1, 1, 1});
+    gl_.setBlend(composite_);
+  }
+
+private:
+  // ---- matrix: x' = a*x + c*y + e, y' = b*x + d*y + f ----
+  struct Mat {
+    float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+    // this * o: o is applied first, then this.
+    Mat mul(const Mat &o) const {
+      return {a * o.a + c * o.b,       b * o.a + d * o.b,
+              a * o.c + c * o.d,       b * o.c + d * o.d,
+              a * o.e + c * o.f + e,   b * o.e + d * o.f + f};
+    }
+    void apply(float x, float y, float &ox, float &oy) const {
+      ox = a * x + c * y + e;
+      oy = b * x + d * y + f;
+    }
+  };
+
+  struct Seg {
+    enum class Kind { Move, Line, Cubic } kind;
+    float x, y;               // endpoint (all kinds)
+    float c1x, c1y, c2x, c2y; // control points (Cubic only)
+    static Seg move(float x, float y) { return {Kind::Move, x, y, 0, 0, 0, 0}; }
+    static Seg line(float x, float y) { return {Kind::Line, x, y, 0, 0, 0, 0}; }
+    static Seg cubic(float c1x, float c1y, float c2x, float c2y, float x,
+                     float y) {
+      return {Kind::Cubic, x, y, c1x, c1y, c2x, c2y};
+    }
+  };
+
+  struct Paint {
+    bool isGradient = false;
+    Color color{0, 0, 0, 255};
+    CanvasGradient gradient;
+    static Paint solid(Color c) {
+      Paint p;
+      p.color = c;
+      return p;
+    }
+    static Paint grad(const CanvasGradient &g) {
+      Paint p;
+      p.isGradient = true;
+      p.gradient = g;
+      return p;
+    }
+  };
+
+  struct State {
+    Mat ctm;
+    Paint fill, stroke;
+    float lineWidth;
+    LineCap lineCap;
+    LineJoin lineJoin;
+    float miterLimit;
+    std::vector<float> dashes;
+    float dashOffset;
+    float globalAlpha;
+    CompositeOp composite;
+    Color shadowColor;
+    float shadowOffsetX, shadowOffsetY;
+    TextStyle font;
+    TextAlign textAlign;
+    TextBaseline textBaseline;
+    int clipLevel;
+  };
+
+  struct Rgba {
+    float r, g, b, a;
+  };
+
+  // Straight 8-bit colour -> premultiplied float, scaled by globalAlpha.
+  Rgba premul(Color c) const {
+    float a = (c.a / 255.0f) * globalAlpha_;
+    return {c.r / 255.0f * a, c.g / 255.0f * a, c.b / 255.0f * a, a};
+  }
+
+  // Makes `p` the renderer's active paint and returns the vertex colour to
+  // draw with: the premultiplied colour for a solid paint, or just the
+  // globalAlpha scale for a gradient (the shader supplies the colour).
+  // Gradient coordinates live in the user space current at draw time, so
+  // the shader gets the inverse CTM. A gradient with no stops, or a
+  // singular transform, paints transparent black (draws nothing).
+  Rgba bindPaint(const Paint &p) {
+    if (!p.isGradient) {
+      gl_.setPaintSolid();
+      return premul(p.color);
+    }
+    float inv[9];
+    if (p.gradient.stops.empty() ||
+        !liteui_canvas_gl::invert2x3(ctm_.a, ctm_.b, ctm_.c, ctm_.d, ctm_.e,
+                                     ctm_.f, inv)) {
+      gl_.setPaintSolid();
+      return {0, 0, 0, 0};
+    }
+    gl_.setPaintGradient(p.gradient, inv);
+    return {globalAlpha_, globalAlpha_, globalAlpha_, globalAlpha_};
+  }
+
+  // The texture for `img`: this node's cached one if it is for the same
+  // pixel buffer, else a fresh upload that replaces it. With no node to
+  // cache on, the texture is retired after this pass.
+  GLuint imageTexture(const CanvasImage &img) {
+    const View::Computed *o = imageCacheOwner_;
+    if (o && o->cachedImageTexture && o->cachedImagePixels == img.pixels.data() &&
+        o->cachedImagePixelsSize == img.pixels.size() &&
+        o->cachedImageW == img.width && o->cachedImageH == img.height)
+      return o->cachedImageTexture;
+    GLuint t = gl_.uploadImage(img);
+    if (!t) {
+      warnOnce("drawImage(): the image is larger than the GPU supports; nothing drawn");
+      return 0;
+    }
+    if (o) {
+      if (o->cachedImageTexture)
+        gl_.deferDelete(o->cachedImageTexture);
+      o->cachedImageTexture = t;
+      o->cachedImagePixels = img.pixels.data();
+      o->cachedImagePixelsSize = img.pixels.size();
+      o->cachedImageW = img.width;
+      o->cachedImageH = img.height;
+    } else {
+      gl_.deferDelete(t);
+    }
+    return t;
+  }
+
+  // Textured version of emitQuad: (u0,v0)-(u1,v1) is the part of the image
+  // mapped onto the rectangle.
+  void emitTexQuad(const Mat &m, float x, float y, float w, float h, float u0,
+                   float v0, float u1, float v1, Rgba c) {
+    float px[4], py[4];
+    m.apply(x, y, px[0], py[0]);
+    m.apply(x + w, y, px[1], py[1]);
+    m.apply(x + w, y + h, px[2], py[2]);
+    m.apply(x, y + h, px[3], py[3]);
+    const float us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
+    auto V = [&](int i) {
+      return liteui_canvas_gl::Vertex{px[i], py[i], c.r, c.g, c.b, c.a,
+                                      us[i],  vs[i]};
+    };
+    const liteui_canvas_gl::Vertex tri[6] = {V(0), V(1), V(2), V(0), V(2), V(3)};
+    gl_.draw(tri, 6);
+  }
+
+  // Two triangles covering the CTM-transformed rectangle (a parallelogram
+  // when rotated or skewed).
+  void emitQuad(float x, float y, float w, float h, Rgba c) {
+    float px[4], py[4];
+    ctm_.apply(x, y, px[0], py[0]);
+    ctm_.apply(x + w, y, px[1], py[1]);
+    ctm_.apply(x + w, y + h, px[2], py[2]);
+    ctm_.apply(x, y + h, px[3], py[3]);
+    auto V = [&](int i) {
+      return liteui_canvas_gl::Vertex{px[i], py[i], c.r, c.g, c.b, c.a};
+    };
+    const liteui_canvas_gl::Vertex tri[6] = {V(0), V(1), V(2), V(0), V(2), V(3)};
+    gl_.draw(tri, 6);
+  }
+
+  void ensureFigure() {
+    if (figureClosed_.empty())
+      moveTo(curX_, curY_);
+  }
+
+  // ---- stencil-and-cover plumbing ----
+  struct Pt {
+    float x, y;
+  };
+  struct Contour {
+    std::vector<Pt> pts;
+    bool closed = false;
+  };
+  // Device-space bounding box of a shape.
+  struct Bounds {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    void add(float x, float y) {
+      x0 = std::min(x0, x);
+      y0 = std::min(y0, y);
+      x1 = std::max(x1, x);
+      y1 = std::max(y1, y);
+    }
+    // Intersects with the canvas; false if nothing is left.
+    bool clampTo(float w, float h) {
+      x0 = std::max(x0, 0.0f);
+      y0 = std::max(y0, 0.0f);
+      x1 = std::min(x1, w);
+      y1 = std::min(y1, h);
+      return x1 > x0 && y1 > y0;
+    }
+  };
+
+  // Colour drawing that respects the current clip.
+  void prepareNormal() {
+    gl_.setMode(Mode::ClipTest, clipLevel_);
+  }
+  bool hasShadow() const {
+    return shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0);
+  }
+  float scaleFactor() const {
+    float sx = std::hypot(ctm_.a, ctm_.b), sy = std::hypot(ctm_.c, ctm_.d);
+    return std::max(std::max(sx, sy), 1e-6f);
+  }
+
+  void emitDeviceQuad(const Bounds &b, Rgba c) {
+    using V = liteui_canvas_gl::Vertex;
+    const V q[6] = {{b.x0, b.y0, c.r, c.g, c.b, c.a},
+                    {b.x1, b.y0, c.r, c.g, c.b, c.a},
+                    {b.x1, b.y1, c.r, c.g, c.b, c.a},
+                    {b.x0, b.y0, c.r, c.g, c.b, c.a},
+                    {b.x1, b.y1, c.r, c.g, c.b, c.a},
+                    {b.x0, b.y1, c.r, c.g, c.b, c.a}};
+    gl_.draw(q, 6);
+  }
+
+  // Recorded path -> user-space polylines. Curves are subdivided so the
+  // flattening error stays under ~0.2 device pixels at the current scale.
+  std::vector<Contour> flattenPath() const {
+    const float tol = 0.2f / scaleFactor();
+    std::vector<Contour> out;
+    size_t fig = 0;
+    bool first = true;
+    Pt cur{0, 0};
+    for (const Seg &s : segs_) {
+      if (s.kind == Seg::Kind::Move) {
+        if (!first)
+          ++fig; // one figureClosed_ entry per Move, in order
+        first = false;
+        Contour c;
+        c.closed = fig < figureClosed_.size() && figureClosed_[fig];
+        c.pts.push_back({s.x, s.y});
+        out.push_back(std::move(c));
+        cur = {s.x, s.y};
+      } else if (out.empty()) {
+        continue;
+      } else if (s.kind == Seg::Kind::Line) {
+        out.back().pts.push_back({s.x, s.y});
+        cur = {s.x, s.y};
+      } else {
+        // Error of a uniform n-piece polyline for a cubic is bounded by
+        // 0.75 * (largest control-polygon second difference) / n^2.
+        float d1x = cur.x - 2 * s.c1x + s.c2x, d1y = cur.y - 2 * s.c1y + s.c2y;
+        float d2x = s.c1x - 2 * s.c2x + s.x, d2y = s.c1y - 2 * s.c2y + s.y;
+        float dd = std::max(std::hypot(d1x, d1y), std::hypot(d2x, d2y));
+        int n = std::clamp(
+            static_cast<int>(std::ceil(std::sqrt(0.75f * dd / tol))), 1, 200);
+        for (int i = 1; i <= n; ++i) {
+          float t = static_cast<float>(i) / n, u = 1 - t;
+          float b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t,
+                b3 = t * t * t;
+          out.back().pts.push_back(
+              {b0 * cur.x + b1 * s.c1x + b2 * s.c2x + b3 * s.x,
+               b0 * cur.y + b1 * s.c1y + b2 * s.c2y + b3 * s.y});
+        }
+        cur = {s.x, s.y};
+      }
+    }
+    return out;
+  }
+
+  // Triangle fans (one per contour, from its first point) in device space,
+  // plus their bounding box. Open contours are closed implicitly, as fill
+  // and clip require.
+  void buildFan(const std::vector<Contour> &cs, float offX, float offY,
+                std::vector<liteui_canvas_gl::Vertex> &fan, Bounds &bb) const {
+    std::vector<Pt> dev;
+    for (const Contour &c : cs) {
+      if (c.pts.size() < 3)
+        continue;
+      dev.clear();
+      for (const Pt &p : c.pts) {
+        Pt d;
+        ctm_.apply(p.x + offX, p.y + offY, d.x, d.y);
+        dev.push_back(d);
+        bb.add(d.x, d.y);
+      }
+      for (size_t i = 1; i + 1 < dev.size(); ++i) {
+        fan.push_back({dev[0].x, dev[0].y, 0, 0, 0, 0});
+        fan.push_back({dev[i].x, dev[i].y, 0, 0, 0, 0});
+        fan.push_back({dev[i + 1].x, dev[i + 1].y, 0, 0, 0, 0});
+      }
+    }
+  }
+
+  void fillContours(const std::vector<Contour> &cs, FillRule rule,
+                    const Paint &paint, float offX, float offY) {
+    std::vector<liteui_canvas_gl::Vertex> fan;
+    Bounds bb;
+    buildFan(cs, offX, offY, fan, bb);
+    if (fan.empty() || !bb.clampTo(width_, height_))
+      return;
+    gl_.setMode(rule == FillRule::EvenOdd ? Mode::CountEvenOdd
+                                          : Mode::CountWinding,
+                clipLevel_);
+    gl_.draw(fan.data(), fan.size());
+    gl_.setMode(Mode::CoverFill, clipLevel_);
+    emitDeviceQuad(bb, bindPaint(paint));
+  }
+
+  // ---- stroking ----
+  // The stroke outline is built in USER space (so a non-uniform scale
+  // squashes the pen correctly), as a pile of overlapping triangles:
+  // segment rectangles, join wedges/discs, cap pieces. Overlaps are
+  // harmless because the pile is rasterized as a union via the stencil
+  // (Mode::CountUnion), so translucent strokes don't darken at joins.
+  void strokeContours(const std::vector<Contour> &cs) {
+    if (lineWidth_ <= 0 || cs.empty())
+      return;
+    gl_.setBlend(composite_);
+    if (hasShadow())
+      strokeContoursAt(cs, Paint::solid(shadowColor_), shadowOffsetX_,
+                       shadowOffsetY_);
+    strokeContoursAt(cs, strokePaint_, 0, 0);
+  }
+
+  void strokeContoursAt(const std::vector<Contour> &cs, const Paint &paint,
+                        float offX, float offY) {
+    strokeScale_ = scaleFactor();
+    // Dash first (open pieces), if a usable pattern is set.
+    std::vector<Contour> pieces;
+    std::vector<float> pat;
+    float patTotal = 0;
+    bool dashed = !dashes_.empty();
+    for (float d : dashes_) {
+      if (!(d >= 0) || !std::isfinite(d))
+        dashed = false;
+      patTotal += d;
+    }
+    if (dashed && patTotal > 1e-6f) {
+      // An odd-length list is repeated to make it even, as in HTML canvas.
+      const int repeats = (dashes_.size() % 2) ? 2 : 1;
+      pat.reserve(dashes_.size() * repeats);
+      for (int r = 0; r < repeats; ++r)
+        for (float d : dashes_)
+          pat.push_back(d);
+      patTotal = 0;
+      for (float d : pat)
+        patTotal += d;
+      for (const Contour &c : cs)
+        dashContour(c, pat, patTotal, pieces);
+    } else {
+      pieces = cs;
+    }
+
+    std::vector<Pt> tris; // user space, 3 per triangle
+    for (const Contour &c : pieces)
+      strokePolyline(c, tris);
+    if (tris.empty())
+      return;
+
+    std::vector<liteui_canvas_gl::Vertex> verts;
+    verts.reserve(tris.size());
+    Bounds bb;
+    for (const Pt &p : tris) {
+      float dx, dy;
+      ctm_.apply(p.x + offX, p.y + offY, dx, dy);
+      verts.push_back({dx, dy, 0, 0, 0, 0});
+      bb.add(dx, dy);
+    }
+    if (!bb.clampTo(width_, height_))
+      return;
+    gl_.setMode(Mode::CountUnion, clipLevel_);
+    gl_.draw(verts.data(), verts.size());
+    gl_.setMode(Mode::CoverFill, clipLevel_);
+    emitDeviceQuad(bb, bindPaint(paint));
+  }
+
+  static float len(Pt a, Pt b) { return std::hypot(b.x - a.x, b.y - a.y); }
+  static Pt dirOf(Pt a, Pt b) {
+    float l = len(a, b);
+    return l > 0 ? Pt{(b.x - a.x) / l, (b.y - a.y) / l} : Pt{1, 0};
+  }
+  static void tri(std::vector<Pt> &o, Pt a, Pt b, Pt c) {
+    o.push_back(a);
+    o.push_back(b);
+    o.push_back(c);
+  }
+
+  // A filled circle as a triangle fan; segment count follows its size on
+  // screen so big round caps stay smooth and tiny ones stay cheap.
+  void disc(std::vector<Pt> &o, Pt c, float r) const {
+    float rd = r * strokeScale_;
+    int n = 8;
+    if (rd > 0.2f) {
+      float step = std::acos(std::max(0.0f, 1.0f - 0.2f / rd));
+      if (step > 1e-4f)
+        n = std::clamp(static_cast<int>(std::ceil(3.14159265f / step)), 8, 64);
+      else
+        n = 64;
+    }
+    for (int i = 0; i < n; ++i) {
+      float a0 = 6.28318530f * i / n, a1 = 6.28318530f * (i + 1) / n;
+      tri(o, c, {c.x + r * std::cos(a0), c.y + r * std::sin(a0)},
+          {c.x + r * std::cos(a1), c.y + r * std::sin(a1)});
+    }
+  }
+
+  void capAt(std::vector<Pt> &o, Pt e, Pt outward, float hw) const {
+    if (lineCap_ == LineCap::Round) {
+      disc(o, e, hw);
+    } else if (lineCap_ == LineCap::Square) {
+      Pt n{-outward.y * hw, outward.x * hw};
+      Pt f{e.x + outward.x * hw, e.y + outward.y * hw};
+      tri(o, {e.x + n.x, e.y + n.y}, {e.x - n.x, e.y - n.y},
+          {f.x + n.x, f.y + n.y});
+      tri(o, {e.x - n.x, e.y - n.y}, {f.x - n.x, f.y - n.y},
+          {f.x + n.x, f.y + n.y});
+    }
+  }
+
+  void joinAt(std::vector<Pt> &o, Pt prev, Pt v, Pt next, float hw) const {
+    Pt d0 = dirOf(prev, v), d1 = dirOf(v, next);
+    float cross = d0.x * d1.y - d0.y * d1.x;
+    float dot = d0.x * d1.x + d0.y * d1.y;
+    if (lineJoin_ == LineJoin::Round) {
+      // Skip joins whose gap would be invisible (nearly straight); a full
+      // reversal (dot < 0) still needs its disc.
+      if (dot < 0 || std::fabs(cross) * hw * strokeScale_ > 0.05f)
+        disc(o, v, hw);
+      return;
+    }
+    if (std::fabs(cross) < 1e-6f)
+      return; // straight on, or a hairpin (nothing to fill)
+    // Outer side of the turn: opposite the side the path bends toward.
+    float s = cross > 0 ? -1.0f : 1.0f;
+    Pt n0{-d0.y, d0.x}, n1{-d1.y, d1.x};
+    Pt A{v.x + s * hw * n0.x, v.y + s * hw * n0.y};
+    Pt B{v.x + s * hw * n1.x, v.y + s * hw * n1.y};
+    tri(o, v, A, B); // bevel
+    if (lineJoin_ == LineJoin::Miter && 1.0f + dot > 1e-6f) {
+      // miterLength / lineWidth == 1 / sin(theta/2) == sqrt(2 / (1 + dot))
+      float ratio = std::sqrt(2.0f / (1.0f + dot));
+      if (ratio <= miterLimit_) {
+        float k = s * hw / (1.0f + dot);
+        Pt M{v.x + k * (n0.x + n1.x), v.y + k * (n0.y + n1.y)};
+        tri(o, A, M, B);
+      }
+    }
+  }
+
+  void strokePolyline(const Contour &c, std::vector<Pt> &o) const {
+    const float hw = lineWidth_ * 0.5f;
+    // Points closer than a small fraction of a device pixel are the same
+    // point. (A fixed tiny epsilon is not enough: the end of a full-circle arc
+    // lands a few millionths away from its start, and the near-zero-length
+    // segment that results has a meaningless direction, which breaks the
+    // joins on both sides of it.)
+    const float same = 0.002f / strokeScale_;
+    std::vector<Pt> q;
+    for (const Pt &p : c.pts)
+      if (q.empty() || len(q.back(), p) > same)
+        q.push_back(p);
+    bool closed = c.closed;
+    if (closed && q.size() > 1 && len(q.front(), q.back()) <= same)
+      q.pop_back();
+    if (q.empty())
+      return;
+    if (q.size() == 1) { // zero-length subpath: a dot for round/square caps
+      if (lineCap_ == LineCap::Round) {
+        disc(o, q[0], hw);
+      } else if (lineCap_ == LineCap::Square) {
+        Pt a{q[0].x - hw, q[0].y - hw}, b{q[0].x + hw, q[0].y - hw};
+        Pt cc{q[0].x + hw, q[0].y + hw}, d{q[0].x - hw, q[0].y + hw};
+        tri(o, a, b, cc);
+        tri(o, a, cc, d);
+      }
+      return;
+    }
+    const size_t n = q.size();
+    const size_t segs = closed ? n : n - 1;
+    for (size_t i = 0; i < segs; ++i) {
+      Pt a = q[i], b = q[(i + 1) % n];
+      Pt d = dirOf(a, b);
+      Pt nn{-d.y * hw, d.x * hw};
+      Pt a1{a.x + nn.x, a.y + nn.y}, a2{a.x - nn.x, a.y - nn.y};
+      Pt b1{b.x + nn.x, b.y + nn.y}, b2{b.x - nn.x, b.y - nn.y};
+      tri(o, a1, a2, b1);
+      tri(o, a2, b2, b1);
+    }
+    for (size_t i = closed ? 0 : 1; i < (closed ? n : n - 1); ++i)
+      joinAt(o, q[(i + n - 1) % n], q[i], q[(i + 1) % n], hw);
+    if (!closed) {
+      Pt s0 = dirOf(q[1], q[0]), s1 = dirOf(q[n - 2], q[n - 1]);
+      capAt(o, q[0], s0, hw);
+      capAt(o, q[n - 1], s1, hw);
+    }
+  }
+
+  // Splits one contour into dash pieces (each an open polyline) following
+  // `pat` (even entry count, positive total), starting dashOffset_ into the
+  // pattern. A zero-length "on" entry yields a single-point piece, which
+  // strokePolyline turns into a dot for round/square caps.
+  void dashContour(const Contour &c, const std::vector<float> &pat,
+                   float total, std::vector<Contour> &out) const {
+    std::vector<Pt> P = c.pts;
+    if (c.closed && !P.empty())
+      P.push_back(P.front());
+    if (P.size() < 2) {
+      out.push_back(c);
+      return;
+    }
+    // Refuse absurd dash counts (tiny dashes on a huge path): draw solid.
+    float pathLen = 0;
+    for (size_t i = 0; i + 1 < P.size(); ++i)
+      pathLen += len(P[i], P[i + 1]);
+    if (pathLen / total * static_cast<float>(pat.size()) > 200000.0f) {
+      out.push_back(c);
+      return;
+    }
+    // Position inside the pattern at the start of the path.
+    float phase = std::fmod(dashOffset_, total);
+    if (phase < 0)
+      phase += total;
+    size_t idx = 0;
+    float remaining = pat[0];
+    while (phase > 0) {
+      if (phase >= remaining) {
+        phase -= remaining;
+        idx = (idx + 1) % pat.size();
+        remaining = pat[idx];
+      } else {
+        remaining -= phase;
+        phase = 0;
+      }
+    }
+    bool on = (idx % 2) == 0;
+    Contour cur;
+    if (on)
+      cur.pts.push_back(P[0]);
+    for (size_t i = 0; i + 1 < P.size(); ++i) {
+      Pt a = P[i], b = P[i + 1];
+      float segLen = len(a, b);
+      Pt d = dirOf(a, b);
+      float pos = 0;
+      while (pos < segLen) {
+        float step = std::min(remaining, segLen - pos);
+        Pt pt{a.x + d.x * (pos + step), a.y + d.y * (pos + step)};
+        if (on)
+          cur.pts.push_back(pt);
+        pos += step;
+        remaining -= step;
+        if (remaining <= 1e-6f) { // reached a dash/gap boundary
+          if (on) {
+            out.push_back(std::move(cur));
+            cur = Contour{};
+          }
+          idx = (idx + 1) % pat.size();
+          remaining = pat[idx];
+          on = !on;
+          if (on)
+            cur.pts.push_back(pt);
+        }
+      }
+    }
+    if (on && !cur.pts.empty())
+      out.push_back(std::move(cur));
+  }
+
+  float strokeScale_ = 1.0f;
+
+  // Splits [startAngle, endAngle) into <=90-degree pieces and appends each
+  // as a cubic Bezier (identical to the Windows backend's helper).
+  void appendArc(float cx, float cy, float rx, float ry, float rotation,
+                 float a0, float a1, bool ccw, bool asMove) {
+    constexpr float kTwoPi = 6.28318530717959f;
+    float delta = a1 - a0;
+    if (!ccw) {
+      while (delta < 0)
+        delta += kTwoPi;
+    } else {
+      while (delta > 0)
+        delta -= kTwoPi;
+    }
+    float cosR = std::cos(rotation), sinR = std::sin(rotation);
+    auto mapPt = [&](float ux, float uy, float &px, float &py) {
+      float ex = rx * ux, ey = ry * uy;
+      px = cx + ex * cosR - ey * sinR;
+      py = cy + ex * sinR + ey * cosR;
+    };
+    float p0x, p0y;
+    mapPt(std::cos(a0), std::sin(a0), p0x, p0y);
+    if (asMove)
+      moveTo(p0x, p0y);
+    else
+      lineTo(p0x, p0y);
+    if (std::abs(delta) < 1e-6f)
+      return;
+    int segCount = std::max(
+        1, static_cast<int>(std::ceil(std::abs(delta) / (3.14159265f / 2))));
+    float segAngle = delta / segCount;
+    float ang = a0;
+    for (int i = 0; i < segCount; ++i) {
+      float ang1 = ang + segAngle;
+      // Control-point length for a circular arc of angle (ang1 - ang): the
+      // formula needs tan of HALF the sweep.
+      float t = std::tan((ang1 - ang) / 2.0f);
+      float alpha =
+          std::sin(ang1 - ang) * (std::sqrt(4.0f + 3.0f * t * t) - 1.0f) / 3.0f;
+      float e0x = std::cos(ang), e0y = std::sin(ang);
+      float e1x = std::cos(ang1), e1y = std::sin(ang1);
+      float d0x = -e0y, d0y = e0x;
+      float d1x = -e1y, d1y = e1x;
+      float c1ex = e0x + alpha * d0x, c1ey = e0y + alpha * d0y;
+      float c2ex = e1x - alpha * d1x, c2ey = e1y - alpha * d1y;
+      float c1x, c1y, c2x, c2y, ex1, ey1;
+      mapPt(c1ex, c1ey, c1x, c1y);
+      mapPt(c2ex, c2ey, c2x, c2y);
+      mapPt(e1x, e1y, ex1, ey1);
+      segs_.push_back(Seg::cubic(c1x, c1y, c2x, c2y, ex1, ey1));
+      curX_ = ex1;
+      curY_ = ey1;
+      ang = ang1;
+    }
+  }
+
+  // Where the layout's top-left goes so the string lands at (x,y) with the
+  // current textAlign/textBaseline (same rules as the other backends).
+  void textOrigin(float advance, float height, float baseline, float x, float y,
+                  float &bx, float &by) const {
+    bx = x;
+    by = y;
+    switch (textAlign_) {
+    case TextAlign::Center:
+      bx -= advance / 2.0f;
+      break;
+    case TextAlign::End:
+      bx -= advance;
+      break;
+    default:
+      break;
+    }
+    switch (textBaseline_) {
+    case TextBaseline::Top:
+      break;
+    case TextBaseline::Middle:
+      by -= height / 2.0f;
+      break;
+    case TextBaseline::Bottom:
+      by -= height;
+      break;
+    case TextBaseline::Alphabetic:
+    default:
+      by -= baseline;
+      break;
+    }
+  }
+
+  // Glyph bitmaps are rasterized at the transform's scale (quantized, so
+  // slightly different scales share cache entries) to stay crisp when the
+  // canvas is zoomed; rotation and skew are applied by the quad.
+  float textRasterScale() const {
+    return std::clamp(std::round(scaleFactor() * 16.0f) / 16.0f, 0.25f, 16.0f);
+  }
+  std::string textKey(const std::string &text, const TextStyle &ts,
+                      float scale) const {
+    char head[160];
+    std::snprintf(head, sizeof(head), "|%g|%d|%d|%d%d|%g|%g|%g|",
+                  static_cast<double>(resolveStatic(ts.fontSize)),
+                  static_cast<int>(resolveStatic(ts.fontWeight)),
+                  static_cast<int>(resolveStatic(ts.fontStyle)),
+                  ts.underline ? 1 : 0, ts.strikethrough ? 1 : 0,
+                  static_cast<double>(ts.letterSpacing),
+                  static_cast<double>(ts.lineHeight),
+                  static_cast<double>(scale));
+    return ts.fontFamily + head + text;
+  }
+
+  void drawTextImpl(const std::string &text, float x, float y, bool stroked) {
+    if (text.empty())
+      return;
+    TextStyle ts = fontToTextStyle();
+    if (stroked) {
+      strokeTextOutline(text, ts, x, y);
+      return;
+    }
+    const float s = textRasterScale();
+    // Strings that may contain colour glyphs (emoji) are rasterized as RGBA
+    // with the (solid) fill colour baked in, so emoji keep their own colours.
+    // A gradient fill can't be baked; those draw as tinted silhouettes.
+    const bool bake =
+        !fillPaint_.isGradient && liteui_canvas_gl::mayHaveColorGlyphs(text);
+    std::string key = textKey(text, ts, s);
+    if (bake) {
+      char suffix[40];
+      std::snprintf(suffix, sizeof(suffix), "#%02x%02x%02x%02x",
+                    fillPaint_.color.r, fillPaint_.color.g, fillPaint_.color.b,
+                    fillPaint_.color.a);
+      key += suffix;
+    }
+    liteui_canvas_gl::TextEntry e;
+    if (!gl_.findText(key, e)) {
+      liteui_canvas_gl::RasterText rt;
+      if (!Gl::rasterizeText(
+              text, ts, s, bake ? &fillPaint_.color : nullptr, rt) ||
+          !gl_.addText(key, rt, e)) {
+        warnOnce("fillText(): the text is too large for the glyph atlas; nothing drawn");
+        return;
+      }
+    }
+    if (e.w == 0)
+      return; // nothing inked (e.g. only spaces)
+    float bx, by;
+    textOrigin(e.advance, e.height, e.baseline, x, y, bx, by);
+    // With an axis-aligned transform, put the origin on a whole device pixel
+    // so the glyph bitmap lands 1:1 on the pixel grid (crisp text).
+    if (ctm_.b == 0 && ctm_.c == 0 && ctm_.a != 0 && ctm_.d != 0) {
+      float ox, oy;
+      ctm_.apply(bx, by, ox, oy);
+      bx += (std::round(ox) - ox) / ctm_.a;
+      by += (std::round(oy) - oy) / ctm_.d;
+    }
+    prepareNormal();
+    gl_.setBlend(composite_);
+    const float qx = bx + e.offX, qy = by + e.offY;
+    const float qw = static_cast<float>(e.w) / s, qh = static_cast<float>(e.h) / s;
+    if (hasShadow()) {
+      gl_.setMask(e.color ? 3 : 1); // the glyph's silhouette, in shadow colour
+      gl_.setPaintSolid();
+      emitTexQuad(ctm_, qx + shadowOffsetX_, qy + shadowOffsetY_, qw, qh, e.u0,
+                  e.v0, e.u1, e.v1, premul(shadowColor_));
+    }
+    gl_.setMask(e.color ? 2 : 1);
+    Rgba c;
+    if (e.color) { // paint is baked into the bitmap; only globalAlpha applies
+      gl_.setPaintSolid();
+      c = {globalAlpha_, globalAlpha_, globalAlpha_, globalAlpha_};
+    } else {
+      c = bindPaint(fillPaint_);
+    }
+    emitTexQuad(ctm_, qx, qy, qw, qh, e.u0, e.v0, e.u1, e.v1, c);
+    gl_.setMask(0);
+  }
+
+  // strokeText traces the real glyph outlines with the normal stroker, so
+  // lineWidth, joins, dashes, gradients, shadow and clip all apply. (The
+  // Cairo and Windows backends only approximate this with offset copies.)
+  void strokeTextOutline(const std::string &text, const TextStyle &ts, float x,
+                         float y) {
+    std::vector<liteui_canvas_gl::OutlineContour> oc;
+    liteui_canvas_gl::TextBox box;
+    if (!Gl::outlineText(text, ts, 0.1f / scaleFactor(), oc,
+                                       box)) {
+      warnOnce("strokeText(): the glyph outlines could not be obtained; nothing drawn");
+      return;
+    }
+    float bx, by;
+    textOrigin(box.advance, box.height, box.baseline, x, y, bx, by);
+    std::vector<Contour> cs;
+    for (const auto &o : oc) {
+      Contour c;
+      c.closed = o.closed;
+      for (size_t i = 0; i + 1 < o.xy.size(); i += 2)
+        c.pts.push_back({bx + o.xy[i], by + o.xy[i + 1]});
+      cs.push_back(std::move(c));
+    }
+    strokeContours(cs);
+  }
+
+  TextStyle fontToTextStyle() const {
+    TextStyle ts = font_;
+    ts.wrap = TextWrap::NoWrap;
+    return ts;
+  }
+
+  // One stderr line per distinct missing feature per process, so a canvas
+  // that repaints every frame doesn't flood the log.
+  static void warnOnce(const char *what) {
+    static std::vector<std::string> seen;
+    for (const auto &s : seen)
+      if (s == what)
+        return;
+    seen.emplace_back(what);
+    fprintf(stderr,
+            "liteui [LITEUI_CANVAS_GL]: %s\n",
+            what);
+  }
+
+  Gl &gl_;
+  float width_, height_;
+  const View::Computed *imageCacheOwner_;
+
+  Mat ctm_;
+  Paint fillPaint_ = Paint::solid(Color{0, 0, 0, 255});
+  Paint strokePaint_ = Paint::solid(Color{0, 0, 0, 255});
+  float lineWidth_ = 1.0f;
+  LineCap lineCap_ = LineCap::Butt;
+  LineJoin lineJoin_ = LineJoin::Miter;
+  float miterLimit_ = 10.0f;
+  std::vector<float> dashes_;
+  float dashOffset_ = 0.0f;
+  float globalAlpha_ = 1.0f;
+  CompositeOp composite_ = CompositeOp::SourceOver;
+  Color shadowColor_{0, 0, 0, 0};
+  float shadowOffsetX_ = 0.0f, shadowOffsetY_ = 0.0f;
+  TextStyle font_;
+  TextAlign textAlign_ = TextAlign::Start;
+  TextBaseline textBaseline_ = TextBaseline::Alphabetic;
+
+  std::vector<Seg> segs_;
+  std::vector<bool> figureClosed_; // one entry per Move, parallel order
+  float curX_ = 0, curY_ = 0, startX_ = 0, startY_ = 0;
+
+  int clipLevel_ = 0; // current clip nesting (see the stencil layout)
+  std::vector<State> stack_;
+};
+
+using CanvasContextImpl = GlCanvasContext<liteui_canvas_gl::Renderer>;
 
 #else // Linux — Cairo
 
@@ -8719,13 +11393,13 @@ void View::freeTextResources() {
     computed.textLayout->Release();
     computed.textLayout = nullptr;
   }
-  if (computed.canvasTarget) {
-    computed.canvasTarget->Release();
-    computed.canvasTarget = nullptr;
+  if (computed.canvasBitmap) {
+    computed.canvasBitmap->Release();
+    computed.canvasBitmap = nullptr;
   }
-  if (computed.canvasWicBitmap) {
-    computed.canvasWicBitmap->Release();
-    computed.canvasWicBitmap = nullptr;
+  if (computed.canvasStaging) {
+    computed.canvasStaging->Release();
+    computed.canvasStaging = nullptr;
   }
   if (computed.cachedImageBitmap) {
     computed.cachedImageBitmap->Release();
@@ -8735,6 +11409,27 @@ void View::freeTextResources() {
   if (computed.textTexture) {
     glDeleteTextures(1, &computed.textTexture);
     computed.textTexture = 0;
+  }
+  if (computed.cachedImageTexture) {
+    glDeleteTextures(1, &computed.cachedImageTexture);
+    computed.cachedImageTexture = 0;
+    computed.cachedImagePixels = nullptr;
+  }
+  if (computed.canvasFbo) {
+    glDeleteFramebuffers(1, &computed.canvasFbo);
+    computed.canvasFbo = 0;
+  }
+  if (computed.canvasMsaaFbo) {
+    glDeleteFramebuffers(1, &computed.canvasMsaaFbo);
+    computed.canvasMsaaFbo = 0;
+  }
+  if (computed.canvasMsaaColorRb) {
+    glDeleteRenderbuffers(1, &computed.canvasMsaaColorRb);
+    computed.canvasMsaaColorRb = 0;
+  }
+  if (computed.canvasDsRb) {
+    glDeleteRenderbuffers(1, &computed.canvasDsRb);
+    computed.canvasDsRb = 0;
   }
   if (computed.canvasTexture) {
     glDeleteTextures(1, &computed.canvasTexture);
@@ -10178,53 +12873,172 @@ private:
 
   // Device-independent: created once in the constructor, lives for the
   // process (well, the LiteUI instance's) lifetime.
-  ID2D1Factory *d2dFactory_ = nullptr;
+  ID2D1Factory1 *d2dFactory_ = nullptr;
 
-  // Backs every Canvas node's offscreen render target with a WIC bitmap
-  // (see ensureCanvasTarget) so getImageData/clearRect can lock real
-  // pixels — see the Canvas limitations note. Lazily created on first use
-  // and cached for the LiteUI instance's lifetime, unlike the file-dialog
-  // helpers above (each of which pairs its own CoInitializeEx/
-  // CoUninitialize per call): this factory has to outlive individual
-  // paint calls, so its COM apartment is torn down alongside it in
-  // ~LiteUI() instead.
-  IWICImagingFactory *wicFactory_ = nullptr;
-  bool wicComInitialized_ = false;
-  IWICImagingFactory *ensureWicFactory() {
-    if (wicFactory_)
-      return wicFactory_;
-    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    wicComInitialized_ = SUCCEEDED(coHr);
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&wicFactory_))))
-      wicFactory_ = nullptr;
-    return wicFactory_;
+  // ---- GPU device objects (Direct3D 11 + Direct2D 1.1) ----------------
+  // Device-dependent. Everything the window and every Canvas node draw
+  // with hangs off one Direct3D 11 device, so a canvas texture can be
+  // drawn straight into the window without ever leaving the GPU:
+  //
+  //   d3dDevice_ -> d2dDevice_ -> renderTarget_ (window context)
+  //                            \-> canvasDc_    (canvas-node context)
+  //   d3dDevice_ + hwnd_ -> swapChain_ -> backBuffer_ (renderTarget_'s target)
+  //
+  // The window and the canvases use separate device contexts because a
+  // canvas is rendered (from paintCanvas) while the window's context is
+  // already inside BeginDraw()/EndDraw(), and a context can't switch
+  // targets or start a second draw in the middle of one.
+  ID3D11Device *d3dDevice_ = nullptr;
+  IDXGISwapChain1 *swapChain_ = nullptr;
+  ID2D1Device *d2dDevice_ = nullptr;
+  // The window's context (kept under its old name: it is still "the render
+  // target" every paint function draws through; a device context is an
+  // ID2D1RenderTarget).
+  ID2D1DeviceContext *renderTarget_ = nullptr;
+  ID2D1Bitmap1 *backBuffer_ = nullptr;
+  ID2D1DeviceContext *canvasDc_ = nullptr;
+  // Set when something reports the device is gone (D2DERR_RECREATE_TARGET,
+  // DXGI_ERROR_DEVICE_REMOVED/RESET); WM_PAINT/WM_SIZE then tear every
+  // device object down and the next paint rebuilds them.
+  bool deviceLost_ = false;
+
+  template <class T> static void releaseCom(T *&p) {
+    if (p) {
+      p->Release();
+      p = nullptr;
+    }
   }
 
-  // Device-dependent: bound to hwnd_'s current size. Torn down and
-  // recreated if EndDraw() ever reports D2DERR_RECREATE_TARGET (e.g. after
-  // a display driver reset) — everything that draws goes through this
-  // pointer, never a raw HDC.
-  ID2D1HwndRenderTarget *renderTarget_ = nullptr;
+  // Wraps the swap chain's current back buffer as renderTarget_'s target.
+  HRESULT createBackBufferTarget() {
+    IDXGISurface *surface = nullptr;
+    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&surface));
+    if (FAILED(hr))
+      return hr;
+    // 96 dpi: the library lays everything out in client-area pixels, so
+    // one Direct2D unit is one pixel (as with the old HwndRenderTarget).
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+        96.0f, 96.0f);
+    hr = renderTarget_->CreateBitmapFromDxgiSurface(surface, &props,
+                                                    &backBuffer_);
+    surface->Release();
+    if (SUCCEEDED(hr))
+      renderTarget_->SetTarget(backBuffer_);
+    return hr;
+  }
 
-  // Lazily (re)creates renderTarget_ against hwnd_'s current client size.
-  // A no-op once a valid target already exists; WM_SIZE calls Resize()
-  // directly instead of tearing this down, so this only actually runs
-  // once per (factory, hwnd) pair unless EndDraw() invalidates the target.
+  HRESULT createDeviceResources() {
+    // BGRA support is required for Direct2D interop. Try the GPU first,
+    // fall back to WARP (Microsoft's software rasterizer) so the library
+    // still runs on a machine without a usable GPU/driver.
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0,
+                                        D3D_FEATURE_LEVEL_10_1,
+                                        D3D_FEATURE_LEVEL_10_0};
+    HRESULT hr = E_FAIL;
+    const D3D_DRIVER_TYPE types[] = {D3D_DRIVER_TYPE_HARDWARE,
+                                     D3D_DRIVER_TYPE_WARP};
+    for (D3D_DRIVER_TYPE type : types) {
+      hr = D3D11CreateDevice(nullptr, type, nullptr,
+                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                             ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                             &d3dDevice_, nullptr, nullptr);
+      if (SUCCEEDED(hr))
+        break;
+    }
+    if (FAILED(hr))
+      return hr;
+
+    IDXGIDevice *dxgiDevice = nullptr;
+    IDXGIAdapter *adapter = nullptr;
+    IDXGIFactory2 *dxgiFactory = nullptr;
+    hr = d3dDevice_->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+    if (SUCCEEDED(hr))
+      hr = d2dFactory_->CreateDevice(dxgiDevice, &d2dDevice_);
+    if (SUCCEEDED(hr))
+      hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                           &renderTarget_);
+    if (SUCCEEDED(hr))
+      hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                           &canvasDc_);
+    if (SUCCEEDED(hr))
+      hr = dxgiDevice->GetAdapter(&adapter);
+    if (SUCCEEDED(hr))
+      hr = adapter->GetParent(IID_PPV_ARGS(&dxgiFactory));
+    if (SUCCEEDED(hr)) {
+      RECT rc;
+      GetClientRect(hwnd_, &rc);
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      desc.Width = static_cast<UINT>(std::max<LONG>(1, rc.right - rc.left));
+      desc.Height = static_cast<UINT>(std::max<LONG>(1, rc.bottom - rc.top));
+      desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = 2;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+      desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+      desc.Scaling = DXGI_SCALING_STRETCH;
+      hr = dxgiFactory->CreateSwapChainForHwnd(d3dDevice_, hwnd_, &desc,
+                                               nullptr, nullptr, &swapChain_);
+      if (SUCCEEDED(hr))
+        dxgiFactory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+    }
+    releaseCom(dxgiFactory);
+    releaseCom(adapter);
+    releaseCom(dxgiDevice);
+    if (FAILED(hr))
+      return hr;
+    renderTarget_->SetDpi(96.0f, 96.0f);
+    canvasDc_->SetDpi(96.0f, 96.0f);
+    return createBackBufferTarget();
+  }
+
+  // Drops every device-dependent object, including each Canvas node's GPU
+  // texture (the tree is walked via freeTextResources; canvases rebuild and
+  // repaint themselves on demand because their texture pointer is null).
+  // Also the destructor's teardown path. Safe to call repeatedly.
+  void releaseDeviceResources() {
+    if (hasRoot_)
+      root_.freeTextResources();
+    if (renderTarget_)
+      renderTarget_->SetTarget(nullptr);
+    if (canvasDc_)
+      canvasDc_->SetTarget(nullptr);
+    releaseCom(backBuffer_);
+    releaseCom(canvasDc_);
+    releaseCom(renderTarget_);
+    releaseCom(swapChain_);
+    releaseCom(d2dDevice_);
+    releaseCom(d3dDevice_);
+    deviceLost_ = false;
+  }
+
+  // Lazily (re)creates the whole device stack against hwnd_'s current
+  // client size. A no-op once it exists; WM_SIZE resizes the swap chain
+  // instead of tearing anything down, so this only really runs at startup
+  // and after a device loss.
   void ensureRenderTarget() {
     if (renderTarget_)
       return;
-    RECT rc;
-    GetClientRect(hwnd_, &rc);
-    D2D1_SIZE_U size =
-        D2D1::SizeU(static_cast<UINT32>(std::max<LONG>(1, rc.right - rc.left)),
-                    static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
-    HRESULT hr = d2dFactory_->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(hwnd_, size), &renderTarget_);
+    if (FAILED(createDeviceResources())) {
+      releaseDeviceResources();
+      throw std::runtime_error("Direct3D 11 / Direct2D device creation failed");
+    }
+  }
+
+  // Swap-chain buffers can only be resized once nothing references them,
+  // so drop the Direct2D wrapper first and re-wrap afterwards.
+  void resizeBackBuffer(UINT w, UINT h) {
+    if (!swapChain_ || !renderTarget_)
+      return;
+    renderTarget_->SetTarget(nullptr);
+    releaseCom(backBuffer_);
+    HRESULT hr = swapChain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    if (SUCCEEDED(hr))
+      hr = createBackBufferTarget();
     if (FAILED(hr))
-      throw std::runtime_error("CreateHwndRenderTarget failed");
+      deviceLost_ = true;
   }
 
   // Converts our own Color into the D2D1::ColorF Direct2D brushes want.
@@ -10282,6 +13096,7 @@ private:
     case WM_PAINT: {
       PAINTSTRUCT ps;
       BeginPaint(hwnd, &ps);
+      bool recreate = false;
       if (self) {
         self->ensureRenderTarget();
         LITEUI_PROF_START(profBuild);
@@ -10292,16 +13107,23 @@ private:
         LITEUI_PROF_ADD(build, profBuild);
         LITEUI_PROF_START(profEnd);
         HRESULT hr = self->renderTarget_->EndDraw();
+        // Hand the finished frame to the display (vsync'd). Skipped when
+        // drawing already failed or a canvas reported device loss.
+        if (SUCCEEDED(hr) && !self->deviceLost_)
+          hr = self->swapChain_->Present(1, 0);
         LITEUI_PROF_ADD(endDraw, profEnd);
-        // D2DERR_RECREATE_TARGET means the underlying device is gone
-        // (driver reset, GPU removal, etc.) — drop the target so the next
-        // WM_PAINT's ensureRenderTarget() rebuilds it from scratch.
-        if (hr == D2DERR_RECREATE_TARGET) {
-          self->renderTarget_->Release();
-          self->renderTarget_ = nullptr;
+        // The GPU/driver went away (reset, removal, TDR): drop every device
+        // object — canvas textures included — and rebuild on the next
+        // paint, which we request below once EndPaint has run.
+        if (self->deviceLost_ || hr == D2DERR_RECREATE_TARGET ||
+            hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+          self->releaseDeviceResources();
+          recreate = true;
         }
       }
       EndPaint(hwnd, &ps);
+      if (recreate)
+        InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
 
@@ -10591,10 +13413,13 @@ private:
       if (self) {
         self->width_ = LOWORD(lp);
         self->height_ = HIWORD(lp);
-        if (self->renderTarget_)
-          self->renderTarget_->Resize(
-              D2D1::SizeU(static_cast<UINT32>(self->width_),
-                          static_cast<UINT32>(self->height_)));
+        if (self->swapChain_) {
+          self->resizeBackBuffer(
+              static_cast<UINT>(std::max(1, self->width_)),
+              static_cast<UINT>(std::max(1, self->height_)));
+          if (self->deviceLost_)
+            self->releaseDeviceResources(); // rebuilt by the next WM_PAINT
+        }
         self->relayout();
         self->pollAndRelayout();
         self->hideTooltip();
@@ -10780,106 +13605,75 @@ private:
     }
   }
 
-  // (Re)builds v.computed.canvasTarget — an offscreen render target sized
-  // to v's inner (padding-excluded) content box, backed by a WIC bitmap
-  // (v.computed.canvasWicBitmap) rather than an opaque GPU-compatible
-  // bitmap so CanvasContext can lock real pixels for getImageData/
-  // clearRect — see the Canvas limitations note. Rebuilt whenever that
-  // size has changed since it was last built, then v.onPaint is
-  // (re)invoked into it whenever the size changed OR the app requested a
-  // redraw via View::requestCanvasRedraw() (canvasNeedsRedraw starts
-  // true, so this always happens at least once). A plain repaint with
-  // neither condition true is a no-op: the previous frame's bitmap is
-  // simply reused.
+  // (Re)builds v.computed.canvasBitmap — a GPU render-target texture sized
+  // to v's inner (padding-excluded) content box, living on the same
+  // Direct3D 11 device as the window — whenever that size has changed
+  // since it was last built, then v.onPaint is (re)invoked into it
+  // whenever the size changed OR the app requested a redraw via
+  // View::requestCanvasRedraw() (canvasNeedsRedraw starts true, so this
+  // always happens at least once). A plain repaint with neither condition
+  // true is a no-op: the previous frame's texture is simply reused.
   void ensureCanvasTarget(const View &v) {
+    if (!canvasDc_)
+      return;
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
     float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
-    bool resized = !v.computed.canvasTarget ||
+    bool resized = !v.computed.canvasBitmap ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
     if (resized) {
-      if (v.computed.canvasTarget) {
-        v.computed.canvasTarget->Release();
-        v.computed.canvasTarget = nullptr;
-      }
-      if (v.computed.canvasWicBitmap) {
-        v.computed.canvasWicBitmap->Release();
-        v.computed.canvasWicBitmap = nullptr;
-      }
-      // A bitmap cached against the OLD canvasTarget can't be reused on
-      // the new one (see CanvasContext::drawImage's comment) — drop it so
-      // the next drawImage call rebuilds fresh instead of leaking it or,
-      // worse, drawing a stale bitmap belonging to a released target.
-      if (v.computed.cachedImageBitmap) {
-        v.computed.cachedImageBitmap->Release();
-        v.computed.cachedImageBitmap = nullptr;
-      }
-      v.computed.cachedImagePixels = nullptr;
-      v.computed.cachedImagePixelsSize = 0;
-      v.computed.cachedImageW = v.computed.cachedImageH = -1;
-      IWICImagingFactory *wic = ensureWicFactory();
-      // GUID_WICPixelFormat32bppPBGRA (premultiplied BGRA) is the pixel
-      // format Direct2D itself requires for a WIC bitmap render target,
-      // and matches the premultiplied byte order Cairo's own ARGB32
-      // surfaces use on the Linux backend — so getImageData/clearRect's
-      // pixel math below mirrors the Cairo path almost exactly.
-      if (wic && SUCCEEDED(wic->CreateBitmap(
-                     static_cast<UINT>(innerW), static_cast<UINT>(innerH),
-                     GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
-                     &v.computed.canvasWicBitmap))) {
-        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
-                              D2D1_ALPHA_MODE_PREMULTIPLIED));
-        d2dFactory_->CreateWicBitmapRenderTarget(
-            v.computed.canvasWicBitmap, props, &v.computed.canvasTarget);
-      }
+      releaseCom(v.computed.canvasBitmap);
+      releaseCom(v.computed.canvasStaging); // sized for the old texture
+      // cachedImageBitmap is deliberately kept: it is a device resource,
+      // not tied to the old texture, so a resize can reuse it.
+      D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+          D2D1_BITMAP_OPTIONS_TARGET,
+          D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D2D1_ALPHA_MODE_PREMULTIPLIED),
+          96.0f, 96.0f);
+      canvasDc_->CreateBitmap(
+          D2D1::SizeU(static_cast<UINT32>(innerW),
+                      static_cast<UINT32>(innerH)),
+          nullptr, 0, &props, &v.computed.canvasBitmap);
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
     }
-    if (!v.computed.canvasTarget)
+    if (!v.computed.canvasBitmap)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
       LITEUI_PROF_START(profCanvas);
-      v.computed.canvasTarget->BeginDraw();
-      v.computed.canvasTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
-      CanvasContextImpl ctx(v.computed.canvasTarget, innerW, innerH,
-                            v.computed.canvasWicBitmap, &v.computed);
-      v.onPaint(ctx);
-      v.computed.canvasTarget->EndDraw();
+      canvasDc_->SetTarget(v.computed.canvasBitmap);
+      canvasDc_->BeginDraw();
+      canvasDc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+      {
+        // Scoped so ~CanvasContextImpl (which pops any clip layers onPaint
+        // left open) runs BEFORE EndDraw().
+        CanvasContextImpl ctx(canvasDc_, v.computed.canvasBitmap, innerW,
+                              innerH, &v.computed);
+        v.onPaint(ctx);
+      }
+      HRESULT hr = canvasDc_->EndDraw();
+      canvasDc_->SetTarget(nullptr);
+      if (hr == D2DERR_RECREATE_TARGET)
+        deviceLost_ = true; // WM_PAINT tears the device down after this frame
       v.computed.canvasNeedsRedraw = false;
       LITEUI_PROF_ADD(canvas, profCanvas);
     }
   }
 
-  // Blits v's cached canvas bitmap into the window's own render target at
-  // v's final on-screen position (inset by padding, same convention as
-  // paintText's x/y). Since a WIC-backed ID2D1RenderTarget has no
-  // GetBitmap() of its own (unlike the old ID2D1BitmapRenderTarget), this
-  // builds a fresh ID2D1Bitmap from canvasWicBitmap on `rt` (always
-  // renderTarget_ in practice) each call via CreateBitmapFromWicBitmap —
-  // a real CPU-to-GPU upload every paint, not just an AddRef the way
-  // GetBitmap() was. That's a deliberate trade-off for correctness and
-  // simplicity (it also sidesteps needing to invalidate any cached bitmap
-  // on device loss/D2DERR_RECREATE_TARGET); revisit with a cache keyed on
-  // canvasNeedsRedraw if this ever shows up as a bottleneck.
+  // Draws v's canvas texture into the window's render target at v's final
+  // on-screen position (inset by padding, same convention as paintText's
+  // x/y). Both contexts share one Direct2D device, so this is a GPU-to-GPU
+  // textured quad: no pixel is copied or uploaded.
   void paintCanvas(ID2D1RenderTarget *rt, const View &v) {
     ensureCanvasTarget(v);
-    if (!v.computed.canvasTarget || !v.computed.canvasWicBitmap)
-      return;
-    LITEUI_PROF_START(profBlit);
-    ID2D1Bitmap *bmp = nullptr;
-    // nullptr bitmapProperties (this parameter is optional, unlike
-    // CreateBitmap's required one above): the WIC bitmap is already
-    // GUID_WICPixelFormat32bppPBGRA, which maps directly onto
-    // DXGI_FORMAT_B8G8R8A8_UNORM + D2D1_ALPHA_MODE_PREMULTIPLIED, so
-    // there's no ambiguity for Direct2D to resolve by inferring it.
-    rt->CreateBitmapFromWicBitmap(v.computed.canvasWicBitmap, nullptr, &bmp);
+    ID2D1Bitmap1 *bmp = v.computed.canvasBitmap;
     if (!bmp)
       return;
+    LITEUI_PROF_START(profBlit);
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float x = v.computed.x + pad.left;
@@ -10887,7 +13681,6 @@ private:
     D2D1_SIZE_F sz = bmp->GetSize();
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->DrawBitmap(bmp, D2D1::RectF(x, y, x + sz.width, y + sz.height));
-    bmp->Release();
     LITEUI_PROF_ADD(blit, profBlit);
   }
 
@@ -11099,7 +13892,7 @@ private:
       false; // Tracks whether the window currently believes
              // itself to be maximized (for toggling and icon state).
 
-  // ---- EGL / GLES2 ----
+  // ---- EGL / GLES 3.0 ----
   // GPU-accelerated replacement for the old wl_shm double buffer. The
   // compositor owns presentation timing via eglSwapBuffers (backed by
   // wayland-egl's own internal buffer queue), so there's no manual
@@ -11110,9 +13903,15 @@ private:
   EGLContext eglContext_ = EGL_NO_CONTEXT;
   EGLSurface eglSurface_ = EGL_NO_SURFACE;
   bool eglReady_ = false; // true once initEgl() has completed
+  EGLConfig eglConfig_ = nullptr; // kept so a lost context can be recreated
+  bool recoveringContext_ = false;
+  int contextLossStreak_ = 0; // consecutive lost swaps (recovery gives up at 3)
 
   GLuint rectProgram_ = 0, flatProgram_ = 0;
   GLuint texProgram_ = 0;
+#if defined(LITEUI_CANVAS_GL)
+  liteui_canvas_gl::Renderer canvasGl_; // shared by every canvas node
+#endif
   GLuint canvasProgram_ = 0; // samples RGBA directly, no alpha-tint (unlike
                              // texProgram_'s glyph-coverage tinting)
   GLuint quadVbo_ = 0; // static unit quad, reused by every rectProgram_ draw
@@ -11135,7 +13934,7 @@ private:
   bool running_ = true;   // Controls the event loop in run(); set false to
                           // request a clean exit.
 
-  // ---- GLES2 rendering ----
+  // ---- GLES 3.0 rendering ----
   // Two tiny shader programs cover everything this UI draws:
   //  - rectProgram_: an axis-aligned box with an optional rounded-corner
   //    radius, via a signed-distance test in the fragment shader. Used for
@@ -11220,6 +14019,16 @@ private:
   // color data straight out of Cairo, so this simply samples it as-is —
   // reuses kTexVS unchanged since the vertex stage (position a unit quad,
   // pass through UV) is identical.
+  // The GPU canvas backend's targets hold plain RGBA (no Cairo BGRA
+  // byte order), already premultiplied: sample as-is.
+  static constexpr const char *kCanvasRgbaFS = R"(
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D u_tex;
+    void main() {
+      gl_FragColor = texture2D(u_tex, v_uv);
+    }
+  )";
   static constexpr const char *kCanvasFS = R"(
     precision mediump float;
     varying vec2 v_uv;
@@ -11785,6 +14594,157 @@ private:
   // compiles the two shader programs. Called once, from surfaceConfigure(),
   // the first time the compositor hands us a configure event — mirroring
   // when attachBuffer() used to run.
+  // ---- GL context lifecycle ----------------------------------------------
+  // Creates the OpenGL ES 3.0 context for eglConfig_.
+  void createEglContext() {
+    const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    eglContext_ =
+        eglCreateContext(eglDisplay_, eglConfig_, EGL_NO_CONTEXT, ctxAttribs);
+    if (eglContext_ == EGL_NO_CONTEXT)
+      throw std::runtime_error(
+          "eglCreateContext failed: liteui needs an OpenGL ES 3.0 capable "
+          "EGL driver");
+  }
+
+  // Binds the context to the window surface and checks what we really got.
+  void makeContextCurrent() {
+    if (!eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_))
+      throw std::runtime_error("eglMakeCurrent failed");
+    // Belt and braces: some drivers hand back a lower-version context than
+    // asked for. Fail here with a clear message rather than later with a
+    // missing-entry-point crash inside the Canvas renderer.
+    GLint glMajor = 0, glMinor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &glMajor);
+    glGetIntegerv(GL_MINOR_VERSION, &glMinor);
+    if (glMajor < 3) {
+      const char *ver = reinterpret_cast<const char *>(glGetString(GL_VERSION));
+      fprintf(stderr, "liteui: got GL \"%s\", need OpenGL ES 3.0+\n",
+              ver ? ver : "?");
+      throw std::runtime_error("OpenGL ES 3.0 context unavailable");
+    }
+    eglSwapInterval(eglDisplay_,
+                    1); // vsync — avoids tearing during scroll drags
+  }
+
+  // Every GL object the window renderer owns: programs, shared buffers and
+  // fixed pipeline state. Run once at startup and again after the context
+  // is recreated.
+  void createGlResources() {
+    rectProgram_ = linkProgram(kRectVS, kRectFS);
+    rectAPos_ = glGetAttribLocation(rectProgram_, "a_pos");
+    rectUPos_ = glGetUniformLocation(rectProgram_, "u_rectPos");
+    rectUSize_ = glGetUniformLocation(rectProgram_, "u_rectSize");
+    rectUScreen_ = glGetUniformLocation(rectProgram_, "u_screen");
+    rectURadius_ = glGetUniformLocation(rectProgram_, "u_radius");
+    rectUColor_ = glGetUniformLocation(rectProgram_, "u_color");
+
+    flatProgram_ = linkProgram(kFlatVS, kFlatFS);
+    flatAPos_ = glGetAttribLocation(flatProgram_, "a_pos");
+    flatUScreen_ = glGetUniformLocation(flatProgram_, "u_screen");
+    flatUColor_ = glGetUniformLocation(flatProgram_, "u_color");
+
+    texProgram_ = linkProgram(kTexVS, kTexFS);
+    texAPos_ = glGetAttribLocation(texProgram_, "a_pos");
+    texUPos_ = glGetUniformLocation(texProgram_, "u_pos");
+    texUSize_ = glGetUniformLocation(texProgram_, "u_size");
+    texUScreen_ = glGetUniformLocation(texProgram_, "u_screen");
+    texUTex_ = glGetUniformLocation(texProgram_, "u_tex");
+    texUColor_ = glGetUniformLocation(texProgram_, "u_color");
+
+#if defined(LITEUI_CANVAS_GL)
+    canvasProgram_ = linkProgram(kTexVS, kCanvasRgbaFS);
+#else
+    canvasProgram_ = linkProgram(kTexVS, kCanvasFS);
+#endif
+    canvasAPos_ = glGetAttribLocation(canvasProgram_, "a_pos");
+    canvasUPos_ = glGetUniformLocation(canvasProgram_, "u_pos");
+    canvasUSize_ = glGetUniformLocation(canvasProgram_, "u_size");
+    canvasUScreen_ = glGetUniformLocation(canvasProgram_, "u_screen");
+    canvasUTex_ = glGetUniformLocation(canvasProgram_, "u_tex");
+
+    static const float kUnitQuad[] = {0, 0, 1, 0, 0, 1, 1, 1};
+    glGenBuffers(1, &quadVbo_);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kUnitQuad), kUnitQuad, GL_STATIC_DRAW);
+    glGenBuffers(1, &flatVbo_); // contents supplied per-draw in drawLine()
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_SCISSOR_TEST); // ClipRect maps straight onto glScissor
+#if defined(LITEUI_CANVAS_GL)
+    if (!canvasGl_.init())
+      throw std::runtime_error("liteui: GL canvas renderer failed to start");
+#endif
+  }
+
+  // Forgets (does NOT delete) every GL name held by the view tree. Used when
+  // the context is gone: all names died with it, and deleting a stale name
+  // inside the replacement context could destroy an unrelated new object
+  // that happens to reuse the number. Everything is rebuilt lazily: text
+  // and canvas textures are re-created because their handle is now 0.
+  static void forgetGlHandles(View &v) {
+    Computed_forget(v.computed);
+    for (auto &c : v.children)
+      forgetGlHandles(c);
+  }
+  static void Computed_forget(const View::Computed &c) {
+    c.textTexture = 0;
+    c.canvasTexture = 0;
+    c.canvasFbo = 0;
+    c.canvasMsaaFbo = 0;
+    c.canvasMsaaColorRb = 0;
+    c.canvasDsRb = 0;
+    c.cachedImageTexture = 0;
+    c.cachedImagePixels = nullptr; // the cached upload is gone
+    c.canvasNeedsRedraw = true;    // contents were GPU-only: repaint them
+    c.canvasBuiltForWidth = c.canvasBuiltForHeight = -1.0f;
+  }
+
+  // Called when eglSwapBuffers reports EGL_CONTEXT_LOST (GPU reset, driver
+  // restart, suspend/resume on some stacks). The window surface survives; the
+  // context and everything created in it does not. Builds a fresh context,
+  // recreates the window's GL objects, and repaints. Gives up after three
+  // consecutive losses so a dead GPU can't spin forever; the window then
+  // simply stops updating.
+  void recoverFromContextLoss() {
+    if (recoveringContext_)
+      return;
+    if (++contextLossStreak_ > 3) {
+      fprintf(stderr, "liteui: GL context keeps getting lost; giving up\n");
+      eglReady_ = false;
+      return;
+    }
+    recoveringContext_ = true;
+    fprintf(stderr, "liteui: GL context lost, recreating it\n");
+    eglReady_ = false;
+    eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (eglContext_ != EGL_NO_CONTEXT) {
+      eglDestroyContext(eglDisplay_, eglContext_);
+      eglContext_ = EGL_NO_CONTEXT;
+    }
+    if (hasRoot_)
+      forgetGlHandles(root_);
+    rectProgram_ = flatProgram_ = texProgram_ = canvasProgram_ = 0;
+    quadVbo_ = flatVbo_ = 0;
+    tooltipTextTexture_ = 0;
+    tooltipTextureBuiltFor_.clear();
+#if defined(LITEUI_CANVAS_GL)
+    canvasGl_.abandon();
+#endif
+    try {
+      createEglContext();
+      makeContextCurrent();
+      createGlResources();
+      eglReady_ = true;
+    } catch (const std::exception &e) {
+      fprintf(stderr, "liteui: could not recover from GL context loss: %s\n",
+              e.what());
+    }
+    recoveringContext_ = false;
+    if (eglReady_)
+      redraw(); // repaint immediately with the new context
+  }
+
   void initEgl() {
     // eglGetDisplay() can't reliably tell "this pointer is a wl_display*"
     // apart from other native display types on multi-platform Mesa
@@ -11809,10 +14769,18 @@ private:
       throw std::runtime_error("eglInitialize failed");
     eglBindAPI(EGL_OPENGL_ES_API);
 
+    // The Canvas backend needs OpenGL ES 3.0 (VAOs, multisampled
+    // renderbuffers, glBlitFramebuffer, PBO readback, R8 textures). EGL 1.5
+    // names the bit EGL_OPENGL_ES3_BIT; older headers only have the KHR
+    // spelling, which has the same value.
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT 0x00000040
+#endif
+
     const EGLint cfgAttribs[] = {EGL_SURFACE_TYPE,
                                  EGL_WINDOW_BIT,
                                  EGL_RENDERABLE_TYPE,
-                                 EGL_OPENGL_ES2_BIT,
+                                 EGL_OPENGL_ES3_BIT,
                                  EGL_RED_SIZE,
                                  8,
                                  EGL_GREEN_SIZE,
@@ -11822,32 +14790,25 @@ private:
                                  EGL_ALPHA_SIZE,
                                  0,
                                  EGL_NONE};
-    EGLConfig config;
     EGLint numConfigs = 0;
-    if (!eglChooseConfig(eglDisplay_, cfgAttribs, &config, 1, &numConfigs) ||
+    if (!eglChooseConfig(eglDisplay_, cfgAttribs, &eglConfig_, 1,
+                         &numConfigs) ||
         numConfigs < 1)
       throw std::runtime_error("eglChooseConfig failed");
 
-    const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    eglContext_ =
-        eglCreateContext(eglDisplay_, config, EGL_NO_CONTEXT, ctxAttribs);
-    if (eglContext_ == EGL_NO_CONTEXT)
-      throw std::runtime_error("eglCreateContext failed");
+    createEglContext();
 
     eglWindow_ = wl_egl_window_create(surface_, width_, height_);
     if (!eglWindow_)
       throw std::runtime_error("wl_egl_window_create failed");
 
     eglSurface_ = eglCreateWindowSurface(
-        eglDisplay_, config, reinterpret_cast<EGLNativeWindowType>(eglWindow_),
-        nullptr);
+        eglDisplay_, eglConfig_,
+        reinterpret_cast<EGLNativeWindowType>(eglWindow_), nullptr);
     if (eglSurface_ == EGL_NO_SURFACE)
       throw std::runtime_error("eglCreateWindowSurface failed");
 
-    if (!eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_))
-      throw std::runtime_error("eglMakeCurrent failed");
-    eglSwapInterval(eglDisplay_,
-                    1); // vsync — avoids tearing during scroll drags
+    makeContextCurrent();
 
     // Tell the compositor this whole surface is opaque, so it can skip
     // blending against the desktop entirely rather than relying solely on
@@ -11859,43 +14820,7 @@ private:
     wl_surface_set_opaque_region(surface_, opaque);
     wl_region_destroy(opaque);
 
-    rectProgram_ = linkProgram(kRectVS, kRectFS);
-    rectAPos_ = glGetAttribLocation(rectProgram_, "a_pos");
-    rectUPos_ = glGetUniformLocation(rectProgram_, "u_rectPos");
-    rectUSize_ = glGetUniformLocation(rectProgram_, "u_rectSize");
-    rectUScreen_ = glGetUniformLocation(rectProgram_, "u_screen");
-    rectURadius_ = glGetUniformLocation(rectProgram_, "u_radius");
-    rectUColor_ = glGetUniformLocation(rectProgram_, "u_color");
-
-    flatProgram_ = linkProgram(kFlatVS, kFlatFS);
-    flatAPos_ = glGetAttribLocation(flatProgram_, "a_pos");
-    flatUScreen_ = glGetUniformLocation(flatProgram_, "u_screen");
-    flatUColor_ = glGetUniformLocation(flatProgram_, "u_color");
-
-    texProgram_ = linkProgram(kTexVS, kTexFS);
-    texAPos_ = glGetAttribLocation(texProgram_, "a_pos");
-    texUPos_ = glGetUniformLocation(texProgram_, "u_pos");
-    texUSize_ = glGetUniformLocation(texProgram_, "u_size");
-    texUScreen_ = glGetUniformLocation(texProgram_, "u_screen");
-    texUTex_ = glGetUniformLocation(texProgram_, "u_tex");
-    texUColor_ = glGetUniformLocation(texProgram_, "u_color");
-
-    canvasProgram_ = linkProgram(kTexVS, kCanvasFS);
-    canvasAPos_ = glGetAttribLocation(canvasProgram_, "a_pos");
-    canvasUPos_ = glGetUniformLocation(canvasProgram_, "u_pos");
-    canvasUSize_ = glGetUniformLocation(canvasProgram_, "u_size");
-    canvasUScreen_ = glGetUniformLocation(canvasProgram_, "u_screen");
-    canvasUTex_ = glGetUniformLocation(canvasProgram_, "u_tex");
-
-    static const float kUnitQuad[] = {0, 0, 1, 0, 0, 1, 1, 1};
-    glGenBuffers(1, &quadVbo_);
-    glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(kUnitQuad), kUnitQuad, GL_STATIC_DRAW);
-    glGenBuffers(1, &flatVbo_); // contents supplied per-draw in drawLine()
-
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnable(GL_SCISSOR_TEST); // ClipRect maps straight onto glScissor
+    createGlResources();
 
     eglReady_ = true;
     redraw();
@@ -12213,6 +15138,7 @@ private:
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
+#if !defined(LITEUI_CANVAS_GL)
   // (Re)builds v.computed.canvasSurface — a Cairo ARGB32 image surface
   // sized to v's inner (padding-excluded) content box — whenever that
   // size has changed since it was last built, then (re)invokes v.onPaint
@@ -12310,8 +15236,58 @@ private:
     }
   }
 
+#else // LITEUI_CANVAS_GL
+  // (Re)builds v's GPU target — an RGBA8 texture + FBO(s) sized to v's inner
+  // (padding-excluded) content box — whenever that size changed, then
+  // re-invokes v.onPaint into it whenever the size changed OR the app
+  // requested a redraw via View::requestCanvasRedraw() (canvasNeedsRedraw
+  // starts true, so this always happens at least once). A plain repaint with
+  // neither condition true reuses the texture untouched: no CPU work, no
+  // upload. Drawing happens between canvasGl_.begin()/end(), which save and
+  // restore the window renderer's GL state around it.
+  void ensureCanvasTargetGl(const View &v) {
+    if (!canvasGl_.ready())
+      return;
+    const EdgeInsets &pad =
+        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
+    float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
+    float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
+    int iw = std::max(1, static_cast<int>(innerW));
+    int ih = std::max(1, static_cast<int>(innerH));
+    bool resized = !v.computed.canvasTexture ||
+                   v.computed.canvasBuiltForWidth != innerW ||
+                   v.computed.canvasBuiltForHeight != innerH;
+    if (resized) {
+      if (!liteui_canvas_gl::Renderer::buildTarget(v.computed, iw, ih)) {
+        fprintf(stderr, "liteui: could not create a %dx%d canvas target\n", iw,
+                ih);
+        return; // texture stays 0: nothing is drawn for this node
+      }
+      v.computed.canvasBuiltForWidth = innerW;
+      v.computed.canvasBuiltForHeight = innerH;
+      v.computed.canvasNeedsRedraw = true;
+    }
+    if (!v.computed.canvasTexture)
+      return;
+    if (v.computed.canvasNeedsRedraw && v.onPaint) {
+      canvasGl_.begin(v.computed, iw, ih);
+      {
+        CanvasContextImpl ctx(canvasGl_, static_cast<float>(iw),
+                              static_cast<float>(ih), &v.computed);
+        v.onPaint(ctx);
+      }
+      canvasGl_.end(v.computed);
+      v.computed.canvasNeedsRedraw = false;
+    }
+  }
+#endif // LITEUI_CANVAS_GL
+
   void drawCanvasTexture(const View &v, const ClipRect &clip) {
+#if defined(LITEUI_CANVAS_GL)
+    ensureCanvasTargetGl(v);
+#else
     ensureCanvasSurface(v);
+#endif
     if (!v.computed.canvasTexture)
       return;
     applyScissor(clip);
@@ -12576,7 +15552,10 @@ private:
     if (!hideTitlebar_)
       drawTitlebar();
     paintTooltip();
-    eglSwapBuffers(eglDisplay_, eglSurface_);
+    if (eglSwapBuffers(eglDisplay_, eglSurface_))
+      contextLossStreak_ = 0;
+    else if (eglGetError() == EGL_CONTEXT_LOST)
+      recoverFromContextLoss();
   }
 
   // Hit-tests a left-button press against the titlebar buttons, resize
@@ -12815,25 +15794,21 @@ inline LiteUIImpl::~LiteUIImpl() {
 
 // Windows-specific teardown path.
 #if defined(_WIN32)
-  // Release Direct2D resources — order matters: the render target must
-  // go before the factory that created it.
-  if (renderTarget_)
-    renderTarget_->Release();
+  // Release the Direct3D 11 / Direct2D device stack — order matters: the
+  // contexts, swap chain and devices must go before the factory that
+  // created them.
+  releaseDeviceResources();
   if (d2dFactory_)
     d2dFactory_->Release();
-  // wicFactory_'s COM apartment (see ensureWicFactory) is paired here
-  // rather than per-call, since the factory itself is cached for our
-  // whole lifetime.
-  if (wicFactory_)
-    wicFactory_->Release();
-  if (wicComInitialized_)
-    CoUninitialize();
   // Destroy the native window if it was successfully created.
   if (hwnd_)
     DestroyWindow(hwnd_);
 // Linux/Wayland-specific teardown path.
 #else
   if (eglDisplay_ != EGL_NO_DISPLAY) {
+#if defined(LITEUI_CANVAS_GL)
+    canvasGl_.destroy(); // needs the context still current
+#endif
     eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (rectProgram_)
       glDeleteProgram(rectProgram_);

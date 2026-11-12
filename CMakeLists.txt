@@ -68,6 +68,14 @@ if(LITEUI_PROFILE)
     target_compile_definitions(liteui INTERFACE LITEUI_PROFILE)
 endif()
 
+# Linux only: render Canvas nodes with the OpenGL ES 3.0 backend (GPU,
+# needs an EGL driver with OpenGL ES 3.0 and libGLESv2/GLES3 headers).
+# Turn OFF to fall back to the previous Cairo-based Canvas backend.
+option(LITEUI_CANVAS_GL "Use the OpenGL ES 3.0 Canvas backend (Linux)" ON)
+if(LITEUI_CANVAS_GL AND NOT WIN32)
+    target_compile_definitions(liteui INTERFACE LITEUI_CANVAS_GL)
+endif()
+
 set(LITEUI_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/wayland-protocols")
 
 if(WIN32)

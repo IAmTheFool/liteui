@@ -27,6 +27,6 @@
 file(GLOB LITEUI_TEST_CASES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cases/*.inc)
 
 liteui_add_test(core
-    SOURCES  liteui_tests.cpp test_helpers.hpp ${LITEUI_TEST_CASES}
+    SOURCES  liteui_tests.cpp test_helpers.hpp canvas_gl_mock.hpp ${LITEUI_TEST_CASES}
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
     LITEUI)
