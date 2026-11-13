@@ -46,7 +46,9 @@ inline void skip(const char *name, const char *why) {
   results().push_back({Result::Kind::Skip, name, why});
 }
 inline void info(const std::string &s) {
-  results().push_back({Result::Kind::Info, "info", s});
+  // Catch2 treats sections with the same name as one section, so each info
+  // line needs a name of its own.
+  results().push_back({Result::Kind::Info, "info: " + s, s});
 }
 
 struct Px {
@@ -56,7 +58,7 @@ inline Px at(const CanvasImage &im, int x, int y) {
   const uint8_t *p = &im.pixels[(static_cast<size_t>(y) * im.width + x) * 4];
   return {p[0], p[1], p[2], p[3]};
 }
-inline bool pxNear(const Px &p, int r, int g, int b, int a, int tol = 3) {
+inline bool near(const Px &p, int r, int g, int b, int a, int tol = 3) {
   return std::abs(p.r - r) <= tol && std::abs(p.g - g) <= tol &&
          std::abs(p.b - b) <= tol && std::abs(p.a - a) <= tol;
 }
@@ -123,7 +125,7 @@ inline void runAll(CanvasContext &g) {
          c.fillRect(10, 10, 40, 40);
        },
        [](const CanvasImage &im) {
-         bool ok = pxNear(at(im, 30, 30), 255, 0, 0, 255) &&
+         bool ok = near(at(im, 30, 30), 255, 0, 0, 255) &&
                    at(im, 5, 5).a == 0 && at(im, 52, 30).a == 0 &&
                    at(im, 30, 52).a == 0;
          report("fillRect: solid colour and edges", ok, str(at(im, 30, 30)));
@@ -138,7 +140,7 @@ inline void runAll(CanvasContext &g) {
        },
        [](const CanvasImage &im) {
          report("alpha blend over opaque white",
-                pxNear(at(im, 40, 40), 127, 127, 255, 255, 4),
+                near(at(im, 40, 40), 127, 127, 255, 255, 4),
                 str(at(im, 40, 40)));
        });
 
@@ -151,7 +153,7 @@ inline void runAll(CanvasContext &g) {
        },
        [](const CanvasImage &im) {
          report("transform: translate + rotate(90deg) + fillRect",
-                pxNear(at(im, 95, 35), 255, 0, 0, 255) &&
+                near(at(im, 95, 35), 255, 0, 0, 255) &&
                     at(im, 110, 25).a == 0 && at(im, 95, 55).a == 0,
                 str(at(im, 95, 35)));
        });
@@ -258,8 +260,8 @@ inline void runAll(CanvasContext &g) {
        },
        [](const CanvasImage &im) {
          report("clip: circle clip, then restore",
-                pxNear(at(im, 80, 80), 255, 0, 0, 255) && at(im, 40, 40).a == 0 &&
-                    pxNear(at(im, 5, 5), 0, 0, 255, 255),
+                near(at(im, 80, 80), 255, 0, 0, 255) && at(im, 40, 40).a == 0 &&
+                    near(at(im, 5, 5), 0, 0, 255, 255),
                 str(at(im, 40, 40)));
        });
 
@@ -272,9 +274,9 @@ inline void runAll(CanvasContext &g) {
          c.fillRect(0, 0, W, H);
        },
        [](const CanvasImage &im) {
-         bool ok = pxNear(at(im, 1, 80), 253, 0, 2, 255, 6) &&
-                   pxNear(at(im, 80, 80), 127, 0, 127, 255, 6) &&
-                   pxNear(at(im, 158, 80), 2, 0, 253, 255, 6);
+         bool ok = near(at(im, 1, 80), 253, 0, 2, 255, 6) &&
+                   near(at(im, 80, 80), 127, 0, 127, 255, 6) &&
+                   near(at(im, 158, 80), 2, 0, 253, 255, 6);
          report("linear gradient", ok, str(at(im, 80, 80)));
        });
 
@@ -287,9 +289,9 @@ inline void runAll(CanvasContext &g) {
          c.fillRect(0, 0, W, H);
        },
        [](const CanvasImage &im) {
-         bool ok = pxNear(at(im, 80, 80), 255, 0, 0, 255, 8) &&
-                   pxNear(at(im, 80, 110), 127, 0, 127, 255, 10) &&
-                   pxNear(at(im, 80, 155), 0, 0, 255, 255, 4);
+         bool ok = near(at(im, 80, 80), 255, 0, 0, 255, 8) &&
+                   near(at(im, 80, 110), 127, 0, 127, 255, 10) &&
+                   near(at(im, 80, 155), 0, 0, 255, 255, 4);
          report("radial gradient (inner colour, middle, padded outside)", ok,
                 str(at(im, 80, 110)));
        });
@@ -303,11 +305,13 @@ inline void runAll(CanvasContext &g) {
          c.drawImage(img, 10, 10, 64, 64);
        },
        [](const CanvasImage &im) {
-         // Quadrant centres are far from the bilinear transitions.
-         bool ok = pxNear(at(im, 26, 26), 255, 0, 0, 255, 6) &&
-                   pxNear(at(im, 58, 26), 0, 255, 0, 255, 6) &&
-                   pxNear(at(im, 26, 58), 0, 0, 255, 255, 6) &&
-                   pxNear(at(im, 58, 58), 255, 255, 255, 255, 6) &&
+         // Quadrant centres are far from the bilinear transitions, but not
+         // exactly on a texel centre: the sample is ~1.6% of a texel off on
+         // each axis, so a pure colour reads as e.g. (247,4,4). Allow 10.
+         bool ok = near(at(im, 26, 26), 255, 0, 0, 255, 10) &&
+                   near(at(im, 58, 26), 0, 255, 0, 255, 10) &&
+                   near(at(im, 26, 58), 0, 0, 255, 255, 10) &&
+                   near(at(im, 58, 58), 255, 255, 255, 255, 10) &&
                    at(im, 5, 5).a == 0;
          report("drawImage: scaling picks the right texels", ok,
                 str(at(im, 26, 26)));
@@ -323,8 +327,8 @@ inline void runAll(CanvasContext &g) {
        },
        [](const CanvasImage &im) {
          report("drawImage: source rectangle crops",
-                pxNear(at(im, 30, 20), 0, 255, 0, 255, 6) &&
-                    pxNear(at(im, 30, 80), 255, 255, 255, 255, 6) &&
+                near(at(im, 30, 20), 0, 255, 0, 255, 6) &&
+                    near(at(im, 30, 80), 255, 255, 255, 255, 6) &&
                     at(im, 55, 20).a == 0,
                 str(at(im, 30, 20)));
        });
@@ -376,8 +380,8 @@ inline void runAll(CanvasContext &g) {
        },
        [](const CanvasImage &im) {
          report("shadow: offset copy beneath the shape",
-                pxNear(at(im, 30, 30), 255, 0, 0, 255) &&
-                    pxNear(at(im, 58, 58), 0, 0, 255, 255),
+                near(at(im, 30, 30), 255, 0, 0, 255) &&
+                    near(at(im, 58, 58), 0, 0, 255, 255),
                 str(at(im, 58, 58)));
        });
 
@@ -397,7 +401,7 @@ inline void runAll(CanvasContext &g) {
            c.fillRect(20, 20, 60, 60);
          },
          [&](const CanvasImage &im) {
-           report(name, pxNear(at(im, 50, 50), r, gr, b, a, 3),
+           report(name, near(at(im, 50, 50), r, gr, b, a, 3),
                   str(at(im, 50, 50)));
          });
   };
@@ -438,7 +442,7 @@ inline void runAll(CanvasContext &g) {
          },
          [](const CanvasImage &im) {
            report("composite: multiply applies once per overlapping shape",
-                  pxNear(at(im, 50, 50), 0, 0, 64, 255, 3), str(at(im, 50, 50)));
+                  near(at(im, 50, 50), 0, 0, 64, 255, 3), str(at(im, 50, 50)));
          });
   } else {
     skip("composite: multiply applies once per overlapping shape",
@@ -469,7 +473,7 @@ inline void runAll(CanvasContext &g) {
          for (int y = b.y0; y <= b.y1 && colour; ++y)
            for (int x = b.x0; x <= b.x1; ++x) {
              Px p = at(im, x, y);
-             if (p.a == 255 && !pxNear(p, 255, 0, 0, 255, 6)) {
+             if (p.a == 255 && !near(p, 255, 0, 0, 255, 6)) {
                colour = false;
                break;
              }
@@ -584,8 +588,8 @@ inline void runSecond(CanvasContext &g) {
   g.arc(32, 32, 16, 0, 2 * kPi);
   g.fill();
   auto im = g.getImageData(0, 0, 64, 64);
-  bool ok = im && pxNear(at(*im, 32, 32), 0, 0, 255, 255) &&
-            pxNear(at(*im, 2, 2), 0, 255, 0, 255);
+  bool ok = im && near(at(*im, 32, 32), 0, 0, 255, 255) &&
+            near(at(*im, 2, 2), 0, 255, 0, 255);
   report("second canvas is independent of the first", ok,
          im ? str(at(*im, 32, 32)) : "getImageData failed");
 }
