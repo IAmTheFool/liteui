@@ -44,7 +44,7 @@ root.style.height = Size::full();
 
 ### Coordinates
 
-`View::computed` holds the result. `computed.x/y/w/h` is the node's **border box in absolute window coordinates**. Pointer handlers such as `onPressAt` and `onDragTo` report coordinates *local* to the view (0,0 at its own top-left). `onLayout` reports the window-space box (see [below](#dynamic-layout-values-and-onlayout)).
+`View::computed` holds the result. `computed.x/y/w/h` is the node's **border box in absolute window coordinates**. Pointer handlers such as `onPointerDown` and `onPointerMove` report coordinates *local* to the view (`e.x`/`e.y`, with (0,0) at its own top-left, measured from the border box), and also the window-space position in `e.windowX`/`e.windowY`. `onLayout` reports the window-space box (see [below](#dynamic-layout-values-and-onlayout)).
 
 ## Box model
 
@@ -212,7 +212,7 @@ Hit-testing mirrors this: absolutes are tested first, from the highest `zIndex` 
 
 An absolute node is clipped by every scrollable ancestor's viewport, like any other content, so it disappears when scrolled out of view. Set `escapeClip = true` to ignore ancestors' clips. This is how a dropdown or tooltip-like popup can extend outside a scroll container.
 
-One known limitation: scrolling and wheel targeting do not apply the ancestors' clip to absolute descendants, so an absolute view inside a scrolled-out region can still be found by the wheel.
+One known limitation: the built-in scrolling and scrollbar targeting do not apply the ancestors' clip to absolute descendants, so an absolute view inside a scrolled-out region can still be found by the built-in wheel scrolling. Pointer events (clicks, `onWheel` and so on) are hit-tested with the clips applied.
 
 ## display and visibility
 
@@ -241,7 +241,7 @@ menu.style.display = [&] { return open ? Display::Flex : Display::None; };
 
 Any value other than `Visible` makes the node a **scroll container**. Its children are measured against *unbounded* space along each scrolling axis, so they report their true desired size instead of being squeezed into the viewport, and that natural total becomes the **scrollable extent**. The extent includes padding and is deliberately not capped by `maxWidth`/`maxHeight` (those limit the box, not the content). In-flow children only count: absolute children do not contribute.
 
-> **Note on `Hidden`.** It clips and draws no scrollbar, but in the current implementation the content can still be moved with the mouse wheel or by dragging, because every non-`Visible` axis is treated as scrollable. If you want a truly fixed clipped box, also set `wheelScrollEnabled = false` and `contentPanEnabled = false`.
+> **Note on `Hidden`.** It clips and draws no scrollbar, but in the current implementation the content can still be moved with the mouse wheel or by dragging, because every non-`Visible` axis is treated as scrollable. If you want a truly fixed clipped box, also set `wheelScrollEnabled = false` and `contentPanEnabled = false`. (An `onWheel` handler is unaffected by either flag.)
 
 ### Giving a container something to scroll
 
@@ -268,10 +268,10 @@ list.style.flexGrow  = 1;          // take the remaining height of the column; s
 
 | Input | Behavior |
 |---|---|
-| Mouse wheel | Scrolls the **deepest scrollable view under the pointer** (scrollbar or content, it does not matter). Disable per view with `wheelScrollEnabled = false`. Wheel notches still fire `onScrollUp`/`onScrollDown`, so a view can turn the wheel into something else (a zoom, say). |
+| Mouse wheel | Scrolls the **deepest scrollable view under the pointer** (scrollbar or content, it does not matter). Disable per view with `wheelScrollEnabled = false`. `onWheel` handlers fire either way and bubble; a handler that calls `e.stopPropagation()` also suppresses the built-in scrolling, so a view can turn the wheel into something else (a zoom, say). |
 | Drag a thumb | Scrolls proportionally. |
 | Click empty track | Jumps the thumb to the click position. |
-| Drag in the content | **Pans** the content. The pointer must move more than **4 px** before it counts as a drag. Until then the press is still an ordinary click, and once it becomes a pan the pending `onClick` is **cancelled**. Disable per view with `contentPanEnabled = false`. |
+| Drag in the content | **Pans** the content, with a mouse, a pen or a finger. The pointer must move more than **4 px** before it counts as a drag. Until then the press is still an ordinary click (and your `onPointerDown` has already run). Once it becomes a pan the pending `onClick` is **dropped**; a view that received the press keeps its capture and keeps getting `onPointerMove`, and on release it gets `onPointerCancel` instead of `onPointerUp`. Disable per view with `contentPanEnabled = false`, for instance on a scroll container whose child (a canvas, a slider) should own the drag. |
 
 Scroll offsets belong to the node. They are **re-clamped on every relayout** (so shrinking content or growing the window cannot leave you scrolled past the end), they are preserved on rows reused by a [keyed list](../README.md#keyed-dynamic-lists), and they reset when `setRoot` replaces the tree.
 
@@ -303,7 +303,7 @@ Callbacks are polled *before* the relayout that updates the values they read, so
 1. A node paints its background, then its border, then (for a canvas) its drawing, then its in-flow children in order, then its scrollbars.
 2. Children of a scroll container are clipped to its box, and nested scroll containers narrow the clip further.
 3. After the whole in-flow tree, absolute nodes paint in `zIndex`, then document order.
-4. Hover state, `hoverColor` and click bubbling follow the same tree: clicks go to the topmost view under the pointer that has a handler for that button, then bubble to the nearest ancestor that does.
+4. Hover state, `hoverColor` and pointer events follow the same tree. An event goes to the topmost view under the pointer that has a handler for it, then bubbles up through ancestors that have one, until a handler calls `stopPropagation()`. Views without a matching handler, and **disabled** views, are transparent to the pointer, so they never block something beneath them (`onWheel` is the one handler that still runs on a disabled view). The hit-test applies the same scroll-ancestor clips as painting, so content scrolled out of view cannot be clicked. The Style `cursor` follows the same tree: it is inherited from the parent unless set.
 
 ## Recipes
 
@@ -406,3 +406,5 @@ These CSS features have no equivalent in `Style` today:
 | A popup is positioned wrongly on Linux | `onLayout` reports window coordinates, but `left`/`top` are relative to the parent's content box. Subtract the parent's origin. |
 | Changing `gap`, `direction` or `flexGrow` at runtime does nothing | Those are plain fields, not `Dynamic<>`. Rebuild the node (or use a keyed list) instead. |
 | A `Hidden`-overflow box still moves under the wheel | Expected today. Set `wheelScrollEnabled = false` and `contentPanEnabled = false`. |
+| A canvas or slider inside a scroll container stops getting drag events | The container's drag-to-pan took the press. Set `contentPanEnabled = false` on the container, or expect `onPointerCancel` on release. |
+| A wheel zoom also scrolls the page | Call `e.stopPropagation()` in `onWheel` to suppress the built-in scrolling. |

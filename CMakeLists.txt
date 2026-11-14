@@ -38,6 +38,8 @@ endif()
 #   platform/wayland-protocols/xdg-shell-client-protocol.h
 #   platform/wayland-protocols/xdg-decoration-protocol.c
 #   platform/wayland-protocols/xdg-decoration-client-protocol.h
+#   platform/wayland-protocols/tablet-protocol.c            (pen input)
+#   platform/wayland-protocols/tablet-client-protocol.h     (tablet-unstable-v2)
 #
 # On a FRESH CHECKOUT those files don't exist yet. This file registers the
 # `regen-protocols` target BEFORE checking for the vendored files, and
@@ -114,19 +116,22 @@ else()
     if(WAYLAND_SCANNER_EXECUTABLE AND _liteui_wp_dir)
         set(_xdg_shell_xml      "${_liteui_wp_dir}/stable/xdg-shell/xdg-shell.xml")
         set(_xdg_decoration_xml "${_liteui_wp_dir}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml")
+        set(_tablet_xml         "${_liteui_wp_dir}/unstable/tablet/tablet-unstable-v2.xml")
         add_custom_target(regen-protocols
             COMMAND ${CMAKE_COMMAND} -E make_directory ${LITEUI_PROTO_DIR}
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_xdg_shell_xml}      ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_xdg_shell_xml}      ${LITEUI_PROTO_DIR}/xdg-shell-client-protocol.h
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_xdg_decoration_xml} ${LITEUI_PROTO_DIR}/xdg-decoration-protocol.c
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_xdg_decoration_xml} ${LITEUI_PROTO_DIR}/xdg-decoration-client-protocol.h
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_tablet_xml}         ${LITEUI_PROTO_DIR}/tablet-protocol.c
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_tablet_xml}         ${LITEUI_PROTO_DIR}/tablet-client-protocol.h
             COMMENT "liteui: regenerating platform/wayland-protocols/ — remember to commit the result"
             VERBATIM
         )
     endif()
 
-    # All four generated files must exist: the two .c files are compiled
-    # into liteui_wayland_protocols, and the two headers are what
+    # All six generated files must exist: the three .c files are compiled
+    # into liteui_wayland_protocols, and the three headers are what
     # liteui.hpp includes. Checking only one would let a partial checkout
     # slip through and fail later with a confusing compile/link error.
     set(LITEUI_PROTO_FILES
@@ -134,6 +139,8 @@ else()
         xdg-shell-client-protocol.h
         xdg-decoration-protocol.c
         xdg-decoration-client-protocol.h
+        tablet-protocol.c
+        tablet-client-protocol.h
     )
     set(LITEUI_PROTO_MISSING "")
     foreach(_f IN LISTS LITEUI_PROTO_FILES)
@@ -166,11 +173,12 @@ else()
         endif()
     endif()
 
-    # Only build (and link) the protocol bindings once all four files exist.
+    # Only build (and link) the protocol bindings once all six files exist.
     if(NOT LITEUI_PROTO_MISSING)
         add_library(liteui_wayland_protocols STATIC
             ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
             ${LITEUI_PROTO_DIR}/xdg-decoration-protocol.c
+            ${LITEUI_PROTO_DIR}/tablet-protocol.c
         )
         target_include_directories(liteui_wayland_protocols PUBLIC ${LITEUI_PROTO_DIR})
         target_compile_options(liteui_wayland_protocols PRIVATE -w)

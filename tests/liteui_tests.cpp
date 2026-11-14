@@ -24,6 +24,7 @@
 #include "cases/svg_paths.inc"
 #include "cases/svg_documents.inc"
 #include "cases/layout.inc"
+#include "cases/pointer_events.inc"
 #include "cases/platform.inc"
 
 // Canvas: the GL backend cases compile only on Linux with LITEUI_CANVAS_GL (the

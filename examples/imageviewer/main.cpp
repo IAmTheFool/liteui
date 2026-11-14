@@ -1,6 +1,8 @@
 // imageviewer — open an image and view it on a Canvas with wheel zoom,
 // drag-to-pan and scrollbars. The image is centered, and wheel zoom is
 // anchored at the pointer (the point under the cursor stays put).
+// Input uses the pointer / wheel / key events (PointerEvent, WheelEvent,
+// addShortcut); keyboard: Ctrl+= / Ctrl+- zoom, Ctrl+1 = 100%, Ctrl+0 = fit.
 // It also shows the high-precision image pipeline (ImageBuffer, RGBA16F /
 // RGBA32F working formats, exposure and clamp display settings).
 //
@@ -70,10 +72,6 @@ namespace
     // on an axis where the zoomed image is larger than the view.
     float scrollX = 0, scrollY = 0;
     float viewW = 0, viewH = 0; // canvas size, updated from onLayout
-    // Last pointer position over the canvas (canvas-local), used as the
-    // wheel-zoom anchor. hasHover is false while the pointer is elsewhere.
-    float hoverX = 0, hoverY = 0;
-    bool hasHover = false;
     bool needFit = false;       // fit the new image once the view size is known
     bool dirty = false;         // the Canvas must repaint
 
@@ -167,13 +165,17 @@ namespace
     zoomAbout(s, newZoom, g.availW / 2.0f, g.availH / 2.0f);
   }
 
-  // Wheel zoom: about the pointer when it is over the canvas, else the centre.
-  void zoomAtPointer(ViewerState &s, float newZoom)
+  // Wheel zoom. WheelEvent already carries the canvas-local pointer position,
+  // so the zoom anchors there without tracking hover state. A notched wheel
+  // steps by kZoomStep per event; a trackpad (precise) zooms continuously in
+  // proportion to the pixel delta. +dy = wheel down = zoom out.
+  void zoomWithWheel(ViewerState &s, const WheelEvent &e)
   {
-    if (s.hasHover)
-      zoomAbout(s, newZoom, s.hoverX, s.hoverY);
-    else
-      zoomAboutCenter(s, newZoom);
+    if (e.dy == 0.0f)
+      return;
+    float factor = e.precise ? std::pow(kZoomStep, -e.dy / 40.0f)
+                             : (e.dy < 0 ? kZoomStep : 1.0f / kZoomStep);
+    zoomAbout(s, s.zoom * factor, e.x, e.y);
   }
 
   // Shrinks a too-big image to fit the view (never enlarges past 100%).
@@ -529,7 +531,7 @@ namespace
 
   // A toolbar button whose label is recomputed every frame.
   View makeButton(std::function<std::string()> label, Color bg, Color hover,
-                  std::function<void()> onClick)
+                  PointerCallback onClick)
   {
     Text t;
     t.label = std::move(label);
@@ -703,30 +705,38 @@ int main(int argc, char **argv)
     else if (resized)
       clampScroll(state);
   };
-  canvas.onScrollUp = [&state]
-  { zoomAtPointer(state, state.zoom * kZoomStep); };
-  canvas.onScrollDown = [&state]
-  { zoomAtPointer(state, state.zoom / kZoomStep); };
-  // Track the pointer for cursor-anchored zoom. Return false: moving the
-  // mouse changes nothing visible, so it must not trigger a repaint.
-  canvas.onHoverAt = [&state](float x, float y)
+  // Wheel: zoom about the pointer. stopPropagation() also suppresses the
+  // built-in overflow scrolling, which would otherwise pan as well.
+  canvas.onWheel = [&state](WheelEvent &e)
   {
-    state.hoverX = x;
-    state.hoverY = y;
-    state.hasHover = true;
-    return false;
+    zoomWithWheel(state, e);
+    e.stopPropagation();
   };
-  canvas.onHoverEnd = [&state]
+  // Press decides what is dragged (image, a scrollbar thumb, a track click).
+  // The press captures the pointer, so the moves and the release below keep
+  // arriving here, in canvas-local coordinates, even outside the canvas.
+  canvas.onPointerDown = [&state](PointerEvent &e)
   {
-    state.hasHover = false;
-    return false;
+    if (e.button == MouseButton::Left)
+      pressAt(state, e.x, e.y);
   };
-  canvas.onPressAt = [&state](float x, float y)
-  { pressAt(state, x, y); };
-  canvas.onDragTo = [&state](float x, float y)
-  { dragTo(state, x, y); };
-  canvas.onDragEnd = [&state]
+  canvas.onPointerMove = [&state](PointerEvent &e)
+  {
+    // Also fires for plain hover (buttons == 0); only a held left button drags.
+    if (e.held(MouseButton::Left))
+      dragTo(state, e.x, e.y);
+  };
+  canvas.onPointerUp = [&state](PointerEvent &e)
+  {
+    if (e.button == MouseButton::Left)
+      state.drag = ViewerState::Drag::None;
+  };
+  // Focus loss / the OS grabbing the mouse: the release will never arrive.
+  canvas.onPointerCancel = [&state](PointerEvent &)
   { state.drag = ViewerState::Drag::None; };
+  // Double-click the canvas: back to fit-to-window.
+  canvas.onDoubleClick = [&state](PointerEvent &)
+  { state.needFit = true; fitToView(state); };
 
   // ---- Window -------------------------------------------------------------
   View root;
@@ -740,6 +750,20 @@ int main(int argc, char **argv)
 
   LiteUI ui("Image Viewer", 1000, 700);
   ui.setRoot(root);
+
+  // Keyboard: app-global shortcuts (no focusable view is needed).
+  {
+    KeyModifiers ctrl;
+    ctrl.ctrl = true;
+    ui.addShortcut(ctrl, Key::Equal, [&state]
+                   { zoomAboutCenter(state, state.zoom * kZoomStep); });
+    ui.addShortcut(ctrl, Key::Minus, [&state]
+                   { zoomAboutCenter(state, state.zoom / kZoomStep); });
+    ui.addShortcut(ctrl, Key::N1, [&state]
+                   { zoomAboutCenter(state, 1.0f); });
+    ui.addShortcut(ctrl, Key::N0, [&state]
+                   { state.needFit = true; fitToView(state); });
+  }
   ui.run(); // blocks until the window closes
   return 0;
 }

@@ -17,8 +17,30 @@ int main() {
   button.style.hoverColor = {210, 210, 210};
   button.style.alignItems = Align::Center;
   button.style.justifyContent = Justify::Center;
+  button.style.cursor = Cursor::Pointer;
 
-  button.onClick = [&]() { model.increment(); };
+  // Left click. The PointerEvent form bubbles to ancestors unless the
+  // handler calls e.stopPropagation(); the old `[&] { ... }` form still
+  // works and ends bubbling after it runs.
+  button.onClick = [&](PointerEvent &e) {
+    int step = e.mods.shift ? 10 : 1;
+    for (int i = 0; i < step; ++i)
+      model.increment();
+    e.stopPropagation(); // nothing above the button needs this click
+  };
+
+  // Right click (fired on release). Middle click would be onAuxClick.
+  button.onContextMenu = [&](PointerEvent &e) {
+    model.value -= 1;
+    e.stopPropagation();
+  };
+
+  // Wheel over the button. Without stopPropagation() the wheel would fall
+  // through to the built-in overflow scrolling.
+  button.onWheel = [&](WheelEvent &e) {
+    model.value += (e.dy < 0) ? 1 : -1; // dy < 0 = wheel up
+    e.stopPropagation();
+  };
 
   Text buttonLabel;
   buttonLabel.label = "Increment";

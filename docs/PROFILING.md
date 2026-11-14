@@ -16,7 +16,7 @@ LiteUI has a small built-in frame profiler. When enabled it prints, about once p
 
 > **The profiler currently produces output on Windows only.**
 >
-> All of the timing probes live in the Direct2D backend. A Linux (Wayland) build accepts `LITEUI_PROFILE`, and the `gcc-*-profile` presets exist and build, but nothing in the Wayland code path is instrumented, so nothing is ever printed.
+> All of the timing probes live in the Windows backend (the Direct2D window painter, the Direct2D canvas path and the `WM_MOUSEMOVE` handler). A Linux (Wayland) build accepts `LITEUI_PROFILE`, and the `gcc-*-profile` presets exist and build, but nothing in the Wayland code path is instrumented, neither the OpenGL ES window painter nor the GL canvas renderer, so nothing is ever printed.
 
 The rest of this guide describes the Windows behavior.
 
@@ -50,7 +50,7 @@ add_subdirectory(path/to/liteui)
 **Without CMake**, define the macro when compiling the translation unit that defines `LITEUI_IMPLEMENTATION` (the profiler lives in the implementation section of the header):
 
 ```bat
-cl /std:c++latest /EHsc /utf-8 /DLITEUI_PROFILE /I path\to\liteui main.cpp user32.lib gdi32.lib d2d1.lib dwrite.lib windowscodecs.lib ole32.lib
+cl /std:c++latest /EHsc /utf-8 /DLITEUI_PROFILE /I path\to\liteui main.cpp user32.lib gdi32.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib windowscodecs.lib ole32.lib
 ```
 
 The report goes to `stderr`, so run the program from a terminal. The bundled examples are console-subsystem programs and show it directly. If you later link your own app as a GUI-subsystem executable (`WIN32_EXECUTABLE`), there is no console, so launch it with `2> profile.txt` or from a debugger that captures stderr.
@@ -64,7 +64,7 @@ While the app is being used, you will see blocks like this (the numbers here are
   mouse     x212  avg   0.04 ms  worst   0.61 ms
   build     x58   avg   1.92 ms  worst   4.10 ms
   canvas    x3    avg   2.75 ms  worst   3.30 ms
-  blit      x58   avg   0.31 ms  worst   0.52 ms
+  blit      x58   avg   0.04 ms  worst   0.09 ms
   EndDraw   x58   avg   0.88 ms  worst   1.90 ms
 ```
 
@@ -80,13 +80,13 @@ Stages are printed in this fixed order:
 
 | Line | Measures |
 |---|---|
-| `mouse` | One `WM_MOUSEMOVE` from start to finish: scrollbar and drag updates, hover tracking, tooltip hover, and, when a hover handler reports a change, the **re-poll and relayout** it triggers. |
+| `mouse` | One `WM_MOUSEMOVE` from start to finish: scrollbar and drag updates, your `onPointerMove` handlers, hover tracking (including `onPointerEnter` / `onPointerLeave`), tooltip hover, and, when a handler may have changed app state, the **re-poll and relayout** it triggers. Only the mouse is measured: pen and touch input (`WM_POINTER*`) has no probe. |
 | `recompute` | *Declared but never recorded* (see [Known gaps](#known-gaps)). Always absent. |
-| `build` | All the drawing of one window paint: `BeginDraw`, clearing the background, painting the whole tree, and painting the tooltip. It does **not** include `EndDraw`. |
-| `canvas` | One run of a canvas's `onPaint` into its offscreen bitmap, including `BeginDraw`/`EndDraw` on that bitmap. Recorded **only when the canvas actually redraws**, not on every window paint. |
+| `build` | All the drawing of one window paint: `BeginDraw`, clearing the background, painting the whole tree, and painting the tooltip. It does **not** include `EndDraw` or `Present`. |
+| `canvas` | One run of a canvas's `onPaint` into its GPU texture, including `BeginDraw`/`EndDraw` on that texture. Recorded **only when the canvas actually redraws** (its first paint, a resize, or a requested redraw), not on every window paint. |
 | `appPaint` | *Declared but never recorded* (see [Known gaps](#known-gaps)). Always absent. |
-| `blit` | Turning one canvas's cached bitmap into a GPU bitmap and drawing it into the window. Recorded **once per canvas per window paint**. |
-| `EndDraw` | The final flush of the window's render target. |
+| `blit` | Drawing one canvas's finished texture into the window. This is a GPU-to-GPU textured quad: no pixels are copied or uploaded, so it is normally tiny. Recorded **once per canvas per window paint**, and it does **not** include the canvas's own redraw (that is `canvas`). |
+| `EndDraw` | The window's `EndDraw` **plus** the `Present` that hands the frame to the display. Presenting uses a sync interval of 1 (vsync), so part of this time can be waiting for the display rather than work. |
 
 ### Nesting
 
@@ -97,23 +97,23 @@ build      (one window paint)
  ├─ canvas   (only for canvases that redrew this paint)
  ├─ blit     (every canvas, every paint)
  └─ everything else: boxes, borders, text, scrollbars, tooltip
-EndDraw    (afterwards, outside build)
+EndDraw    (afterwards, outside build; includes the vsynced Present)
 ```
 
-`canvas` and `blit` run **inside** `build`. A paint's total cost is roughly `build + EndDraw`. The time `build` spends on things *other* than canvases is approximately `build − canvas − blit`, but be careful: `canvas` and `blit` count once per canvas, so with several canvases per paint subtract their sums over the window, not their averages.
+`canvas` and `blit` run **inside** `build` (a canvas's texture is brought up to date just before it is drawn). A paint's total cost is roughly `build + EndDraw`, and because `EndDraw` includes the vsynced `Present`, a paint can look slower than the work it actually did. The time `build` spends on things *other* than canvases is approximately `build − canvas − blit`, but be careful: `canvas` and `blit` count once per canvas, so with several canvases per paint subtract their sums over the window, not their averages.
 
 ## Reading the numbers
 
-The budget at 60 Hz is **16.7 ms per frame**. Aim to keep `build + EndDraw` well inside it. Then look for what dominates.
+The budget at 60 Hz is **16.7 ms per frame**. Aim to keep `build` well inside it, and remember that `EndDraw` includes the vsynced `Present`: a large `EndDraw` is not automatically GPU cost, since part of it can be time spent waiting for the display. Then look for what dominates.
 
 | What you see | What it usually means | What to try |
 |---|---|---|
 | `canvas` average is large | Your `onPaint` is expensive. | Precompute data outside `onPaint`, draw less, or shrink the canvas. See [CANVAS.md](CANVAS.md#performance-notes). |
 | `canvas` runs far more often than expected (`x` is large) | `canvasDirtySource` returns `true` too often, or an always-on interval is driving redraws. | Return `true` only on real change; stop timers when nothing animates. |
-| `blit` is large or `canvas` is small but `build` is large | Big canvases are re-uploaded to the GPU on **every** window paint on Windows, even when they did not redraw. | Make canvases no larger than necessary; avoid forcing frequent repaints around a large canvas. |
+| `blit` is large | Unusual: it is a GPU texture draw, not an upload. Suspect very many or very large canvases, or a machine that fell back to the **WARP software rasterizer** (no usable GPU or driver). | Make canvases no larger than necessary and check that the app is really on a GPU. |
 | `build` is large with little `canvas`/`blit` time | Lots of nodes, or many text nodes whose layout is being rebuilt (text content changing every frame, width changing). | Cut node counts, use [keyed lists](../README.md#keyed-dynamic-lists) so unchanged rows are reused, and avoid animating text. |
-| `EndDraw` is large | Presenting/flushing is slow: GPU or driver bound, or a very large window. | Compare on other hardware; reduce overdraw and canvas sizes. |
-| `mouse` average is high or `worst` spikes | A hover handler (`onHoverAt`) is doing real work, or returns `true` constantly, forcing a re-poll and relayout on every pointer move. | Make hover handlers cheap and return `true` only when something visible changed. |
+| `EndDraw` is large | Flushing or presenting is slow: GPU or driver bound, a very large window, or simply waiting for vsync (`Present` is vsynced). A steady value near the refresh interval with a small `build` usually means vsync pacing, not slowness. | Look at `build` first. Compare on other hardware; reduce overdraw and canvas sizes. |
+| `mouse` average is high or `worst` spikes | An `onPointerMove`, `onPointerEnter` or `onPointerLeave` handler is doing real work, or its effects make the library re-poll every `Dynamic<>` value and relayout on each pointer move. | Make pointer handlers cheap, keep per-move work off the UI path (for example, only record the position and let a `canvasDirtySource` or an interval redraw), and keep `Dynamic<>` callbacks cheap, since they all run after the handler. |
 | `build` runs (`xN`) while the app is idle | Something keeps requesting repaints: an interval, a `Dynamic<>` callback whose value changes every poll, or a dirty source stuck on `true`. | Find what changes each tick; an idle LiteUI should print nothing. |
 
 An **idle** application should be silent. If the report keeps printing while you are not touching anything, that is itself a finding.
@@ -138,17 +138,19 @@ An **idle** application should be silent. If the report keeps printing while you
 - Reporting is therefore **driven by activity**, not by a timer. Nothing prints while the window is idle, and the first event after a quiet spell prints a block covering everything since the previous report. The `xN` counts are "since the last report", which can be longer than one second after an idle gap.
 - The block only prints if at least one `mouse` or `build` event was recorded in the window. A window containing only canvas redraws and no paint or mouse event is reset silently.
 - The counters are plain, unsynchronized data, which is fine because every probe runs on the UI thread.
-- A probe costs two `steady_clock` reads. With `LITEUI_PROFILE` undefined, the probes expand to nothing.
+- A probe costs a few `steady_clock` reads. With `LITEUI_PROFILE` undefined, the probes expand to nothing.
 
 ### Known gaps
 
-- **No Linux instrumentation.** The Wayland backend has no probes, so Linux builds print nothing.
+- **No Linux instrumentation.** The Wayland backend and the OpenGL ES canvas renderer have no probes, so Linux builds print nothing.
+- **Only mouse movement is timed.** Pen and touch input is not measured, and neither are key events, clicks or wheel events. Time those yourself if they look slow.
+- **`EndDraw` includes `Present`.** There is no separate line for the vsync wait.
 - **`recompute` and `appPaint` are never recorded.** The report has slots and print lines for them, but no code path feeds them, so they never appear. Relayout cost is only visible indirectly, inside `mouse` when a hover handler triggers it.
 - **Fixed set of stages.** You cannot register your own stage with the built-in report.
 
 ## Timing your own code
 
-The built-in stages cover the library's work. For your own code, use `std::chrono` and print or log it yourself. For example, to see how long a canvas's `onPaint` spends in one section (on Linux, where the built-in `canvas` stage is not available, this is the way to do it):
+The built-in stages cover the library's work. For your own code, use `std::chrono` and print or log it yourself. For example, to see how long a canvas's `onPaint` spends in one section (on Linux, where the built-in `canvas` stage is not available, this is the way to do it; on either platform it also lets you time a handler such as `onPointerMove`, which the built-in `mouse` stage lumps together with hover and re-polling):
 
 ```cpp
 c.onPaint = [&](CanvasContext &g) {
@@ -166,6 +168,7 @@ The same applies to expensive `Dynamic<>` callbacks, which run after every event
 
 **Nothing is printed.**
 - On Linux, that is expected: there are no probes in the Wayland backend.
+- If you are on Windows but only using a pen or touch screen, nothing mouse-related is recorded; paint stages (`build`, `EndDraw`) still appear when the window repaints.
 - On Windows, confirm the build really has `LITEUI_PROFILE` (for example, configure with a `*-profile` preset and check that the build directory is `build/release-profile` or `build/debug-profile`).
 - The report prints only when something happens. Move the mouse over the window or cause a repaint.
 - If the program has no console, redirect `stderr` to a file.

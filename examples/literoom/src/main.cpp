@@ -533,7 +533,7 @@ struct EditorState
   // box-downsampled to roughly kPreviewMaxEdge on its long side) instead
   // of the full-resolution original, and the result (`previewImage`) is
   // drawn stretched to the document's full size. One full-resolution
-  // recompute runs when the drag ends (View::onDragEnd). `previewBase` is
+  // recompute runs when the drag ends (pointer up / cancel). `previewBase` is
   // null for images already small enough that a preview wouldn't be
   // cheaper, in which case dragging just uses the full-resolution path.
   std::shared_ptr<CanvasImage> previewBase;
@@ -1423,7 +1423,7 @@ static void setCornerMode(bool expand)
 // Interactive path for an angle drag on a large image: turns the small
 // `orientedPreview` instead of the full-resolution picture, drawn stretched
 // to the size the full-resolution result will have (previewDoc*). The
-// full-resolution turn runs once, when the drag ends (View::onDragEnd).
+// full-resolution turn runs once, when the drag ends (pointer up / cancel).
 static void updateAnglePreview()
 {
   if (!state.orientedPreview || !state.oriented)
@@ -3668,6 +3668,55 @@ static void toggleSidebar()
 
 // ---------------- Small reusable pieces ----------------
 
+// ---- Pointer-event helper ---------------------------------------------------
+// A left-button drag gesture on one view, built on pointer events. press / drag
+// / end get the view-local point, like the old onPressAt / onDragTo /
+// onDragEnd did. The press captures the pointer, so drag and release keep
+// arriving even when the pointer leaves the view. `rightPress` (optional)
+// handles right-button presses. The shared `active` flag makes sure the drag
+// and the end only run for a gesture that actually started on this view: a
+// pointer-up can also reach a view that never saw the press.
+static void bindDrag(View &v,
+                     std::function<void(float, float)> press,
+                     std::function<void(float, float)> drag,
+                     std::function<void()> end,
+                     std::function<void(float, float)> rightPress = nullptr)
+{
+  auto active = std::make_shared<bool>(false);
+  v.onPointerDown = [active, press, rightPress](PointerEvent &e)
+  {
+    e.stopPropagation(); // this view owns the press (no ancestor handlers)
+    if (e.button == MouseButton::Left)
+    {
+      *active = true;
+      if (press)
+        press(e.x, e.y);
+    }
+    else if (e.button == MouseButton::Right && rightPress)
+      rightPress(e.x, e.y);
+  };
+  v.onPointerMove = [active, drag](PointerEvent &e)
+  {
+    if (*active && drag && e.held(MouseButton::Left))
+      drag(e.x, e.y);
+  };
+  auto finish = [active, end]
+  {
+    if (!*active)
+      return;
+    *active = false;
+    if (end)
+      end();
+  };
+  v.onPointerUp = [finish](PointerEvent &e)
+  {
+    if (e.button == MouseButton::Left)
+      finish();
+  };
+  v.onPointerCancel = [finish](PointerEvent &)
+  { finish(); }; // focus loss / the OS took the mouse: the release never comes
+}
+
 // One row of a dropdown: label, action, and an optional shortcut hint shown
 // right-aligned (display only — the real bindings are in main()).
 struct MenuItem
@@ -3947,7 +3996,7 @@ static View buildSliderRow(const SliderSpec &spec)
   fill.style.borderRadius = kTrackH / 2.0f;
   track.addChild(std::move(fill));
 
-  // Shared between onPressAt and onDragTo across one drag gesture, same
+  // Shared between the press and the drag moves of one gesture, same
   // pattern as the standalone slider widget this is adapted from.
   auto grabX = std::make_shared<float>(0.0f);
 
@@ -3964,9 +4013,9 @@ static View buildSliderRow(const SliderSpec &spec)
   thumb.style.borderColor = s.hasAccent ? s.accent : kThumbEdge;
   thumb.style.borderRadius = kThumb / 2.0f;
 
-  thumb.onPressAt = [grabX](float lx, float)
+  auto thumbPress = [grabX](float lx, float)
   { *grabX = lx; };
-  thumb.onDragTo = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float)
+  auto thumbDrag = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float)
   {
     if (!state.original)
       return; // no image loaded yet — nothing to adjust
@@ -3988,7 +4037,7 @@ static View buildSliderRow(const SliderSpec &spec)
   // recompute (deferred to the next canvasDirtySource poll like any other
   // adjustment change — endPress polls right after this fires, so it lands
   // in the same frame the mouse is released).
-  thumb.onDragEnd = [s]
+  auto thumbEnd = [s]
   {
     if (s.onEnd)
       s.onEnd();
@@ -3998,6 +4047,7 @@ static View buildSliderRow(const SliderSpec &spec)
     state.dragIsAngle = false;
     state.markAdjustDirty();
   };
+  bindDrag(thumb, thumbPress, thumbDrag, thumbEnd);
   track.addChild(std::move(thumb));
 
   group.addChild(std::move(track));
@@ -4219,13 +4269,16 @@ static View buildGradeWheel(int range, int diameter, float pad)
       enterDrag(false); // switches recompute+paint to the preview path
     state.markAdjustDirty();
   };
-  c.onPressAt = [apply](float lx, float ly)
-  { apply(lx, ly, false); };
-  c.onDragTo = [apply](float lx, float ly)
-  { apply(lx, ly, true); };
-  c.onDragEnd = []
-  { gradeEndDrag(); };
-  c.onRightClick = [range] { // reset hue + sat, keep luminance
+  bindDrag(
+      c,
+      [apply](float lx, float ly)
+      { apply(lx, ly, false); },
+      [apply](float lx, float ly)
+      { apply(lx, ly, true); },
+      []
+      { gradeEndDrag(); });
+  c.onContextMenu = [range](PointerEvent &e) { // reset hue + sat, keep luminance
+    e.stopPropagation();
     if (!state.original)
       return;
     gradeEdit(
@@ -7767,7 +7820,7 @@ static void paintCanvas(CanvasContext &ctx)
 
 // ---------------- RGB readout under the cursor ----------------
 // Both return true only when the readout changed, so LiteUI repaints only
-// then (see View::onHoverAt).
+// then (see View::onPointerMove: a change marks the canvas dirty).
 static bool hoverClear()
 {
   const bool was = state.hoverValid;
@@ -8957,14 +9010,16 @@ static View buildMaskCurveCanvas()
     lastTabs = tabs;
     return true;
   };
-  c.onPressAt = [](float lx, float ly)
-  { maskCurvePress(lx, ly); };
-  c.onDragTo = [](float lx, float ly)
-  { maskCurveDrag(lx, ly); };
-  c.onDragEnd = []
-  { maskCurveEnd(); };
-  c.onRightPressAt = [](float lx, float ly)
-  { maskCurveRightPress(lx, ly); };
+  bindDrag(
+      c,
+      [](float lx, float ly)
+      { maskCurvePress(lx, ly); },
+      [](float lx, float ly)
+      { maskCurveDrag(lx, ly); },
+      []
+      { maskCurveEnd(); },
+      [](float lx, float ly)
+      { maskCurveRightPress(lx, ly); });
   return c;
 }
 
@@ -9167,8 +9222,11 @@ int main()
   titlebar.style.borderWidth = 0.0f;
   // Empty space in the titlebar (i.e. not over a button) drags the
   // window, and also closes any open dropdown menu.
-  titlebar.onPressAt = [&](float, float)
+  titlebar.onPointerDown = [&](PointerEvent &e)
   {
+    if (e.button != MouseButton::Left)
+      return;
+    e.stopPropagation();
     state.openMenu = -1;
     ui.requestMove();
   };
@@ -9295,8 +9353,11 @@ int main()
   workspace.style.flexGrow = 1;
   // Clicking anywhere in the workspace that isn't itself a button
   // (e.g. the canvas, or blank sidebar space) closes an open menu too.
-  workspace.onPressAt = [](float, float)
-  { state.openMenu = -1; };
+  workspace.onPointerDown = [](PointerEvent &e)
+  {
+    if (e.button == MouseButton::Left)
+      state.openMenu = -1;
+  };
 
   // ---- Activity bar ----
   View activityBar;
@@ -9399,8 +9460,12 @@ int main()
   histogram.style.margin = EdgeInsets{0, 0, 12, 0};
   histogram.onPaint = [](CanvasContext &ctx)
   { paintHistogram(ctx); };
-  histogram.onPressAt = [](float lx, float ly)
+  histogram.onPointerDown = [](PointerEvent &e)
   {
+    if (e.button != MouseButton::Left)
+      return;
+    e.stopPropagation();
+    const float lx = e.x, ly = e.y;
     if (!state.image)
       return;
     // The top corners toggle the clipping overlays; anywhere else cycles the
@@ -9941,16 +10006,16 @@ int main()
     lastPainted = state.histVersion;
     return true;
   };
-  curveCanvas.onPressAt = [](float lx, float ly)
-  { curvePress(lx, ly); };
-  curveCanvas.onDragTo = [](float lx, float ly)
-  { curveDrag(lx, ly); };
-  curveCanvas.onDragEnd = []
-  { curveEnd(); };
-  curveCanvas.onRightPressAt = [](float lx, float ly)
-  {
-    curveRightPress(lx, ly);
-  };
+  bindDrag(
+      curveCanvas,
+      [](float lx, float ly)
+      { curvePress(lx, ly); },
+      [](float lx, float ly)
+      { curveDrag(lx, ly); },
+      []
+      { curveEnd(); },
+      [](float lx, float ly)
+      { curveRightPress(lx, ly); });
   curvePane.addChild(std::move(curveCanvas));
 
   Text curveInfo;
@@ -11467,14 +11532,11 @@ int main()
     float next = state.sidebarWidth + localX - kDividerW / 2.0f;
     state.sidebarWidth = std::clamp(next, kMinSidebarW, kMaxSidebarW);
   };
-  vDivider.onPressAt = [updateSidebarWidth](float localX, float)
   {
-    updateSidebarWidth(localX);
-  };
-  vDivider.onDragTo = [updateSidebarWidth](float localX, float)
-  {
-    updateSidebarWidth(localX);
-  };
+    auto resize = [updateSidebarWidth](float localX, float)
+    { updateSidebarWidth(localX); };
+    bindDrag(vDivider, resize, resize, nullptr);
+  }
 
   workspace.addChild(std::move(vDivider));
 
@@ -11525,22 +11587,42 @@ int main()
   {
     // Polled once per frame (see liteui.hpp's checkForUpdates) — the right
     // place to do the deferred, expensive part of a slider drag exactly
-    // once per frame, no matter how many onDragTo events fired since the
+    // once per frame, no matter how many pointer-move events fired since the
     // last poll.
     flushPendingAdjust();
     bool d = state.dirty;
     state.dirty = false;
     return d;
   };
-  canvas.onHoverAt = [](float lx, float ly)
-  { return hoverSample(lx, ly); };
-  canvas.onHoverEnd = []
-  { return hoverClear(); };
+  // RGB readout under the cursor. Pointer moves have no return value; a
+  // change just marks the canvas dirty so the next poll repaints it.
+  canvas.onPointerLeave = [](PointerEvent &)
+  {
+    if (hoverClear())
+      state.dirty = true;
+  };
   // Crop-selection dragging (no-ops unless the Crop pane is open).
   // Each is a no-op unless its own pane is open (crop: 2, masks: 7).
   // While comparing, the canvas does nothing but move the split line.
-  canvas.onPressAt = [](float lx, float ly)
+  // `pressed` marks a left press that started on this canvas, so moves and
+  // the release of some other gesture crossing it are not taken for a drag.
+  auto pressed = std::make_shared<bool>(false);
+  canvas.onPointerDown = [pressed](PointerEvent &e)
   {
+    e.stopPropagation();
+    const float lx = e.x, ly = e.y;
+    if (e.button == MouseButton::Right)
+    {
+      if (state.compare == CompareMode::Off)
+      {
+        objectPress(lx, ly, true);
+        polygonRightPress(lx, ly);
+      }
+      return;
+    }
+    if (e.button != MouseButton::Left)
+      return;
+    *pressed = true;
     if (state.compare != CompareMode::Off)
     {
       if (state.compare == CompareMode::Split)
@@ -11555,36 +11637,48 @@ int main()
     cropPress(lx, ly);
     maskPress(lx, ly);
   };
-
-  canvas.onRightPressAt = [](float lx, float ly)
+  canvas.onPointerMove = [pressed](PointerEvent &e)
   {
-    if (state.compare == CompareMode::Off)
-    {
-      objectPress(lx, ly, true);
-      polygonRightPress(lx, ly);
-    }
-  };
-  canvas.onDragTo = [](float lx, float ly)
-  {
+    if (hoverSample(e.x, e.y))
+      state.dirty = true;
+    if (!*pressed || !e.held(MouseButton::Left))
+      return;
     if (state.compare != CompareMode::Off)
     {
       if (state.compare == CompareMode::Split)
-        splitFromX(lx);
+        splitFromX(e.x);
       return;
     }
-    cropDrag(lx, ly);
-    maskDrag(lx, ly);
+    cropDrag(e.x, e.y);
+    maskDrag(e.x, e.y);
   };
-  canvas.onDragEnd = []
+  auto endCanvasDrag = [pressed]
   {
+    if (!*pressed)
+      return;
+    *pressed = false;
     state.crop.drag = CropUi::Drag::None;
     if (state.mask.drag != MaskUi::Drag::None)
       maskEndDrag();
   };
-  canvas.onScrollUp = []
-  { setZoom(state.zoom * kZoomStep); };
-  canvas.onScrollDown = []
-  { setZoom(state.zoom / kZoomStep); };
+  canvas.onPointerUp = [endCanvasDrag](PointerEvent &e)
+  {
+    if (e.button == MouseButton::Left)
+      endCanvasDrag();
+  };
+  canvas.onPointerCancel = [endCanvasDrag](PointerEvent &)
+  { endCanvasDrag(); };
+  // Wheel zoom. A notched wheel steps by kZoomStep; a trackpad (precise
+  // pixel deltas) zooms continuously. +dy = wheel down = zoom out.
+  canvas.onWheel = [](WheelEvent &e)
+  {
+    if (e.dy == 0.0f)
+      return;
+    const float f = e.precise ? std::pow(kZoomStep, -e.dy / 40.0f)
+                              : (e.dy < 0.0f ? kZoomStep : 1.0f / kZoomStep);
+    setZoom(state.zoom * f);
+    e.stopPropagation();
+  };
 
   viewport.addChild(std::move(canvas));
 
@@ -11628,12 +11722,25 @@ int main()
     state.film.dirty = false;
     return d;
   };
-  filmstrip.onPressAt = [&ui](float lx, float ly)
-  { filmClick(lx, ly, ui.modifiers()); };
-  filmstrip.onScrollUp = []
-  { filmScrollBy(-2.0f * kFilmCellW); };
-  filmstrip.onScrollDown = []
-  { filmScrollBy(2.0f * kFilmCellW); };
+  filmstrip.onPointerDown = [](PointerEvent &e)
+  {
+    if (e.button != MouseButton::Left)
+      return;
+    e.stopPropagation();
+    filmClick(e.x, e.y, e.mods); // modifiers now come with the event
+  };
+  // Wheel: two cells per notch; a trackpad scrolls by its pixel delta (and
+  // honours sideways swipes).
+  filmstrip.onWheel = [](WheelEvent &e)
+  {
+    if (e.precise)
+      filmScrollBy(std::abs(e.dx) > std::abs(e.dy) ? e.dx : e.dy);
+    else if (e.dy != 0.0f)
+      filmScrollBy((e.dy < 0.0f ? -2.0f : 2.0f) * kFilmCellW);
+    else
+      return;
+    e.stopPropagation();
+  };
   centerColumn.addChild(std::move(filmstrip));
 
   workspace.addChild(std::move(centerColumn));
@@ -11658,10 +11765,11 @@ int main()
     const float next = state.maskPanelW - (localX - kDividerW / 2.0f);
     state.maskPanelW = std::clamp(next, kMinMaskPanelW, kMaxMaskPanelW);
   };
-  rDivider.onPressAt = [updateMaskPanelWidth](float localX, float)
-  { updateMaskPanelWidth(localX); };
-  rDivider.onDragTo = [updateMaskPanelWidth](float localX, float)
-  { updateMaskPanelWidth(localX); };
+  {
+    auto resize = [updateMaskPanelWidth](float localX, float)
+    { updateMaskPanelWidth(localX); };
+    bindDrag(rDivider, resize, resize, nullptr);
+  }
   workspace.addChild(std::move(rDivider));
 
   View maskPanel;

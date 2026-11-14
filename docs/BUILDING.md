@@ -25,7 +25,8 @@ This guide covers building the LiteUI examples and tests from a checkout, and bu
 | CMake | 3.21 or newer | 3.21 or newer |
 | Generator | Ninja | Ninja |
 | Display | Windows desktop | A **Wayland** session |
-| Libraries | Windows SDK (`user32`, `gdi32`, `d2d1`, `dwrite`, `windowscodecs`, `ole32`) | See [Linux setup](#linux-setup) |
+| Libraries | Windows SDK (`user32`, `gdi32`, `d3d11`, `dxgi`, `d2d1`, `dwrite`, `windowscodecs`, `ole32`) | See [Linux setup](#linux-setup) |
+| GPU at run time | Direct3D 10.0 or newer feature level (falls back to the WARP software rasterizer if there is no usable GPU) | A driver with **OpenGL ES 3.0** through EGL |
 
 CMake 3.21 is the minimum because the presets file uses preset schema version 3. The `liteui::liteui` target sets `cxx_std_23` for you.
 
@@ -67,7 +68,7 @@ The sanitizer preset (`msvc-debug-asan`) needs the AddressSanitizer component of
 
 ## Linux setup
 
-LiteUI renders through Wayland, EGL/GLES2, Cairo and Pango, so you need the development packages for each of those. `CMakeLists.txt` finds them through `pkg-config`, one module each:
+LiteUI renders through Wayland, EGL and OpenGL ES 3.0, with Cairo and Pango for text, so you need the development packages for each of those. `CMakeLists.txt` finds them through `pkg-config`, one module each:
 
 | pkg-config module | Used for |
 |---|---|
@@ -75,12 +76,12 @@ LiteUI renders through Wayland, EGL/GLES2, Cairo and Pango, so you need the deve
 | `wayland-cursor` | Resize/arrow cursors |
 | `wayland-egl` | EGL window surface |
 | `egl` | EGL context |
-| `glesv2` | GLES2 rendering |
-| `cairo` | Canvas surfaces |
+| `glesv2` | OpenGL ES rendering (the header includes `GLES3/gl3.h`, so the package must ship the ES 3.0 headers) |
+| `cairo` | Text rasterization (and canvas surfaces with `LITEUI_CANVAS_GL=OFF`) |
 | `pangocairo` | Text shaping and layout |
 | `xkbcommon` | Keyboard layout and keysyms |
-| `libpng` | PNG decoding |
-| `libjpeg` | JPEG decoding |
+| `libpng` | PNG decoding and encoding |
+| `libjpeg` | JPEG decoding and encoding |
 
 On Debian/Ubuntu (package names vary by distribution):
 
@@ -90,9 +91,11 @@ sudo apt install build-essential cmake ninja-build pkg-config \
     libegl-dev libgles-dev libpng-dev libjpeg-dev
 ```
 
-You do **not** need `wayland-scanner` or the `wayland-protocols` package to build. The generated `xdg-shell` and `xdg-decoration` bindings are vendored in `platform/wayland-protocols/`. See [Wayland protocol bindings](#wayland-protocol-bindings) for when you would need them.
+You do **not** need `wayland-scanner` or the `wayland-protocols` package to build. The generated `xdg-shell`, `xdg-decoration` and `tablet-unstable-v2` (pen input) bindings are vendored in `platform/wayland-protocols/`. See [Wayland protocol bindings](#wayland-protocol-bindings) for when you would need them.
 
-Linux builds also enable the C language (for those vendored `.c` files) and link `libutil`. Windows builds never compile any C.
+Linux builds also enable the C language (for those vendored `.c` files). Windows builds never compile any C.
+
+The GPU driver must provide **OpenGL ES 3.0** (Mesa does on practically all current hardware). This applies to the window renderer itself, even if you turn the GL canvas backend off.
 
 ### Optional runtime tools
 
@@ -162,9 +165,10 @@ These are defined at the top level of the repository.
 | `LITEUI_BUILD_EXAMPLES` | `ON` | Build the programs under `examples/` |
 | `LITEUI_SANITIZE` | `OFF` | Build the tests with AddressSanitizer (plus UBSan on GCC/Clang) |
 | `LITEUI_PROFILE` | `OFF` | Add `-DLITEUI_PROFILE` to everything that links `liteui::liteui` (see [Profiling build](#profiling-build)) |
+| `LITEUI_CANVAS_GL` | `ON` | **Linux only.** Render `Canvas` nodes with the OpenGL ES 3.0 backend (GPU). Turn it `OFF` to fall back to the older Cairo canvas backend, which differs in a few behaviors (see [CANVAS.md](CANVAS.md#platform-differences)). Adds `-DLITEUI_CANVAS_GL` to everything that links `liteui::liteui`. Ignored on Windows, where canvases always render through Direct2D. |
 | `LITEUI_EXAMPLE_<NAME>` | `ON` | One switch per example directory (see [Examples](#examples)) |
 
-`LITEUI_BUILD_TESTS`, `LITEUI_BUILD_EXAMPLES` and `LITEUI_SANITIZE` only exist when LiteUI is the **top-level** project. When another project pulls LiteUI in with `add_subdirectory` or `FetchContent`, it never downloads Catch2 and never builds tests or examples. `LITEUI_PROFILE` is available in both situations.
+`LITEUI_BUILD_TESTS`, `LITEUI_BUILD_EXAMPLES` and `LITEUI_SANITIZE` only exist when LiteUI is the **top-level** project. When another project pulls LiteUI in with `add_subdirectory` or `FetchContent`, it never downloads Catch2 and never builds tests or examples. `LITEUI_PROFILE` and `LITEUI_CANVAS_GL` are available in both situations.
 
 ## Where things end up
 
@@ -203,7 +207,7 @@ LiteUI uses Catch2 v3.
 
 **How Catch2 is found.** The root `CMakeLists.txt` first looks for an installed Catch2 v3 (`apt install catch2`, vcpkg, Conan, ...). If none is found, it fetches the pinned release v3.8.1 with `FetchContent`, which needs network access and `git`. Catch2 is located once, in the root, so the core tests and every example's tests see the same `Catch2::Catch2WithMain`.
 
-**What the suites are.** The core suite (`liteui_core`) is one translation unit, `tests/liteui_tests.cpp`. It defines `LITEUI_IMPLEMENTATION` itself and then includes each case file from `tests/cases/*.inc`: core types, layout, platform, XML, and SVG paths, primitives and documents. New `.inc` files are picked up on the next configure. Examples with a `tests/` folder, such as `counter`, register their own tests through the same helper, `liteui_add_test()`.
+**What the suites are.** The core suite (`liteui_core`) is one translation unit, `tests/liteui_tests.cpp`. It defines `LITEUI_IMPLEMENTATION` itself and then includes each case file from `tests/cases/*.inc`: core types, layout, platform, XML, and SVG paths, primitives and documents, and the GL canvas context (`canvas_gl_context.inc`, which runs it against a software renderer so no GPU is needed). New `.inc` files are picked up on the next configure. Examples with a `tests/` folder, such as `counter`, register their own tests through the same helper, `liteui_add_test()`.
 
 **Running them.**
 
@@ -236,7 +240,7 @@ cmake --build --preset gcc-release-profile
 
 Programs built this way print a short report to **stderr** about once per second, giving the average and worst-case time (in milliseconds) and the run count of each stage: mouse handling, painting, canvas drawing, canvas blits and presenting. With the option off, the profiler expands to nothing.
 
-> **Windows only for now.** The timing probes exist only in the Direct2D backend. A Linux build with `LITEUI_PROFILE` compiles and runs normally but prints nothing. The stage list, how to read the output and the known gaps are in [PROFILING.md](PROFILING.md).
+> **Windows only for now.** The timing probes exist only in the Windows backend. A Linux build with `LITEUI_PROFILE` compiles and runs normally but prints nothing. The stage list, how to read the output and the known gaps are in [PROFILING.md](PROFILING.md).
 
 Without CMake, define `LITEUI_PROFILE` for the translation unit that defines `LITEUI_IMPLEMENTATION`.
 
@@ -291,24 +295,27 @@ These commands are a starting point; adjust paths to your layout.
 
 ```bat
 cl /std:c++latest /EHsc /utf-8 /I path\to\liteui main.cpp ^
-   user32.lib gdi32.lib d2d1.lib dwrite.lib windowscodecs.lib ole32.lib
+   user32.lib gdi32.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib windowscodecs.lib ole32.lib
 ```
 
-**Linux (GCC):** the two generated protocol files are C, so compile them with a C compiler and link the objects in:
+**Linux (GCC):** the three generated protocol files are C, so compile them with a C compiler and link the objects in:
 
 ```sh
 P=path/to/liteui/platform/wayland-protocols
 gcc -c $P/xdg-shell-protocol.c      -o xdg-shell-protocol.o
 gcc -c $P/xdg-decoration-protocol.c -o xdg-decoration-protocol.o
+gcc -c $P/tablet-protocol.c         -o tablet-protocol.o
 
-g++ -std=c++23 -I path/to/liteui -I $P main.cpp \
-    xdg-shell-protocol.o xdg-decoration-protocol.o \
+g++ -std=c++23 -DLITEUI_CANVAS_GL -I path/to/liteui -I $P main.cpp \
+    xdg-shell-protocol.o xdg-decoration-protocol.o tablet-protocol.o \
     $(pkg-config --cflags --libs wayland-client wayland-cursor wayland-egl \
         cairo pangocairo egl glesv2 xkbcommon libpng libjpeg) \
     -o app
 ```
 
-The `-I $P` is required: the implementation includes `xdg-shell-client-protocol.h` and `xdg-decoration-client-protocol.h` by bare name.
+The `-I $P` is required: the implementation includes `xdg-shell-client-protocol.h`, `xdg-decoration-client-protocol.h` and `tablet-client-protocol.h` by bare name.
+
+`-DLITEUI_CANVAS_GL` selects the OpenGL ES 3.0 canvas backend, which is what the CMake target enables by default on Linux. Leave it out to get the Cairo canvas backend instead. Define it (or not) in the translation unit that defines `LITEUI_IMPLEMENTATION`.
 
 ## Wayland protocol bindings
 
@@ -319,13 +326,15 @@ platform/wayland-protocols/xdg-shell-protocol.c
 platform/wayland-protocols/xdg-shell-client-protocol.h
 platform/wayland-protocols/xdg-decoration-protocol.c
 platform/wayland-protocols/xdg-decoration-client-protocol.h
+platform/wayland-protocols/tablet-protocol.c               (pen input)
+platform/wayland-protocols/tablet-client-protocol.h        (tablet-unstable-v2)
 ```
 
 The trade-off is that the vendored files are frozen at the `wayland-protocols` version that generated them. A maintainer picks up upstream changes by regenerating and committing them.
 
 ### Regenerating
 
-The `regen-protocols` target exists whenever `wayland-scanner` and the `wayland-protocols` package are both available. It creates the directory if needed and regenerates all four files from the installed protocol XML (`stable/xdg-shell/xdg-shell.xml` and `unstable/xdg-decoration/xdg-decoration-unstable-v1.xml`):
+The `regen-protocols` target exists whenever `wayland-scanner` and the `wayland-protocols` package are both available. It creates the directory if needed and regenerates all six files from the installed protocol XML (`stable/xdg-shell/xdg-shell.xml`, `unstable/xdg-decoration/xdg-decoration-unstable-v1.xml` and `unstable/tablet/tablet-unstable-v2.xml`):
 
 ```sh
 sudo apt install libwayland-bin wayland-protocols
@@ -337,7 +346,7 @@ Then re-run the configure step.
 
 ### What happens when files are missing
 
-All four files must exist. If any is missing, configuration behaves like this:
+All six files must exist. If any is missing, configuration behaves like this:
 
 | Situation | Result |
 |---|---|
@@ -370,7 +379,10 @@ Your target is not linking `liteui::liteui`, or you are compiling by hand withou
 The opposite problem: no translation unit in the executable defines `LITEUI_IMPLEMENTATION` before including the header.
 
 **The program throws `std::runtime_error` at startup on Linux.**
-The backend reports initialization failures with exceptions. "Failed to connect to Wayland display" means you are not in a Wayland session (or `WAYLAND_DISPLAY` is not set, for example over SSH or in a container). "Missing required Wayland globals" means the compositor did not offer an interface LiteUI needs. An EGL error means EGL/GLES2 initialization failed, which usually points to missing GPU drivers or Mesa libraries.
+The backend reports initialization failures with exceptions. "Failed to connect to Wayland display" means you are not in a Wayland session (or `WAYLAND_DISPLAY` is not set, for example over SSH or in a container). "Missing required Wayland globals" means the compositor did not offer an interface LiteUI needs. A message saying LiteUI "needs an OpenGL ES 3.0 capable EGL driver" (or that it got an older GL version) means the EGL driver cannot provide ES 3.0, which usually points to missing GPU drivers or Mesa libraries, or a software or remote-desktop GL stack that only offers ES 2.0. Any other EGL error is an initialization failure of the same kind.
+
+**`GLES3/gl3.h: No such file or directory` (Linux).**
+The OpenGL ES development package you installed only has the ES 2.0 headers, or is missing. Install the one that ships `GLES3/gl3.h` (on Debian/Ubuntu, `libgles-dev`).
 
 **Garbled non-ASCII text in source on MSVC.**
 Add `/utf-8` to your compile options.

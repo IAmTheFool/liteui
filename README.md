@@ -1,6 +1,6 @@
 # LiteUI
 
-A single-header, retained-mode C++23 GUI library with a flexbox-style layout engine and native rendering backends: **Direct2D + DirectWrite** on Windows and **Wayland + EGL/GLES2 + Cairo/Pango** on Linux.
+A single-header, retained-mode C++23 GUI library with a flexbox-style layout engine and native rendering backends: **Direct3D 11 + Direct2D + DirectWrite** on Windows and **Wayland + EGL/OpenGL ES 3.0 + Cairo/Pango** on Linux. Both draw on the GPU, and mouse, pen and touch input share one event model.
 
 ```cpp
 #define LITEUI_IMPLEMENTATION
@@ -55,18 +55,19 @@ Each image links to the single-file demo that produced it, all built from the sa
 - **Flexbox-subset layout.** Row/column direction, `justifyContent`, `alignItems`, `gap`, wrapping with `alignContent`, `flexGrow`/`flexShrink`, min/max sizes, margin/padding, absolute positioning, z-index, `display: none` and `visibility: hidden` analogs, and per-axis overflow with scrollbars.
 - **`Dynamic<T>` fields.** Most style and text fields accept either a plain value or a callback. LiteUI re-polls the callbacks after every dispatched event, so UI state is "assign a lambda once", not "push updates by hand".
 - **Keyed lists.** Declare a list of keys and an item builder; survivors are reused untouched (cached text, canvas surfaces, scroll offsets), so adding or removing a row costs one build, not a rebuild of the whole list.
-- **Built-in leaf nodes.** `Text`, `TextInput`, `Canvas` (an HTML5-2D-context-style API), `Image` (PNG/JPEG and more on Windows) and `Svg` (a vector subset that re-renders crisply at any size).
-- **Small platform helpers.** File/folder pickers, clipboard access, image decoding, timers, global shortcuts, tooltips, frameless windows with custom title bars, and a thread-safe `wake()`.
+- **Pointer events for mouse, pen and touch.** One DOM-style event type with bubbling, pointer capture, double-click, wheel, pen pressure and tilt, and batched pen samples for smooth strokes.
+- **Built-in leaf nodes.** `Text`, `TextInput`, `Canvas` (a GPU-accelerated, HTML5-2D-context-style API), `Image` (PNG/JPEG and more on Windows, including 16-bit and float sources) and `Svg` (a vector subset that re-renders crisply at any size).
+- **Small platform helpers.** File/folder pickers, clipboard access, image decoding and encoding, timers, global shortcuts, tooltips, frameless windows with custom title bars, and a thread-safe `wake()`.
 - **No virtual interface layer.** Platform differences are selected at compile time with `#if`, not through a runtime abstraction. `LiteUI` is a thin handle over the platform implementation.
 
 ## Platform support
 
 | Platform | Window system | Rendering | Text | Notes |
 |---|---|---|---|---|
-| Windows | Win32 | Direct2D | DirectWrite | Image decoding via WIC |
-| Linux | **Wayland only** (xdg-shell) | EGL + GLES2 | Pango (rasterized with Cairo) | Image decoding via libpng/libjpeg |
+| Windows | Win32 | Direct2D on a Direct3D 11 swap chain (WARP software fallback) | DirectWrite | Images via WIC; pen and touch via `WM_POINTER*` |
+| Linux | **Wayland only** (xdg-shell) | EGL + **OpenGL ES 3.0** | Pango (rasterized with Cairo) | Images via libpng/libjpeg; touch via `wl_touch`, pen via tablet-v2 |
 
-macOS and X11 are not supported. On Linux, LiteUI draws its own 32 px title bar (with minimize/maximize/close) unless you create the window with `hideTitlebar = true`.
+macOS and X11 are not supported. Linux needs a GPU driver that provides OpenGL ES 3.0. On Linux, LiteUI draws its own 32 px title bar (with minimize/maximize/close) unless you create the window with `hideTitlebar = true`.
 
 The bundled CMake presets use **MSVC** on Windows and **GCC** on Linux. The project requires **C++23** (set for you by the `liteui::liteui` target).
 
@@ -116,14 +117,14 @@ When LiteUI is pulled in as a subproject it never downloads Catch2 and never bui
 
 Copy `liteui.hpp` into your project and compile with C++23. You must provide the platform pieces yourself:
 
-- **Windows:** link `user32 gdi32 d2d1 dwrite windowscodecs ole32`.
-- **Linux:** link wayland-client, wayland-cursor, wayland-egl, cairo, pangocairo, egl, glesv2, xkbcommon, libpng and libjpeg, compile the generated `xdg-shell` and `xdg-decoration` protocol `.c` files, and put their headers on the include path (the header includes `xdg-shell-client-protocol.h` and `xdg-decoration-client-protocol.h`). The repository ships these under `platform/wayland-protocols/`.
+- **Windows:** link `user32 gdi32 d3d11 dxgi d2d1 dwrite windowscodecs ole32`.
+- **Linux:** link wayland-client, wayland-cursor, wayland-egl, cairo, pangocairo, egl, glesv2, xkbcommon, libpng and libjpeg, compile the generated `xdg-shell`, `xdg-decoration` and `tablet` protocol `.c` files, and put their headers on the include path (the header includes `xdg-shell-client-protocol.h`, `xdg-decoration-client-protocol.h` and `tablet-client-protocol.h`). The repository ships these under `platform/wayland-protocols/`. Also define `LITEUI_CANVAS_GL` for the OpenGL ES canvas backend (the CMake target does this for you on Linux); without it you get the Cairo canvas backend. See [`docs/BUILDING.md`](docs/BUILDING.md) for a complete command line.
 
 ### Dependencies
 
 **Windows:** the Windows SDK and a C++23-capable MSVC. Nothing else.
 
-**Linux:** development packages for the libraries above. On Debian/Ubuntu (package names vary by distribution):
+**Linux:** development packages for the libraries above, and a GPU driver with OpenGL ES 3.0 (Mesa on most hardware). On Debian/Ubuntu (package names vary by distribution):
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
@@ -166,7 +167,7 @@ row.addChild(otherView);      // flatten into Views automatically
 | Size | `width`, `height` (`Size::pixel(n)`, `Size::percentage(n)`, `Size::fit()`, `Size::full()`), `minWidth`/`maxWidth`/`minHeight`/`maxHeight` |
 | Spacing | `margin`, `padding` (`EdgeInsets`, or `EdgeInsets::all(n)`), `gap` |
 | Flex | `direction` (`Row`/`Column`), `justifyContent`, `alignItems`, `flexWrap`, `alignContent`, `flexGrow`, `flexShrink` |
-| Box | `backgroundColor`, `borderWidth`, `borderColor`, `borderRadius`, `hoverColor` |
+| Box | `backgroundColor`, `borderWidth`, `borderColor`, `borderRadius`, `hoverColor`, `cursor` |
 | Positioning | `position` (`Static`/`Absolute`), `left`/`top`/`right`/`bottom`, `zIndex`, `escapeClip` |
 | Visibility | `display` (`Flex`/`None`: removed from layout, paint and hit-testing), `visibility` (`Visible`/`Hidden`: keeps its space) |
 | Scrolling | `overflowX`/`overflowY` (`Visible`, `Hidden`, `Scroll`, `Auto`), `wheelScrollEnabled`, `contentPanEnabled`, scrollbar colors and `scrollbarAutoHide` |
@@ -189,21 +190,23 @@ view.style.backgroundColor = [&] { return count > 5 ? Color{200, 0, 0}
                                                     : Color{40, 40, 40}; };
 ```
 
-Callbacks are polled after every dispatched event (click, key, wheel, interval tick, wake) and once when you call `setRoot`. If a value changed, LiteUI relayouts and repaints; if nothing changed, nothing is redrawn. Callbacks should therefore be cheap and side-effect free. Use `Dynamic<float>` fields with float literals (`8.0f`), since an `int` assigned to a `std::variant<float, ...>` is a narrowing conversion and will not compile.
+Callbacks are polled after every dispatched event (pointer, key, wheel, interval tick, wake) and once when you call `setRoot`. If a value changed, LiteUI relayouts and repaints; if nothing changed, nothing is redrawn. Callbacks should therefore be cheap and side-effect free. Use `Dynamic<float>` fields with float literals (`8.0f`), since an `int` assigned to a `std::variant<float, ...>` is a narrowing conversion and will not compile.
 
 ### Events
 
-Handlers are plain `std::function`s on `View` (and on `Canvas`):
+Handlers are plain `std::function`s on `View` (and on `Canvas`). Mouse, pen and touch all produce the same `PointerEvent`: the position (`x`/`y` local to the view, `windowX`/`windowY` in the window), the `button` that changed, a `buttons` bitmask, the modifier keys, and pen data (`pressure`, `tiltX`/`tiltY`, `eraser`). A pen tip or a finger counts as the left button.
 
 | Category | Members |
 |---|---|
-| Clicks | `onClick`, `onMiddleClick`, `onRightClick`. **Bubble** up to the nearest ancestor with a handler |
-| Press / drag (local coordinates) | `onPressAt`, `onDragTo`, `onDragEnd` (plus `onMiddle*` and `onRight*` variants) |
-| Hover | `onHoverAt(x, y)`, `onHoverEnd()`. Return `true` if app state changed and a repaint is needed |
-| Wheel notches | `onScrollUp`, `onScrollDown` (bubble like clicks; independent of content scrolling) |
+| Pointer | `onPointerDown`, `onPointerMove`, `onPointerUp`, `onPointerCancel`, `onPointerEnter`, `onPointerLeave`. A press **captures** the pointer, so moves and the release keep arriving even when the pointer leaves the view |
+| Clicks | `onClick` (left button), `onDoubleClick`, `onAuxClick` (middle), `onContextMenu` (right). They **bubble** up to the nearest ancestor with a handler, unless a handler taking `PointerEvent &e` calls `e.stopPropagation()` |
+| Wheel | `onWheel`. Bubbles; call `e.stopPropagation()` to use the wheel yourself instead of the built-in scrolling |
 | Keyboard | `focusable`, `onFocus`, `onBlur`, `onKeyDown`, `onKeyUp`, `onTextInput(codepoint)`. Only the focused view receives them |
 | Layout | `onLayout(x, y, w, h)` fires after each layout so you can read a view's real box |
 | Tooltip | `tooltip = "text"`, styled with `LiteUI::setTooltipStyle` |
+| Cursor | `style.cursor` (`Cursor::Pointer`, `Text`, `Crosshair`, `Grab`, ...), inherited from the parent |
+
+`onClick` accepts either `[&] { ... }` or `[&](PointerEvent &e) { ... }`. The short form ends bubbling; the long form lets you look at the event or let it continue. Views without a handler for an event, and disabled views, are transparent to the pointer. The full model (capture, cancel, coalesced pen samples, touch) is in [`docs/API.md`](docs/API.md#pointer-events).
 
 Window-level hooks live on `LiteUI`:
 
@@ -247,12 +250,12 @@ list.itemBuilder = [&](const std::string &id) {
 | `Text` | Label with font size/weight/style/family, color, alignment, wrapping, ellipsis, line height, letter spacing, `maxLines`, underline, strikethrough. `label` and `color` are `Dynamic` |
 | `TextInput` | Single-line field with placeholder, blinking caret, click-to-position, arrow-key navigation, `onChange`, `onSubmit` (Enter). State is shared through `TextInput::state` |
 | `Canvas` | A surface you draw on via `onPaint(CanvasContext &)`; see below |
-| `Image` | A decoded bitmap from `path`, `memoryData`, or a (possibly dynamic) `source`; `ObjectFit` (`Fill`, `Contain`, `Cover`, `None`, `ScaleDown`), `onLoad`/`onError` |
+| `Image` | A decoded bitmap from `path`, `memoryData`, or a (possibly dynamic) `source`, or high-precision pixels from an `ImageBuffer` through `hdrSource` (with `displaySettings` for exposure); `ObjectFit` (`Fill`, `Contain`, `Cover`, `None`, `ScaleDown`), `onLoad`/`onError` |
 | `Svg` | Parsed from `path` or inline `source`; stays vector and re-renders at the node's pixel size; `onLoad`/`onError` |
 
 ### Canvas
 
-`CanvasContext` mirrors the HTML5 2D context: transforms, paths (`moveTo`, `lineTo`, `arc`, `arcTo`, `ellipse`, Bezier curves, `rect`, `roundRect`), `fill`/`stroke`/`clip`, linear and radial gradients, line caps/joins/dashes, global alpha, shadows, text (`fillText`, `strokeText`, `measureText`), `drawImage`, and `getImageData`/`putImageData`.
+`CanvasContext` mirrors the HTML5 2D context, drawn on the GPU on both platforms: transforms, paths (`moveTo`, `lineTo`, `arc`, `arcTo`, `ellipse`, Bezier curves, `rect`, `roundRect`), `fill`/`stroke`/`clip`, linear and radial gradients, line caps/joins/dashes, global alpha, shadows, text (`fillText`, `strokeText`, `measureText`), `drawImage`, and `getImageData`/`putImageData`.
 
 ```cpp
 Canvas c;
@@ -271,7 +274,14 @@ root.addChild(c);
 
 ```cpp
 bool dirty = false;
-c.onDragTo = [&](float x, float y) { addStrokePoint(x, y); dirty = true; };
+c.onPointerMove = [&](PointerEvent &e) {
+    if (!e.held(MouseButton::Left)) return;          // hover moves have buttons == 0
+    for (const PointerSample &s : e.coalesced) {      // every position since the last event
+        PointerSample p = e.toLocal(s);
+        addStrokePoint(p.x, p.y);
+    }
+    dirty = true;
+};
 c.canvasDirtySource = [&] { bool d = dirty; dirty = false; return d; };
 ```
 
@@ -314,10 +324,14 @@ liteui_clipboard::setText("copied");
 std::optional<std::string> text = liteui_clipboard::getText();
 
 std::string err;
-std::optional<CanvasImage> img = liteui_image::decodeFile("photo.jpg", &err);
+std::optional<CanvasImage> img = liteui_image::decodeFile("photo.jpg", &err);   // 8-bit RGBA
+
+// Keep the file's precision (a 16-bit PNG stays 16-bit), then write it back out:
+std::optional<ImageBuffer> buf = liteui_image::decodeFileBuffer("photo.png", &err);
+if (buf) liteui_image::encodePng("copy.png", *buf, &err);
 ```
 
-Pickers are modal and block until the user chooses or cancels (safe to call from an `onClick`). Filter patterns use the same `";"`-separated glob syntax on both platforms. A `CanvasImage` is straight-alpha RGBA8, `width * height * 4` bytes.
+Pickers are modal and block until the user chooses or cancels (safe to call from an `onClick`). Filter patterns use the same `";"`-separated glob syntax on both platforms. A `CanvasImage` is straight-alpha RGBA8, `width * height * 4` bytes. An `ImageBuffer` also holds 16-bit and half/float pixels, and `liteui_image` can probe file headers, encode PNG and JPEG, convert between pixel formats, and build the 8-bit display copy that `Image::hdrSource` shows (see [`docs/API.md`](docs/API.md#liteui_image-decoding-encoding-and-display-conversion)).
 
 ## Examples
 
@@ -362,11 +376,12 @@ The generator is Ninja. On Windows the MSVC presets expect an environment where 
 | `LITEUI_BUILD_EXAMPLES` | `ON` | Build the example programs |
 | `LITEUI_SANITIZE` | `OFF` | Build tests with AddressSanitizer (plus UBSan on GCC/Clang) |
 | `LITEUI_PROFILE` | `OFF` | Define `LITEUI_PROFILE` for consumers (see below) |
+| `LITEUI_CANVAS_GL` | `ON` | Linux only: render canvases with the OpenGL ES 3.0 backend. `OFF` falls back to Cairo |
 | `LITEUI_EXAMPLE_<NAME>` | `ON` | Per-example switch, e.g. `LITEUI_EXAMPLE_HELLO` |
 
 ### Tests
 
-Tests use [Catch2](https://github.com/catchorg/Catch2) v3. An installed Catch2 is preferred; otherwise v3.8.1 is fetched. The core suite (`liteui_core`) is a single translation unit that defines `LITEUI_IMPLEMENTATION` and includes every case file from `tests/cases/*.inc` (core types, layout, platform, XML, and SVG paths/primitives/documents). Examples that ship a `tests/` folder register their own.
+Tests use [Catch2](https://github.com/catchorg/Catch2) v3. An installed Catch2 is preferred; otherwise v3.8.1 is fetched. The core suite (`liteui_core`) is a single translation unit that defines `LITEUI_IMPLEMENTATION` and includes every case file from `tests/cases/*.inc`: core types, pixel formats, `ImageBuffer`, image conversion, display and codecs, XML, SVG, layout, pointer events, the Linux keysym mapping, and (on Linux with the GL canvas backend) the GL canvas helpers and context, which run against a software renderer so no GPU is needed. An opt-in `[hardware]` case opens a real window and checks the actual canvas backend. Examples that ship a `tests/` folder register their own.
 
 ```sh
 ctest --preset msvc-release          # or gcc-release, gcc-debug-asan, ...
@@ -380,7 +395,7 @@ Configure with `LITEUI_PROFILE=ON` (or use a `*-profile` preset) to print, about
 
 ### Regenerating the Wayland bindings
 
-On Linux, the `regen-protocols` target regenerates `platform/wayland-protocols/` from your installed `wayland-protocols` using `wayland-scanner`. You only need it to pick up upstream protocol changes. Commit the result afterwards.
+On Linux, the `regen-protocols` target regenerates `platform/wayland-protocols/` (xdg-shell, xdg-decoration and tablet-unstable-v2) from your installed `wayland-protocols` using `wayland-scanner`. You only need it to pick up upstream protocol changes. Commit the result afterwards.
 
 ```sh
 cmake --build build/release --target regen-protocols
@@ -396,23 +411,23 @@ liteui.hpp                 the library (API at the top, implementation under LIT
 CMakeLists.txt             liteui::liteui target; tests and examples when top-level
 CMakePresets.json          msvc-* and gcc-* configure/build/test presets
 cmake/LiteuiTests.cmake    liteui_add_test() and sanitizer helpers
-platform/wayland-protocols vendored xdg-shell / xdg-decoration bindings (Linux)
+platform/wayland-protocols vendored xdg-shell / xdg-decoration / tablet-v2 bindings (Linux)
 tests/                     Catch2 suite: liteui_tests.cpp + cases/*.inc
 examples/                  hello, counter, literoom, others/
 docs/                      documentation
 .github/workflows/         CI (build, release, single-header check)
 ```
 
-Inside `liteui.hpp`, the public declarations come first (colors, keys, `Style`, leaf nodes, `CanvasContext`, `View`, `LiteUI`). After that, the `LITEUI_IMPLEMENTATION` section contains, in order: the optional profiler, file pickers, clipboard, image decoding, the XML and SVG parsers, the text backend, the Canvas backends, the layout engine, and the Win32 / Wayland window implementation.
+Inside `liteui.hpp`, the public declarations come first (colors, keys, pointer events, pixel formats and `ImageBuffer`, `Style`, leaf nodes, `CanvasContext`, `View`, `LiteUI`). After that, the `LITEUI_IMPLEMENTATION` section contains, in order: the optional profiler, file pickers, clipboard, image codecs, the XML and SVG parsers, the text backend, the Canvas backends, the layout engine, the pointer router, and the Win32 / Wayland window implementation.
 
 ## Known limitations
 
 - **Platforms:** Windows and Linux/Wayland only. No X11 or macOS backend. The header contains no DPI or output-scale handling today.
 - **One window per process** is the intended model (`LiteUI::current()` returns the most recently constructed window).
 - **`TextInput`** is single-line, and its caret works on byte offsets (ASCII-oriented). For anything richer, build a `Canvas` widget using `liteui_text::caretIndexForX`.
-- **Images:** on Linux, `Image` and `liteui_image` decode **PNG and JPEG only**; file decoding is chosen by extension and memory decoding by magic bytes. On Windows, decoding goes through WIC, so any format WIC supports works. Decoding is synchronous.
+- **Images:** on Linux, `Image` and `liteui_image` decode and encode **PNG and JPEG only**. `decodeFile` picks the codec by extension and the memory and `ImageBuffer` decoders by content. On Windows, decoding goes through WIC, so any format WIC supports works. Decoding is synchronous. JPEG encoding is 8-bit only, and the 16-bit and float pixel formats must be converted before encoding to JPEG.
 - **SVG** is a vector subset: shapes (`path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`), groups, `<defs>`/`<use>`, transforms, presentation attributes and inline `style=""`. `<style>` blocks support **simple `.class` rules only**. There are no gradients, patterns, `clipPath`/`mask`, or text. Group opacity is approximated per shape.
-- **Canvas on Windows:** `globalCompositeOperation` is stored but only normal source-over blending is applied; radial gradients with an inner radius are approximated; shadows are flat, unblurred offset copies (on both platforms); `strokeText` approximates an outline; `fillText`'s `maxWidth` is accepted but unused.
+- **Canvas:** shadows are flat, unblurred offset copies on every backend, and `fillText`'s `maxWidth` is accepted but unused. On Windows, `globalCompositeOperation` honors only `SourceOver`, `Copy` and `Lighter`, radial gradients with an inner radius are approximated, `strokeText` approximates an outline, and gradient fills on text use only the first stop. The Linux OpenGL ES backend has none of these gaps; the Cairo fallback (`LITEUI_CANVAS_GL=OFF`) shares the text ones. Details in [`docs/CANVAS.md`](docs/CANVAS.md#platform-differences).
 - **File pickers and the system clipboard on Linux** rely on external tools (see [Dependencies](#dependencies)).
 - **Threading:** only `LiteUI::wake()` may be called off the UI thread.
 
@@ -423,7 +438,7 @@ Detailed guides live in [`docs/`](docs/):
 - `GETTING_STARTED.md`: a step-by-step tutorial from an empty folder to a working app
 - `PLATFORM_NOTES.md`: every Windows and Linux difference in one place, plus known platform gaps
 - `ARCHITECTURE.md`: how the library is put together: header layout, update cycle, rendering, event loops and threading
-- `API.md`: reference for the public types and functions
+- `API.md`: reference for the public types and functions, including pointer events and image helpers
 - `BUILDING.md`: platform setup, presets and options
 - `LAYOUT.md`: the layout engine and `Style` in depth
 - `CANVAS.md`: the Canvas API and its platform differences

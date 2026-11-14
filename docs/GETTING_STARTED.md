@@ -11,7 +11,7 @@ This tutorial takes you from an empty folder to a small working LiteUI app, one 
 7. [Common stumbling blocks](#common-stumbling-blocks)
 8. [Where to go next](#where-to-go-next)
 
-You need a C++23 compiler, CMake 3.21+ and Ninja. On Windows that is Visual Studio's MSVC; on Linux it is GCC plus the Wayland, Cairo and Pango development packages. [BUILDING.md](BUILDING.md#requirements) has the exact list and the install command.
+You need a C++23 compiler, CMake 3.21+ and Ninja. On Windows that is Visual Studio's MSVC; on Linux it is GCC plus the Wayland, EGL/OpenGL ES, Cairo and Pango development packages, and a GPU driver that provides OpenGL ES 3.0. [BUILDING.md](BUILDING.md#requirements) has the exact list and the install command.
 
 All names in the examples (`View`, `Text`, `Size`, ...) are in the global namespace, so there is nothing to `using`.
 
@@ -162,6 +162,7 @@ Things to notice:
 
 - **`count` lives in `main`, and the callbacks capture it by reference.** Your state stays in your variables. The tree never owns it. It just has to outlive `ui.run()`, which it does.
 - **A button is just a `View` with `onClick`.** Clicking the "+1" text works because clicks *bubble* from the text up to the nearest ancestor that has a handler.
+- **`onClick` takes two shapes.** The short form `[&] { ... }`, used above, is all a button needs. If you want to know where or how the click happened, write `[&](PointerEvent &e) { ... }` instead: `e.x` and `e.y` give the position inside the view, and `e.stopPropagation()` keeps the click from also reaching ancestors. (The short form ends bubbling for you, since it has no way to ask for it.) It works the same for a mouse, a pen tip or a finger.
 - **`hoverColor`** replaces the background while the pointer is over the view.
 - **Use float literals for `Dynamic<float>` fields.** `borderRadius = 6.0f` compiles, but `borderRadius = 6` does not, because an `int` assigned to a `std::variant<float, ...>` is a narrowing conversion.
 - **Callbacks should be cheap.** They run after *every* event. Compute from your state, return a value, do nothing else.
@@ -321,7 +322,37 @@ root.addChild(gauge);
 
 The key idea: **`onPaint` is not a per-frame loop.** LiteUI keeps the bitmap and calls `onPaint` only when the canvas is first laid out, is resized, or `canvasDirtySource` returns `true`. Here the dirty source simply compares the value last drawn with the current `count`, the same "poll your own state" idea as `Dynamic<>`. It is polled after every event, so clicking "+1" redraws the gauge and nothing else does.
 
-Also always call `setLineWidth` yourself: the default stroke width differs between platforms. The full drawing API is in [CANVAS.md](CANVAS.md).
+Also always call `setLineWidth` yourself. The default stroke width is 1 px on Windows and with the default Linux canvas backend, but a build that falls back to the Cairo canvas backend (`-DLITEUI_CANVAS_GL=OFF`) uses 2 px, so an explicit width keeps your drawing identical everywhere. The full drawing API is in [CANVAS.md](CANVAS.md).
+
+### Making the gauge respond to the pointer
+
+A canvas can also receive input. Add `#include <cmath>` at the top, then, next to the gauge code and **before** `root.addChild(gauge)` (the node is copied when you add it, so set its handlers first), let the user set the value by clicking or dragging around the ring:
+
+```cpp
+constexpr float kHalf = 60.0f;                     // half of the 120 px canvas
+auto scrub = [&](PointerEvent &e) {
+    // Angle of the pointer around the centre: 0 at the top, increasing clockwise.
+    float angle = std::atan2(e.x - kHalf, kHalf - e.y);
+    if (angle < 0) angle += 6.2831853f;
+    count = static_cast<int>(std::lround(angle / 6.2831853f * 10.0f));
+};
+
+gauge.onPointerDown = [&](PointerEvent &e) {
+    if (e.button == MouseButton::Left) scrub(e);
+};
+gauge.onPointerMove = [&](PointerEvent &e) {
+    if (e.held(MouseButton::Left)) scrub(e);       // only while dragging
+};
+```
+
+What is happening here:
+
+- **One event type for every pointer.** The handlers receive a `PointerEvent`, whether the input came from a mouse, a pen or a finger. A pen tip or a finger counts as the left button, so this gauge already works on a touch screen. `e.x` and `e.y` are measured from the canvas's own top-left corner, which is why the centre is simply `(60, 60)`.
+- **A press captures the pointer.** Once `onPointerDown` has run on the gauge, the moves and the release that follow are delivered to it even if the pointer leaves the canvas, so a drag keeps working when you overshoot the ring. You do not have to write anything extra for that.
+- **`onPointerMove` also fires for plain hovering.** While no button is down, `e.buttons` is `0`. `e.held(MouseButton::Left)` is the usual test for "this is a drag".
+- **No redraw call is needed.** The handlers only change `count`. After every dispatched event LiteUI polls `canvasDirtySource`, sees that `count` changed, and redraws the gauge, and the "Count" label updates for the same reason.
+
+For strokes and other fine-grained input, `PointerEvent` also carries `pressure`, pen tilt and `coalesced` (every position since the last event), and there are matching `onPointerUp`, `onPointerCancel`, `onWheel` and more. They are described in [API.md](API.md#pointer-events).
 
 ---
 
@@ -383,6 +414,9 @@ Rules of thumb:
 | A fixed-width box gets squeezed beside a large sibling | Set `flexShrink = 0` on the fixed box. See [LAYOUT.md](LAYOUT.md#shrink-is-not-weighted-by-size). |
 | A crash or garbage after the window closes | A callback outlived the state it captured, or a thread was still calling `wake()`. Keep captured state alive for the life of the window and join your threads. |
 | Non-ASCII characters look wrong in source on MSVC | Compile with `/utf-8`, as in the CMake file above. |
+| `onPressAt`, `onDragTo`, `onHoverAt` or `onScrollUp` does not compile (older code) | Those handlers were replaced by pointer events: `onPointerDown`, `onPointerMove`, `onPointerEnter`/`onPointerLeave` and `onWheel`. See the migration table in [API.md](API.md#event-handlers). |
+| A drag inside a scroll container scrolls the page instead of reaching your view | The container's drag-to-pan claims the press. Set `contentPanEnabled = false` on the container. See [LAYOUT.md](LAYOUT.md#how-users-scroll). |
+| The program exits on Linux with a message about OpenGL ES 3.0 | The GPU driver cannot provide ES 3.0. See [BUILDING.md](BUILDING.md#troubleshooting). |
 
 ---
 
@@ -391,7 +425,7 @@ Rules of thumb:
 - **[README](../README.md):** a tour of the concepts with short snippets.
 - **[LAYOUT.md](LAYOUT.md):** how sizes, grow/shrink, alignment, absolute positioning and scrolling really work, plus layout recipes.
 - **[CANVAS.md](CANVAS.md):** custom drawing, input handling, animation and images.
-- **[API.md](API.md):** the complete reference.
+- **[API.md](API.md):** the complete reference, including the pointer-event model.
 - **[ARCHITECTURE.md](ARCHITECTURE.md):** how the library works inside.
 - **[PLATFORM_NOTES.md](PLATFORM_NOTES.md):** Windows and Linux differences in one place.
 - **`examples/`:** `hello`, `counter`, and the large `literoom` photo editor show real structure. The single-file demos in `examples/others/` cover a code editor, paint program, file explorer and more.

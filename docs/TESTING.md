@@ -36,6 +36,8 @@ ctest --preset gcc-release --rerun-failed        # only what failed last time
 
 **Discovery happens when you run `ctest`**, not at build time (`DISCOVERY_MODE PRE_TEST`). Building never needs to execute the test binary, but it does need to have been built before `ctest` can list or run anything.
 
+**Which presets can run tests.** There are test presets for `msvc-debug`, `msvc-release`, `msvc-debug-asan`, `gcc-debug`, `gcc-release` and `gcc-debug-asan`. The `*-profile` configure presets have none, so for those run `ctest --test-dir build/debug-profile` (or the matching build directory) instead.
+
 **Timeouts.** Tests registered through `liteui_add_test` get a **60 second** per-test timeout unless you pass `TIMEOUT`. The test presets also set a 120 second default, which only applies to tests that have no timeout of their own. The presets additionally print output on failure and treat "no tests found" as an error.
 
 ### Running the executable directly
@@ -48,13 +50,17 @@ build/release/tests/liteui_core_test "[layout]"              # by tag
 build/release/tests/liteui_core_test "[layout][scroll]"      # tags AND-ed
 build/release/tests/liteui_core_test "layout: resolveAxis"   # by name
 build/release/tests/liteui_core_test -s "[flex]"             # show passing assertions too
+build/release/tests/liteui_core_test "[image]"               # image codecs and the Image widget
+build/release/tests/liteui_core_test "[pixel]"               # ImageBuffer, conversion, display, 16-bit formats
+build/release/tests/liteui_core_test "[canvas][gl]"          # GL canvas cases (Linux, GL backend only)
+build/release/tests/liteui_core_test "[hardware]"            # hidden by default: see below
 ```
 
-Tags are **not** turned into CTest labels, so tag filtering is only available through the executable. (`ctest -L` works only for suites registered with a `LABEL`, and the core suite has none.)
+Tests tagged `[.]` are **hidden**: a normal run skips them, and you must name them explicitly (as in the last line above). Tags are **not** turned into CTest labels, so tag filtering is only available through the executable. (`ctest -L` works only for suites registered with a `LABEL`, and the core suite has none.)
 
 ## How the core suite is organized
 
-The whole core suite is **one translation unit**. That is deliberate: the internals under test (`liteui_layout`, `liteui_xml`, `liteui_svg`, the keysym tables, ...) exist only in the `LITEUI_IMPLEMENTATION` section of `liteui.hpp`, and that section may be compiled into exactly one translation unit per program. So `tests/liteui_tests.cpp` defines `LITEUI_IMPLEMENTATION` itself and then `#include`s every test file:
+The whole core suite is **one translation unit**. That is deliberate: the internals under test (`liteui_layout`, `liteui_xml`, `liteui_svg`, `liteui_pointer`, the GL canvas context, the keysym tables, ...) exist only in the `LITEUI_IMPLEMENTATION` section of `liteui.hpp`, and that section may be compiled into exactly one translation unit per program. So `tests/liteui_tests.cpp` defines `LITEUI_IMPLEMENTATION` itself and then `#include`s every test file:
 
 ```cpp
 #define LITEUI_IMPLEMENTATION
@@ -63,27 +69,90 @@ The whole core suite is **one translation unit**. That is deliberate: the intern
 #include "test_helpers.hpp"
 
 #include "cases/core_types.inc"
+#include "cases/pixel_format.inc"
+#include "cases/image_buffer.inc"
+#include "cases/image_convert.inc"
+#include "cases/image_display.inc"
+#include "cases/image_formats16.inc"
+#include "cases/image_codec.inc"
+#include "cases/image_widget.inc"
 #include "cases/xml.inc"
 #include "cases/svg_primitives.inc"
 #include "cases/svg_paths.inc"
 #include "cases/svg_documents.inc"
 #include "cases/layout.inc"
+#include "cases/pointer_events.inc"
 #include "cases/platform.inc"
+
+#include "cases/canvas_gl_helpers.inc"
+#include "cases/canvas_gl_context.inc"
+#include "cases/canvas_hardware.inc"
 ```
 
-The `cases/*.inc` files are **not standalone `.cpp` files**. They are fragments that rely on everything above them in `liteui_tests.cpp`. Because the test links `liteui::liteui`, the test executable also picks up the platform libraries (Direct2D on Windows, Wayland/Cairo/Pango/EGL on Linux), but the suites are pure logic and do not open a window.
+`tests/liteui_tests.cpp` is always the authoritative list of what runs. The last three canvas files are special: see [Conditionally compiled and hidden cases](#conditionally-compiled-and-hidden-cases).
+
+The `cases/*.inc` files are **not standalone `.cpp` files**. They are fragments that rely on everything above them in `liteui_tests.cpp`. Because the test links `liteui::liteui`, the test executable also picks up the platform libraries (Direct2D and Direct3D on Windows; Wayland, Cairo, Pango, EGL and OpenGL ES on Linux), but the suites are pure logic and do not open a window or need a GPU.
 
 | File | Covers | Main tags |
 |---|---|---|
 | `core_types.inc` | `Color`, `Size`, `EdgeInsets`, `Dynamic<T>` | `[core]` `[color]` `[size]` `[dynamic]` |
+| `pixel_format.inc` | `PixelFormat` and its size helpers: `bytesPerPixel`, `minimumRowBytes`, and `imageByteSize` for tight, padded and empty images and for overflow | `[pixel]` |
+| `image_buffer.inc` | `ImageBuffer`: creation and validation, padded strides, empty and invalid images, `valid()` detecting inconsistency, pixel access (RGBA8 and untouched RGBA32F), out-of-range access, copy and move | `[pixel]` `[imagebuffer]` |
+| `image_convert.inc` | The sRGB transfer functions and `convertImage`: RGBA8 to RGBA32F decoding sRGB with alpha kept linear, a round trip of every 8-bit code, clamping and sanitising, alpha separate from colour, same-format copies dropping padding, in-place use, and failures leaving the destination untouched | `[pixel]` `[convert]` |
+| `image_display.inc` | `DisplaySettings` and `makeDisplayImage` (defaults matching `convertImage`, exposure in stops, the clamp modes, negative/NaN/infinite values, RGBA8 passing through) and `toCanvasImage` honouring settings | `[pixel]` `[display]` |
+| `image_formats16.inc` | The 16-bit formats and half-float helpers (every finite half round-trips exactly), 24-megapixel memory footprints, UNORM 8/16 rescaling, FP16/RGBA16 quality against the FP32 reference, region (tiled) display, `downscaleImage`, and the `Image` widget accepting 16-bit sources | `[pixel]` `[half]` `[fmt16]` `[convert]` `[quality]` `[region]` `[downscale]` |
+| `image_codec.inc` | PNG and JPEG against `ImageBuffer`: `probeFile`/`probeMemory`, `decodeFileBuffer`/`decodeMemoryBuffer`, `encodePng`, `encodeJpeg` and their `Memory` forms. Every PNG colour type and bit depth, `tRNS`, 16-bit byte order, real files from another encoder, truncated/garbage/damaged input, encode-to-decode round trips, atomic file writes, JPEG alpha flattening and chroma options, `jpegSizeOk`, and chunk-CRC enforcement | `[image]` `[codec]` `[png]` `[jpeg]` `[convert]` |
+| `image_widget.inc` | The `Image` widget with `hdrSource`/`displaySettings` and `toCanvasImage`: what the node resolves and reports (sizing, `onLoad`, errors, swapping by pointer, rebuilding when settings change). Painting itself needs a real backend, so it is not checked here | `[image]` `[hdr]` |
 | `xml.inc` | `liteui_xml`, the small, forgiving XML parser behind the SVG loader: structure, attributes (quotes, entities, namespace prefixes, lenient unquoted and bare forms, duplicates), text, entities and numeric character references, CDATA, comments/PIs/DOCTYPE, malformed and truncated input, deep nesting | `[xml]` `[attrs]` `[text]` `[entities]` `[cdata]` `[misc]` `[errors]` `[limits]` |
 | `svg_primitives.inc` | The low-level SVG helpers: `scanNumber` and compact number lists, `Mat2x3` and `parseTransform`, hex/named/`rgb()`/`rgba()` colours and `parsePaint`, `parseOpacity`, dash arrays, CSS declarations and class-only stylesheets | `[svg]` `[number]` `[matrix]` `[transform]` `[color]` `[style]` |
 | `svg_paths.inc` | `parsePathData` (absolute and relative commands, implicit repeats, smooth curves, arcs converted to cubics, compact notation, truncated data) and the shape-to-path converters (`rectToOps`, `ellipseToOps`, `polyToOps`) | `[svg]` `[path]` `[shapes]` |
 | `svg_documents.inc` | End-to-end `svg::parseString` / `svg::parseFile`: sizing from `viewBox`/`width`/`height`, shape generation, fill/stroke/opacity, group inheritance and transforms, style precedence, `<defs>`/`<symbol>`/`<use>` (including cycles and depth limits), and file errors | `[svg]` `[doc]` `[shapes]` `[style]` `[group]` `[css]` `[use]` `[file]` |
-| `layout.inc` | The flexbox engine: helpers, flow, spacing, justify/align, grow/shrink, sizes and clamps, display/visibility, absolute positioning, wrapping, scrolling, `onLayout`, polled styles | `[layout]` plus `[helpers]` `[flex]` `[box]` `[grow]` `[shrink]` `[size]` `[display]` `[absolute]` `[wrap]` `[scroll]` `[callbacks]` `[dynamic]` |
+| `layout.inc` | The flexbox engine, with fixed-size boxes and no text: helpers, flow, spacing, justify/align, grow/shrink, sizes and clamps, display/visibility, absolute positioning, wrapping, scrolling, `onLayout`, polled styles | `[layout]` plus `[helpers]` `[flex]` `[box]` `[grow]` `[shrink]` `[size]` `[display]` `[absolute]` `[wrap]` `[scroll]` `[callbacks]` `[dynamic]` |
+| `pointer_events.inc` | Pointer events, driven straight through `liteui_pointer::Router` with no window (46 cases): dispatch and bubbling with `stopPropagation`, local coordinates, capture (who gets it, and moves bubbling from it), the `buttons` bitmask and mouse pressure, cancel, silent `invalidate()` (including mid-dispatch), transparency of disabled and handler-less views, absolute views, click rules (left only, same view, no-argument form, `PointerCallback` forms, aux and context-menu clicks, double-click within 500 ms / 4 px), pan's `dropClick`, wheel, enter/leave, hover moves, focus on press, handlers surviving the `Canvas` to `View` flattening, cursor resolution (inheritance, absolute views, capture pinning, dynamic values, `None`), touch (independent fingers), pen (tip is Left, barrel is Right, pressure, tilt, eraser, hover), `coalesced` samples, pointer ids, and `TextInput`'s press handling | `[pointer]` `[cursor]` `[touch]` `[pen]` |
 | `platform.inc` | Platform helpers that are still pure logic. Currently the Linux keysym → `Key` mapping (compiled only when `!defined(_WIN32)`) | `[platform]` `[keys]` |
+| `canvas_gl_helpers.inc` | The **pure helpers** of the GL canvas backend, none of which touch GL: the blend factors for every composite operator against the W3C formulas (and `Multiply`, which the shader computes), the gradient colour ramp, the glyph-atlas shelf packer, `invert2x3`, premultiplication, and the colour-glyph (emoji) heuristic. Uses a small deterministic random generator so failures reproduce | `[canvas]` `[gl]` `[blend]` `[atlas]` `[matrix]` `[gradient]` `[image]` |
+| `canvas_gl_context.inc` | The GL canvas **context**: the logic that decides *what* gets drawn (fill rules, arcs/ellipses/rounded rectangles, clips, strokes, transforms and state, gradients, `drawImage`, `ImageData`, text placement, emoji, `globalCompositeOperation`, shadows, and a path with thousands of segments), checked against the software renderer in `canvas_gl_mock.hpp`. No GPU, window or fonts needed | `[canvas]` `[gl]` `[fill]` `[clip]` `[stroke]` `[transform]` `[gradient]` `[image]` `[imagedata]` `[text]` `[emoji]` `[blend]` `[shadow]` |
+| `canvas_hardware.inc` | **Opt-in, opens a real window.** Draws known patterns on the real backend and reads the pixels back with `getImageData()`. See [Hardware check](#hardware-check) | `[.]` `[hardware]` `[canvas]` |
+
+`canvas_gl_mock.hpp` is a helper header, not a case file; see [The software renderer](#the-software-renderer).
 
 Case files are picked up by the build automatically for IDE display (`file(GLOB ... CONFIGURE_DEPENDS cases/*.inc)`), but **adding a file to the glob does not run it**. It only runs once `liteui_tests.cpp` includes it.
+
+### Conditionally compiled and hidden cases
+
+Not everything in the table runs everywhere:
+
+- **The GL canvas cases** (`canvas_gl_helpers.inc`, `canvas_gl_context.inc`) and `canvas_gl_mock.hpp` are wrapped in `#if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)`. They exist only on **Linux with the GL canvas backend** (the default). On Windows, or on Linux configured with `-DLITEUI_CANVAS_GL=OFF`, the files compile to nothing and those test names simply do not appear.
+- **`platform.inc`** is Linux-only (`!defined(_WIN32)`).
+- **The image codec cases run on both platforms.** They are written so that the same expected pixels must hold for the libpng (Linux) and WIC (Windows) backends.
+- **`canvas_hardware.inc` builds on every platform but is hidden.** It needs a display, so its `[.]` tag keeps it out of normal runs and out of CI. See below.
+
+### The software renderer
+
+`canvas_gl_mock.hpp` is a software stand-in for `liteui_canvas_gl::Renderer`. It implements the interface `GlCanvasContext` calls and emulates what the real renderer asks the GPU to do:
+
+- the **stencil modes** (clip level in bits 7..4, scratch/winding count in bits 3..0) on a per-pixel stencil array;
+- the **fragment-shader maths** (solid, image, linear and radial gradient, glyph masks) evaluated per pixel;
+- **blending** through the real `blendFactorsFor()`, plus the `Multiply` shader formula, on premultiplied float colour;
+- **triangle rasterization** by pixel-centre sampling, with no antialiasing, so pixel counts and positions are exact.
+
+**Text is faked on purpose**, so tests do not depend on installed fonts: `rasterizeText` returns a solid bar per character (6 px per character, ink on rows 2 to 9 of a 12 px line, baseline at 10) and `outlineText` returns one 4×8 rectangle per character. That lets the *placement logic* (alignment and baselines, for example) be checked exactly.
+
+What the mock cannot tell you is what a real GPU and driver do with those draw calls. That is the job of the hardware check.
+
+### Hardware check
+
+`canvas hardware: drawing on the real backend` opens a real 360×220 window, draws known patterns into canvases, reads the actual pixels back with `getImageData()` and verifies them. Unlike the other canvas cases it exercises the real backend and driver (OpenGL ES 3.0 on Linux, Direct3D 11 on Windows, or Cairo with `-DLITEUI_CANVAS_GL=OFF`), so it is how you find out whether a particular GPU or driver does what LiteUI expects.
+
+```sh
+build/release/tests/liteui_core_test "[hardware]"        # add -s to also list passing checks
+```
+
+- **It needs a display**, which is why it is hidden. The window closes itself once the canvases have painted. If nothing paints within about ten seconds, the test fails with "the canvases never painted (is a display available?)".
+- **Each check is its own Catch2 section**, so a failing check is named in the output. The window is opened only once; results are recorded while it paints and reported afterwards.
+- **A backend without a feature gets a warning, not a failure.** You will see lines such as `SKIP: <check> (<reason>)`, and the emoji line is informational (`INFO: ...`).
+- **Run it under each backend** (Linux GL, Linux Cairo, Windows) and compare the reports.
+- Whether CTest registers or runs a `[.]` test depends on Catch2's discovery. If you use `ctest`, check with `ctest -N` that it is not selected on a machine without a display.
 
 ## Writing a test
 
@@ -112,6 +181,9 @@ TEST_CASE("layout: a left margin shifts later siblings", "[layout][box]") {
 1. Create `tests/cases/<name>.inc`.
 2. Add `#include "cases/<name>.inc"` to `tests/liteui_tests.cpp`, after `test_helpers.hpp` (and after `layout.inc` if you want to use its `doLayout` helper, see below).
 3. Build. (The `cases/*.inc` glob only feeds the IDE file list; nothing else needs registering.)
+4. If you also add a helper **header** (like `canvas_gl_mock.hpp`), list it in the `SOURCES` of `tests/CMakeLists.txt` so it shows in the IDE tree. The glob only picks up `cases/*.inc`.
+
+For backend-specific cases, wrap the whole file in the same `#if` the implementation uses (`defined(LITEUI_CANVAS_GL) && !defined(_WIN32)` for the GL canvas), so the file compiles to nothing where it does not apply.
 
 Start the file with a comment like the existing ones: what it covers, and that it is included from `liteui_tests.cpp` rather than being a standalone `.cpp`.
 
@@ -205,7 +277,39 @@ The same file pins **documented limitations as tests** (for example, that mixed 
 
 **Parsers: test through the data, not through pixels.** SVG tests parse a document and inspect the resulting `svg::Document` (`width`, `height`, `viewBoxX/Y`, `shapes`) and each `Shape` (`fill`, `stroke`, `hasFill`, `hasStroke`, `strokeWidth`, `lineCap`, `lineJoin`, `miterLimit`, `dashArray`, `evenOdd`, `transform`, `ops`). Path tests inspect `svg::PathOp` values (`kind`, `x`, `y`, ...) and use a file-local alias (`using Op = svg::PathOp::Kind;`) that is available to files included after `svg_paths.inc`. `apply(mat, x, y)` checks a matrix by where it sends a point.
 
-**What is not covered by this suite.** By design the suite does not create a window, so painting, real input delivery, the event loop and the platform text renderers are exercised by running the examples rather than by unit tests. The layout cases also deliberately do not cover text-dependent sizing.
+**Drive window-free internals directly.** Several pieces that sound platform-bound are written so a test can use them without a window or a GPU:
+
+- **`GlCanvasContext` is a template over its renderer.** Production code instantiates it with the real OpenGL ES renderer; `canvas_gl_context.inc` instantiates it with the software renderer (see [The software renderer](#the-software-renderer)) and checks the result per pixel. A new canvas method should get a case there, which also exercises the "implement it in every backend" rule from [ARCHITECTURE.md](ARCHITECTURE.md#extending-liteui).
+- **The GL canvas's CPU helpers** (matrix inversion, the blend-factor table, the gradient ramp, the atlas packer) contain no GL calls, so they are tested directly. The blend-factor table, for instance, is checked operator by operator against the W3C compositing formulas.
+- **`liteui_pointer`** (hit-testing geometry and the pointer `Router`) has no window, platform or renderer dependency. The platform backends only translate native messages into the same router calls, so `pointer_events.inc` drives the router directly and covers behavior that would otherwise need a real window and a real pen.
+
+The rule of thumb is the one the layout tests follow: keep the logic in plain functions or templates, push the platform call to the edge, and the logic becomes testable.
+
+**Test pointer behavior through a rig.** `pointer_events.inc` defines a small `ptr::Rig` that owns a `View` root, a `Router` and a `log` of strings. The pattern:
+
+```cpp
+ptr::Rig g;
+g.root = container(300, 300);
+g.root.onPointerDown = [&](PointerEvent &) { g.note("root"); };
+g.root.children.push_back(box(100, 100));
+g.root.children[0].onPointerDown = [&](PointerEvent &) { g.note("child"); };
+g.attach();                                   // lays out and attaches the router
+
+ptr::press(g, ptr::centerOf(g.root.children[0]));
+CHECK(g.log == std::vector<std::string>{"child", "root"});   // the order IS the assertion
+```
+
+Handlers append to `g.log`, and each test compares the whole vector, so bubbling order, who was and was not called, and how many times are all checked at once. **Build the whole tree (children included) before `attach()`**: it lays the tree out and the router keeps pointers into it, so the views must not move afterwards. Helpers such as `ptr::twoBoxes`, `ptr::press`/`ptr::release`, `ptr::finger(...)` and `ptr::pen(...)` build the events; touch and pen cases use distinct pointer ids to test several pointers at once.
+
+**Build binary fixtures in the test.** The PNG decoder tests construct their inputs in memory with a tiny PNG writer that emits *stored* deflate blocks, so no zlib is needed and no fixture files are checked in. That covers every colour type, bit depth, `tRNS` and interlace combination, and the same expected pixels apply to libpng and WIC. Real-world compressed and filtered data comes from a few tiny files made by another encoder (Pillow), embedded as byte arrays, and from encode-then-decode round trips.
+
+**Be exhaustive where the domain is small.** Instead of sampling, the suite checks every 8-bit code through the sRGB round trip, and every finite 16-bit half-float value. Exact checks over a small domain are cheap and leave no corner untested.
+
+**Check reduced precision against a reference.** The "quality" cases compute the same image in FP32 and in the 16-bit formats, and assert that the results agree within a stated tolerance (for example, within 1 LSB). That turns "FP16 is good enough" into a regression test.
+
+**Use a deterministic generator.** The GL helper cases use a small deterministic pseudo-random generator, so a failure reproduces exactly.
+
+**What is not covered by this suite.** A normal run does not create a window or touch a GPU, so real painting (the Direct2D and OpenGL ES drawing itself), real input delivery from the OS (`WM_POINTER*`, Wayland touch and tablet events), the event loop, device-loss recovery and the platform text renderers are not exercised by it. The opt-in [hardware check](#hardware-check) covers the canvas drawing path on a real backend; everything else is exercised by running the examples. The layout cases also deliberately do not cover text-dependent sizing, and the `Image` widget cases check what the node resolves and reports, not its pixels on screen.
 
 ## CMake helpers
 
@@ -237,8 +341,8 @@ Always applied: `cxx_std_23`, `Catch2::Catch2WithMain`, and `/utf-8` under MSVC 
 
 ```cmake
 liteui_add_test(core
-    SOURCES  liteui_tests.cpp test_helpers.hpp ${LITEUI_TEST_CASES}
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}
+    SOURCES  liteui_tests.cpp test_helpers.hpp canvas_gl_mock.hpp ${LITEUI_TEST_CASES}
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
     LITEUI)
 ```
 
@@ -315,7 +419,7 @@ Examples with a `tests/` folder register their own tests, and they are built and
 The test presets treat that as an error. Either tests were not built (`LITEUI_BUILD_TESTS=OFF`, or you configured with a different preset than you are running), or the build has not been done yet. Discovery runs the built binary, so build first.
 
 **Configure fails or stalls fetching Catch2.**
-Catch2 v3 is fetched (v3.8.1) when not installed. Install it with your package manager or vcpkg so `find_package(Catch2 3)` succeeds, or configure with `-DLITEUI_BUILD_TESTS=OFF`.
+Catch2 v3 is fetched (v3.8.1) when not installed. Install it with your package manager or vcpkg so `find_package(Catch2 3)` succeeds, or configure with `-DLITEUI_BUILD_TESTS=OFF`. (A fetched Catch2 is built with C++23 on, so it agrees with LiteUI's headers.)
 
 **A new `.inc` file's tests do not run.**
 Add `#include "cases/<name>.inc"` to `tests/liteui_tests.cpp`. The glob only adds it to the IDE file list.
@@ -331,6 +435,21 @@ The runtime DLL is copied from the directory of `cl.exe` after build. If Visual 
 
 **Sanitized build fails on Linux with "cannot find -lasan" or similar.**
 Install your distribution's ASan/UBSan runtime packages (for GCC, `libasan` and `libubsan`).
+
+**Linking the tests fails on Linux with undefined references to `xdg_wm_base_interface`, `zwp_tablet_*` or similar.**
+The vendored Wayland protocol files are missing, so `liteui_wayland_protocols` was skipped (configure printed a warning about it). Every test links `liteui::liteui`, so every test is affected. Run `cmake --build <builddir> --target regen-protocols`, commit the result and reconfigure. See [BUILDING.md](BUILDING.md#wayland-protocol-bindings).
+
+**The tests will not build on a machine without the Linux graphics packages.**
+The suites never open a window, but they link `liteui::liteui`, which needs the Wayland, EGL/OpenGL ES, Cairo, Pango, xkbcommon, libpng and libjpeg development packages at build time. See [BUILDING.md](BUILDING.md#linux-setup).
+
+**The GL canvas cases are missing from `ctest -N` or from the executable's `--list-tests`.**
+They compile only on Linux with the GL canvas backend. On Windows, or with `-DLITEUI_CANVAS_GL=OFF`, they are compiled out by design.
+
+**`[hardware]` fails with "the canvases never painted".**
+It opens a real window and needs a display (on Linux, a running Wayland session). Run it from a graphical session, not over plain SSH or in a headless container.
+
+**A hardware check reports `SKIP`.**
+That backend lacks the feature; it is a warning, not a failure. Compare against another backend to see what differs.
 
 **Two test cases interfere with each other's temp files.**
 Give each `TempFile` a unique name, because cases can run in parallel under `ctest -j`.

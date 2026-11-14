@@ -2,7 +2,7 @@
 
 `Canvas` is LiteUI's escape hatch for custom drawing: charts, gauges, paint programs, image viewers, custom controls. You get a `CanvasContext` modeled on the HTML5 2D context (paths, transforms, gradients, text, images, pixel access) and draw whatever you like into a rectangle that takes part in normal layout.
 
-This guide covers the mental model, how and when your drawing code runs, handling input, the full drawing API, and the places where the Windows (Direct2D) and Linux (Cairo) backends behave differently.
+This guide covers the mental model, how and when your drawing code runs, handling input, the full drawing API, and the places where the backends behave differently. There are three: **Windows** (Direct2D on a Direct3D 11 device), **Linux with OpenGL ES 3.0** (the default), and **Linux with Cairo** (a fallback you get by configuring with `-DLITEUI_CANVAS_GL=OFF`). Both Windows and Linux/GL draw on the GPU.
 
 - [Mental model](#mental-model)
 - [Quick start](#quick-start)
@@ -64,10 +64,11 @@ A `Canvas` has a `Style` like any other node, so it lays out with the normal [la
 - **The surface is the canvas's content box**: the node's size minus its padding, in whole pixels (at least 1 × 1). `g.width()` and `g.height()` give you that size, so lay your drawing out from them and it follows resizes automatically.
 - **A `Canvas` has no intrinsic size.** It has no children to fit around, so a `Fit` width or height resolves to **0** and nothing is drawn. Give it a `Fixed`, `Percentage` or `Full` size, or let `flexGrow` size it. (`Image` and `Svg` are different: they default to their natural size.)
 - **Every `onPaint` starts from a fully transparent surface and a fresh context.** Nothing carries over from the previous call, neither pixels nor state such as the fill color or transform. Redraw everything each time.
-- **A resize rebuilds the surface and triggers a redraw.** You do not need to detect it.
+- **A resize rebuilds the surface and triggers a redraw.** You do not need to detect it. A lost GPU device or EGL context is also recovered automatically: the surfaces are rebuilt for you.
+- **Some failures print one line to `stderr`** instead of throwing, for example an image larger than the GPU supports, text too large for the glyph atlas, or a canvas target that could not be created on Linux/GL (messages start with `liteui [LITEUI_CANVAS_GL]:`). Nothing is drawn for that call, and each distinct message prints once per process.
 - **Coordinates are 1:1 with window pixels.** The header performs no DPI scaling.
 - **Do not keep the `CanvasContext` after `onPaint` returns.** It is a stack object owned by the library. Unbalanced `save()`/`clip()` calls are cleaned up for you when the callback returns.
-- **A huge canvas costs memory**, because the surface is a CPU bitmap the size of the box. For something like a zoomable image, keep the canvas the size of the viewport and draw with a source rectangle (see [the viewer recipe](#recipes)).
+- **A huge canvas costs memory**, because the surface is a texture the size of the box (GPU memory on Windows and Linux/GL; a CPU bitmap on the Cairo fallback). For something like a zoomable image, keep the canvas the size of the viewport and draw with a source rectangle (see [the viewer recipe](#recipes)).
 
 ## When `onPaint` runs
 
@@ -112,27 +113,29 @@ Every tick repaints the window, not just the canvas, so animate only while somet
 
 ## Input and focus
 
-`Canvas` exposes the same pointer, hover, wheel and focus members as `View`:
+`Canvas` exposes the same pointer, wheel and focus members as `View`, with the same types and semantics (the full rules for dispatch, capture and bubbling are in [API.md](API.md#pointer-events)):
 
 | Category | Members |
 |---|---|
-| Clicks | `onClick`, `onMiddleClick`, `onRightClick` |
-| Press / drag | `onPressAt(x, y)`, `onDragTo(x, y)` (plus `onMiddle*` and `onRight*` variants), `onDragEnd()` |
-| Hover | `onHoverAt(x, y)`, `onHoverEnd()`: return `true` if app state changed and a repaint is needed |
-| Wheel notches | `onScrollUp`, `onScrollDown` |
+| Pointer | `onPointerDown`, `onPointerMove`, `onPointerUp`, `onPointerCancel`, `onPointerEnter`, `onPointerLeave` (all `void(PointerEvent &)`) |
+| Clicks | `onClick` (accepts `[&]{...}` or `[&](PointerEvent &e){...}`), `onDoubleClick`, `onAuxClick` (middle), `onContextMenu` (right, on release) |
+| Wheel | `onWheel` (`void(WheelEvent &)`) |
 | Keyboard | `focusable`, `onFocus`, `onBlur`, `onKeyDown`, `onTextInput(codepoint)` |
 
-`Canvas` does not expose `onKeyUp`, `onLayout` or `tooltip`. Use `g.width()`/`g.height()` inside `onPaint` to learn the size.
+`Canvas` does not expose `onKeyUp`, `onLayout` or `tooltip`. Use `g.width()`/`g.height()` inside `onPaint` to learn the size. To change the mouse cursor over a canvas, set `style.cursor` (for example `Cursor::Crosshair`).
+
+One event type covers mouse, pen and touch. The button is a **field**, not a separate handler: `if (e.button == MouseButton::Middle) ...`. A pen tip or a finger counts as the left button, so a paint program written for the mouse works with a pen, and additionally gets `e.pressure`, `e.tiltX` / `e.tiltY` and `e.eraser` for free.
 
 Things that matter when drawing from pointer events:
 
 - **Pointer coordinates are local to the node's border box**, with (0, 0) at its top-left, **not** to the drawing surface. If the canvas has padding, subtract `padding.left` and `padding.top` before using the coordinates for drawing. The simplest fix is to give canvases no padding.
-- **Drags keep reporting while the button is held**, even when the pointer leaves the canvas. Coordinates can be negative or larger than `width()`/`height()`.
-- **`onDragEnd` fires once** when the button is released or the platform aborts the drag (for example alt-tab).
-- **A drag needs a press handler too.** A press lands on the topmost view that has an `onClick` or `onPressAt` for that button (or the middle/right equivalents). A canvas that sets only `onDragTo` is never the press target, so it never receives drags. Set `onPressAt` as well, even if it only records the start point.
-- **Clicks bubble.** If the deepest view under the pointer has no handler, the press goes to the nearest ancestor that does.
+- **A press captures the pointer.** Once `onPointerDown` has run on the canvas, the following moves and the final `onPointerUp` are delivered to it **even when the pointer leaves the canvas**, so coordinates can be negative or larger than `width()`/`height()`. This is what makes dragging work, and it needs no extra handler: `onPointerDown` alone is enough to become the capture target.
+- **Tell hover from dragging with `buttons`.** `onPointerMove` fires for both. During a hover `e.buttons == 0`; during a drag the button bit is set, so `e.held(MouseButton::Left)` is the usual test.
+- **Use `e.coalesced` for strokes.** Handlers run once per frame, but a fast pen or mouse can report several positions in that time. `e.coalesced` lists every position since the previous move event, oldest first, ending with the current one, so a stroke built from it has no gaps. The samples are in window coordinates; convert each with `e.toLocal(sample)`. Copy what you need, because the span is only valid while the handler runs.
+- **End a drag in both `onPointerUp` and `onPointerCancel`.** The cancel arrives when the OS takes the pointer away (alt-tab, a system dialog, a touch gesture the compositor claims) or when the press turned into a scroll container's drag-to-pan: the canvas keeps getting `onPointerMove` during the pan, and the release arrives as `onPointerCancel` instead of `onPointerUp`. It is **not** sent if the canvas is destroyed mid-drag (a keyed-list rebuild or `setRoot()`).
+- **Bubbling.** An event goes to the deepest view under the pointer that has a handler for it, then up through ancestors that have one. A one-argument handler can call `e.stopPropagation()` to stop that; the short `[&]{...}` form of `onClick` ends bubbling automatically. A press on a canvas inside a scroll container may start a pan once the pointer moves a few pixels; if you want the canvas to keep the drag for itself, set `contentPanEnabled = false` on the scroll container.
 - **Keyboard focus is explicit.** Set `focusable = true` and a click on the canvas focuses it. Only the focused view receives `onKeyDown` and `onTextInput`.
-- **Wheel:** `onScrollUp`/`onScrollDown` fire per notch. A canvas is not a scroll container, so there is no pixel scrolling to turn off.
+- **The wheel falls through to scrolling.** A canvas is not a scroll container, but if an ancestor scrolls, a wheel event that nothing stops will scroll that ancestor. If the canvas uses the wheel itself (zooming, say), call `e.stopPropagation()` in `onWheel`; that also suppresses the built-in scrolling. `e.dy` is in pixels, positive for "scroll down". On Windows one notch is 40 px.
 
 ## Context state and defaults
 
@@ -141,7 +144,7 @@ A new `CanvasContext` starts with:
 | State | Default |
 |---|---|
 | Fill and stroke | opaque black |
-| Line width | 1 px on Windows, **2 px on Linux** (see below) |
+| Line width | 1 px (Windows and Linux/GL), **2 px on the Linux/Cairo fallback** (see below) |
 | Line cap / join / miter limit | `Butt` / `Miter` / 10 |
 | Line dash | solid |
 | Global alpha | 1 |
@@ -151,7 +154,7 @@ A new `CanvasContext` starts with:
 | Text align / baseline | `Start` / `Alphabetic` |
 | Transform | identity |
 
-> **Always call `setLineWidth` before stroking.** The Windows backend initializes the line width to 1 px, while the Linux backend leaves Cairo's own default in place, which is 2 px. A stroke that relies on the default will differ between platforms.
+> **Always call `setLineWidth` before stroking.** The Windows and Linux/GL backends initialize the line width to 1 px, while the Cairo fallback leaves Cairo's own default in place, which is 2 px. A stroke that relies on the default will differ if you ever build with `-DLITEUI_CANVAS_GL=OFF`.
 
 `save()` and `restore()` stack the transform, clip, fill/stroke paints, line width/cap/join/miter/dash, global alpha, composite operation, shadow, font, and text alignment and baseline. The **current path is not saved**, which matches HTML canvas.
 
@@ -177,7 +180,7 @@ g.stroke();                    // same path, still current
 
 ### Transforms
 
-`translate`, `rotate` (radians, clockwise on screen), `scale`, `transformBy(a,b,c,d,e,f)` (multiplies onto the current matrix), `setTransform(a,b,c,d,e,f)` (replaces it) and `resetTransform()`. The transform in effect when you call `fill`, `stroke`, `fillText` or `drawImage` is the one applied to that call. Shape coordinates are not "baked in" earlier, except for `arc`/`ellipse`/`arcTo` on Linux, which follow Cairo's rules.
+`translate`, `rotate` (radians, clockwise on screen), `scale`, `transformBy(a,b,c,d,e,f)` (multiplies onto the current matrix), `setTransform(a,b,c,d,e,f)` (replaces it) and `resetTransform()`. The transform in effect when you call `fill`, `stroke`, `fillText` or `drawImage` is the one applied to that call. Shape coordinates are not "baked in" earlier, except for `arc`/`ellipse`/`arcTo` on the Cairo fallback, which follow Cairo's rules.
 
 ### Clipping
 
@@ -210,7 +213,7 @@ g.fillRect(0, 0, g.width(), g.height());
 
 `CanvasGradient::radial(x0, y0, r0, x1, y1, r1)` takes an inner and an outer circle. Gradient coordinates are interpreted in the user space in effect when you fill or stroke. Offsets are clamped to 0..1.
 
-On Windows, radial gradients with a non-zero inner radius are **approximated** (stop offsets are rescaled), while Linux draws the exact two-circle model.
+On Windows, radial gradients with a non-zero inner radius are **approximated** (Direct2D only models one circle plus a focal point, so stop offsets are rescaled), while both Linux backends draw the exact two-circle model.
 
 ### Global alpha
 
@@ -224,8 +227,9 @@ On Windows, radial gradients with a non-zero inner radius are **approximated** (
 
 `setGlobalCompositeOperation` takes `SourceOver`, `SourceIn`, `SourceOut`, `SourceAtop`, `DestinationOver`, `DestinationIn`, `DestinationOut`, `DestinationAtop`, `Lighter`, `Copy`, `Xor`, `Multiply` or `Screen`.
 
-- **Linux:** honored, mapped onto the matching Cairo operator.
-- **Windows:** **ignored.** The value is stored but everything draws with normal source-over blending. Do not rely on it if you ship on both platforms (erasing with `DestinationOut` is the usual casualty; use `clearRect` instead).
+- **Linux/GL (default):** every operator is honored with GPU blending. `Multiply` is the expensive one: it reads back the canvas drawn so far, so it costs one copy of the canvas **per shape**. Avoid it for many small shapes.
+- **Linux/Cairo fallback:** every operator is honored, mapped onto the matching Cairo operator.
+- **Windows:** only `SourceOver`, `Copy` and `Lighter` (additive) are honored. Any other value is stored but draws as plain source-over, because Direct2D's primitive blend modes cover only those three. Do not rely on the others if you ship on Windows (erasing with `DestinationOut` is the usual casualty; use `clearRect` instead).
 
 ## Text
 
@@ -243,11 +247,12 @@ float w = g.measureText("Hello").width;       // width only, single line
 - `TextAlign` accepts `Start`, `Center` and `End`. (`Justify` behaves like `Start`.) `TextBaseline` accepts `Top`, `Middle`, `Alphabetic` and `Bottom`.
 - `measureText` returns only a width. It does not report ascent, descent or bounding boxes.
 - The `maxWidth` argument of `fillText`/`strokeText` is accepted but **unused**. There is no squeeze-to-fit.
-- **Gradient fills on text use only the first stop's color.** Text is always drawn in a single flat color.
-- `strokeText` is an approximation: it draws the text repeatedly in the stroke color, nudged in a ring of eight directions by half the line width. It is not a true glyph outline, and it looks rough at large widths.
+- **Gradient fills on text:** on Linux/GL a gradient fill really paints the text. On Windows and the Cairo fallback only the **first stop's color** is used, so text is a single flat color there.
+- **`strokeText`** differs by backend. On Linux/GL it traces the **real glyph outlines** with the normal stroker, so line width, joins, dashes, gradients, shadow and clip all apply. On Windows and the Cairo fallback it is an approximation: it draws the text repeatedly in the stroke color, nudged in a ring of directions by half the line width, which looks rough at large widths.
+- **Color emoji** keep their own colors with `fillText` on Linux/GL when the fill is a solid color. With a gradient fill they draw as silhouettes tinted by the gradient.
 - Text is drawn with the current transform, shadow, alpha and (on Linux) composite operation.
 
-Small cross-platform differences: `measureText` returns a rounded whole-pixel width on Linux and a fractional one on Windows, and on Windows the `Alphabetic` baseline is approximated as 80% of the line height, whereas Linux uses the font's real baseline. Expect text placed on the alphabetic baseline to sit a pixel or two differently between platforms.
+Small cross-platform differences: `measureText` returns a rounded whole-pixel width on both Linux backends and a fractional one on Windows, and on Windows the `Alphabetic` baseline is approximated as 80% of the line height, whereas Linux uses the font's real baseline. Expect text placed on the alphabetic baseline to sit a pixel or two differently between platforms.
 
 ## Images and pixels
 
@@ -261,7 +266,7 @@ std::optional<CanvasImage> img = liteui_image::decodeFile("photo.jpg", &err);
 // or: liteui_image::decodeMemory(bytes.data(), bytes.size(), &err);
 ```
 
-On Linux, decoding supports **PNG and JPEG only**. On Windows it uses WIC, so anything WIC supports works. Decoding is synchronous.
+On Linux, decoding supports **PNG and JPEG only**. On Windows it uses WIC, so anything WIC supports works. Decoding is synchronous. A 16-bit PNG is reduced to 8 bits here; for photo work that needs the file's full precision, decode to an `ImageBuffer` with `liteui_image::decodeFileBuffer` and turn it into a displayable `CanvasImage` with `liteui_image::toCanvasImage` (see [API.md](API.md#liteui_image-decoding-encoding-and-display-conversion)). The `Image` node does that conversion for you when you give it an `hdrSource`.
 
 ### Drawing images
 
@@ -271,7 +276,7 @@ g.drawImage(img, dx, dy, dw, dh);                      // scaled
 g.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);      // source rect -> destination rect
 ```
 
-Images are drawn with bilinear filtering, the current transform and global alpha. The nine-argument form is how you crop, zoom and pan.
+Images are drawn with bilinear filtering, the current transform, clip and global alpha (and, on Linux/GL, the composite operation). The nine-argument form is how you crop, zoom and pan. On Windows and Linux/GL the source rectangle really **crops**: the part outside the image is dropped and the destination shrinks in proportion. The Cairo fallback treats an out-of-bounds source rectangle differently, so keep it inside the image if you may run there.
 
 > **In-place edits are not detected.** To avoid re-converting and re-uploading the same bitmap every redraw, each canvas caches the last image it drew, keyed on the pixel buffer's **address, size and dimensions**. A new image (a fresh allocation) or a resized one is picked up. If you change pixels **in place**, with the same buffer at the same address, the cache still holds the old picture and the canvas keeps drawing it. After in-place edits, give the image a fresh `pixels` vector (assign a new one, or copy the image) before the next draw.
 
@@ -284,35 +289,40 @@ g.putImageData(*data, dx, dy);
 
 Both work in **raw surface pixels**, ignoring the current transform.
 
-- `getImageData` returns straight RGBA. Areas outside the canvas come back transparent black.
-- `putImageData` ignores the transform. Beyond that, the platforms differ for **translucent** pixels (see below).
-- `clearRect(x, y, w, h)` really clears to transparent, honoring clip and transform. On Windows the clear tests pixel centers, so a rotated or skewed rectangle has hard (non-antialiased) edges.
+- `getImageData` returns straight RGBA. Areas outside the canvas come back transparent black. On both GPU backends it **flushes pending drawing and reads the pixels back from the GPU**, which is slow compared with drawing. Call it once per redraw (as in the per-pixel recipe), not once per shape or pixel.
+- `putImageData` ignores the transform. Beyond that, the platforms differ for **translucent** pixels and for clipping (see below).
+- `clearRect(x, y, w, h)` really clears to transparent, honoring clip and transform. The edges are antialiased on every backend, including for rotated or skewed rectangles.
 
 ## Platform differences
 
-| Area | Windows (Direct2D) | Linux (Cairo) |
-|---|---|---|
-| Backing surface | Software render target on a WIC bitmap | Cairo ARGB32 image surface |
-| Surface upload | Rebuilt as a GPU bitmap **every window paint** | Uploaded to a texture only when the canvas redraws |
-| Default line width | 1 px | 2 px (Cairo default), so set it explicitly |
-| `setGlobalCompositeOperation` | Ignored (always source-over) | Fully honored |
-| Radial gradient inner radius | Approximated | Exact |
-| `putImageData` | Alpha-**blends** over existing pixels and respects clipping | **Replaces** pixels directly, ignoring clip, alpha and compositing |
-| `clearRect` | Hard pixel-center test on rotated edges | Antialiased |
-| `measureText` width | Fractional | Rounded to whole pixels |
-| `Alphabetic` baseline | Approximated (80% of line height) | Font's real baseline |
-| `width()` / `height()` | Content box size, possibly fractional | Whole pixels |
-| Shadow blur | Not supported | Not supported |
+| Area | Windows (Direct2D) | Linux, OpenGL ES 3.0 (default) | Linux, Cairo (`LITEUI_CANVAS_GL=OFF`) |
+|---|---|---|---|
+| Backing surface | GPU render target (`ID2D1Bitmap1`) on the window's Direct3D 11 device | GPU texture (MSAA when available) | CPU Cairo ARGB32 image surface, uploaded as a texture |
+| Surface lifetime | Stays in video memory; redrawn only when `onPaint` reruns | Same | Uploaded to a texture only when the canvas redraws |
+| Default line width | 1 px | 1 px | 2 px (Cairo default), so set it explicitly |
+| `setGlobalCompositeOperation` | `SourceOver`, `Copy`, `Lighter` only; others draw as source-over | All operators (`Multiply` costs a canvas copy per shape) | All operators |
+| Radial gradient inner radius | Approximated | Exact | Exact |
+| Gradient fill on text | First stop's color only | Honored | First stop's color only |
+| `strokeText` | Approximation (offset copies) | True glyph outlines | Approximation (offset copies) |
+| Color emoji in `fillText` | Not specified | Keep their colors (solid fill) | Not specified |
+| `putImageData` | Alpha-**blends** over existing pixels, honors clip, nearest-neighbor | **Replaces** pixels, ignoring clip, alpha and compositing; origin rounded to whole pixels | **Replaces** pixels directly, ignoring clip, alpha and compositing |
+| `getImageData` | GPU to CPU readback (flushes pending work) | GPU to CPU readback | Direct read of the surface |
+| `clearRect` | Antialiased | Antialiased, honors rotation and skew | Antialiased |
+| `measureText` width | Fractional | Rounded to whole pixels | Rounded to whole pixels |
+| `Alphabetic` baseline | Approximated (80% of line height) | Font's real baseline | Font's real baseline |
+| `width()` / `height()` | Content box size, possibly fractional | Whole pixels | Whole pixels |
+| `drawImage` source rectangle | Crops | Crops | Differs for out-of-bounds rectangles |
+| Shadow blur | Not supported | Not supported | Not supported |
 
-The same on both: gradient text uses the first stop, `strokeText` is approximate, `maxWidth` is unused, shadows are unblurred, and there is no DPI scaling.
+The same on all three: `maxWidth` is unused, shadows are flat and unblurred, `drawImage` and `putImageData` draw no shadow, and there is no DPI scaling.
 
-For `putImageData`, the difference only shows for pixels that are not fully opaque. For opaque pixels, which is the usual case for photos and for round-tripping `getImageData` on an opaque drawing, both platforms give identical results.
+For `putImageData`, the differences only show for pixels that are not fully opaque, or when a clip is active. For opaque pixels with no clip, which is the usual case for photos and for round-tripping `getImageData` on an opaque drawing, all backends give identical results.
 
 ## Canvas-backed built-ins
 
 Three built-ins are implemented on top of the canvas machinery, so everything above about redraw behavior, surfaces and caching applies to them too:
 
-- `Image` blits a decoded `CanvasImage` honoring `ObjectFit` (`Fill`, `Contain`, `Cover`, `None`, `ScaleDown`). Its `source` can be a callback returning a `std::shared_ptr<CanvasImage>`. Return a **different** pointer to make it repaint.
+- `Image` blits a decoded `CanvasImage` honoring `ObjectFit` (`Fill`, `Contain`, `Cover`, `None`, `ScaleDown`). Its `source` can be a callback returning a `std::shared_ptr<CanvasImage>`. Return a **different** pointer to make it repaint. For high-precision data, `hdrSource` takes a `std::shared_ptr<ImageBuffer>` and `displaySettings` (exposure, clamp mode) can be a callback, so an exposure slider re-renders without a new buffer.
 - `Svg` replays a parsed vector document at the node's size.
 - `TextInput` draws its text, placeholder and caret on a canvas, and uses the public helper `liteui_text::caretIndexForX` for click-to-position. You can use the same helper to build your own text widgets.
 
@@ -329,17 +339,27 @@ Canvas c;
 c.style.width = Size::full();
 c.style.height = Size::full();
 c.style.backgroundColor = Color{255, 255, 255};
+c.style.cursor = Cursor::Crosshair;
 
-c.onPressAt = [&](float x, float y) {
+c.onPointerDown = [&](PointerEvent &e) {
+    if (e.button != MouseButton::Left) return;
     Stroke s;
-    s.color = Color{20, 20, 20};
+    s.color = e.eraser ? Color{255, 255, 255} : Color{20, 20, 20};
     s.width = 3.0f;
-    s.pts.push_back({x, y});
+    s.pts.push_back({e.x, e.y});
     strokes.push_back(std::move(s));
     dirty = true;
 };
-c.onDragTo = [&](float x, float y) {
-    if (!strokes.empty()) strokes.back().pts.push_back({x, y});
+c.onPointerMove = [&](PointerEvent &e) {
+    if (!e.held(MouseButton::Left) || strokes.empty()) return;   // ignore hover
+    for (const PointerSample &smp : e.coalesced) {               // no gaps in fast strokes
+        PointerSample p = e.toLocal(smp);                        // window -> this canvas
+        strokes.back().pts.push_back({p.x, p.y});
+    }
+    dirty = true;
+};
+c.onPointerCancel = [&](PointerEvent &) {                        // OS took the pointer
+    if (!strokes.empty()) strokes.pop_back();
     dirty = true;
 };
 c.canvasDirtySource = [&] { bool d = dirty; dirty = false; return d; };
@@ -360,7 +380,7 @@ c.onPaint = [&](CanvasContext &g) {
 };
 ```
 
-Because the whole picture is rebuilt from `strokes` on every redraw, it also survives window resizes. For very long drawings, keep a committed `CanvasImage` of finished strokes and replay only the current one.
+Because the whole picture is rebuilt from `strokes` on every redraw, it also survives window resizes. Pen input works with no extra code: a tip touching down is the left button, and `e.pressure` is available if you want to vary `width` with it. For very long drawings, keep a committed `CanvasImage` of finished strokes and replay only the current one.
 
 **A progress ring**
 
@@ -398,9 +418,9 @@ struct Dot { float x, y, r; };
 std::vector<Dot> dots;
 Dot *selected = nullptr;
 
-c.onPressAt = [&](float px, float py) {   // carries the position, unlike onClick
+c.onPointerDown = [&](PointerEvent &e) {   // e.x, e.y are local to the canvas
     for (auto it = dots.rbegin(); it != dots.rend(); ++it) {     // topmost first
-        float dx = px - it->x, dy = py - it->y;
+        float dx = e.x - it->x, dy = e.y - it->y;
         if (dx * dx + dy * dy <= it->r * it->r) { selected = &*it; dirty = true; break; }
     }
 };
@@ -414,12 +434,17 @@ float zoom = 1.0f, panX = 0, panY = 0;           // panX/panY: image-space offse
 float lastX = 0, lastY = 0;
 bool dirty = false;
 
-c.onScrollUp   = [&] { zoom = std::min(16.0f, zoom * 1.1f); dirty = true; };
-c.onScrollDown = [&] { zoom = std::max(0.05f, zoom / 1.1f); dirty = true; };
-c.onPressAt    = [&](float x, float y) { lastX = x; lastY = y; };
-c.onDragTo     = [&](float x, float y) {
-    panX -= (x - lastX) / zoom;  panY -= (y - lastY) / zoom;
-    lastX = x;  lastY = y;  dirty = true;
+c.onWheel = [&](WheelEvent &e) {
+    zoom = e.dy < 0 ? std::min(16.0f, zoom * 1.1f)    // wheel up: zoom in
+                    : std::max(0.05f, zoom / 1.1f);   // wheel down: zoom out
+    dirty = true;
+    e.stopPropagation();                              // don't also scroll an ancestor
+};
+c.onPointerDown = [&](PointerEvent &e) { lastX = e.x; lastY = e.y; };
+c.onPointerMove = [&](PointerEvent &e) {
+    if (!e.held(MouseButton::Left)) return;
+    panX -= (e.x - lastX) / zoom;  panY -= (e.y - lastY) / zoom;
+    lastX = e.x;  lastY = e.y;  dirty = true;
 };
 c.canvasDirtySource = [&] { bool d = dirty; dirty = false; return d; };
 
@@ -431,13 +456,14 @@ c.onPaint = [&](CanvasContext &g) {
 };
 ```
 
-Only the visible window of the image is ever scaled and uploaded, so the canvas stays viewport-sized no matter how large the picture is. (Clamp `panX`/`panY` to the image bounds in real code.)
+Only the visible window of the image is ever scaled and drawn, so the canvas stays viewport-sized no matter how large the picture is. (Clamp `panX`/`panY` to the image bounds in real code; the source rectangle crops on Windows and Linux/GL, but is best kept inside the image on the Cairo fallback.)
 
 **Per-pixel processing**
 
 ```cpp
 c.onPaint = [&](CanvasContext &g) {
     // ...draw an opaque scene first...
+    // getImageData reads back from the GPU, so call it once per redraw like this.
     if (auto data = g.getImageData(0, 0, g.width(), g.height())) {
         auto &px = data->pixels;
         for (size_t i = 0; i + 3 < px.size(); i += 4) {
@@ -453,7 +479,7 @@ c.onPaint = [&](CanvasContext &g) {
 
 - **Cache your inputs, not your output.** A redraw rasterizes everything you issue, so avoid rebuilding large data structures inside `onPaint`. Precompute them and let `onPaint` only draw.
 - **Redraw only when something changed.** Prefer event-driven dirty flags over a permanent timer. An always-on interval repaints the whole window every tick.
-- **On Windows the finished bitmap is re-uploaded to the GPU on every window paint**, even when the canvas itself did not redraw. A large canvas on a window that repaints often (hovering, animating siblings) pays that cost repeatedly. Keep canvases no bigger than they need to be.
+- **The finished canvas stays on the GPU** (Windows and Linux/GL), so a window repaint that does not redraw the canvas only draws its texture. The costs to watch instead are `getImageData` (a GPU readback that flushes pending work), `globalCompositeOperation = Multiply` on Linux/GL (one canvas copy per shape), and very large canvases, which take GPU memory proportional to their pixel size. Keep canvases no bigger than they need to be.
 - **Large images:** draw with a source rectangle (see the viewer recipe) rather than scaling a huge image into a tiny box, and decode once, outside `onPaint`.
 - **Save/restore around clips and transforms** rather than undoing them by hand.
 
@@ -463,6 +489,6 @@ These HTML canvas features do not exist on `CanvasContext` today:
 
 - patterns (`createPattern`), `Path2D`, `isPointInPath` / `isPointInStroke`, `getTransform`
 - shadow blur (the parameter is ignored), filters, `imageSmoothingEnabled` (images are always bilinear; `putImageData` on Windows is nearest-neighbor)
-- text metrics beyond width, wrapped or multi-line text, `letterSpacing`, `direction`, true stroked glyph outlines
+- text metrics beyond width, wrapped or multi-line text, `letterSpacing`, `direction`, and (on Windows and the Cairo fallback) true stroked glyph outlines; Linux/GL does trace real outlines
 - `createImageData` (use `CanvasImage(w, h)` instead)
 - DPI-aware surfaces

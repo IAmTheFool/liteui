@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 5
+#define LITEUI_VERSION_MINOR 6
 
 #include <algorithm>
 #include <array>
@@ -36,7 +36,9 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -57,11 +59,23 @@ struct Color {
   bool operator==(const Color &) const = default;
 };
 
-// Which physical mouse button an event refers to. Used to key the
-// per-button press/drag tracking in LiteUI (pressedView_/dragView_) and
-// to select which of a View's onClick/onMiddleClick/onRightClick (etc.)
-// triple gets checked/fired.
-enum class MouseButton { Left, Middle, Right };
+// Which button an event refers to (a pen tip or finger counts as Left). Keys
+// the per-button press tracking in the pointer router and selects which of a
+// View's onClick / onAuxClick / onContextMenu gets fired.
+//
+// `None` is what PointerEvent::button holds on events where no button
+// changed state (moves, wheel, enter/leave). It is deliberately LAST so the
+// numeric values of Left/Middle/Right (used as array indices) are unchanged.
+enum class MouseButton { Left, Middle, Right, None };
+
+// Bit for a button in PointerEvent::buttons (Left = 1, Middle = 2, Right = 4;
+// None = 0). Note this is NOT the DOM's `buttons` bit order (which puts
+// right before middle) — it simply follows the enum order.
+constexpr uint8_t buttonBit(MouseButton b) {
+  return b == MouseButton::None
+             ? uint8_t{0}
+             : static_cast<uint8_t>(1u << static_cast<int>(b));
+}
 
 // Logical key identity, independent of platform scancode/VK. Extend as
 // needed — this covers what a typical text field / shortcut system wants.
@@ -154,6 +168,197 @@ struct KeyModifiers {
 struct KeyEvent {
   Key key = Key::Unknown;
   KeyModifiers mods;
+};
+
+// ---------------------------------------------------------------------------
+// Pointer events (modelled on the DOM pointer-events API).
+//
+// Dispatch model, written down once:
+//
+//  * Down / move / up / click / wheel go to the DEEPEST view under the pointer
+//    that has a handler for that event, then BUBBLE to its ancestors (also
+//    only those with a handler) until a handler calls e.stopPropagation().
+//    A Position::Absolute view bubbles to its parent in the tree, like the
+//    DOM, not to whatever happens to be painted beneath it.
+//  * Views without a handler are transparent to the pointer; so are disabled
+//    views.
+//  * Capture: a press captures the pointer. The capture target is the view
+//    that called stopPropagation() in its onPointerDown, or, if none did, the
+//    deepest view whose onPointerDown ran. While any button is held, moves
+//    and the final up go to the capture target (then bubble from it) even
+//    when the pointer is outside it. It ends when the last button is
+//    released, or via onPointerCancel (focus loss, OS taking over the mouse).
+//    onPointerCancel is NOT fired for a view that is being destroyed (a
+//    keyed-list rebuild, setRoot()): the view may already be gone.
+//  * onPointerEnter / onPointerLeave do not bubble. They follow the same
+//    hover flag that drives Style::hoverColor, so they are purely geometric
+//    and are not suppressed while another view holds capture.
+//  * onClick fires for the LEFT button only, and only if the release lands on
+//    the same view the press did. Middle = onAuxClick, right = onContextMenu
+//    (fired on release). onDoubleClick follows a second left click within
+//    500 ms and 4 px; PointerEvent::clickCount holds the running count.
+//  * onWheel: if no handler calls stopPropagation(), the wheel falls through
+//    to the existing overflow scrolling.
+//  * Pen and touch use the same events. A pen tip touching down, or a finger,
+//    is MouseButton::Left (so clicks and double-clicks work for them with no
+//    extra code); the pen's barrel button is Right and its second barrel
+//    button Middle; the eraser end sets PointerEvent::eraser. Each pen tool
+//    and finger has its own pointerId, capture, and click pairing. A pen
+//    reports hover (moves with buttons == 0, pressure 0) before and after
+//    contact and drives onPointerEnter/Leave and hover colours like a mouse;
+//    a finger has no hover, so it only produces events while it is down.
+//    Touch panning of scrollable content (Style::contentPanEnabled) and
+//    scrollbar grabs work for fingers and pens as for the mouse, one pointer
+//    at a time. onPointerCancel is also what a touch gets when the system
+//    takes it over (a compositor gesture, a lost capture).
+//  * Coordinates in an event are rewritten for each view the event reaches:
+//    x/y are local to the view whose handler is running; windowX/windowY
+//    are not.
+// ---------------------------------------------------------------------------
+enum class PointerType : uint8_t { Mouse, Pen, Touch };
+
+// The mouse cursor shown over a view; see Style::cursor. The names follow
+// CSS's `cursor` keywords. `Inherit` (the default) means "use my parent's";
+// the root's fallback is `Default`.
+enum class Cursor : uint8_t {
+  Inherit,    // CSS `inherit`/`auto`: take the nearest ancestor's cursor
+  Default,    // the ordinary arrow
+  None,       // hide the cursor
+  Pointer,    // hand, for things that are clickable
+  Text,       // I-beam
+  Crosshair,
+  Move,       // four-way arrows
+  Grab,       // open hand
+  Grabbing,   // closed hand
+  NotAllowed,
+  Wait,       // busy, blocks the UI
+  Progress,   // busy, but still interactive
+  Help,
+  ResizeEW,   // <->
+  ResizeNS,
+  ResizeNESW, // diagonal
+  ResizeNWSE,
+  ZoomIn,
+  ZoomOut,
+};
+
+// One position sample of a pointer, in WINDOW coordinates (see
+// PointerEvent::coalesced and PointerEvent::toLocal).
+struct PointerSample {
+  float x = 0, y = 0;
+  float pressure = 0;
+  float tiltX = 0, tiltY = 0, twist = 0;
+  uint64_t timeMs = 0;
+};
+
+struct PointerEvent {
+  float x = 0, y = 0;         // local to the view whose handler is running
+  float windowX = 0, windowY = 0;
+  // Which pointer this is. The mouse is always 1; every pen tool and every
+  // finger contact gets its own id for as long as it exists, so several
+  // touches can be in flight at once, each with its own capture and clicks.
+  uint32_t pointerId = 1;
+  // The primary pointer of its type: the mouse; the first finger that went
+  // down (until it lifts); a pen.
+  bool isPrimary = true;
+  MouseButton button = MouseButton::None; // the button that changed (down/up)
+  uint8_t buttons = 0;        // bitmask (buttonBit) of buttons currently held,
+                              // AFTER this event's change
+  KeyModifiers mods;
+  PointerType type = PointerType::Mouse;
+  float pressure = 0.5f;      // 0..1 (mouse: 0.5 while a button is held, else 0)
+  float tiltX = 0, tiltY = 0, twist = 0;
+  bool eraser = false;
+  uint8_t clickCount = 0;     // onClick / onDoubleClick only; 0 elsewhere
+  uint64_t timeMs = 0;        // monotonic milliseconds (arbitrary epoch)
+
+  // onPointerMove only: EVERY position the pointer reported since the
+  // previous move event, oldest first, ending with this event's own position
+  // — so a fast pen stroke loses no samples even though handlers run once per
+  // frame. Always at least one entry on a move; empty on other events. Valid
+  // only while the handler runs: copy what you need. Window coordinates; use
+  // toLocal() for the view the handler belongs to.
+  std::span<const PointerSample> coalesced;
+  PointerSample toLocal(PointerSample sample) const {
+    sample.x += x - windowX;
+    sample.y += y - windowY;
+    return sample;
+  }
+
+  // Stops this event from reaching any further (ancestor) view.
+  void stopPropagation() { stopped_ = true; }
+  bool propagationStopped() const { return stopped_; }
+  // True if `b` is currently held.
+  bool held(MouseButton b) const { return (buttons & buttonBit(b)) != 0; }
+  // A copy that hasn't been stopped yet (for firing a second event off the
+  // same data, e.g. onDoubleClick after onClick).
+  PointerEvent fresh() const {
+    PointerEvent c = *this;
+    c.stopped_ = false;
+    return c;
+  }
+
+private:
+  bool stopped_ = false;
+};
+
+struct WheelEvent {
+  float x = 0, y = 0;         // local to the view whose handler is running
+  float windowX = 0, windowY = 0;
+  float dx = 0, dy = 0;       // pixels; +dy = content scrolls down, +dx = right
+  bool precise = false;       // trackpad-style pixel deltas vs. a notched
+                              // wheel. Backends that cannot tell leave false.
+  KeyModifiers mods;
+  uint64_t timeMs = 0;
+
+  // Stops bubbling AND suppresses the built-in overflow scrolling.
+  void stopPropagation() { stopped_ = true; }
+  bool propagationStopped() const { return stopped_; }
+
+private:
+  bool stopped_ = false;
+};
+
+using PointerHandler = std::function<void(PointerEvent &)>;
+using WheelHandler = std::function<void(WheelEvent &)>;
+
+// The type of View::onClick (and Canvas::onClick). Accepts either
+//   [&](PointerEvent &e) { ... }   // bubbles to ancestors unless the handler
+//                                  // calls e.stopPropagation()
+//   [&] { ... }                    // short form: runs, then ENDS bubbling
+//                                  // (a no-argument handler cannot call
+//                                  // stopPropagation(), so it is taken to have
+//                                  // handled the click)
+class PointerCallback {
+public:
+  PointerCallback() = default;
+  PointerCallback(std::nullptr_t) {}
+  template <class F>
+    requires(!std::is_same_v<std::decay_t<F>, PointerCallback> &&
+             !std::is_same_v<std::decay_t<F>, std::nullptr_t> &&
+             (std::is_invocable_v<std::decay_t<F> &, PointerEvent &> ||
+              std::is_invocable_v<std::decay_t<F> &>))
+  PointerCallback(F &&f) {
+    if constexpr (std::is_invocable_v<std::decay_t<F> &, PointerEvent &>) {
+      fn_ = std::forward<F>(f);
+    } else {
+      endsBubbling_ = true;
+      fn_ = [g = std::forward<F>(f)](PointerEvent &) mutable { g(); };
+    }
+  }
+  explicit operator bool() const { return static_cast<bool>(fn_); }
+  void operator()(PointerEvent &e) const { fn_(e); }
+  // Direct call without an event.
+  void operator()() const {
+    PointerEvent e;
+    fn_(e);
+  }
+  // True if constructed from a no-argument callable (see above).
+  bool endsBubbling() const { return endsBubbling_; }
+
+private:
+  std::function<void(PointerEvent &)> fn_;
+  bool endsBubbling_ = false;
 };
 
 // Width (vertical bar) / height (horizontal bar) of a scrollbar's track, in
@@ -298,6 +503,19 @@ struct Style {
   // automatically by LiteUI::updateHover from pointer position, never
   // app-sourced.
   std::optional<Color> hoverColor;
+
+  // The mouse cursor while the pointer is over this view. Inherited: a view
+  // with Cursor::Inherit (the default) shows its parent's cursor, so setting
+  // it once on a container covers everything inside. While a view holds
+  // pointer capture (a press with an onPointerDown) the
+  // capture target's cursor is shown wherever the pointer goes, so a drag
+  // keeps its "grabbing"/resize cursor outside the view. A window-edge resize
+  // handle still wins over this. Accepts a plain value or a callback, like
+  // the other Dynamic<> style fields:
+  //   v.style.cursor = Cursor::Pointer;
+  //   v.style.cursor = [&] { return tool == Tool::Brush ? Cursor::Crosshair
+  //                                                      : Cursor::Default; };
+  Dynamic<Cursor> cursor = Cursor::Inherit;
 
   // Absolute children are pulled out of flex distribution entirely and
   // placed against the parent's content box using left/top/right/bottom.
@@ -1235,7 +1453,7 @@ protected:
 // backing surface) whenever the canvas needs to be redrawn: once after
 // the first layout, and again any time `canvasDirtySource` reports true
 // (see its own comment on View — that's the mechanism an interactive
-// canvas, like a paint program responding to mouse drags via `onDragTo`,
+// canvas, like a paint program responding to pen strokes via `onPointerMove`,
 // uses to request the next redraw, since those handlers have no direct
 // reference back into the tree) — plain drawing calls made once are
 // *not* re-issued on every frame the way a real-time game loop's draw
@@ -1244,22 +1462,19 @@ protected:
 struct Canvas {
   Style style;
   std::function<void(CanvasContext &)> onPaint;
-  std::function<void()> onClick;
-  std::function<void()> onMiddleClick;
-  std::function<void()> onRightClick;
-  std::function<void(float localX, float localY)> onPressAt;
-  std::function<void(float localX, float localY)> onMiddlePressAt;
-  std::function<void(float localX, float localY)> onRightPressAt;
-  std::function<void(float localX, float localY)> onDragTo;
-  std::function<void(float localX, float localY)> onMiddleDragTo;
-  std::function<void(float localX, float localY)> onRightDragTo;
-  // See View::onDragEnd's comment for exactly when this fires (and when
-  // it deliberately doesn't).
-  std::function<void()> onDragEnd;
-  std::function<bool(float localX, float localY)> onHoverAt;
-  std::function<bool()> onHoverEnd;
-  std::function<void()> onScrollUp;
-  std::function<void()> onScrollDown;
+  // Pointer events — same semantics as on View (see the "Pointer events"
+  // comment near PointerEvent). A paint program wants onPointerDown/Move/Up.
+  PointerCallback onClick;
+  PointerHandler onDoubleClick;
+  PointerHandler onAuxClick;
+  PointerHandler onContextMenu;
+  PointerHandler onPointerDown;
+  PointerHandler onPointerMove;
+  PointerHandler onPointerUp;
+  PointerHandler onPointerCancel;
+  PointerHandler onPointerEnter;
+  PointerHandler onPointerLeave;
+  WheelHandler onWheel;
   std::function<bool()> canvasDirtySource;
   bool focusable = false;
   std::function<void()> onFocus;
@@ -1442,62 +1657,32 @@ public:
   bool isCanvas = false;
   std::function<void(CanvasContext &)> onPaint;
 
-  // Fired on a left-click whose point lands on this view (see LiteUI::hitTest).
-  // Bubbles: if a deeper view under the point has no handler, the nearest
-  // containing ancestor's onClick fires instead.
-  std::function<void()> onClick;
+  // ---- Pointer events (DOM pointer-events model) -------------------------
+  // Full dispatch/capture/bubbling rules: see the "Pointer events" comment
+  // above PointerEvent. In short: events go to the deepest view with a
+  // handler, bubble up through ancestors with handlers until one calls
+  // e.stopPropagation(), and a press captures the pointer so drags keep
+  // working outside the view. Buttons are a field, not separate handlers:
+  // `if (e.button == MouseButton::Middle) ...`.
+  PointerHandler onPointerDown;
+  PointerHandler onPointerMove; // hover (buttons == 0) and drag moves
+  PointerHandler onPointerUp;
+  // The press can no longer complete: the OS took the mouse (alt-tab, a
+  // system dialog, a window-move grab) or a scroll pan claimed it.
+  PointerHandler onPointerCancel;
+  // Do not bubble. Follow the same hover flag as Style::hoverColor.
+  PointerHandler onPointerEnter;
+  PointerHandler onPointerLeave;
+  PointerHandler onDoubleClick; // after a 2nd left click (clickCount == 2)
+  PointerHandler onAuxClick;    // middle-button click
+  PointerHandler onContextMenu; // right-button click, fired on release
+  WheelHandler onWheel;         // falls through to overflow scrolling unless
+                                // a handler calls e.stopPropagation()
 
-  // Same bubbling semantics as onClick, for the middle and right buttons.
-  std::function<void()> onMiddleClick;
-  std::function<void()> onRightClick;
-
-  // Fired the instant a left-button press lands on this view (before
-  // any matching release/onClick pairing) — unlike onClick, this gives
-  // the press point in coordinates *local* to this view (0,0 at its
-  // own top-left), which onClick has no way to expose. Lets a view like
-  // a slider track compute "where along my width was I clicked" without
-  // the library needing to know anything about sliders specifically.
-  std::function<void(float localX, float localY)> onPressAt;
-  std::function<void(float localX, float localY)> onMiddlePressAt;
-  std::function<void(float localX, float localY)> onRightPressAt;
-
-  // Fired continuously while a left-button press that started on this
-  // view is still held and the pointer moves — unlike onPressAt (which
-  // fires once, at the instant of the initial press), this fires on
-  // every subsequent move until release, giving the *current* press
-  // point in this view's own local coordinates. Lets a view like a
-  // slider track drive a live drag instead of only sampling the
-  // initial click position.
-  std::function<void(float localX, float localY)> onDragTo;
-  // Same idea as onDragTo, tracked independently per button — a
-  // middle-button drag and a left-button drag can't be started by the
-  // same physical press, but nothing stops an app from wiring both up
-  // on the same view for different purposes.
-  std::function<void(float localX, float localY)> onMiddleDragTo;
-  std::function<void(float localX, float localY)> onRightDragTo;
-
-  // Fired once when a drag in progress on this view legitimately ends: a
-  // matching button release, or the platform aborting it (input capture
-  // lost to alt-tab/a system dialog, a window-move grab swallowing the
-  // release). There's a single onDragEnd regardless of which button
-  // (Left/Middle/Right) was dragging — in practice a view wires up only
-  // one of onDragTo/onMiddleDragTo/onRightDragTo at a time, so this stays
-  // one callback instead of three. Deliberately NOT fired when the view
-  // itself is about to be destroyed (a fresh setRoot(), or any other
-  // invalidateViewPointers() case): the pointer may already be dangling
-  // by then, so those paths null dragView_ directly instead of going
-  // through endDrag() — same reasoning as onBlur being skipped there.
-  std::function<void()> onDragEnd;
-
-  // Fired on every pointer move while the pointer is over this view, with
-  // the position local to the view (0,0 = its top-left, same space as
-  // onPressAt). Return true if the app state it drives visibly changed:
-  // LiteUI then re-polls dynamic values and repaints once. Return false
-  // for "nothing to redraw", so plain mouse movement stays cheap.
-  std::function<bool(float localX, float localY)> onHoverAt;
-  // Fired once when the pointer leaves this view (or the view is hidden
-  // while hovered). Same return convention as onHoverAt.
-  std::function<bool()> onHoverEnd;
+  // Left-button click (press and release on the same view). Accepts
+  // `[&](PointerEvent &e) {...}` (bubbles unless stopped) or the shorter
+  // `[&] {...}` (runs, then ends bubbling) — see PointerCallback.
+  PointerCallback onClick;
 
   // Fired once per relayout(), right after placeNode() finalizes this
   // node's absolute on-screen box. Lets the app read a view's real
@@ -1536,20 +1721,11 @@ public:
   // dead keys in a way a raw Key never captures.
   std::function<void(uint32_t codepoint)> onTextInput;
 
-  // Fired on a discrete wheel notch (or trackpad step) whose point lands
-  // on this view, independent of pixel-based content scrolling — lets a
-  // plain, non-overflow view (e.g. a stepper/spinner arrow) react to the
-  // wheel the same way onClick reacts to a press. Bubbles exactly like
-  // onClick: the nearest ancestor with a handler fires if the deepest
-  // hit view has none.
-  std::function<void()> onScrollUp;
-  std::function<void()> onScrollDown;
-
   // isCanvas nodes only. Polled the same way as the sources above; return
   // true once to make the next paint/render pass re-invoke onPaint (see
   // Canvas's own comment), then go back to returning false until there's
   // something new to draw. This is the mechanism to use from inside a
-  // canvas's own onPressAt/onDragTo/onClick handlers — those are plain
+  // canvas's own onPointerDown/onPointerMove/onClick handlers — those are plain
   // callbacks with no reference back into the tree, so they can't call
   // View::requestCanvasRedraw() on themselves directly; stashing a dirty
   // flag in app state and reporting+clearing it here is the workaround.
@@ -1606,6 +1782,7 @@ public:
     mutable float resolvedBottom = std::numeric_limits<float>::quiet_NaN();
     mutable Display resolvedDisplay = Display::Flex;
     mutable Visibility resolvedVisibility = Visibility::Visible;
+    mutable Cursor resolvedCursor = Cursor::Inherit;
     mutable int resolvedZIndex = 0;
     mutable Color resolvedTextColor{0, 0, 0};
     mutable float resolvedFontSize = 16.0f;
@@ -1837,6 +2014,7 @@ private:
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1877,6 +2055,7 @@ private:
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
+#include "tablet-client-protocol.h" // Generated client bindings for tablet-unstable-v2 (pen pressure/tilt/eraser/barrel buttons).
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h> // OpenGL ES 3.0 (superset of the ES 2.0 entry points used so far)
@@ -6050,19 +6229,16 @@ View View::toView(Canvas c) {
   v.isCanvas = true;
   v.onPaint = std::move(c.onPaint);
   v.onClick = std::move(c.onClick);
-  v.onMiddleClick = std::move(c.onMiddleClick);
-  v.onRightClick = std::move(c.onRightClick);
-  v.onPressAt = std::move(c.onPressAt);
-  v.onMiddlePressAt = std::move(c.onMiddlePressAt);
-  v.onRightPressAt = std::move(c.onRightPressAt);
-  v.onDragTo = std::move(c.onDragTo);
-  v.onMiddleDragTo = std::move(c.onMiddleDragTo);
-  v.onRightDragTo = std::move(c.onRightDragTo);
-  v.onDragEnd = std::move(c.onDragEnd);
-  v.onHoverAt = std::move(c.onHoverAt);
-  v.onHoverEnd = std::move(c.onHoverEnd);
-  v.onScrollUp = std::move(c.onScrollUp);
-  v.onScrollDown = std::move(c.onScrollDown);
+  v.onDoubleClick = std::move(c.onDoubleClick);
+  v.onAuxClick = std::move(c.onAuxClick);
+  v.onContextMenu = std::move(c.onContextMenu);
+  v.onPointerDown = std::move(c.onPointerDown);
+  v.onPointerMove = std::move(c.onPointerMove);
+  v.onPointerUp = std::move(c.onPointerUp);
+  v.onPointerCancel = std::move(c.onPointerCancel);
+  v.onPointerEnter = std::move(c.onPointerEnter);
+  v.onPointerLeave = std::move(c.onPointerLeave);
+  v.onWheel = std::move(c.onWheel);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
   v.focusable = c.focusable;
   v.onFocus = std::move(c.onFocus);
@@ -11307,6 +11483,782 @@ inline void layoutRoot(View &root, float windowW, float windowH,
 
 } // namespace liteui_layout
 
+// ---------------------------------------------------------------------------
+// liteui_pointer — pointer hit-testing and event routing, with no window,
+// platform or renderer dependency (so the unit tests can drive it directly).
+// LiteUIImpl owns one Router and its platform backends translate native
+// mouse messages into PointerEvent / WheelEvent calls on it. See the
+// "Pointer events" comment above PointerEvent for the semantics.
+// ---------------------------------------------------------------------------
+namespace liteui_pointer {
+
+// A rectangle used to accumulate the intersection of every scrollable
+// ancestor's viewport as we walk down the tree, so painting and
+// hit-testing can both tell "is this point/pixel actually visible, or
+// has it scrolled behind a clipping ancestor". Defaults to "the whole
+// plane" so the root of any walk starts unclipped.
+struct ClipRect {
+  float x0 = -std::numeric_limits<float>::infinity();
+  float y0 = -std::numeric_limits<float>::infinity();
+  float x1 = std::numeric_limits<float>::infinity();
+  float y1 = std::numeric_limits<float>::infinity();
+  bool contains(float px, float py) const {
+    return px >= x0 && px < x1 && py >= y0 && py < y1;
+  }
+  // Narrows this clip to also be inside the given box — used every time
+  // we descend into a scroll container's children.
+  ClipRect intersect(float bx, float by, float bw, float bh) const {
+    return {std::max(x0, bx), std::max(y0, by), std::min(x1, bx + bw),
+            std::min(y1, by + bh)};
+  }
+};
+
+// Global z-index stacking, shared by both renderers and by hit-testing.
+struct AbsoluteEntry {
+  const View *view;
+  int order;     // document/discovery order, for stable z-index ties
+  ClipRect clip; // intersection of every scrollable ancestor's viewport
+};
+
+// Returns whether (px, py) lies within v's already-computed border-box.
+inline bool containsPoint(const View &v, float px, float py) {
+  return px >= v.computed.x && px < v.computed.x + v.computed.w &&
+         py >= v.computed.y && py < v.computed.y + v.computed.h;
+}
+
+// Walks the whole tree (not just direct children) collecting every
+// Position::Absolute node, tagged with its pre-order discovery index.
+// Recurses into every node regardless of its own position, so nested
+// absolutes (an absolute inside another absolute's subtree) still get
+// their own top-level slot in the global list. Each entry also carries
+// the clip of its scrollable ancestors, so absolutes scrolled out of
+// view are neither painted nor hit-tested.
+inline void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out,
+                             ClipRect clip = ClipRect{}) {
+  ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                           ? clip.intersect(v.computed.x, v.computed.y,
+                                            v.computed.w, v.computed.h)
+                           : clip;
+  for (const auto &child : v.children) {
+    if (resolveDynamic(child.style.display, child.computed.resolvedDisplay) ==
+        Display::None)
+      continue; // a display:none subtree contributes no absolutes either
+    if (child.style.position == Position::Absolute)
+      out.push_back({&child, static_cast<int>(out.size()),
+                     child.style.escapeClip ? ClipRect{} : childClip});
+    collectAbsolutes(child, out, childClip);
+  }
+}
+
+// Sorts absolute entries by zIndex ascending, document order breaking ties.
+inline void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
+  std::stable_sort(absolutes.begin(), absolutes.end(),
+                   [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
+                     int za = resolveDynamic(a.view->style.zIndex,
+                                             a.view->computed.resolvedZIndex);
+                     int zb = resolveDynamic(b.view->style.zIndex,
+                                             b.view->computed.resolvedZIndex);
+                     if (za != zb)
+                       return za < zb;
+                     return a.order < b.order;
+                   });
+}
+
+// The id of the mouse; PointerEvent::pointerId defaults to it.
+inline constexpr uint32_t kMousePointerId = 1;
+
+class Router {
+public:
+  // ---- Wiring (set by the owner) -----------------------------------------
+  View *root = nullptr; // null until a tree exists
+  // Polls dynamic sources and relayouts (LiteUIImpl::pollAndRelayout).
+  // Returns whether anything changed. Called after dispatch, never between
+  // two handlers of one event.
+  std::function<bool()> poll;
+  // Moves keyboard focus (LiteUIImpl::setFocus); called on a left press.
+  std::function<void(View *)> focus;
+
+  static constexpr uint64_t kDoubleClickMs = 500;
+  static constexpr float kDoubleClickSlop = 4.0f;
+
+  Router() {
+    pointers_.push_back(
+        std::make_unique<PointerState>(kMousePointerId, PointerType::Mouse));
+  }
+
+  // ---- Introspection (tests, and the platform layer) ---------------------
+  // Mouse unless a pointer id is given.
+  uint8_t buttonsHeld(uint32_t id = kMousePointerId) const {
+    const PointerState *s = find(id);
+    return s ? s->held : 0;
+  }
+  View *capturedView(uint32_t id = kMousePointerId) const {
+    const PointerState *s = find(id);
+    return s ? s->captured : nullptr;
+  }
+  View *pressedView(MouseButton b, uint32_t id = kMousePointerId) const {
+    const PointerState *s = find(id);
+    return (s && b != MouseButton::None) ? s->pressed[idx(b)] : nullptr;
+  }
+  // Pointers the router currently tracks: the mouse, plus every finger down
+  // and every pen that is in range.
+  size_t pointerCount() const { return pointers_.size(); }
+  bool knows(uint32_t id) const { return find(id) != nullptr; }
+
+  // Drops every raw View* this router holds WITHOUT calling anything. Use
+  // whenever views may already be destroyed (tree rebuilt, setRoot). No
+  // onPointerCancel is delivered. A dispatch in progress notices
+  // (see generation_) and stops bubbling. Pointers stay known (their buttons
+  // are still physically held); the releases that follow are no-ops.
+  void invalidate() {
+    ++generation_;
+    for (auto &p : pointers_) {
+      for (int i = 0; i < 3; ++i)
+        p->pressed[i] = nullptr;
+      p->captured = nullptr;
+      p->captureChain.clear();
+      p->downMask = 0;
+    }
+    for (auto &c : lastClick_)
+      c = {};
+  }
+
+  // A press-in-scrollable-content has turned into a pan: the eventual
+  // release must not count as a click. The pointer's capture stays armed, so
+  // a view that is dragging keeps receiving moves while the content pans.
+  void dropClick(MouseButton b, uint32_t id = kMousePointerId) {
+    if (PointerState *s = find(id); s && b != MouseButton::None)
+      s->pressed[idx(b)] = nullptr;
+  }
+
+  // ---- Events ------------------------------------------------------------
+  // e.windowX/windowY, e.button (down/up), e.mods, e.type, e.pointerId and
+  // e.isPrimary must be filled by the caller; e.timeMs may be 0 (stamped with
+  // the steady clock). A pen/touch contact is MouseButton::Left (see the
+  // "Pointer events" comment).
+
+  void down(PointerEvent e) {
+    if (e.button == MouseButton::None)
+      return;
+    const MouseButton btn = e.button;
+    const int i = idx(btn);
+    PointerState &st = stateFor(e);
+    prepare(st, e);
+    st.held |= buttonBit(btn);
+    st.downMask |= buttonBit(btn);
+    e.buttons = st.held;
+    fixPressure(e);
+    e.coalesced = {};
+
+    Scratch chain(*this);
+    chainAt(e.windowX, e.windowY,
+            [btn](const View &v) { return wantsPress(v, btn); }, chain.v);
+    View *target = chain.v.empty() ? nullptr : chain.v.front();
+    st.pressed[i] = target;
+
+    // Focus before any handler, as it always was: a left press focuses the
+    // target if it's focusable and otherwise clears focus.
+    if (btn == MouseButton::Left && focus)
+      focus((target && target->focusable) ? target : nullptr);
+
+    const uint64_t gen = generation_;
+    View *stopper = nullptr, *deepestDown = nullptr;
+    bool aborted = false;
+    for (View *v : chain.v) {
+      if (v->onPointerDown) {
+        if (!deepestDown)
+          deepestDown = v;
+        setLocal(e, *v);
+        v->onPointerDown(e);
+        if (gen != generation_) {
+          aborted = true;
+          break;
+        }
+        if (e.propagationStopped()) {
+          stopper = v;
+          break;
+        }
+      }
+    }
+
+    if (!aborted && !st.captured) {
+      if (View *cap = stopper ? stopper : deepestDown) {
+        st.captured = cap;
+        st.captureChain.clear();
+        st.captureChain.push_back(cap);
+        ancestorsOf(*cap, st.captureChain);
+      }
+    }
+    if (!aborted && poll)
+      poll(); // reconcile what the handlers changed; may invalidate()
+  }
+
+  // Returns whether anything changed (caller should repaint).
+  bool move(PointerEvent e) {
+    PointerState &st = stateFor(e); // a pen hovering creates its state
+    prepare(st, e);
+    e.button = MouseButton::None;
+    e.buttons = st.held;
+    fixPressure(e);
+    if (!root)
+      return false;
+
+    // A move always carries at least its own position as a sample.
+    PointerSample own{e.windowX, e.windowY, e.pressure, e.tiltX,
+                      e.tiltY,   e.twist,   e.timeMs};
+    if (e.coalesced.empty())
+      e.coalesced = std::span<const PointerSample>(&own, 1);
+
+    const uint64_t gen = generation_;
+    bool ran = false;
+    {
+      Scratch chain(*this);
+      if (st.captured)
+        chain.v = st.captureChain;
+      else
+        chainAt(e.windowX, e.windowY,
+                [](const View &v) {
+                  return (bool)v.onPointerMove && !isDisabled(v);
+                },
+                chain.v);
+      ran |= bubble(chain.v, e, &View::onPointerMove, gen, st.captured != nullptr);
+    }
+    if (gen != generation_)
+      return poll ? poll() : false;
+
+    return ran && poll ? poll() : false;
+  }
+
+  // Returns whether anything changed (caller should repaint).
+  bool up(PointerEvent e) {
+    if (e.button == MouseButton::None)
+      return false;
+    PointerState *stp = find(e.pointerId);
+    if (!stp)
+      return false;
+    PointerState &st = *stp;
+    const MouseButton btn = e.button;
+    const int i = idx(btn);
+    prepare(st, e);
+    st.held &= static_cast<uint8_t>(~buttonBit(btn));
+    e.buttons = st.held;
+    fixPressure(e);
+    e.coalesced = {};
+    const bool hadDown = (st.downMask & buttonBit(btn)) != 0;
+    st.downMask &= static_cast<uint8_t>(~buttonBit(btn));
+    // A finger's pointer ceases to exist when it lifts.
+    const uint32_t id = st.id;
+    const bool transient = st.type == PointerType::Touch && st.held == 0;
+    auto finish = [&](bool r) {
+      if (transient)
+        erase(id);
+      return r;
+    };
+    if (!hadDown || !root)
+      return finish(false); // a release with no matching press we saw
+
+    const uint64_t gen = generation_;
+
+    // 1. pointerup — to the capture target, else to whatever is under it.
+    {
+      Scratch chain(*this);
+      const bool viaCapture = st.captured != nullptr;
+      if (viaCapture)
+        chain.v = st.captureChain;
+      else
+        chainAt(e.windowX, e.windowY,
+                [](const View &v) {
+                  return (bool)v.onPointerUp && !isDisabled(v);
+                },
+                chain.v);
+      bubble(chain.v, e, &View::onPointerUp, gen, viaCapture);
+    }
+    if (gen != generation_)
+      return finish(poll ? poll() : false);
+    if (st.held == 0) { // capture lasts until the last button is released
+      st.captured = nullptr;
+      st.captureChain.clear();
+    }
+
+    // 2. click — only if the release landed on the view the press did.
+    View *pressedTarget = st.pressed[i];
+    st.pressed[i] = nullptr;
+    if (pressedTarget) {
+      Scratch chain(*this);
+      chainAt(e.windowX, e.windowY,
+              [btn](const View &v) { return wantsPress(v, btn); }, chain.v);
+      if (!chain.v.empty() && chain.v.front() == pressedTarget) {
+        e.clickCount = countClick(pressedTarget, e);
+        dispatchClick(chain.v, e, gen);
+      }
+    }
+    return finish(poll ? poll() : false);
+  }
+
+  // MOUSE: the press of `b` can no longer complete (capture lost, an OS move
+  // loop swallowed the release, the release landed in window chrome).
+  // Delivers onPointerCancel to the capture target when the last button goes
+  // away.
+  void cancel(MouseButton b) {
+    if (b == MouseButton::None)
+      return;
+    PointerState &st = mouse();
+    const int i = idx(b);
+    const uint8_t bit = buttonBit(b);
+    st.pressed[i] = nullptr;
+    st.held &= static_cast<uint8_t>(~bit);
+    st.downMask &= static_cast<uint8_t>(~bit);
+    if (st.held == 0)
+      cancelCapture(st);
+  }
+
+  void cancelAll() {
+    for (int i = 0; i < 3; ++i)
+      cancel(static_cast<MouseButton>(i));
+    cancelCapture(mouse());
+  }
+
+  // ANY pointer: the system took it away (a compositor gesture, a lost
+  // capture, a tool leaving the tablet mid-stroke). onPointerCancel to its
+  // capture target, and a touch ceases to exist. For the mouse this is
+  // cancelAll().
+  void cancelPointer(uint32_t id) {
+    if (id == kMousePointerId) {
+      cancelAll();
+      return;
+    }
+    PointerState *stp = find(id);
+    if (!stp)
+      return;
+    PointerState &st = *stp;
+    for (int i = 0; i < 3; ++i)
+      st.pressed[i] = nullptr;
+    st.held = 0;
+    st.downMask = 0;
+    cancelCapture(st);
+    erase(id);
+  }
+
+  // A pen left the tablet's range (or any non-mouse pointer stopped
+  // existing without a press in flight): drop its state. Nothing is
+  // delivered; a press still in flight should be cancelPointer()'d instead.
+  void forget(uint32_t id) {
+    PointerState *s = find(id);
+    if (s && id != kMousePointerId && s->held == 0)
+      erase(id);
+  }
+
+  // Runs the wheel handlers. Returns whether any handler ran (caller should
+  // repaint). If !e.propagationStopped() afterwards, the caller applies the
+  // built-in overflow scrolling.
+  bool wheel(WheelEvent &e) {
+    if (!root || (e.dx == 0.0f && e.dy == 0.0f))
+      return false;
+    if (e.timeMs == 0)
+      e.timeMs = nowMs();
+    const uint64_t gen = generation_;
+    bool ran = false;
+    Scratch chain(*this);
+    // Wheel handlers don't care whether a view is disabled.
+    chainAt(e.windowX, e.windowY, [](const View &v) { return (bool)v.onWheel; },
+            chain.v);
+    for (View *v : chain.v) {
+      e.x = e.windowX - v->computed.x;
+      e.y = e.windowY - v->computed.y;
+      v->onWheel(e);
+      ran = true;
+      if (gen != generation_ || e.propagationStopped())
+        break;
+    }
+    if (ran && poll)
+      poll();
+    return ran;
+  }
+
+  // The cursor to show with the MOUSE at window (x, y): the nearest
+  // non-Inherit Style::cursor walking from the deepest view under the pointer
+  // up through its ancestors (every view counts, whether or not it has a
+  // handler), else Cursor::Default. While a view holds the mouse's capture —
+  // a press with an onPointerDown — the walk starts from the capture target
+  // instead, wherever the pointer is. Dynamic
+  // cursors are read from the cache the owner's poll keeps fresh
+  // (computed.resolvedCursor).
+  Cursor cursorAt(float x, float y) {
+    if (!root)
+      return Cursor::Default;
+    PointerState &st = mouse();
+    Scratch chain(*this);
+    if (st.captured)
+      chain.v = st.captureChain;
+    else
+      chainAt(x, y, [](const View &) { return true; }, chain.v);
+    for (const View *v : chain.v) {
+      Cursor c = resolveDynamic(v->style.cursor, v->computed.resolvedCursor);
+      if (c != Cursor::Inherit)
+        return c;
+    }
+    return Cursor::Default;
+  }
+
+  // Refreshes every view's hover flag from the pointer position (clip-aware,
+  // so a view scrolled out of view is never hovered) and fires
+  // onPointerEnter/Leave. Returns whether any flag flipped. *needPoll is set when a handler may have changed app
+  // state, so the caller should pollAndRelayout(). Call it for the mouse and
+  // for a hovering pen; a finger has no hover.
+  bool hover(PointerEvent e, bool *needPoll) {
+    if (!root)
+      return false;
+    PointerState &st = stateFor(e);
+    prepare(st, e);
+    e.button = MouseButton::None;
+    e.buttons = st.held;
+    fixPressure(e);
+    e.coalesced = {};
+    return updateHover(*root, e, ClipRect{}, needPoll);
+  }
+
+private:
+  struct ClickRecord {
+    View *target = nullptr;
+    MouseButton button = MouseButton::None;
+    float x = 0, y = 0;
+    uint64_t timeMs = 0;
+    uint8_t count = 0;
+  };
+
+  // Everything that is per pointer: which buttons it holds, what each press
+  // landed on, its capture, and its click history. The mouse's lives for the
+  // router's lifetime; a finger's from down to up; a pen's while in range.
+  struct PointerState {
+    PointerState(uint32_t i, PointerType t) : id(i), type(t) {}
+    uint32_t id;
+    PointerType type;
+    uint8_t held = 0;     // buttons physically held (buttonBit)
+    uint8_t downMask = 0; // buttons whose press this router handled
+    View *pressed[3] = {nullptr, nullptr, nullptr}; // click pairing, per button
+    View *captured = nullptr;          // pointer-capture target
+    std::vector<View *> captureChain;  // captured first, then tree ancestors
+    float lastX = 0, lastY = 0;
+    KeyModifiers lastMods;
+  };
+
+  static int idx(MouseButton b) { return static_cast<int>(b); }
+
+  PointerState &mouse() { return *pointers_.front(); }
+  const PointerState *find(uint32_t id) const {
+    for (const auto &p : pointers_)
+      if (p->id == id)
+        return p.get();
+    return nullptr;
+  }
+  PointerState *find(uint32_t id) {
+    return const_cast<PointerState *>(std::as_const(*this).find(id));
+  }
+  PointerState &stateFor(const PointerEvent &e) {
+    if (PointerState *s = find(e.pointerId))
+      return *s;
+    pointers_.push_back(std::make_unique<PointerState>(e.pointerId, e.type));
+    return *pointers_.back();
+  }
+  void erase(uint32_t id) {
+    if (id == kMousePointerId)
+      return;
+    std::erase_if(pointers_, [id](const auto &p) { return p->id == id; });
+  }
+
+  static uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  }
+
+  static void prepare(PointerState &st, PointerEvent &e) {
+    if (e.timeMs == 0)
+      e.timeMs = nowMs();
+    e.x = e.windowX;
+    e.y = e.windowY;
+    st.lastX = e.windowX;
+    st.lastY = e.windowY;
+    st.lastMods = e.mods;
+  }
+  // A mouse has no pressure sensor: 0.5 while any button is held, else 0.
+  // (Pen and touch backends report their own.)
+  static void fixPressure(PointerEvent &e) {
+    if (e.type == PointerType::Mouse)
+      e.pressure = e.buttons ? 0.5f : 0.0f;
+  }
+  static void setLocal(PointerEvent &e, const View &v) {
+    e.x = e.windowX - v.computed.x;
+    e.y = e.windowY - v.computed.y;
+  }
+  static bool isDisabled(const View &v) {
+    return resolveDynamic(v.disabled, v.computed.resolvedDisabled);
+  }
+
+  // ---- Which views care about a button ---------------------------------------
+  static bool hasClickFamily(const View &v, MouseButton b) {
+    switch (b) {
+    case MouseButton::Left:
+      return (bool)v.onClick || (bool)v.onDoubleClick;
+    case MouseButton::Middle:
+      return (bool)v.onAuxClick;
+    case MouseButton::Right:
+      return (bool)v.onContextMenu;
+    default:
+      return false;
+    }
+  }
+  // Whether v takes part in pressing `b`: it handles the down, or a click of
+  // that button. Disabled views are transparent.
+  static bool wantsPress(const View &v, MouseButton b) {
+    if (isDisabled(v))
+      return false;
+    return (bool)v.onPointerDown || hasClickFamily(v, b);
+  }
+
+  // ---- Chains ------------------------------------------------------------------
+  // A reusable vector for building a chain without allocating per event.
+  // Handlers can re-enter (and two chains can be alive at once), so each
+  // user takes the pooled vector for its lifetime and hands it back.
+  struct Scratch {
+    Router &r;
+    std::vector<View *> v;
+    explicit Scratch(Router &rr) : r(rr) { v.swap(r.pool_); }
+    ~Scratch() {
+      v.clear();
+      r.pool_.swap(v);
+    }
+  };
+
+  // Mirrors the paint order: the topmost Position::Absolute layer (highest
+  // zIndex, latest in document order) that has a matching view under the
+  // point wins; otherwise the in-flow tree. `out` receives the matching view
+  // deepest under the point first, then its matching ancestors up to the
+  // root. A layer with no match under the point falls through to the layers
+  // below, so a view without a handler never blocks one beneath it.
+  template <class Pred>
+  void chainAt(float x, float y, Pred pred, std::vector<View *> &out) {
+    out.clear();
+    if (!root)
+      return;
+    absolutes_.clear();
+    collectAbsolutes(*root, absolutes_);
+    sortAbsolutes(absolutes_);
+    for (auto it = absolutes_.rbegin(); it != absolutes_.rend(); ++it) {
+      View &av = const_cast<View &>(*it->view);
+      if (walk(av, x, y, it->clip, pred, out)) {
+        // An absolute view bubbles to its parent in the tree (like the DOM).
+        ancestors_.clear();
+        ancestorsOf(av, ancestors_);
+        for (View *a : ancestors_)
+          if (pred(*a))
+            out.push_back(a);
+        return;
+      }
+    }
+    walk(*root, x, y, ClipRect{}, pred, out);
+  }
+
+  // Clip-aware descent, same geometry rules as painting. Children are tried
+  // last-to-first (later siblings paint on top); absolute children are
+  // separate layers handled by chainAt. Pushes post-order, so deeper matches
+  // come first. Returns whether anything matched.
+  template <class Pred>
+  static bool walk(View &v, float x, float y, ClipRect clip, Pred &pred,
+                   std::vector<View *> &out) {
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden)
+      return false;
+    if (!clip.contains(x, y) || !containsPoint(v, x, y))
+      return false;
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
+    bool found = false;
+    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
+      if (it->style.position == Position::Absolute ||
+          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
+              Display::None)
+        continue;
+      if (walk(*it, x, y, childClip, pred, out)) {
+        found = true;
+        break;
+      }
+    }
+    if (pred(v)) {
+      out.push_back(&v);
+      found = true;
+    }
+    return found;
+  }
+
+  // Appends target's ancestors (parent first, root last) to `out`.
+  bool ancestorsOf(View &target, std::vector<View *> &out) {
+    return root && pathTo(*root, &target, out);
+  }
+  static bool pathTo(View &v, const View *target, std::vector<View *> &out) {
+    for (auto &c : v.children) {
+      if (&c == target || pathTo(c, target, out)) {
+        out.push_back(&v);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // ---- Delivery ------------------------------------------------------------------
+  // Fires `h` along `chain` (deepest first) until a handler stops the event.
+  // Returns whether any handler ran. `filter` is for capture chains, which
+  // (unlike hit chains) were not filtered for disabled views when built.
+  bool bubble(const std::vector<View *> &chain, PointerEvent e,
+              PointerHandler View::*h, uint64_t gen, bool filter) {
+    bool ran = false;
+    for (View *v : chain) {
+      if (!(v->*h) || (filter && isDisabled(*v)))
+        continue;
+      setLocal(e, *v);
+      (v->*h)(e);
+      ran = true;
+      if (gen != generation_ || e.propagationStopped())
+        break;
+    }
+    return ran;
+  }
+
+  // Counts consecutive clicks on the same view by the same KIND of pointer
+  // (DOM's `detail`). Kept per type rather than per pointer: each finger
+  // contact is a new, short-lived pointer, so a double-tap is two different
+  // pointers; mouse, pen and touch each keep their own history.
+  uint8_t countClick(View *target, const PointerEvent &e) {
+    ClickRecord &c = lastClick_[static_cast<int>(e.type)];
+    const bool again = c.target == target && c.button == e.button &&
+                       e.timeMs >= c.timeMs &&
+                       e.timeMs - c.timeMs <= kDoubleClickMs &&
+                       std::abs(e.windowX - c.x) <= kDoubleClickSlop &&
+                       std::abs(e.windowY - c.y) <= kDoubleClickSlop;
+    const uint8_t n = again ? static_cast<uint8_t>(std::min(c.count + 1, 255)) : 1;
+    c = {target, e.button, e.windowX, e.windowY, e.timeMs, n};
+    return n;
+  }
+
+  // Click-family dispatch: onClick (left) / onAuxClick (middle) /
+  // onContextMenu (right), then onDoubleClick on the second left click.
+  void dispatchClick(const std::vector<View *> &chain, PointerEvent e,
+                     uint64_t gen) {
+    const MouseButton btn = e.button;
+    const PointerEvent pristine = e.fresh();
+    for (View *v : chain) {
+      setLocal(e, *v);
+      bool stop = false;
+      switch (btn) {
+      case MouseButton::Left:
+        if (v->onClick) {
+          v->onClick(e);
+          stop = v->onClick.endsBubbling();
+        }
+        break;
+      case MouseButton::Middle:
+        if (v->onAuxClick)
+          v->onAuxClick(e);
+        break;
+      case MouseButton::Right:
+        if (v->onContextMenu)
+          v->onContextMenu(e);
+        break;
+      default:
+        break;
+      }
+      if (gen != generation_ || stop || e.propagationStopped())
+        break;
+    }
+    if (gen == generation_ && btn == MouseButton::Left &&
+        pristine.clickCount == 2)
+      bubble(chain, pristine, &View::onDoubleClick, gen, false);
+  }
+
+  // Delivers onPointerCancel to the capture chain and drops the capture.
+  void cancelCapture(PointerState &st) {
+    if (!st.captured)
+      return;
+    std::vector<View *> chain = std::move(st.captureChain);
+    st.captured = nullptr;
+    st.captureChain.clear();
+    PointerEvent e;
+    e.pointerId = st.id;
+    e.type = st.type;
+    e.windowX = st.lastX;
+    e.windowY = st.lastY;
+    e.mods = st.lastMods;
+    e.buttons = st.held;
+    e.timeMs = nowMs();
+    fixPressure(e);
+    bubble(chain, e, &View::onPointerCancel, generation_, false);
+  }
+
+  // ---- Hover ---------------------------------------------------------------------
+  static void fireBoundary(View &v, PointerHandler View::*h,
+                           const PointerEvent &proto, bool *needPoll) {
+    if (!(v.*h))
+      return;
+    PointerEvent e = proto;
+    e.x = proto.windowX - v.computed.x;
+    e.y = proto.windowY - v.computed.y;
+    (v.*h)(e);
+    if (needPoll)
+      *needPoll = true;
+  }
+
+  // Updates v's (and its descendants') isHovered flag based on the pointer
+  // position, mirroring walk()'s clip-aware descent so a node scrolled out of
+  // view is never marked hovered. Returns whether any flag actually flipped,
+  // so callers only repaint when hover state visibly changes.
+  static bool updateHover(View &v, const PointerEvent &p, ClipRect clip,
+                          bool *needPoll) {
+    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
+        Visibility::Hidden) {
+      bool changed = v.computed.isHovered;
+      if (changed)
+        fireBoundary(v, &View::onPointerLeave, p, needPoll);
+      v.computed.isHovered = false; // scrolled-out/None already relied on
+                                    // this same "force false" idiom
+      return changed;
+    }
+    bool inside = clip.contains(p.windowX, p.windowY) &&
+                  containsPoint(v, p.windowX, p.windowY);
+    bool changed = false;
+    if (inside != v.computed.isHovered) {
+      v.computed.isHovered = inside;
+      if (v.style.hoverColor)
+        v.computed.dirty = true;
+      changed = true;
+      fireBoundary(v, inside ? &View::onPointerEnter : &View::onPointerLeave, p,
+                   needPoll);
+    }
+    ClipRect childClip = (v.scrollsX() || v.scrollsY())
+                             ? clip.intersect(v.computed.x, v.computed.y,
+                                              v.computed.w, v.computed.h)
+                             : clip;
+    for (auto &c : v.children)
+      changed |= updateHover(c, p, childClip, needPoll);
+    return changed;
+  }
+
+  // ---- State -----------------------------------------------------------------------
+  // Bumped by invalidate(); a dispatch that sees it change mid-flight stops
+  // touching its (possibly dangling) chain.
+  uint64_t generation_ = 0;
+  ClickRecord lastClick_[3]; // indexed by PointerType
+  // pointers_[0] is always the mouse. unique_ptr keeps a PointerState's
+  // address stable while another pointer is added.
+  std::vector<std::unique_ptr<PointerState>> pointers_;
+  std::vector<View *> pool_, ancestors_;
+  std::vector<AbsoluteEntry> absolutes_;
+};
+
+} // namespace liteui_pointer
+
 #if !defined(_WIN32)
 inline Key xkbKeysymToKey(xkb_keysym_t sym) {
   if (sym >= XKB_KEY_a && sym <= XKB_KEY_z)
@@ -11598,26 +12550,11 @@ private:
 #endif
   }
 
-  // A rectangle used to accumulate the intersection of every scrollable
-  // ancestor's viewport as we walk down the tree, so painting and
-  // hit-testing can both tell "is this point/pixel actually visible, or
-  // has it scrolled behind a clipping ancestor". Defaults to "the whole
-  // plane" so the root of any walk starts unclipped.
-  struct ClipRect {
-    float x0 = -std::numeric_limits<float>::infinity();
-    float y0 = -std::numeric_limits<float>::infinity();
-    float x1 = std::numeric_limits<float>::infinity();
-    float y1 = std::numeric_limits<float>::infinity();
-    bool contains(float px, float py) const {
-      return px >= x0 && px < x1 && py >= y0 && py < y1;
-    }
-    // Narrows this clip to also be inside the given box — used every time
-    // we descend into a scroll container's children.
-    ClipRect intersect(float bx, float by, float bw, float bh) const {
-      return {std::max(x0, bx), std::max(y0, by), std::min(x1, bx + bw),
-              std::min(y1, by + bh)};
-    }
-  };
+  // Hit-testing geometry and the pointer router live in liteui_pointer (no
+  // window needed, so the tests can drive them); these are the names the
+  // renderers have always used.
+  using ClipRect = liteui_pointer::ClipRect;
+  using AbsoluteEntry = liteui_pointer::AbsoluteEntry;
 
   // Plain float rectangle for scrollbar geometry (track/thumb), kept
   // separate from Wayland's integer-pixel `Rect` below since scrollbar math
@@ -11777,6 +12714,10 @@ private:
     // ordinary click (see beginScrollPress/updateScrollDrag/endScrollPress).
     bool moved = false;
   } scrollDrag_;
+  // Which pointer (PointerEvent::pointerId) armed scrollDrag_: only it may
+  // advance or end the drag, so a finger panning a list isn't moved by mouse
+  // motion and vice versa. Meaningful only while scrollDrag_.mode != None.
+  uint32_t scrollOwner_ = liteui_pointer::kMousePointerId;
 
   // Pixels of pointer movement before a press-in-content is treated as a
   // pan-to-scroll drag rather than a click.
@@ -11791,7 +12732,8 @@ private:
   // which case a ContentPan drag is armed here but the ordinary click path
   // still runs too, since a small movement should behave as a click, not a
   // pan (see updateScrollDrag/endScrollPress).
-  bool beginScrollPress(float x, float y) {
+  bool beginScrollPress(float x, float y,
+                        uint32_t pointerId = liteui_pointer::kMousePointerId) {
     if (!hasRoot_)
       return false;
     ScrollPress r = resolveScrollTarget(root_, x, y, ClipRect{});
@@ -11800,11 +12742,13 @@ private:
       scrollDrag_ = {
           DragMode::VThumb,         r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
+      scrollOwner_ = pointerId;
       return true;
     case ScrollHit::HThumb:
       scrollDrag_ = {
           DragMode::HThumb,         r.view, x, y, r.view->computed.scrollX,
           r.view->computed.scrollY, true};
+      scrollOwner_ = pointerId;
       return true;
     case ScrollHit::VTrack: {
       PixRect track = vTrackRect(*r.view), thumb = vThumbRect(*r.view);
@@ -11831,6 +12775,7 @@ private:
         scrollDrag_ = {
             DragMode::ContentPan,     r.view, x, y, r.view->computed.scrollX,
             r.view->computed.scrollY, false};
+        scrollOwner_ = pointerId;
       }
       return false; // ordinary click press still proceeds too
     case ScrollHit::None:
@@ -11842,8 +12787,9 @@ private:
   // Call on every pointer-motion event while a button is held. Advances an
   // in-progress scrollbar drag or content pan; a no-op if scrollDrag_ isn't
   // active. Returns true if it changed anything (caller should repaint).
-  bool updateScrollDrag(float x, float y) {
-    if (scrollDrag_.mode == DragMode::None)
+  bool updateScrollDrag(float x, float y,
+                        uint32_t pointerId = liteui_pointer::kMousePointerId) {
+    if (scrollDrag_.mode == DragMode::None || scrollOwner_ != pointerId)
       return false;
     View &v = *scrollDrag_.target;
     float dx = x - scrollDrag_.startPointerX;
@@ -11856,7 +12802,7 @@ private:
         scrollDrag_.moved = true;
         // It just became a drag, not a click — cancel any pending onClick
         // so the eventual release doesn't also fire it.
-        pressedView_[btnIdx(MouseButton::Left)] = nullptr;
+        ptrRouter_.dropClick(MouseButton::Left, pointerId);
       }
       if (v.scrollsX())
         v.computed.scrollX =
@@ -11887,12 +12833,19 @@ private:
   // scrollbar grab, or a pan that moved) just ends quietly. Always clears
   // scrollDrag_ so a stale target can't leak into some unrelated later
   // press.
-  bool endScrollPress(float x, float y) {
+  //
+  // `e` is the release as a PointerEvent for a pen or finger (null = the
+  // mouse). Only the pointer that armed scrollDrag_ may end it: a release by
+  // any other pointer is an ordinary release and leaves the drag alone.
+  bool endScrollPress(float x, float y, const PointerEvent *e = nullptr) {
     bool changed = false;
-    if (scrollDrag_.mode == DragMode::None ||
+    const uint32_t pid = e ? e->pointerId : liteui_pointer::kMousePointerId;
+    const bool owner = scrollDrag_.mode != DragMode::None && scrollOwner_ == pid;
+    if (!owner ||
         (scrollDrag_.mode == DragMode::ContentPan && !scrollDrag_.moved))
-      changed = endPress(x, y);
-    scrollDrag_ = {};
+      changed = e ? ptrRouter_.up(*e) : endPress(x, y);
+    if (owner)
+      scrollDrag_ = {};
     return changed;
   }
 
@@ -11907,10 +12860,10 @@ private:
   // If the resolved view has style.wheelScrollEnabled == false, this is a
   // no-op — the wheel no longer moves that view's scroll position at all,
   // even though it's still scrollable via its scrollbar. This function is
-  // entirely separate from dispatchScroll()/onScrollUp/onScrollDown: a
-  // caller that wants "wheel does something custom instead of scrolling"
-  // (e.g. zoom) should turn this off and rely on those handlers, which
-  // fire regardless of wheelScrollEnabled.
+  // entirely separate from dispatchWheel()'s onWheel handlers: a caller that
+  // wants "wheel does something custom instead of scrolling" (e.g. zoom)
+  // can either call stopPropagation() in its onWheel, or turn this off and
+  // rely on onWheel, which fires regardless of wheelScrollEnabled.
   bool applyWheelScroll(float x, float y, float deltaX, float deltaY) {
     if (!hasRoot_)
       return false;
@@ -11921,8 +12874,7 @@ private:
     if (!v.style.wheelScrollEnabled)
       return false; // pixel scroll disabled for this view; scrollbar
                     // drag/track-click still work normally, and
-                    // onScrollUp/onScrollDown still fire via the
-                    // caller's separate dispatchScroll() call
+                    // onWheel handlers still fire via dispatchWheel()
     bool changed = false;
     if (v.scrollsY() && deltaY != 0.0f) {
       float ns = std::clamp(v.computed.scrollY + deltaY, 0.0f, v.maxScrollY());
@@ -11939,133 +12891,15 @@ private:
     return changed;
   }
 
-  // Global z-index stacking, shared by both backends.
-  struct AbsoluteEntry {
-    const View *view;
-    int order;     // document/discovery order, for stable z-index ties
-    ClipRect clip; // intersection of every scrollable ancestor's viewport
-  };
-
-  // Walks the whole tree (not just direct children) collecting every
-  // Position::Absolute node, tagged with its pre-order discovery index.
-  // Recurses into every node regardless of its own position, so nested
-  // absolutes (an absolute inside another absolute's subtree) still get
-  // their own top-level slot in the global list. Each entry also carries
-  // the clip of its scrollable ancestors, so absolutes scrolled out of
-  // view are neither painted nor hit-tested.
   void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out) {
-    // Overload instead of `ClipRect clip = ClipRect{}`: GCC/Clang reject a
-    // default argument that needs a nested class's default member
-    // initializers before the enclosing class is complete.
-    collectAbsolutes(v, out, ClipRect{});
+    liteui_pointer::collectAbsolutes(v, out);
   }
-  void collectAbsolutes(const View &v, std::vector<AbsoluteEntry> &out,
-                        ClipRect clip) {
-    ClipRect childClip = (v.scrollsX() || v.scrollsY())
-                             ? clip.intersect(v.computed.x, v.computed.y,
-                                              v.computed.w, v.computed.h)
-                             : clip;
-    for (const auto &child : v.children) {
-      if (resolveDynamic(child.style.display, child.computed.resolvedDisplay) ==
-          Display::None)
-        continue; // a display:none subtree contributes no absolutes either
-      if (child.style.position == Position::Absolute)
-        out.push_back({&child, static_cast<int>(out.size()),
-                       child.style.escapeClip ? ClipRect{} : childClip});
-      collectAbsolutes(child, out, childClip);
-    }
-  }
-
-  // Sorts absolute entries by zIndex ascending, document order breaking
-  // ties — shared by paintRoot() (Windows) and redraw() (Linux).
   static void sortAbsolutes(std::vector<AbsoluteEntry> &absolutes) {
-    std::stable_sort(absolutes.begin(), absolutes.end(),
-                     [](const AbsoluteEntry &a, const AbsoluteEntry &b) {
-                       int za = resolveDynamic(a.view->style.zIndex,
-                                               a.view->computed.resolvedZIndex);
-                       int zb = resolveDynamic(b.view->style.zIndex,
-                                               b.view->computed.resolvedZIndex);
-                       if (za != zb)
-                         return za < zb;
-                       return a.order < b.order;
-                     });
+    liteui_pointer::sortAbsolutes(absolutes);
   }
 
-  // Returns whether (px, py) lies within v's already-computed border-box.
   static bool containsPoint(const View &v, float px, float py) {
-    return px >= v.computed.x && px < v.computed.x + v.computed.w &&
-           py >= v.computed.y && py < v.computed.y + v.computed.h;
-  }
-
-  // Whether v itself would respond to a press/click of the given button —
-  // shared by hitTestFlow so each button tracks its own independent hit
-  // test instead of only ever matching onClick/onPressAt.
-  static bool hasButtonHandler(const View &v, MouseButton btn) {
-    if (resolveDynamic(v.disabled, v.computed.resolvedDisabled))
-      return false;
-    switch (btn) {
-    case MouseButton::Left:
-      return (bool)v.onClick || (bool)v.onPressAt;
-    case MouseButton::Middle:
-      return (bool)v.onMiddleClick || (bool)v.onMiddlePressAt;
-    case MouseButton::Right:
-      return (bool)v.onRightClick || (bool)v.onRightPressAt;
-    }
-    return false;
-  }
-
-  // Recursively finds the topmost in-flow view under (x, y) with a
-  // non-null onClick. Children are checked last-to-first (later siblings
-  // paint on top), and Position::Absolute children are skipped here —
-  // they're handled globally by hitTest(), same split as
-  // collectAbsolutes()/renderView(). If the deepest matching view (or any
-  // of its flow descendants) has no handler, the search falls through to
-  // checking `v` itself, so a click bubbles up to the nearest ancestor
-  // that does have one.
-  //
-  // `clip` is the accumulated intersection of every scrollable ancestor's
-  // viewport seen so far — a point outside it means whatever's physically
-  // there has scrolled out of view, so it can't be hit no matter what its
-  // own box says. Only scrollable nodes narrow the clip further as we
-  // descend, exactly mirroring how renderView() decides what to clip.
-  static View *hitTestFlow(View &v, float x, float y, ClipRect clip,
-                           MouseButton btn) {
-    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
-        Visibility::Hidden)
-      return nullptr;
-    if (!clip.contains(x, y) || !containsPoint(v, x, y))
-      return nullptr;
-    ClipRect childClip = (v.scrollsX() || v.scrollsY())
-                             ? clip.intersect(v.computed.x, v.computed.y,
-                                              v.computed.w, v.computed.h)
-                             : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
-      if (it->style.position == Position::Absolute ||
-          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
-              Display::None)
-        continue;
-      if (View *hit = hitTestFlow(*it, x, y, childClip, btn))
-        return hit;
-    }
-    return hasButtonHandler(v, btn) ? &v : nullptr;
-  }
-
-  // Top-level hit test against the whole tree: absolutes take priority
-  // over the flow tree, highest zIndex/latest doc-order first, mirroring
-  // paint order (collectAbsolutes + sortAbsolutes are the same lists used
-  // to paint on Windows/Linux). Absolutes are tested unclipped — see the
-  // "known limitation" note on resolveScrollTarget() above.
-  View *hitTest(float x, float y, MouseButton btn = MouseButton::Left) {
-    if (!hasRoot_)
-      return nullptr;
-    std::vector<AbsoluteEntry> absolutes;
-    collectAbsolutes(root_, absolutes);
-    sortAbsolutes(absolutes);
-    for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
-      if (View *hit =
-              hitTestFlow(const_cast<View &>(*it->view), x, y, it->clip, btn))
-        return hit;
-    return hitTestFlow(root_, x, y, ClipRect{}, btn);
+    return liteui_pointer::containsPoint(v, px, py);
   }
 
   static View *hitTestTooltipFlow(View &v, float x, float y, ClipRect clip) {
@@ -12103,34 +12937,6 @@ private:
               hitTestTooltipFlow(const_cast<View &>(*it->view), x, y, it->clip))
         return hit;
     return hitTestTooltipFlow(root_, x, y, ClipRect{});
-  }
-
-  // Same bubbling shape as hitTestFlow, but matches on onScrollUp/
-  // onScrollDown instead of click/press handlers — kept as a separate
-  // walk (rather than folding into hasButtonHandler) since scroll
-  // notches aren't a MouseButton and can coexist with a view that also
-  // has click handlers.
-  static View *hitTestScroll(View &v, float x, float y, ClipRect clip,
-                             bool up) {
-    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
-        Visibility::Hidden)
-      return nullptr;
-    if (!clip.contains(x, y) || !containsPoint(v, x, y))
-      return nullptr;
-    ClipRect childClip = (v.scrollsX() || v.scrollsY())
-                             ? clip.intersect(v.computed.x, v.computed.y,
-                                              v.computed.w, v.computed.h)
-                             : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
-      if (it->style.position == Position::Absolute ||
-          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
-              Display::None)
-        continue;
-      if (View *hit = hitTestScroll(*it, x, y, childClip, up))
-        return hit;
-    }
-    bool has = up ? (bool)v.onScrollUp : (bool)v.onScrollDown;
-    return has ? &v : nullptr;
   }
 
   // Polls every dynamic source in the subtree rooted at v, writing
@@ -12198,6 +13004,15 @@ private:
         v.computed.dirty = true;
         changed =
             true; // affects text measurement — relayout() picked up by caller
+      }
+    }
+    if (auto *fn = std::get_if<std::function<Cursor()>>(&v.style.cursor)) {
+      Cursor next = (*fn)();
+      if (next != v.computed.resolvedCursor) {
+        v.computed.resolvedCursor = next;
+        // Needs no relayout or repaint: just a cursor refresh, which
+        // pollAndRelayout() does when it sees this flag.
+        cursorDirty_ = true;
       }
     }
     if (auto *fn = std::get_if<std::function<bool()>>(&v.disabled)) {
@@ -12422,14 +13237,10 @@ private:
   // them all rather than risk resolving a dangling one on the next
   // release/motion/key event. focusedView_ is nulled directly rather than
   // via setFocus(nullptr): the old target may already be freed, so firing
-  // its onBlur would be a use-after-free. dragView_ is nulled directly
-  // for the same reason, bypassing endDrag() — firing onDragEnd here
-  // could dereference a freed view.
+  // its onBlur would be a use-after-free. The pointer router is dropped
+  // silently for the same reason: no onPointerCancel here.
   void invalidateViewPointers() {
-    for (int i = 0; i < 3; ++i) {
-      pressedView_[i] = nullptr;
-      dragView_[i] = nullptr;
-    }
+    ptrRouter_.invalidate(); // press and capture targets, silently
     scrollDrag_ = {};
     focusedView_ = nullptr;
     hideTooltip(); // clears tooltipTarget_ and cancels its timer
@@ -12441,113 +13252,29 @@ private:
       return false;
     structureChanged_ = false;
     pendingFocusRequest_ = nullptr;
-    if (!checkForUpdates(root_))
+    cursorDirty_ = false;
+    if (!checkForUpdates(root_)) {
+      if (cursorDirty_)
+        refreshCursor(); // only a dynamic Style::cursor changed
       return false;
+    }
     if (structureChanged_)
       invalidateViewPointers();
     if (pendingFocusRequest_)
       setFocus(pendingFocusRequest_);
     relayout();
+    refreshCursor(); // the view under a stationary pointer may have changed
     return true;
   }
 
-  // Updates v's (and its descendants') isHovered flag based on (x, y),
-  // mirroring hitTestFlow's clip-aware descent so a node scrolled out of
-  // view is never marked hovered. Returns whether any flag actually
-  // flipped, so callers only repaint when hover state visibly changes.
-  static bool updateHover(View &v, float x, float y, ClipRect clip,
-                          bool *needPoll = nullptr) {
-    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
-        Visibility::Hidden) {
-      bool changed = v.computed.isHovered;
-      if (changed && v.onHoverEnd && v.onHoverEnd() && needPoll)
-        *needPoll = true;
-      v.computed.isHovered = false; // scrolled-out/None already relied on
-                                    // this same "force false" idiom
-      return changed;
-    }
-    bool inside = clip.contains(x, y) && containsPoint(v, x, y);
-    bool changed = false;
-    if (inside != v.computed.isHovered) {
-      v.computed.isHovered = inside;
-      if (v.style.hoverColor)
-        v.computed.dirty = true;
-      changed = true;
-      if (!inside && v.onHoverEnd && v.onHoverEnd() && needPoll)
-        *needPoll = true;
-    }
-    if (inside && v.onHoverAt &&
-        v.onHoverAt(x - v.computed.x, y - v.computed.y) && needPoll)
-      *needPoll = true;
-    ClipRect childClip = (v.scrollsX() || v.scrollsY())
-                             ? clip.intersect(v.computed.x, v.computed.y,
-                                              v.computed.w, v.computed.h)
-                             : clip;
-    for (auto &c : v.children)
-      changed |= updateHover(c, x, y, childClip, needPoll);
-    return changed;
-  }
+  // Set by checkForUpdates when a callback-valued Style::cursor changed.
+  bool cursorDirty_ = false;
 
-  // Invokes v's click handler for `btn` if it has one; no-op for
-  // nullptr, a disabled view, or an unset handler.
-  static void dispatchClick(View *v, MouseButton btn) {
-    if (!v || resolveDynamic(v->disabled, v->computed.resolvedDisabled))
-      return;
-    switch (btn) {
-    case MouseButton::Left:
-      if (v->onClick)
-        v->onClick();
-      break;
-    case MouseButton::Middle:
-      if (v->onMiddleClick)
-        v->onMiddleClick();
-      break;
-    case MouseButton::Right:
-      if (v->onRightClick)
-        v->onRightClick();
-      break;
-    }
-  }
+  // All pointer state (press/capture/click pairing) and event
+  // routing. The platform backends below only translate native mouse
+  // messages into calls on this; see liteui_pointer::Router.
+  liteui_pointer::Router ptrRouter_;
 
-  // Fires onScrollUp/onScrollDown on the topmost view under (x, y) that
-  // declares one, via hitTestScroll. Independent of applyWheelScroll's
-  // pixel-based content scrolling, so a plain (non-overflow) view can
-  // still react to the wheel. `notches` > 0 means wheel-up. Returns
-  // whether a handler fired (caller should repaint) — poll/relayout for
-  // any state the handler mutated, same idiom as endPress/updateDrag.
-  bool dispatchScroll(float x, float y, float notches) {
-    if (notches == 0.0f || !hasRoot_)
-      return false;
-    bool up = notches > 0;
-    View *v = hitTestScroll(root_, x, y, ClipRect{}, up);
-    if (!v)
-      return false;
-    if (up) {
-      if (v->onScrollUp)
-        v->onScrollUp();
-    } else {
-      if (v->onScrollDown)
-        v->onScrollDown();
-    }
-    pollAndRelayout();
-    return true;
-  }
-
-  // Tracks which view (if any) most recently received a press of each
-  // button, so a click only fires if the matching release lands back on
-  // the same view — ordinary UI click semantics: press, drag off,
-  // release elsewhere cancels; press and release both on the button
-  // fires it. Indexed by MouseButton so an independent left/middle/right
-  // press-release pairing can be in flight at once without clobbering
-  // each other.
-  View *pressedView_[3] = {nullptr, nullptr, nullptr};
-
-  // The view beginPress() found to have the relevant onXDragTo handler
-  // for that button, if any — kept separate from pressedView_ (which
-  // exists purely for click press/release pairing) so a click and a
-  // drag can be tracked independently. Cleared on release/capture-loss
-  // the same way pressedView_ is. Also indexed by MouseButton.
-  View *dragView_[3] = {nullptr, nullptr, nullptr};
 
   // Set by checkForUpdates whenever reconcileChildren actually rebuilt a
   // child list; consumed (and cleared) by pollAndRelayout above.
@@ -12748,115 +13475,244 @@ private:
     return false;
   }
 
-  // Records the view under (x, y) as the pending click's press target,
-  // for whichever button was pressed.
+  // A PointerEvent for the router from a window-space position. Timestamp is
+  // stamped by the router; modifiers come from the backend's key state.
+  PointerEvent makePointerEvent(float x, float y,
+                                MouseButton btn = MouseButton::None) const {
+    PointerEvent e;
+    e.windowX = e.x = x;
+    e.windowY = e.y = y;
+    e.button = btn;
+    e.mods = modifiers();
+    e.type = PointerType::Mouse;
+    return e;
+  }
+
+  // Button `btn` went down at (x, y). Focus, onPointerDown (bubbling),
+  // capture, and click pairing — all in the router.
   void beginPress(float x, float y, MouseButton btn = MouseButton::Left) {
-    int i = btnIdx(btn);
-    View *hit = hitTest(x, y, btn);
-
-    pressedView_[i] = hit;
-
-    // Decide the drag target and the local coordinates BEFORE invoking any
-    // handler below: onPressAt may mutate app state a keysSource-tracked
-    // list depends on, and once pollAndRelayout() reconciles that list at
-    // the end of this function, `hit` can dangle.
-    bool hasDrag =
-        hit && (btn == MouseButton::Left     ? (bool)hit->onDragTo
-                : btn == MouseButton::Middle ? (bool)hit->onMiddleDragTo
-                                             : (bool)hit->onRightDragTo);
-    dragView_[i] = hasDrag ? hit : nullptr;
-    float lx = hit ? x - hit->computed.x : 0.0f;
-    float ly = hit ? y - hit->computed.y : 0.0f;
-
-    if (btn == MouseButton::Left)
-      setFocus((hit && hit->focusable) ? hit : nullptr);
-    if (hit) {
-
-      switch (btn) {
-      case MouseButton::Left:
-        if (hit->onPressAt)
-          hit->onPressAt(lx, ly);
-        break;
-      case MouseButton::Middle:
-        if (hit->onMiddlePressAt)
-          hit->onMiddlePressAt(lx, ly);
-        break;
-      case MouseButton::Right:
-        if (hit->onRightPressAt)
-          hit->onRightPressAt(lx, ly);
-        break;
-      }
-    }
-    // Reconcile immediately, so a keyed-list mutation the handler just made
-    // nulls pressedView_/dragView_ (via structureChanged_) before the next
-    // motion/release event can dereference a pointer into a freed row.
-    pollAndRelayout();
+    ptrRouter_.down(makePointerEvent(x, y, btn));
+    refreshCursor(); // a press may start a capture, which pins the cursor
   }
 
-  // Call on every pointer-motion event while a button is held. Advances
-  // an in-progress onDragTo drag (armed by beginPress above) by
-  // re-invoking the handler with the current point translated into
-  // dragView_'s own local coordinates, then polling/applying whatever
-  // state the handler changed — same checkForUpdates+relayout idiom used
-  // everywhere else dynamic sources are re-read. A no-op, and cheap,
-  // when no drag is active.
-  bool updateDrag(float x, float y, MouseButton btn = MouseButton::Left) {
-    View *v = dragView_[btnIdx(btn)];
-    if (!v)
-      return false;
-    float lx = x - v->computed.x, ly = y - v->computed.y;
-    switch (btn) {
-    case MouseButton::Left:
-      v->onDragTo(lx, ly);
-      break;
-    case MouseButton::Middle:
-      v->onMiddleDragTo(lx, ly);
-      break;
-    case MouseButton::Right:
-      v->onRightDragTo(lx, ly);
-      break;
-    }
-    return pollAndRelayout();
+  // Call on every pointer-motion event: onPointerMove (to the capture target
+  // while a button is held, else to the view under the pointer). Cheap when
+  // nothing cares.
+  // Returns true if it changed anything (caller should repaint).
+  bool dispatchPointerMove(float x, float y) {
+    return ptrRouter_.move(makePointerEvent(x, y));
   }
 
-  // Advances any of the three buttons' drags at once — motion events
-  // don't carry "which button", so this just tries all three; each is a
-  // no-op unless that button's drag is actually in progress.
-  bool updateAllDrags(float x, float y) {
-    bool changed = false;
-    changed |= updateDrag(x, y, MouseButton::Left);
-    changed |= updateDrag(x, y, MouseButton::Middle);
-    changed |= updateDrag(x, y, MouseButton::Right);
+  // Hover flags and onPointerEnter/Leave.
+  // Returns whether any hover flag flipped; *needPoll is set if a handler may
+  // have changed app state (caller then runs pollAndRelayout()).
+  bool updateHoverAt(float x, float y, bool *needPoll) {
+    return ptrRouter_.hover(makePointerEvent(x, y), needPoll);
+  }
+
+  // Button `btn` went up at (x, y): onPointerUp, then the click family if the
+  // release landed on the press target. Returns whether anything changed.
+  bool endPress(float x, float y, MouseButton btn = MouseButton::Left) {
+    bool changed = ptrRouter_.up(makePointerEvent(x, y, btn));
+    refreshCursor();
     return changed;
   }
 
-  // Ends button i's drag, if one is in progress: fires the view's
-  // onDragEnd (see its comment on View) then clears dragView_[i]. Use this
-  // instead of assigning dragView_[i] = nullptr directly at any site where
-  // the view is still valid — i.e. everywhere except a view's own
-  // destruction (invalidateViewPointers, setRoot), where the pointer may
-  // already be dangling and firing a callback on it would be a
-  // use-after-free.
-  void endDrag(int i) {
-    if (View *v = dragView_[i]) {
-      dragView_[i] = nullptr;
-      if (v->onDragEnd)
-        v->onDragEnd();
-    }
+  // The press of `btn` can't complete (capture lost, OS move loop, release
+  // in the titlebar): delivers onPointerCancel.
+  void cancelPress(MouseButton btn) {
+    ptrRouter_.cancel(btn);
+    refreshCursor();
+  }
+  void cancelAllPresses() {
+    ptrRouter_.cancelAll();
+    refreshCursor();
   }
 
-  // Completes a pending press: fires pressedView_'s onClick only if the
-  // release also landed on that same view, then clears the pending state
-  // unconditionally (a press that never resolves shouldn't linger and
-  // affect some later, unrelated release).
-  bool endPress(float x, float y, MouseButton btn = MouseButton::Left) {
-    int i = btnIdx(btn);
-    View *released = hitTest(x, y, btn);
-    if (released && released == pressedView_[i])
-      dispatchClick(released, btn);
-    pressedView_[i] = nullptr;
-    endDrag(i);
-    return pollAndRelayout();
+  // ---- Pen and touch ----------------------------------------------------------
+  // Backends deliver pen/finger input as *frames*: the full state of one
+  // pointer at one instant, plus every position it reported since the last
+  // frame. feedPointer() turns that into router events, so the backends only
+  // translate native data and never reimplement press/release bookkeeping.
+
+  // Id ranges: the mouse is 1; fingers and pens are numbered by the backend
+  // from these bases so they can never collide.
+  static constexpr uint32_t kTouchIdBase = 0x1000;
+  static constexpr uint32_t kPenIdBase = 0x2000;
+
+  struct PointerFrame {
+    uint32_t id = 0;
+    PointerType type = PointerType::Touch;
+    bool primary = true;
+    float x = 0, y = 0;     // window coordinates of the latest position
+    uint8_t buttons = 0;    // buttonBit mask that should be held NOW
+                            // (tip/finger contact = Left, barrel = Right,
+                            // second barrel = Middle)
+    float pressure = 0, tiltX = 0, tiltY = 0, twist = 0;
+    bool eraser = false;
+    uint64_t timeMs = 0;
+    // Every position since the previous frame, oldest first, ending with
+    // (x, y). Empty = no motion in this frame (a pure button change).
+    std::span<const PointerSample> samples;
+  };
+
+  // Buttons feedPointer believes each non-mouse pointer holds. Separate from
+  // the router's own record because a press that scrolled instead of
+  // clicking (a scrollbar grab) is never handed to the router.
+  std::unordered_map<uint32_t, uint8_t> fedButtons_;
+
+  // Applies one frame: a move (coalesced samples, hover for a pen, scroll
+  // pans), then any button releases, then any presses. Returns true if
+  // anything changed (caller should repaint).
+  bool feedPointer(const PointerFrame &f) {
+    using liteui_pointer::kMousePointerId;
+    if (f.id == kMousePointerId)
+      return false; // the mouse has its own entry points
+    PointerEvent base;
+    base.pointerId = f.id;
+    base.type = f.type;
+    base.isPrimary = f.primary;
+    base.windowX = base.x = f.x;
+    base.windowY = base.y = f.y;
+    base.mods = modifiers();
+    base.pressure = f.pressure;
+    base.tiltX = f.tiltX;
+    base.tiltY = f.tiltY;
+    base.twist = f.twist;
+    base.eraser = f.eraser;
+    base.timeMs = f.timeMs;
+
+    bool changed = false;
+    uint8_t &fed = fedButtons_[f.id];
+
+    if (!f.samples.empty()) {
+      PointerEvent m = base;
+      m.coalesced = f.samples;
+      if (updateScrollDrag(f.x, f.y, f.id))
+        changed = true;
+      if (ptrRouter_.move(m))
+        changed = true;
+      if (f.type == PointerType::Pen && hasRoot_) { // a pen hovers like a mouse
+        bool needPoll = false;
+        if (ptrRouter_.hover(m, &needPoll))
+          changed = true;
+        if (needPoll) {
+          pollAndRelayout();
+          changed = true;
+        }
+      }
+    }
+
+    for (int i = 0; i < 3; ++i) { // releases first, then presses
+      const uint8_t bit = static_cast<uint8_t>(1u << i);
+      if (!(fed & bit) || (f.buttons & bit))
+        continue;
+      fed &= static_cast<uint8_t>(~bit);
+      PointerEvent u = base;
+      u.button = static_cast<MouseButton>(i);
+      u.coalesced = {};
+      bool panConsumed = false;
+      if (u.button == MouseButton::Left) {
+        panConsumed = scrollDrag_.mode == DragMode::ContentPan &&
+                      scrollDrag_.moved && scrollOwner_ == f.id;
+        if (endScrollPress(f.x, f.y, &u))
+          changed = true;
+      } else if (ptrRouter_.up(u)) {
+        changed = true;
+      }
+      // A pan swallowed the release (the router never saw an up): end the
+      // pointer's press state the way a cancelled press ends.
+      if (panConsumed) {
+        ptrRouter_.cancelPointer(f.id);
+        changed = true;
+      }
+    }
+    for (int i = 0; i < 3; ++i) {
+      const uint8_t bit = static_cast<uint8_t>(1u << i);
+      if ((fed & bit) || !(f.buttons & bit))
+        continue;
+      fed |= bit;
+      PointerEvent d = base;
+      d.button = static_cast<MouseButton>(i);
+      d.coalesced = {};
+      if (d.button == MouseButton::Left && beginScrollPress(f.x, f.y, f.id)) {
+        changed = true; // a scrollbar grab / track click owns this press
+        continue;
+      }
+      ptrRouter_.down(d);
+      changed = true;
+    }
+    if (f.type == PointerType::Touch && fed == 0)
+      fedButtons_.erase(f.id); // a finger's record ends when it lifts
+    return changed;
+  }
+
+  // The system took pointer `id` away (compositor gesture, lost capture):
+  // onPointerCancel, and the pointer is forgotten.
+  bool cancelPointerInput(uint32_t id) {
+    ptrRouter_.cancelPointer(id);
+    if (scrollDrag_.mode != DragMode::None && scrollOwner_ == id)
+      scrollDrag_ = {};
+    fedButtons_.erase(id);
+    return true;
+  }
+
+  // A pen left the tablet's range: cancels a press still in flight, drops its
+  // state, and un-hovers (the mouse's hover, if it's in the window, is
+  // restored by refreshMouseHover()).
+  bool penLeftRange(uint32_t id) {
+    auto it = fedButtons_.find(id);
+    if (it != fedButtons_.end() && it->second != 0)
+      cancelPointerInput(id);
+    ptrRouter_.forget(id);
+    fedButtons_.erase(id);
+    bool changed = false;
+    if (hasRoot_) {
+      bool needPoll = false;
+      changed = refreshMouseHover(&needPoll);
+      if (needPoll) {
+        pollAndRelayout();
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  // A backend's 32-bit millisecond event time (it wraps every ~49 days) as
+  // the 64-bit monotonic milliseconds PointerEvent::timeMs uses. Assumes the
+  // backend's clock is the same one the steady clock reads (true for
+  // compositors and for Windows' tick count modulo 2^32); if it isn't, times
+  // are still monotonic and correctly spaced, just on an arbitrary epoch.
+  static uint64_t widenMs32(uint32_t t) {
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    uint64_t cand = (now & ~0xFFFFFFFFull) | t;
+    if (cand > now + (1ull << 31))
+      cand -= (1ull << 32);
+    else if (cand + (1ull << 31) < now)
+      cand += (1ull << 32);
+    return cand;
+  }
+
+  // Wheel / trackpad scroll at (x, y); dx/dy in pixels (+dy = scroll down,
+  // +dx = right — each backend converts to that). Runs onWheel (bubbling),
+  // then, unless a handler called stopPropagation(), the built-in overflow
+  // scrolling. Returns true if anything changed (caller should repaint).
+  bool dispatchWheel(float x, float y, float dx, float dy,
+                     bool precise = false) {
+    WheelEvent e;
+    e.windowX = e.x = x;
+    e.windowY = e.y = y;
+    e.dx = dx;
+    e.dy = dy;
+    e.precise = precise;
+    e.mods = modifiers();
+    bool changed = ptrRouter_.wheel(e);
+    if (!e.propagationStopped() && applyWheelScroll(x, y, dx, dy))
+      changed = true;
+    return changed;
   }
 
 // Windows-only member/method block.
@@ -13060,6 +13916,222 @@ private:
 
   // The Win32 window procedure: Windows calls this for every message sent to
   // hwnd.
+  // Win32 resource for a Style::cursor value. Windows has no stock "grab"
+  // cursors or zoom cursors: Grab/Grabbing use the hand / four-way arrow, and
+  // ZoomIn/ZoomOut fall back to the crosshair.
+  static LPCTSTR cursorResource(Cursor c) {
+    switch (c) {
+    case Cursor::Pointer:
+    case Cursor::Grab:
+      return IDC_HAND;
+    case Cursor::Text:
+      return IDC_IBEAM;
+    case Cursor::Crosshair:
+    case Cursor::ZoomIn:
+    case Cursor::ZoomOut:
+      return IDC_CROSS;
+    case Cursor::Move:
+    case Cursor::Grabbing:
+      return IDC_SIZEALL;
+    case Cursor::NotAllowed:
+      return IDC_NO;
+    case Cursor::Wait:
+      return IDC_WAIT;
+    case Cursor::Progress:
+      return IDC_APPSTARTING;
+    case Cursor::Help:
+      return IDC_HELP;
+    case Cursor::ResizeEW:
+      return IDC_SIZEWE;
+    case Cursor::ResizeNS:
+      return IDC_SIZENS;
+    case Cursor::ResizeNESW:
+      return IDC_SIZENESW;
+    case Cursor::ResizeNWSE:
+      return IDC_SIZENWSE;
+    default:
+      return IDC_ARROW;
+    }
+  }
+
+  // The cursor to show with the pointer at client (x, y); null hides it.
+  HCURSOR cursorHandleAt(float x, float y) {
+    Cursor c = ptrRouter_.cursorAt(x, y);
+    return c == Cursor::None ? nullptr : LoadCursor(nullptr, cursorResource(c));
+  }
+
+  // Applies the right cursor right now, without waiting for the next mouse
+  // message — after a press/release/cancel changes capture, or a relayout
+  // puts a different view under a stationary pointer. WM_SETCURSOR covers
+  // ordinary motion.
+  void refreshCursor() {
+    if (!hwnd_)
+      return;
+    POINT pt;
+    if (!GetCursorPos(&pt))
+      return;
+    const bool captured = GetCapture() == hwnd_;
+    if (!captured && WindowFromPoint(pt) != hwnd_)
+      return;
+    ScreenToClient(hwnd_, &pt);
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    if (!captured && !PtInRect(&rc, pt))
+      return; // over the titlebar/border: leave it to Windows
+    SetCursor(cursorHandleAt(static_cast<float>(pt.x), static_cast<float>(pt.y)));
+  }
+
+  // ---- Pen and touch (WM_POINTER*, Windows 8+) ---------------------------------
+  // Pen and finger input arrives as WM_POINTERDOWN/UPDATE/UP. We handle those
+  // two pointer types ourselves and return 0, which also stops Windows from
+  // promoting them to fake mouse messages; mouse and touchpad pointers are
+  // passed to DefWindowProc, which promotes them to the WM_MOUSE* messages the
+  // rest of this file already handles.
+
+  // Hover of the mouse (so a pen leaving range doesn't leave a stale hover):
+  // re-derive it from where the mouse is, or un-hover everything if it isn't
+  // over the client area.
+  bool refreshMouseHover(bool *needPoll) {
+    float x = -1e6f, y = -1e6f;
+    POINT pt;
+    RECT rc;
+    if (hwnd_ && GetCursorPos(&pt) && ScreenToClient(hwnd_, &pt) &&
+        GetClientRect(hwnd_, &rc) && PtInRect(&rc, pt)) {
+      x = static_cast<float>(pt.x);
+      y = static_cast<float>(pt.y);
+    }
+    return updateHoverAt(x, y, needPoll);
+  }
+
+  // Returns true if the message was a pen or finger and has been handled.
+  bool handleWinPointer(UINT msg, WPARAM wp) {
+    if (!hwnd_)
+      return false;
+    const UINT32 wid = GET_POINTERID_WPARAM(wp);
+    POINTER_INPUT_TYPE type;
+    if (!GetPointerType(wid, &type) || (type != PT_PEN && type != PT_TOUCH))
+      return false;
+
+    auto clientPos = [this](const POINTER_INFO &pi, float &x, float &y) {
+      POINT p = pi.ptPixelLocation; // device pixels, screen space
+      ScreenToClient(hwnd_, &p);
+      x = static_cast<float>(p.x);
+      y = static_cast<float>(p.y);
+    };
+    PointerFrame f;
+    std::vector<PointerSample> samples;
+
+    if (type == PT_PEN) {
+      POINTER_PEN_INFO pen;
+      if (!GetPointerPenInfo(wid, &pen))
+        return false;
+      f.id = kPenIdBase + wid;
+      f.type = PointerType::Pen;
+      // One PointerSample from a POINTER_PEN_INFO.
+      auto sampleOf = [&](const POINTER_PEN_INFO &pi) {
+        PointerSample sm;
+        clientPos(pi.pointerInfo, sm.x, sm.y);
+        const bool contact = (pi.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT) != 0;
+        sm.pressure = (pi.penMask & PEN_MASK_PRESSURE)
+                          ? static_cast<float>(pi.pressure) / 1024.0f // 0..1024
+                          : (contact ? 0.5f : 0.0f);
+        if (pi.penMask & PEN_MASK_TILT_X)
+          sm.tiltX = static_cast<float>(pi.tiltX); // degrees, -90..90
+        if (pi.penMask & PEN_MASK_TILT_Y)
+          sm.tiltY = static_cast<float>(pi.tiltY);
+        if (pi.penMask & PEN_MASK_ROTATION)
+          sm.twist = static_cast<float>(pi.rotation); // degrees, 0..359
+        sm.timeMs = pi.pointerInfo.dwTime ? widenMs32(pi.pointerInfo.dwTime) : 0;
+        return sm;
+      };
+      // Every sample since the last message, oldest first (the history call
+      // returns newest first and includes the current one).
+      if (msg == WM_POINTERUPDATE) {
+        UINT32 count = 0;
+        if (GetPointerPenInfoHistory(wid, &count, nullptr) && count > 1) {
+          std::vector<POINTER_PEN_INFO> hist(count);
+          if (GetPointerPenInfoHistory(wid, &count, hist.data()))
+            for (UINT32 i = count; i-- > 0;)
+              samples.push_back(sampleOf(hist[i]));
+        }
+        if (samples.empty())
+          samples.push_back(sampleOf(pen));
+      }
+      const PointerSample cur = sampleOf(pen);
+      f.x = cur.x;
+      f.y = cur.y;
+      f.pressure = cur.pressure;
+      f.tiltX = cur.tiltX;
+      f.tiltY = cur.tiltY;
+      f.twist = cur.twist;
+      f.timeMs = cur.timeMs;
+      f.eraser = (pen.penFlags & (PEN_FLAG_ERASER | PEN_FLAG_INVERTED)) != 0;
+      // msg == WM_POINTERUP has no INCONTACT, so the tip comes off here.
+      if (pen.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT)
+        f.buttons |= buttonBit(MouseButton::Left);
+      if (pen.penFlags & PEN_FLAG_BARREL)
+        f.buttons |= buttonBit(MouseButton::Right);
+    } else {
+      POINTER_TOUCH_INFO touch;
+      if (!GetPointerTouchInfo(wid, &touch))
+        return false;
+      f.id = kTouchIdBase + wid;
+      f.type = PointerType::Touch;
+      f.primary = (touch.pointerInfo.pointerFlags & POINTER_FLAG_PRIMARY) != 0;
+      auto sampleOf = [&](const POINTER_TOUCH_INFO &ti) {
+        PointerSample sm;
+        clientPos(ti.pointerInfo, sm.x, sm.y);
+        sm.pressure = (ti.touchMask & TOUCH_MASK_PRESSURE)
+                          ? static_cast<float>(ti.pressure) / 1024.0f
+                          : 0.5f;
+        sm.timeMs = ti.pointerInfo.dwTime ? widenMs32(ti.pointerInfo.dwTime) : 0;
+        return sm;
+      };
+      // No stray move on the down or up itself; those carry the position.
+      if (msg == WM_POINTERUPDATE) {
+        UINT32 count = 0;
+        if (GetPointerTouchInfoHistory(wid, &count, nullptr) && count > 1) {
+          std::vector<POINTER_TOUCH_INFO> hist(count);
+          if (GetPointerTouchInfoHistory(wid, &count, hist.data()))
+            for (UINT32 i = count; i-- > 0;)
+              samples.push_back(sampleOf(hist[i]));
+        }
+        if (samples.empty())
+          samples.push_back(sampleOf(touch));
+      }
+      const PointerSample cur = sampleOf(touch);
+      f.x = cur.x;
+      f.y = cur.y;
+      f.pressure = cur.pressure;
+      f.timeMs = cur.timeMs;
+      if (touch.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT)
+        f.buttons |= buttonBit(MouseButton::Left);
+    }
+    f.samples = samples;
+    if (feedPointer(f))
+      InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+  }
+
+  // A pen left range (WM_POINTERLEAVE) or any pointer lost its capture
+  // (WM_POINTERCAPTURECHANGED). Both ids are tried because the pointer type
+  // can no longer be queried at this point.
+  void winPointerGone(UINT msg, UINT32 wid) {
+    bool changed = false;
+    const uint32_t penId = kPenIdBase + wid, touchId = kTouchIdBase + wid;
+    if (msg == WM_POINTERLEAVE) {
+      if (ptrRouter_.knows(penId))
+        changed = penLeftRange(penId);
+    } else {
+      if (ptrRouter_.knows(touchId))
+        changed |= cancelPointerInput(touchId);
+      if (ptrRouter_.knows(penId))
+        changed |= cancelPointerInput(penId);
+    }
+    if (changed && hwnd_)
+      InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // Will hold the LiteUI instance associated with this hwnd, if any.
     LiteUIImpl *self = nullptr;
@@ -13165,8 +14237,7 @@ private:
 
           // The OS loop swallowed the release, so drop our pending press
           // instead of leaving it dangling.
-          self->pressedView_[btnIdx(MouseButton::Left)] = nullptr;
-          self->endDrag(btnIdx(MouseButton::Left));
+          self->cancelPress(MouseButton::Left);
           InvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
@@ -13178,6 +14249,35 @@ private:
       return 0;
     }
 
+    case WM_POINTERDOWN:
+    case WM_POINTERUPDATE:
+    case WM_POINTERUP: {
+      if (self && self->handleWinPointer(msg, wp))
+        return 0; // pen/finger handled here: no mouse promotion
+      return DefWindowProcW(hwnd, msg, wp, lp); // mouse/touchpad: promote
+    }
+    case WM_POINTERLEAVE:
+    case WM_POINTERCAPTURECHANGED: {
+      if (self)
+        self->winPointerGone(msg, GET_POINTERID_WPARAM(wp));
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    // Windows asks for the cursor on every mouse move. Inside the client area
+    // we answer from Style::cursor; elsewhere (borders, titlebar) the default
+    // handling picks the resize/arrow cursor.
+    case WM_SETCURSOR: {
+      if (self && LOWORD(lp) == HTCLIENT) {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        SetCursor(
+            self->cursorHandleAt(static_cast<float>(pt.x), static_cast<float>(pt.y)));
+        return TRUE;
+      }
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
     // Pointer moved with a button held: advances an in-progress scrollbar
     // drag or content pan. No-op (returns false) if neither is active, so
     // this costs nothing on ordinary hover.
@@ -13187,11 +14287,10 @@ private:
         float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
         float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
         bool changed = self->updateScrollDrag(x, y);
-        if (self->updateAllDrags(x, y))
+        if (self->dispatchPointerMove(x, y))
           changed = true;
         bool needPoll = false;
-        if (self->hasRoot_ &&
-            LiteUIImpl::updateHover(self->root_, x, y, ClipRect{}, &needPoll))
+        if (self->hasRoot_ && self->updateHoverAt(x, y, &needPoll))
           changed = true;
         self->updateTooltipHover(x, y);
         if (needPoll) {
@@ -13284,13 +14383,12 @@ private:
         float notches =
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
         // Wheel-up (positive notches) should scroll content up, i.e.
-        // decrease scrollY — hence the negation.
-        bool changed = self->applyWheelScroll(static_cast<float>(pt.x),
-                                              static_cast<float>(pt.y), 0.0f,
-                                              -notches * 40.0f);
-        if (self->dispatchScroll(static_cast<float>(pt.x),
-                                 static_cast<float>(pt.y), notches))
-          changed = true;
+        // decrease scrollY — hence the negation. A delta that isn't a whole
+        // number of notches comes from a precision touchpad/wheel.
+        bool precise = std::fmod(std::abs(notches), 1.0f) != 0.0f;
+        bool changed = self->dispatchWheel(static_cast<float>(pt.x),
+                                           static_cast<float>(pt.y), 0.0f,
+                                           -notches * 40.0f, precise);
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -13306,9 +14404,10 @@ private:
         ScreenToClient(hwnd, &pt);
         float notches =
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
-        if (self->applyWheelScroll(static_cast<float>(pt.x),
-                                   static_cast<float>(pt.y), notches * 40.0f,
-                                   0.0f) &&
+        bool precise = std::fmod(std::abs(notches), 1.0f) != 0.0f;
+        if (self->dispatchWheel(static_cast<float>(pt.x),
+                                static_cast<float>(pt.y), notches * 40.0f,
+                                0.0f, precise) &&
             self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -13321,10 +14420,7 @@ private:
     // let a later, unrelated event resolve them.
     case WM_CAPTURECHANGED:
       if (self) {
-        for (int i = 0; i < 3; ++i) {
-          self->pressedView_[i] = nullptr;
-          self->endDrag(i);
-        }
+        self->cancelAllPresses(); // onPointerCancel
         self->scrollDrag_ = {};
       }
       return 0;
@@ -14145,12 +15241,400 @@ private:
       self->keyboard_ = wl_seat_get_keyboard(seat);
       wl_keyboard_add_listener(self->keyboard_, &keyboardListener, self);
     }
+    if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !self->touch_) {
+      self->touch_ = wl_seat_get_touch(seat);
+      wl_touch_add_listener(self->touch_, &touchListener, self);
+    }
   }
 
   // Called when the seat reports its human-readable name; unused here.
   static void seatName(void *, wl_seat *, const char *) {}
   // Listener struct binding the two seat callbacks above to wl_seat's events.
   static constexpr wl_seat_listener seatListener = {seatCapabilities, seatName};
+
+  // ---- Touch (wl_touch) and pen (zwp_tablet_v2) ---------------------------------
+  // Both report in *frames*: a burst of events describing one instant, closed
+  // by a frame event. We fold each frame into a state per finger / pen tool,
+  // and hand it to feedPointer(). A frame that only moves things is parked and
+  // applied once per event-loop iteration with every sample it collected (so a
+  // 400 Hz pen costs one handler call per display frame yet loses nothing —
+  // PointerEvent::coalesced); a frame that presses, lifts, or changes a button
+  // first applies everything older, so ordering is preserved.
+
+  // One finger currently on the surface.
+  struct TouchPoint {
+    int32_t wlId = 0;     // the compositor's id for this contact
+    uint32_t id = 0;      // ours: unique for the process lifetime
+    bool primary = false; // the first finger down while no other was
+    float x = 0, y = 0;
+    bool isNew = true;    // down seen, not yet delivered
+    bool lifted = false;  // up seen, not yet delivered
+    uint64_t timeMs = 0;
+    std::vector<PointerSample> pending; // motion not yet delivered
+  };
+  std::vector<TouchPoint> touchPoints_;
+  uint32_t nextTouchId_ = kTouchIdBase;
+
+  // One pen/eraser/etc. tool the tablet has announced.
+  struct TabletTool {
+    LiteUIImpl *owner = nullptr;
+    zwp_tablet_tool_v2 *tool = nullptr;
+    uint32_t id = 0;
+    bool eraser = false;
+    // Latest raw values (events of a frame update these).
+    float x = 0, y = 0, pressure = 0, tiltX = 0, tiltY = 0, twist = 0;
+    bool havePosition = false, inProximity = false, contact = false,
+         stylus1 = false, stylus2 = false;
+    // Set by the events of the frame being assembled; consumed at frame().
+    bool dirty = false, proxIn = false, proxOut = false;
+    uint32_t proxSerial = 0;
+    uint8_t desired = 0;   // buttonBit mask the pen should hold after the frame
+    uint64_t lastMs = 0;
+    std::vector<PointerSample> pending;
+  };
+  std::vector<std::unique_ptr<TabletTool>> tabletTools_;
+  uint32_t nextPenId_ = kPenIdBase;
+
+  // Motion parked by a touch/tablet frame, waiting for the loop's next flush.
+  bool penTouchPending_ = false;
+
+  zwp_tablet_manager_v2 *tabletManager_ = nullptr;
+  zwp_tablet_seat_v2 *tabletSeat_ = nullptr;
+  wl_touch *touch_ = nullptr;
+  wl_surface *toolCursorSurface_ = nullptr; // a tablet tool's cursor needs its
+                                            // own surface (a different role
+                                            // from the pointer's)
+  bool pointerInside_ = false; // whether the mouse pointer is over the surface
+
+  // Hover of the mouse (so a pen leaving range doesn't leave a stale hover):
+  // re-derive it from where the mouse is, or un-hover everything if it
+  // isn't in the window.
+  bool refreshMouseHover(bool *needPoll) {
+    const float x = pointerInside_ ? static_cast<float>(pointer_x_) : -1e6f;
+    const float y = pointerInside_ ? static_cast<float>(pointer_y_) : -1e6f;
+    return updateHoverAt(x, y, needPoll);
+  }
+
+  // Sends a touch point's parked motion (it is held down).
+  bool flushTouch(TouchPoint &p) {
+    if (p.pending.empty() || p.isNew)
+      return false; // a finger that hasn't gone down yet has nothing to move
+    PointerFrame f;
+    f.id = p.id;
+    f.type = PointerType::Touch;
+    f.primary = p.primary;
+    f.x = p.x;
+    f.y = p.y;
+    f.buttons = buttonBit(MouseButton::Left);
+    f.pressure = 0.5f;
+    f.timeMs = p.pending.back().timeMs;
+    f.samples = p.pending;
+    bool changed = feedPointer(f);
+    p.pending.clear();
+    return changed;
+  }
+
+  // Sends a pen's parked motion together with its current button state.
+  bool flushTool(TabletTool &t) {
+    if (!t.havePosition || (!t.inProximity && t.desired == 0 && t.pending.empty()))
+      return false;
+    PointerFrame f;
+    f.id = t.id;
+    f.type = PointerType::Pen;
+    f.x = t.x;
+    f.y = t.y;
+    f.buttons = t.desired;
+    f.pressure = t.pressure;
+    f.tiltX = t.tiltX;
+    f.tiltY = t.tiltY;
+    f.twist = t.twist;
+    f.eraser = t.eraser;
+    f.timeMs = t.pending.empty() ? t.lastMs : t.pending.back().timeMs;
+    f.samples = t.pending;
+    bool changed = feedPointer(f);
+    t.pending.clear();
+    return changed;
+  }
+
+  // Applies everything parked. Returns whether anything changed.
+  bool flushPenTouchPending() {
+    penTouchPending_ = false;
+    bool changed = false;
+    for (auto &t : tabletTools_)
+      if (!t->pending.empty())
+        changed |= flushTool(*t);
+    for (auto &p : touchPoints_)
+      changed |= flushTouch(p);
+    return changed;
+  }
+  // The event loop's once-per-iteration flush (see run()).
+  void flushPendingPen() {
+    if (penTouchPending_ && flushPenTouchPending())
+      redraw();
+  }
+
+  // -- wl_touch --
+  static void touchDown(void *data, wl_touch *, uint32_t, uint32_t time,
+                        wl_surface *, int32_t wlId, wl_fixed_t sx,
+                        wl_fixed_t sy) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    TouchPoint p;
+    p.wlId = wlId;
+    p.id = self->nextTouchId_++;
+    p.primary = true;
+    for (const auto &o : self->touchPoints_)
+      if (!o.lifted)
+        p.primary = false;
+    p.x = static_cast<float>(wl_fixed_to_double(sx));
+    p.y = static_cast<float>(wl_fixed_to_double(sy));
+    p.timeMs = widenMs32(time);
+    self->touchPoints_.push_back(std::move(p));
+  }
+  static void touchUp(void *data, wl_touch *, uint32_t, uint32_t time,
+                      int32_t wlId) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    for (auto &p : self->touchPoints_)
+      if (p.wlId == wlId && !p.lifted) {
+        p.lifted = true;
+        p.timeMs = widenMs32(time);
+      }
+  }
+  static void touchMotion(void *data, wl_touch *, uint32_t time, int32_t wlId,
+                          wl_fixed_t sx, wl_fixed_t sy) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    for (auto &p : self->touchPoints_)
+      if (p.wlId == wlId && !p.lifted) {
+        p.x = static_cast<float>(wl_fixed_to_double(sx));
+        p.y = static_cast<float>(wl_fixed_to_double(sy));
+        p.timeMs = widenMs32(time);
+        p.pending.push_back({p.x, p.y, 0.5f, 0, 0, 0, p.timeMs});
+      }
+  }
+  static void touchFrame(void *data, wl_touch *) {
+    static_cast<LiteUIImpl *>(data)->processTouchFrame();
+  }
+  // The compositor took the touches over (e.g. a system gesture): every
+  // contact is cancelled, and no up will follow.
+  static void touchCancel(void *data, wl_touch *) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    for (auto &p : self->touchPoints_)
+      self->cancelPointerInput(p.id);
+    self->touchPoints_.clear();
+    if (self->eglReady_)
+      self->redraw();
+  }
+  static constexpr wl_touch_listener touchListener = {
+      touchDown, touchUp, touchMotion, touchFrame, touchCancel};
+
+  void processTouchFrame() {
+    bool transition = false;
+    for (const auto &p : touchPoints_)
+      if (p.isNew || p.lifted)
+        transition = true;
+    if (!transition) { // motion only: park it for the loop's flush
+      for (const auto &p : touchPoints_)
+        if (!p.pending.empty())
+          penTouchPending_ = true;
+      return;
+    }
+    bool changed = flushPenTouchPending(); // older motion first, in order
+    for (size_t i = 0; i < touchPoints_.size();) {
+      TouchPoint &p = touchPoints_[i];
+      PointerFrame f;
+      f.id = p.id;
+      f.type = PointerType::Touch;
+      f.primary = p.primary;
+      f.x = p.x;
+      f.y = p.y;
+      f.pressure = 0.5f;
+      f.timeMs = p.timeMs;
+      if (p.isNew) {
+        p.isNew = false;
+        p.pending.clear(); // a press at the latest position; no stray move
+        f.buttons = buttonBit(MouseButton::Left);
+        changed |= feedPointer(f);
+      }
+      if (p.lifted) {
+        f.buttons = 0;
+        changed |= feedPointer(f);
+        touchPoints_.erase(touchPoints_.begin() + static_cast<long>(i));
+        continue;
+      }
+      ++i;
+    }
+    if (changed && eglReady_)
+      redraw();
+  }
+
+  // -- zwp_tablet_v2 --
+  // Shows an arrow for a tool entering range: the compositor leaves a tablet
+  // tool's cursor to the client.
+  void setToolCursor(TabletTool &t) {
+    if (!cursorTheme_ || !compositor_)
+      return;
+    if (!toolCursorSurface_)
+      toolCursorSurface_ = wl_compositor_create_surface(compositor_);
+    wl_cursor *c = wl_cursor_theme_get_cursor(cursorTheme_, "left_ptr");
+    if (!c)
+      c = wl_cursor_theme_get_cursor(cursorTheme_, "default");
+    if (!c || c->image_count == 0 || !toolCursorSurface_) {
+      zwp_tablet_tool_v2_set_cursor(t.tool, t.proxSerial, nullptr, 0, 0);
+      return;
+    }
+    wl_cursor_image *image = c->images[0];
+    wl_buffer *buf = wl_cursor_image_get_buffer(image);
+    if (!buf)
+      return;
+    wl_surface_attach(toolCursorSurface_, buf, 0, 0);
+    wl_surface_damage_buffer(toolCursorSurface_, 0, 0, image->width,
+                             image->height);
+    wl_surface_commit(toolCursorSurface_);
+    zwp_tablet_tool_v2_set_cursor(t.tool, t.proxSerial, toolCursorSurface_,
+                                  image->hotspot_x, image->hotspot_y);
+  }
+
+  void processToolFrame(TabletTool &t, uint64_t ms) {
+    if (t.proxIn)
+      setToolCursor(t);
+    t.lastMs = ms;
+    if (t.dirty && t.havePosition)
+      t.pending.push_back({t.x, t.y, t.pressure, t.tiltX, t.tiltY, t.twist, ms});
+
+    uint8_t desired = 0;
+    if (t.inProximity && !t.proxOut) {
+      if (t.contact)
+        desired |= buttonBit(MouseButton::Left); // tip (or eraser end)
+      if (t.stylus1)
+        desired |= buttonBit(MouseButton::Right); // barrel button
+      if (t.stylus2)
+        desired |= buttonBit(MouseButton::Middle);
+    }
+    const bool buttonsChanged = desired != t.desired;
+    t.desired = desired;
+    const bool leaving = t.proxOut;
+    t.dirty = t.proxIn = t.proxOut = false;
+    if (leaving)
+      t.inProximity = false;
+
+    if (!buttonsChanged && !leaving) { // motion only: park it
+      if (!t.pending.empty())
+        penTouchPending_ = true;
+      return;
+    }
+    bool changed = flushPenTouchPending(); // older motion first, in order
+    changed |= flushTool(t);               // then this frame's transitions
+    if (leaving)
+      changed |= penLeftRange(t.id);
+    if (changed && eglReady_)
+      redraw();
+  }
+
+  static TabletTool *toolOf(void *data) { return static_cast<TabletTool *>(data); }
+  static void toolType(void *data, zwp_tablet_tool_v2 *, uint32_t type) {
+    toolOf(data)->eraser = type == ZWP_TABLET_TOOL_V2_TYPE_ERASER;
+  }
+  static void toolIgnore2(void *, zwp_tablet_tool_v2 *, uint32_t, uint32_t) {}
+  static void toolIgnore1(void *, zwp_tablet_tool_v2 *, uint32_t) {}
+  static void toolIgnoreI(void *, zwp_tablet_tool_v2 *, int32_t) {}
+  static void toolIgnoreNone(void *, zwp_tablet_tool_v2 *) {}
+  static void toolIgnoreWheel(void *, zwp_tablet_tool_v2 *, wl_fixed_t,
+                              int32_t) {}
+  static void toolRemoved(void *data, zwp_tablet_tool_v2 *tool) {
+    TabletTool *t = toolOf(data);
+    LiteUIImpl *self = t->owner;
+    const bool changed = self->penLeftRange(t->id);
+    zwp_tablet_tool_v2_destroy(tool);
+    std::erase_if(self->tabletTools_,
+                  [t](const auto &p) { return p.get() == t; });
+    if (changed && self->eglReady_)
+      self->redraw();
+  }
+  static void toolProximityIn(void *data, zwp_tablet_tool_v2 *, uint32_t serial,
+                              zwp_tablet_v2 *, wl_surface *) {
+    TabletTool *t = toolOf(data);
+    t->proxIn = true;
+    t->inProximity = true;
+    t->proxSerial = serial;
+  }
+  static void toolProximityOut(void *data, zwp_tablet_tool_v2 *) {
+    toolOf(data)->proxOut = true;
+  }
+  static void toolDown(void *data, zwp_tablet_tool_v2 *, uint32_t) {
+    toolOf(data)->contact = true;
+  }
+  static void toolUp(void *data, zwp_tablet_tool_v2 *) {
+    toolOf(data)->contact = false;
+  }
+  static void toolMotion(void *data, zwp_tablet_tool_v2 *, wl_fixed_t x,
+                         wl_fixed_t y) {
+    TabletTool *t = toolOf(data);
+    t->x = static_cast<float>(wl_fixed_to_double(x));
+    t->y = static_cast<float>(wl_fixed_to_double(y));
+    t->havePosition = t->dirty = true;
+  }
+  static void toolPressure(void *data, zwp_tablet_tool_v2 *, uint32_t p) {
+    TabletTool *t = toolOf(data);
+    t->pressure = static_cast<float>(p) / 65535.0f; // protocol range 0..65535
+    t->dirty = true;
+  }
+  static void toolTilt(void *data, zwp_tablet_tool_v2 *, wl_fixed_t tx,
+                       wl_fixed_t ty) {
+    TabletTool *t = toolOf(data);
+    t->tiltX = static_cast<float>(wl_fixed_to_double(tx)); // degrees, -90..90
+    t->tiltY = static_cast<float>(wl_fixed_to_double(ty));
+    t->dirty = true;
+  }
+  static void toolRotation(void *data, zwp_tablet_tool_v2 *, wl_fixed_t deg) {
+    TabletTool *t = toolOf(data);
+    t->twist = static_cast<float>(wl_fixed_to_double(deg));
+    t->dirty = true;
+  }
+  static void toolButton(void *data, zwp_tablet_tool_v2 *, uint32_t,
+                         uint32_t button, uint32_t state) {
+    TabletTool *t = toolOf(data);
+    const bool pressed = state == ZWP_TABLET_TOOL_V2_BUTTON_STATE_PRESSED;
+    if (button == 0x14b) // BTN_STYLUS  (linux/input-event-codes.h)
+      t->stylus1 = pressed;
+    else if (button == 0x14c) // BTN_STYLUS2
+      t->stylus2 = pressed;
+  }
+  static void toolFrame(void *data, zwp_tablet_tool_v2 *, uint32_t time) {
+    TabletTool *t = toolOf(data);
+    t->owner->processToolFrame(*t, widenMs32(time));
+  }
+  static constexpr zwp_tablet_tool_v2_listener toolListener = {
+      toolType,       toolIgnore2,    toolIgnore2,    toolIgnore1,
+      toolIgnoreNone, toolRemoved,    toolProximityIn, toolProximityOut,
+      toolDown,       toolUp,         toolMotion,     toolPressure,
+      toolIgnore1 /*distance*/,       toolTilt,       toolRotation,
+      toolIgnoreI /*slider*/,         toolIgnoreWheel, toolButton,
+      toolFrame};
+
+  static void tabletSeatTabletAdded(void *, zwp_tablet_seat_v2 *,
+                                    zwp_tablet_v2 *) {}
+  static void tabletSeatToolAdded(void *data, zwp_tablet_seat_v2 *,
+                                  zwp_tablet_tool_v2 *tool) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    auto t = std::make_unique<TabletTool>();
+    t->owner = self;
+    t->tool = tool;
+    t->id = self->nextPenId_++;
+    zwp_tablet_tool_v2_add_listener(tool, &toolListener, t.get());
+    self->tabletTools_.push_back(std::move(t));
+  }
+  static void tabletSeatPadAdded(void *, zwp_tablet_seat_v2 *,
+                                 zwp_tablet_pad_v2 *) {}
+  static constexpr zwp_tablet_seat_v2_listener tabletSeatListener = {
+      tabletSeatTabletAdded, tabletSeatToolAdded, tabletSeatPadAdded};
+
+  // The tablet protocol hangs off the seat, and the registry may announce
+  // the manager and the seat in either order.
+  void maybeCreateTabletSeat() {
+    if (tabletSeat_ || !tabletManager_ || !seat_)
+      return;
+    tabletSeat_ = zwp_tablet_manager_v2_get_tablet_seat(tabletManager_, seat_);
+    zwp_tablet_seat_v2_add_listener(tabletSeat_, &tabletSeatListener, this);
+  }
 
   // Called when the pointer enters this surface.
   static void pointerEnter(void *data, wl_pointer *, uint32_t serial,
@@ -14169,8 +15653,8 @@ private:
     // (e.g. after a resize/move) may land us back on the same cursor name
     // the compositor's default already reset to something else.
     self->currentCursorName_.clear();
-    self->setCursor(cursorNameForEdge(
-        self->resizeEdgeAt(self->pointer_x_, self->pointer_y_)));
+    self->pointerInside_ = true;
+    self->refreshCursor();
   }
   // Called when the pointer leaves this surface. Reset the cached cursor
   // name so re-entering always re-applies one, rather than skipping the
@@ -14178,6 +15662,7 @@ private:
   static void pointerLeave(void *data, wl_pointer *, uint32_t, wl_surface *) {
     static_cast<LiteUIImpl *>(data)->flushPendingMotion();
     static_cast<LiteUIImpl *>(data)->currentCursorName_.clear();
+    static_cast<LiteUIImpl *>(data)->pointerInside_ = false;
   }
   // Called on every pointer movement while over this surface.
   // Called on every pointer movement while over this surface.
@@ -14188,7 +15673,7 @@ private:
     // Only remember where the pointer is now. A compositor can deliver
     // several motion events per frame (and a high-polling-rate mouse many
     // more); doing the drag/hover/redraw work for each one made a slow
-    // onDragTo handler (e.g. a photo editor's slider recompute) run many
+    // onPointerMove handler (e.g. a photo editor's slider recompute) run many
     // times per frame, with vsync-blocked redraws in between. The work is
     // done once per loop iteration by flushPendingMotion() instead, always
     // with the newest position.
@@ -14198,7 +15683,7 @@ private:
   }
 
   // Applies the most recent pointer position recorded by pointerMotion, if
-  // any: advances scrollbar drags / content pans and onDragTo handlers,
+  // any: advances scrollbar drags / content pans and onPointerMove handlers,
   // refreshes hover and the tooltip timer, redraws once if anything
   // changed, and updates the cursor image. Called once per event-loop
   // iteration (see run()), and first thing in any handler that acts on the
@@ -14220,10 +15705,10 @@ private:
     // beginScrollPress/handlePress). A no-op, and cheap, when nothing's
     // being dragged.
     bool changed = updateScrollDrag(x, y);
-    if (updateAllDrags(x, y))
+    if (dispatchPointerMove(x, y))
       changed = true;
     bool needPoll = false;
-    if (hasRoot_ && LiteUIImpl::updateHover(root_, x, y, ClipRect{}, &needPoll))
+    if (hasRoot_ && updateHoverAt(x, y, &needPoll))
       changed = true;
 
     // arms/cancels/re-targets the tooltip timer. Handles its own
@@ -14238,10 +15723,9 @@ private:
     if (changed)
       redraw();
 
-    // Re-derive which edge (if any) the pointer is over and update the
-    // cursor image to match, so the user sees a resize cursor before they
-    // even click.
-    setCursor(cursorNameForEdge(resizeEdgeAt(pointer_x_, pointer_y_)));
+    // Re-derive the cursor (window-edge resize handle, else Style::cursor of
+    // what's under the pointer) so the user sees it before they even click.
+    refreshCursor();
   }
   // Called on scroll/axis events — mouse wheel rotation or a touchpad's
   // continuous scroll gesture. `value` is already a relative-movement
@@ -14258,17 +15742,13 @@ private:
       dy = delta;
     else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
       dx = delta;
+    // Wayland's axis value is already positive for scroll-down/right, which
+    // is WheelEvent's sign convention. This listener has no axis_source
+    // event, so it can't tell a trackpad from a notched wheel: precise stays
+    // false.
     bool changed =
-        self->applyWheelScroll(static_cast<float>(self->pointer_x_),
-                               static_cast<float>(self->pointer_y_), dx, dy);
-    // Wayland's vertical-scroll axis value is positive for
-    // scroll-down/content-down, matching applyWheelScroll's sign
-    // convention above — negate it here so dispatchScroll's "notches >
-    // 0 means wheel-up" contract stays consistent across platforms.
-    if (dy != 0.0f &&
-        self->dispatchScroll(static_cast<float>(self->pointer_x_),
-                             static_cast<float>(self->pointer_y_), -dy))
-      changed = true;
+        self->dispatchWheel(static_cast<float>(self->pointer_x_),
+                            static_cast<float>(self->pointer_y_), dx, dy);
     if (changed)
       self->redraw();
   }
@@ -14468,6 +15948,13 @@ private:
       // ...and register the capabilities/name listener so we learn about the
       // pointer.
       wl_seat_add_listener(self->seat_, &seatListener, self);
+      self->maybeCreateTabletSeat();
+    }
+    // If instead this global is the tablet manager (pens)...
+    else if (strcmp(interface, zwp_tablet_manager_v2_interface.name) == 0) {
+      self->tabletManager_ = static_cast<zwp_tablet_manager_v2 *>(
+          wl_registry_bind(registry, name, &zwp_tablet_manager_v2_interface, 1));
+      self->maybeCreateTabletSeat();
     }
     // If instead this global is the decoration-manager interface...
     else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) ==
@@ -14549,13 +16036,89 @@ private:
     }
   }
 
-  // Swaps the pointer's visible cursor to the named XCursor image, skipping
-  // the work entirely if it's already showing (motion events fire far more
-  // often than the cursor actually needs to change).
-  void setCursor(const char *name) {
+  // XCursor names for a Style::cursor value: the CSS-style name most
+  // current themes ship, then the classic X11 name older themes use.
+  struct CursorNames {
+    const char *primary;
+    const char *alt;
+  };
+  static CursorNames xcursorNames(Cursor c) {
+    switch (c) {
+    case Cursor::None:
+      return {"none", nullptr}; // special-cased in setCursor: hides it
+    case Cursor::Pointer:
+      return {"pointer", "hand2"};
+    case Cursor::Text:
+      return {"text", "xterm"};
+    case Cursor::Crosshair:
+      return {"crosshair", "cross"};
+    case Cursor::Move:
+      return {"move", "fleur"};
+    case Cursor::Grab:
+      return {"grab", "openhand"};
+    case Cursor::Grabbing:
+      return {"grabbing", "closedhand"};
+    case Cursor::NotAllowed:
+      return {"not-allowed", "crossed_circle"};
+    case Cursor::Wait:
+      return {"wait", "watch"};
+    case Cursor::Progress:
+      return {"progress", "left_ptr_watch"};
+    case Cursor::Help:
+      return {"help", "question_arrow"};
+    case Cursor::ResizeEW:
+      return {"ew-resize", "sb_h_double_arrow"};
+    case Cursor::ResizeNS:
+      return {"ns-resize", "sb_v_double_arrow"};
+    case Cursor::ResizeNESW:
+      return {"nesw-resize", "fd_double_arrow"};
+    case Cursor::ResizeNWSE:
+      return {"nwse-resize", "bd_double_arrow"};
+    case Cursor::ZoomIn:
+      return {"zoom-in", "zoom_in"};
+    case Cursor::ZoomOut:
+      return {"zoom-out", "zoom_out"};
+    case Cursor::Inherit:
+    case Cursor::Default:
+    default:
+      return {"left_ptr", "default"};
+    }
+  }
+
+  // Shows the cursor for wherever the pointer is: a window-edge resize
+  // handle wins, otherwise the Style::cursor of what's under it (or of the
+  // view holding capture). Cheap enough to call often: setCursor() does
+  // nothing when the cursor is already showing.
+  void refreshCursor() {
+    if (!cursorTheme_ || !pointer_)
+      return;
+    uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
+    if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+      setCursor(cursorNameForEdge(edge));
+      return;
+    }
+    CursorNames n = xcursorNames(ptrRouter_.cursorAt(
+        static_cast<float>(pointer_x_), static_cast<float>(pointer_y_)));
+    setCursor(n.primary, n.alt);
+  }
+
+  // Swaps the pointer's visible cursor to the named XCursor image (trying
+  // `alt` if the theme lacks `name`), skipping the work entirely if it's
+  // already showing (motion events fire far more often than the cursor
+  // actually needs to change). "none" hides the cursor.
+  void setCursor(const char *name, const char *alt = nullptr) {
     if (!cursorTheme_ || !pointer_ || currentCursorName_ == name)
       return;
+    if (std::strcmp(name, "none") == 0) {
+      currentCursorName_ = name;
+      wl_pointer_set_cursor(pointer_, pointerEnterSerial_, nullptr, 0, 0);
+      return;
+    }
     wl_cursor *cursor = wl_cursor_theme_get_cursor(cursorTheme_, name);
+    if (!cursor && alt)
+      cursor = wl_cursor_theme_get_cursor(cursorTheme_, alt);
+    if (!cursor)
+      cursor = wl_cursor_theme_get_cursor(cursorTheme_, "left_ptr");
     if (!cursor)
       cursor = wl_cursor_theme_get_cursor(cursorTheme_, "default");
     if (!cursor || cursor->image_count == 0)
@@ -15633,11 +17196,12 @@ private:
                                     static_cast<float>(pointer_y_), btn);
       if (changed)
         redraw();
-    } else {
-      // release moved back into the titlebar; cancel the pending press
-      pressedView_[btnIdx(btn)] = nullptr;
     }
-    endDrag(btnIdx(btn));
+    // Whatever the release didn't resolve — it landed in the titlebar, or a
+    // content pan (which never reaches endPress) swallowed it — can't
+    // complete: deliver onPointerCancel. A no-op after
+    // a normal release, which has already cleared everything.
+    cancelPress(btn);
     if (btn == MouseButton::Left)
       scrollDrag_ = {}; // scroll-drag tracking only ever exists for Left
   }
@@ -15654,6 +17218,8 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   startMaximized_ = (w <= 0 || h <= 0);
   hideTitlebar_ = hideTitlebar;
   activeInstance_ = this;
+  ptrRouter_.poll = [this] { return pollAndRelayout(); };
+  ptrRouter_.focus = [this](View *v) { setFocus(v); };
 // Windows-specific construction path.
 #if defined(_WIN32)
   // Handle to the current executable module, needed to register a window class.
@@ -15832,6 +17398,19 @@ inline LiteUIImpl::~LiteUIImpl() {
   }
   if (eglWindow_)
     wl_egl_window_destroy(eglWindow_);
+  // Pens and touch.
+  for (auto &t : tabletTools_)
+    if (t->tool)
+      zwp_tablet_tool_v2_destroy(t->tool);
+  tabletTools_.clear();
+  if (tabletSeat_)
+    zwp_tablet_seat_v2_destroy(tabletSeat_);
+  if (tabletManager_)
+    zwp_tablet_manager_v2_destroy(tabletManager_);
+  if (touch_)
+    wl_touch_destroy(touch_);
+  if (toolCursorSurface_)
+    wl_surface_destroy(toolCursorSurface_);
   // Destroy the cursor surface and theme if they were created.
   if (cursorSurface_)
     wl_surface_destroy(cursorSurface_);
@@ -15970,13 +17549,16 @@ View View::toView(TextInput ti) {
     ctx.restore();
   };
 
-  v.onPressAt = [state, ts, leftPad](float lx, float) {
+  v.onPointerDown = [state, ts, leftPad](PointerEvent &e) {
+    if (e.button != MouseButton::Left)
+      return; // only the primary button places the caret
     state->cursor = liteui_text::caretIndexForX(
         state->text, ts, resolveStatic(ts.fontSize),
         resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle),
-        lx - leftPad + state->scrollOffset);
+        e.x - leftPad + state->scrollOffset);
     state->blinkOn = true;
     state->dirty = true;
+    e.stopPropagation(); // the field owns the press; don't also click a parent
   };
 
   v.onFocus = [state] {
@@ -16462,16 +18044,14 @@ inline void LiteUIImpl::setRoot(View view) {
   // via focusedView_, a scroll via scrollDrag_.target, a tooltip poll
   // via tooltipTarget_, ...) would then use-after-free.
   focusedView_ = nullptr;
-  for (int i = 0; i < 3; ++i) {
-    pressedView_[i] = nullptr;
-    dragView_[i] = nullptr;
-  }
+  ptrRouter_.invalidate();
   scrollDrag_ = ScrollDrag{};
   hideTooltip(); // clears tooltipTarget_ and its timer
   if (hasRoot_)
     root_.freeTextResources();
   root_ = std::move(view);
   hasRoot_ = true;
+  ptrRouter_.root = &root_;
   // First pass: runs every onLayout callback (e.g. a track capturing its
   // own width into a plain variable) so any positionSource/valueSource
   // that reads such app-side state sees a real value, not whatever it
@@ -16517,12 +18097,13 @@ inline void LiteUIImpl::run() {
     // redraw) before blocking. Must happen here, outside the
     // prepare_read/read_events window below — see flushPendingMotion.
     flushPendingMotion();
+    flushPendingPen(); // parked pen/touch motion, with all its samples
     while (wl_display_prepare_read(display_) != 0)
       wl_display_dispatch_pending(display_);
     // Events dispatched by the loop above may have recorded fresh motion.
     // Give up the read intent and go around again to flush it, rather than
     // sleeping in poll() with an unapplied pointer position.
-    if (motionPending_) {
+    if (motionPending_ || penTouchPending_) {
       wl_display_cancel_read(display_);
       continue;
     }
