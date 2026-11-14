@@ -76,10 +76,11 @@ jobs:
           mkdir -p scratch
           cp liteui.hpp scratch/
 
-          # On Linux liteui.hpp #include's "xdg-shell-client-protocol.h" and
-          # "xdg-decoration-client-protocol.h" by relative name, and linking
-          # needs the generated .c files: the four vendored files under
-          # platform/wayland-protocols/ are the only extras a drop-in user needs.
+          # On Linux liteui.hpp #include's the generated protocol headers
+          # (xdg-shell, xdg-decoration, tablet) by relative name, and linking
+          # needs the matching generated .c files: the six vendored files
+          # under platform/wayland-protocols/ are the only extras a drop-in
+          # user needs.
           if [ "$RUNNER_OS" = "Linux" ]; then
             cp platform/wayland-protocols/* scratch/
           fi
@@ -106,14 +107,17 @@ jobs:
       # libjpeg is left out of the pkg-config calls: it doesn't reliably ship a
       # .pc file for every distro, and libjpeg-dev installs jpeglib.h to a
       # default system include path anyway (it is linked with -ljpeg below).
+      #
+      # The protocol .c files are globbed (*-protocol.c) so that adding another
+      # vendored protocol doesn't silently break the link step again.
       - name: Compile and link (Linux)
         if: runner.os == 'Linux'
         working-directory: scratch
         run: |
           PKGS="wayland-client wayland-cursor wayland-egl cairo pangocairo egl glesv2 xkbcommon libpng"
-          gcc -c xdg-shell-protocol.c xdg-decoration-protocol.c
+          gcc -c *-protocol.c
           g++ -std=c++23 -Wall -Wextra -c impl.cpp user_a.cpp user_b.cpp $(pkg-config --cflags $PKGS)
-          g++ impl.o user_a.o user_b.o xdg-shell-protocol.o xdg-decoration-protocol.o \
+          g++ impl.o user_a.o user_b.o *-protocol.o \
               -o check $(pkg-config --libs $PKGS) -ljpeg
 
       - name: Set up MSVC environment (Windows)
