@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 6
+#define LITEUI_VERSION_MINOR 7
 
 #include <algorithm>
 #include <array>
@@ -1080,6 +1080,12 @@ size_t caretIndexForX(const std::string &text, const TextStyle &style,
 } // namespace liteui_text
 
 namespace liteui_image {
+// 8-bit RGBA convenience wrappers over decodeFileInto / decodeMemoryInto
+// (declared further down, with the rules they share): same content-based
+// format detection and PNG validation, decoded straight into the CanvasImage
+// (no intermediate copy), with a 16-bit PNG narrowed to the nearest byte while
+// it is read (DecodeOptions::to8bit). New code that cares about precision, or
+// wants the image's own format, should call decodeFileBuffer directly.
 std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
                                         std::string *errorOut = nullptr);
 std::optional<CanvasImage> decodeFile(const std::string &path,
@@ -1160,8 +1166,8 @@ std::optional<ImageBuffer> downscaleImage(const ImageBuffer &source,
 
 // ---- Image files <-> ImageBuffer, 8- and 16-bit ---------------------------
 // decodeFile / decodeMemory above always give an 8-bit CanvasImage (a 16-bit
-// PNG is reduced to 8 bits). The functions below keep the file's own
-// precision and speak ImageBuffer:
+// PNG is narrowed to 8 bits); they are wrappers over the functions below,
+// which keep the file's own precision and speak ImageBuffer:
 //
 //   JPEG, and PNG of 8 bits per channel or fewer  ->  RGBA8_UNORM
 //   PNG of 16 bits per channel                    ->  RGBA16_UNORM
@@ -1221,10 +1227,70 @@ std::optional<ImageInfo> probeMemory(const uint8_t *data, size_t size,
 //
 // Unusual JPEGs depend on the platform codec: libjpeg (Linux) refuses
 // CMYK/YCCK and 12-bit files, WIC (Windows) may decode them.
+//
+// DecodeOptions::to8bit asks for at most 8 bits per channel: a 16-bit PNG then
+// comes back as RGBA8_UNORM, each sample narrowed to the nearest byte,
+// (v + 128) / 257 (the rule convertImage uses). Everything else is unaffected.
+// On Linux libpng narrows while it reads, so the 16-bit picture is never held
+// in memory; on Windows the picture is decoded at 16 bits and narrowed right
+// after. Use it when the 16 bits would be thrown away anyway (thumbnails, an
+// 8-bit canvas).
+struct DecodeOptions {
+  bool to8bit = false;
+};
 std::optional<ImageBuffer> decodeFileBuffer(const std::string &path,
-                                            std::string *errorOut = nullptr);
+                                            std::string *errorOut = nullptr,
+                                            const DecodeOptions &options = {});
 std::optional<ImageBuffer> decodeMemoryBuffer(const uint8_t *data, size_t size,
-                                              std::string *errorOut = nullptr);
+                                              std::string *errorOut = nullptr,
+                                              const DecodeOptions &options = {});
+
+// Decodes into memory the CALLER owns, so a picture is never held twice (a
+// decodeFileBuffer result copied into a CanvasImage or another container
+// briefly needs double the memory). `alloc(width, height, format)` is called
+// exactly once, after the file has been probed and (for a PNG) validated, and
+// before any pixel is written; it must return a pointer to
+// width * height * bytesPerPixel(format) writable bytes, tightly packed (no row
+// padding), in the machine's byte order for 16-bit samples, or nullptr (out of
+// memory, unwanted format): the decode then fails with "out of memory". The
+// memory has to stay valid until the call returns; it is not touched after
+// that. `format` is RGBA8_UNORM, or RGBA16_UNORM for a 16-bit PNG when
+// options.to8bit is false. If the decode fails after alloc was called, the
+// memory is left half written. alloc is not called for a file that is refused
+// up front (truncated, bad CRC, unknown format).
+using ImageAllocFn =
+    std::function<std::byte *(uint32_t width, uint32_t height, PixelFormat format)>;
+bool decodeFileInto(const std::string &path, const ImageAllocFn &alloc,
+                    std::string *errorOut = nullptr,
+                    const DecodeOptions &options = {});
+bool decodeMemoryInto(const uint8_t *data, size_t size,
+                      const ImageAllocFn &alloc, std::string *errorOut = nullptr,
+                      const DecodeOptions &options = {});
+
+// CRC-32 as PNG and zlib use it (polynomial 0xEDB88320), e.g. for a chunk you
+// build yourself. `crc` is the value so far, 0 to start, like zlib's crc32():
+// the CRC of a buffer given in pieces is
+// crc32(b, nb, crc32(a, na)) == crc32 of a followed by b. The check value is
+// crc32("123456789") == 0xCBF43926. Defined here, inline, so it needs no
+// LITEUI_IMPLEMENTATION and no platform library.
+inline uint32_t crc32(const uint8_t *p, size_t n, uint32_t crc = 0) {
+  struct Table {
+    uint32_t v[256];
+    Table() {
+      for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; ++k)
+          c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        v[i] = c;
+      }
+    }
+  };
+  static const Table table;
+  crc = ~crc;
+  for (size_t i = 0; i < n; ++i)
+    crc = table.v[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
 
 struct PngEncodeOptions {
   // zlib level 0..9 (libpng). Default 3: on a 24-megapixel 16-bit photo,
@@ -3147,26 +3213,6 @@ inline bool isOpaque(const ImageBuffer &img) {
   return true;
 }
 
-// CRC-32 as PNG uses it (polynomial 0xEDB88320), continued across calls: start
-// from 0xFFFFFFFF and xor the final value with 0xFFFFFFFF.
-inline uint32_t crc32Update(uint32_t crc, const uint8_t *p, size_t n) {
-  struct Table {
-    uint32_t v[256];
-    Table() {
-      for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k)
-          c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-        v[i] = c;
-      }
-    }
-  };
-  static const Table table;
-  for (size_t i = 0; i < n; ++i)
-    crc = table.v[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
-  return crc;
-}
-
 // Walks every chunk of a PNG held in memory and checks the file is whole:
 // each chunk's data and CRC are present and correct, there is at least one
 // IDAT, and the last chunk is IEND. (The signature and IHDR were already
@@ -3188,10 +3234,7 @@ inline bool validatePngChunks(const uint8_t *d, size_t n, std::string *err) {
       return fail("PNG is truncated");
     const uint8_t *type =
         d + off + 4; // type and data are contiguous: one CRC run
-    const uint32_t crc =
-        crc32Update(0xFFFFFFFFu, type, static_cast<size_t>(4 + len)) ^
-        0xFFFFFFFFu;
-    if (crc != be32(d + off + 8 + len))
+    if (crc32(type, static_cast<size_t>(4 + len)) != be32(d + off + 8 + len))
       return fail("PNG is corrupt (chunk CRC mismatch)");
     if (std::memcmp(type, "IDAT", 4) == 0)
       sawIdat = true;
@@ -3264,10 +3307,10 @@ inline bool checkEncodable(const ImageBuffer &img, bool jpeg,
 
 // Per-platform codecs (defined below in the Windows / Linux branches). The
 // public functions have already validated their arguments.
-inline std::optional<ImageBuffer> decodeBackend(const uint8_t *data,
-                                                size_t size,
-                                                const ImageInfo &info,
-                                                std::string *err);
+// Decodes `data` (already probed and validated) into the memory `alloc` returns.
+inline bool decodeBackendInto(const uint8_t *data, size_t size,
+                              const ImageInfo &info, bool to8bit,
+                              const ImageAllocFn &alloc, std::string *err);
 inline bool encodePngBackend(std::vector<uint8_t> &out, const ImageBuffer &img,
                              const PngEncodeOptions &opt, std::string *err);
 inline bool encodeJpegBackend(std::vector<uint8_t> &out, const ImageBuffer &img,
@@ -3304,47 +3347,180 @@ std::optional<ImageInfo> probeFile(const std::string &path,
   return info;
 }
 
-std::optional<ImageBuffer> decodeMemoryBuffer(const uint8_t *data, size_t size,
-                                              std::string *errorOut) {
+namespace codec_detail {
+// Copies a decoded buffer into the caller's memory, narrowing 16 -> 8 bits when
+// asked (the rule is (v + 128) / 257, the same as convertImage). This is how a
+// backend that has to decode to an ImageBuffer first (the libpng fallback when
+// LITEUI_NO_PNG_SCALE16 is set) fills decodeXxxInto's storage; the WIC backend
+// and the normal libpng / libjpeg path write there directly and do not use it.
+inline bool copyBufferInto(const ImageBuffer &b, bool to8bit,
+                           const ImageAllocFn &alloc, std::string *err) {
+  const bool narrow = to8bit && b.format == PixelFormat::RGBA16_UNORM;
+  const PixelFormat f = narrow ? PixelFormat::RGBA8_UNORM : b.format;
+  std::byte *dst = nullptr;
   try {
+    dst = alloc(b.width, b.height, f);
+  } catch (const std::exception &) {
+    dst = nullptr;
+  }
+  if (!dst) {
+    if (err)
+      *err = "out of memory";
+    return false;
+  }
+  const size_t rowBytes = static_cast<size_t>(b.width) * bytesPerPixel(f);
+  const size_t samples = static_cast<size_t>(b.width) * 4;
+  for (uint32_t y = 0; y < b.height; ++y) {
+    const std::byte *s = b.row(y);
+    std::byte *d = dst + static_cast<size_t>(y) * rowBytes;
+    if (!narrow) {
+      std::memcpy(d, s, rowBytes);
+    } else {
+      for (size_t i = 0; i < samples; ++i) {
+        uint16_t v;
+        std::memcpy(&v, s + i * 2, 2);
+        d[i] = static_cast<std::byte>((v + 128u) / 257u);
+      }
+    }
+  }
+  return true;
+}
+} // namespace codec_detail
+
+bool decodeMemoryInto(const uint8_t *data, size_t size,
+                      const ImageAllocFn &alloc, std::string *errorOut,
+                      const DecodeOptions &options) {
+  try {
+    if (!alloc) {
+      if (errorOut)
+        *errorOut = "no allocator";
+      return false;
+    }
     auto info = probeMemory(data, size, errorOut);
     if (!info)
-      return std::nullopt;
+      return false;
     if (info->truncated) {
       if (errorOut)
         *errorOut = "PNG is truncated";
-      return std::nullopt;
+      return false;
     }
     if (info->format == ImageFileFormat::Png &&
         !codec_detail::validatePngChunks(data, size, errorOut))
-      return std::nullopt;
-    return codec_detail::decodeBackend(data, size, *info, errorOut);
+      return false;
+    return codec_detail::decodeBackendInto(data, size, *info, options.to8bit,
+                                           alloc, errorOut);
   } catch (const std::exception &e) {
     if (errorOut)
       *errorOut = std::string("decode failed: ") + e.what();
-    return std::nullopt;
+    return false;
   }
 }
 
-std::optional<ImageBuffer> decodeFileBuffer(const std::string &path,
-                                            std::string *errorOut) {
+bool decodeFileInto(const std::string &path, const ImageAllocFn &alloc,
+                    std::string *errorOut, const DecodeOptions &options) {
   // The whole file is read into memory first: both libpng and WIC then decode
-  // from one buffer, and the same code path serves decodeMemoryBuffer.
+  // from one buffer, and the same code path serves decodeMemoryInto.
   std::vector<uint8_t> bytes;
   try {
     if (!codec_detail::readFileBytes(path, bytes, errorOut))
-      return std::nullopt;
+      return false;
   } catch (const std::exception &e) {
     if (errorOut)
       *errorOut = std::string("read failed: ") + e.what();
-    return std::nullopt;
+    return false;
   }
   if (bytes.empty()) {
     if (errorOut)
       *errorOut = "empty file";
+    return false;
+  }
+  return decodeMemoryInto(bytes.data(), bytes.size(), alloc, errorOut, options);
+}
+
+std::optional<ImageBuffer> decodeMemoryBuffer(const uint8_t *data, size_t size,
+                                              std::string *errorOut,
+                                              const DecodeOptions &options) {
+  std::optional<ImageBuffer> out;
+  auto alloc = [&out](uint32_t w, uint32_t h, PixelFormat f) -> std::byte * {
+    out = ImageBuffer::create(w, h, f);
+    return out ? out->pixels.data() : nullptr;
+  };
+  if (!decodeMemoryInto(data, size, alloc, errorOut, options))
+    return std::nullopt;
+  return out;
+}
+
+std::optional<ImageBuffer> decodeFileBuffer(const std::string &path,
+                                            std::string *errorOut,
+                                            const DecodeOptions &options) {
+  std::optional<ImageBuffer> out;
+  auto alloc = [&out](uint32_t w, uint32_t h, PixelFormat f) -> std::byte * {
+    out = ImageBuffer::create(w, h, f);
+    return out ? out->pixels.data() : nullptr;
+  };
+  if (!decodeFileInto(path, alloc, errorOut, options))
+    return std::nullopt;
+  return out;
+}
+
+// ---- The 8-bit API: thin wrappers over decodeFileInto -------------------------
+// decodeFile / decodeMemory used to be two more decoders per platform (WIC on
+// Windows; libpng + libjpeg, chosen by file EXTENSION, on Linux). They are now
+// wrappers: decodeFileInto / decodeMemoryInto decode (so every check those make
+// applies: the format comes from the content, a truncated PNG or one with a bad
+// chunk CRC is refused), straight into the CanvasImage's own pixels, with
+// DecodeOptions::to8bit so a 16-bit PNG is narrowed to the nearest byte,
+// (v + 128) / 257, the rule convertImage uses (the old Linux decoder cut the low
+// byte off; WIC rounded).
+namespace codec_detail {
+// Decodes into a CanvasImage (always RGBA8: the caller asked for to8bit).
+template <class Run>
+inline std::optional<CanvasImage> decodeToCanvas(Run &&run, std::string *err) {
+  std::optional<CanvasImage> img;
+  bool tooLarge = false;
+  auto alloc = [&](uint32_t w, uint32_t h, PixelFormat f) -> std::byte * {
+    constexpr uint32_t kMax =
+        static_cast<uint32_t>(std::numeric_limits<int>::max());
+    if (f != PixelFormat::RGBA8_UNORM)
+      return nullptr;
+    if (w > kMax || h > kMax) {
+      tooLarge = true;
+      return nullptr;
+    }
+    try {
+      img.emplace(static_cast<int>(w), static_cast<int>(h));
+    } catch (const std::exception &) {
+      return nullptr;
+    }
+    return reinterpret_cast<std::byte *>(img->pixels.data());
+  };
+  DecodeOptions options;
+  options.to8bit = true;
+  if (!run(ImageAllocFn(alloc), options)) {
+    if (tooLarge && err)
+      *err = "image is too large";
     return std::nullopt;
   }
-  return decodeMemoryBuffer(bytes.data(), bytes.size(), errorOut);
+  return img;
+}
+} // namespace codec_detail
+
+std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
+                                        std::string *errorOut) {
+  return codec_detail::decodeToCanvas(
+      [&](const ImageAllocFn &alloc, const DecodeOptions &opt) {
+        return decodeMemoryInto(data, size, alloc, errorOut, opt);
+      },
+      errorOut);
+}
+
+std::optional<CanvasImage> decodeFile(const std::string &path,
+                                      std::string *errorOut) {
+  return codec_detail::decodeToCanvas(
+      [&](const ImageAllocFn &alloc, const DecodeOptions &opt) {
+        return decodeFileInto(path, alloc, errorOut, opt);
+      },
+      errorOut);
 }
 
 bool encodePngMemory(std::vector<uint8_t> &out, const ImageBuffer &image,
@@ -3413,185 +3589,6 @@ bool encodeJpeg(const std::string &path, const ImageBuffer &image, int quality,
 
 #if defined(_WIN32)
 
-std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
-                                        std::string *errorOut) {
-  if (!data || size == 0) {
-    if (errorOut)
-      *errorOut = "empty buffer";
-    return std::nullopt;
-  }
-
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return std::nullopt;
-  }
-
-  // IWICStream::InitializeFromMemory wraps the buffer in place (no copy),
-  // so `data` must stay valid for the lifetime of this call — fine here
-  // since decoding happens synchronously before we return.
-  IWICStream *stream = nullptr;
-  hr = factory->CreateStream(&stream);
-  if (SUCCEEDED(hr))
-    hr = stream->InitializeFromMemory(const_cast<BYTE *>(data),
-                                      static_cast<DWORD>(size));
-  if (FAILED(hr)) {
-    if (stream)
-      stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: InitializeFromMemory failed";
-    return std::nullopt;
-  }
-
-  IWICBitmapDecoder *decoder = nullptr;
-  hr = factory->CreateDecoderFromStream(
-      stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
-  if (FAILED(hr)) {
-    stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: failed to decode buffer (unrecognized format?)";
-    return std::nullopt;
-  }
-
-  IWICBitmapFrameDecode *frame = nullptr;
-  hr = decoder->GetFrame(0, &frame);
-  IWICFormatConverter *converter = nullptr;
-  if (SUCCEEDED(hr)) {
-    hr = factory->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr))
-      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
-                                 WICBitmapDitherTypeNone, nullptr, 0.0,
-                                 WICBitmapPaletteTypeCustom);
-  }
-  if (FAILED(hr)) {
-    if (converter)
-      converter->Release();
-    if (frame)
-      frame->Release();
-    decoder->Release();
-    stream->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: decode/convert failed";
-    return std::nullopt;
-  }
-
-  UINT w = 0, h = 0;
-  converter->GetSize(&w, &h);
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  hr = converter->CopyPixels(
-      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
-
-  converter->Release();
-  frame->Release();
-  decoder->Release();
-  stream->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (FAILED(hr)) {
-    if (errorOut)
-      *errorOut = "WIC: CopyPixels failed";
-    return std::nullopt;
-  }
-  return img;
-}
-
-std::optional<CanvasImage> decodeFile(const std::string &path,
-                                      std::string *errorOut) {
-  // WIC needs an apartment; tolerate "already initialized differently"
-  // rather than fail, since the host app may have called this itself.
-  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  bool weInitialized = coHr == S_OK;
-
-  IWICImagingFactory *factory = nullptr;
-  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) {
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: CoCreateInstance failed";
-    return std::nullopt;
-  }
-
-  std::wstring wpath = toWide(path);
-  IWICBitmapDecoder *decoder = nullptr;
-  hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ,
-                                          WICDecodeMetadataCacheOnDemand,
-                                          &decoder);
-  if (FAILED(hr)) {
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: failed to open/decode file";
-    return std::nullopt;
-  }
-
-  IWICBitmapFrameDecode *frame = nullptr;
-  hr = decoder->GetFrame(0, &frame);
-  IWICFormatConverter *converter = nullptr;
-  if (SUCCEEDED(hr)) {
-    hr = factory->CreateFormatConverter(&converter);
-    if (SUCCEEDED(hr))
-      // Straight (non-premultiplied) alpha, matching CanvasImage's contract.
-      hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
-                                 WICBitmapDitherTypeNone, nullptr, 0.0,
-                                 WICBitmapPaletteTypeCustom);
-  }
-  if (FAILED(hr)) {
-    if (converter)
-      converter->Release();
-    if (frame)
-      frame->Release();
-    decoder->Release();
-    factory->Release();
-    if (weInitialized)
-      CoUninitialize();
-    if (errorOut)
-      *errorOut = "WIC: decode/convert failed";
-    return std::nullopt;
-  }
-
-  UINT w = 0, h = 0;
-  converter->GetSize(&w, &h);
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  hr = converter->CopyPixels(
-      nullptr, w * 4, static_cast<UINT>(img.pixels.size()), img.pixels.data());
-
-  converter->Release();
-  frame->Release();
-  decoder->Release();
-  factory->Release();
-  if (weInitialized)
-    CoUninitialize();
-
-  if (FAILED(hr)) {
-    if (errorOut)
-      *errorOut = "WIC: CopyPixels failed";
-    return std::nullopt;
-  }
-  return img;
-}
-
 // ---- Image files <-> ImageBuffer: WIC backend ------------------------------
 namespace codec_detail {
 // Minimal owning COM pointer (no ATL / WRL dependency).
@@ -3641,31 +3638,46 @@ inline bool wicFactory(ComRef<IWICImagingFactory> &f, std::string *err) {
   return true;
 }
 
-// Decodes through a format converter to straight-alpha RGBA: 32bppRGBA for
-// 8-bit files, 64bppRGBA (16-bit UNORM per channel) for a 16-bit PNG.
-inline std::optional<ImageBuffer> decodeBackend(const uint8_t *data,
-                                                size_t size,
-                                                const ImageInfo &info,
-                                                std::string *err) {
-  auto fail = [&](const char *msg) -> std::optional<ImageBuffer> {
+// Decodes straight into the caller's memory (see decodeFileInto), so a picture
+// is never held twice. The pixels come through a format converter to
+// straight-alpha RGBA: 32bppRGBA for 8-bit files, 64bppRGBA (16-bit UNORM per
+// channel) for a 16-bit PNG.
+//   * 8-bit file, or 16-bit file kept at 16 bits: one CopyPixels into `alloc`'s
+//     memory, no intermediate buffer.
+//   * 16-bit file with to8bit: WIC still produces 16-bit samples, but they are
+//     pulled in bands of about a megabyte and narrowed into the 8-bit storage
+//     with (v + 128) / 257 right here, so the full 16-bit picture never exists
+//     and the rounding is the library's own rule, not whatever WIC's converter
+//     would do for 64bppRGBA -> 32bppRGBA.
+// What WIC itself caches inside the decoder (e.g. an interlaced PNG) is outside
+// our control and not counted here.
+inline bool decodeBackendInto(const uint8_t *data, size_t size,
+                              const ImageInfo &info, bool to8bit,
+                              const ImageAllocFn &alloc, std::string *err) {
+  auto fail = [&](const char *msg) {
     if (err)
       *err = msg;
-    return std::nullopt;
+    return false;
   };
   if (size > 0xFFFFFFFFull)
     return fail("WIC: buffer too large");
-  const PixelFormat fmt = info.bufferFormat();
-  const bool wide = fmt == PixelFormat::RGBA16_UNORM;
-  auto out = ImageBuffer::create(info.width, info.height, fmt);
-  if (!out)
-    return fail("out of memory");
-  if (out->pixels.size() > 0xFFFFFFFFull)
+  const bool wide = info.bufferFormat() == PixelFormat::RGBA16_UNORM;
+  const bool narrow = wide && to8bit;
+  const PixelFormat outFmt =
+      (wide && !narrow) ? PixelFormat::RGBA16_UNORM : PixelFormat::RGBA8_UNORM;
+  const uint64_t outRow = static_cast<uint64_t>(info.width) * bytesPerPixel(outFmt);
+  const uint64_t outBytes = outRow * info.height;
+  if (outRow > 0xFFFFFFFFull || outBytes > std::numeric_limits<size_t>::max())
+    return fail("WIC: image too large");
+  // The one-shot copy hands WIC a UINT byte count; the banded narrowing path
+  // has no such limit (each band is small).
+  if (!narrow && outBytes > 0xFFFFFFFFull)
     return fail("WIC: image too large");
 
   WicCom com;
   ComRef<IWICImagingFactory> factory;
   if (!wicFactory(factory, err))
-    return std::nullopt;
+    return false;
   // InitializeFromMemory wraps the buffer in place: `data` only has to
   // outlive this call, which it does (decoding is synchronous).
   ComRef<IWICStream> stream;
@@ -3681,48 +3693,88 @@ inline std::optional<ImageBuffer> decodeBackend(const uint8_t *data,
   ComRef<IWICBitmapFrameDecode> frame;
   if (FAILED(decoder->GetFrame(0, frame.put())))
     return fail("WIC: file has no image frame");
+
   // A 16-bit gray PNG: WIC's converter does not return the exact 16-bit values
   // when widening 16bppGray to 64bppRGBA (every other 16-bit layout converts
-  // exactly). Copy the gray plane in its native format and replicate it into
+  // exactly). Read the gray plane in its native format and replicate it into
   // RGB by hand instead.
   WICPixelFormatGUID native = {};
-  if (wide && SUCCEEDED(frame->GetPixelFormat(&native)) &&
-      IsEqualGUID(native, GUID_WICPixelFormat16bppGray)) {
-    UINT fw = 0, fh = 0;
-    frame->GetSize(&fw, &fh);
-    if (fw != info.width || fh != info.height)
-      return fail("WIC: decoded size differs from the file header");
-    std::vector<uint16_t> gray(static_cast<size_t>(fw) * fh);
-    if (FAILED(frame->CopyPixels(nullptr, fw * 2u,
-                                 static_cast<UINT>(gray.size() * 2),
-                                 reinterpret_cast<BYTE *>(gray.data()))))
+  const bool gray16 = wide && SUCCEEDED(frame->GetPixelFormat(&native)) &&
+                      IsEqualGUID(native, GUID_WICPixelFormat16bppGray);
+  ComRef<IWICFormatConverter> conv;
+  IWICBitmapSource *src = frame.get();
+  if (!gray16) {
+    if (FAILED(factory->CreateFormatConverter(conv.put())) ||
+        FAILED(conv->Initialize(
+            frame.get(),
+            wide ? GUID_WICPixelFormat64bppRGBA : GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
+      return fail("WIC: decode/convert failed");
+    src = conv.get();
+  }
+  UINT w = 0, h = 0;
+  if (FAILED(src->GetSize(&w, &h)) || w != info.width || h != info.height)
+    return fail("WIC: decoded size differs from the file header");
+
+  // Everything that can refuse the file has run: only now ask for the memory.
+  std::byte *dst = nullptr;
+  try {
+    dst = alloc(info.width, info.height, outFmt);
+  } catch (const std::exception &) {
+    dst = nullptr;
+  }
+  if (!dst)
+    return fail("out of memory");
+
+  if (!narrow && !gray16) {
+    if (FAILED(src->CopyPixels(nullptr, static_cast<UINT>(outRow),
+                               static_cast<UINT>(outBytes),
+                               reinterpret_cast<BYTE *>(dst))))
       return fail("WIC: CopyPixels failed");
-    for (UINT y = 0; y < fh; ++y) {
-      std::byte *dst = out->row(y);
-      const uint16_t *srcRow = &gray[static_cast<size_t>(y) * fw];
-      for (UINT x = 0; x < fw; ++x) {
-        const uint16_t px[4] = {srcRow[x], srcRow[x], srcRow[x], 0xFFFF};
-        std::memcpy(dst + static_cast<size_t>(x) * 8, px, 8);
+    return true;
+  }
+
+  // Banded path: gray16 (replicate into RGB) and/or narrowing to 8 bits.
+  const size_t srcSamples = gray16 ? 1 : 4;
+  const size_t srcRow = static_cast<size_t>(w) * srcSamples * 2;
+  constexpr size_t kBandBytes = size_t(1) << 20;
+  const UINT bandRows = static_cast<UINT>(
+      std::clamp<size_t>(kBandBytes / srcRow, 1, std::max<UINT>(h, 1)));
+  std::vector<uint16_t> band(static_cast<size_t>(bandRows) * w * srcSamples);
+  auto narrow8 = [](uint16_t v) {
+    return static_cast<uint8_t>((v + 128u) / 257u);
+  };
+  for (UINT y0 = 0; y0 < h; y0 += bandRows) {
+    const UINT n = std::min(bandRows, h - y0);
+    const WICRect rc = {0, static_cast<INT>(y0), static_cast<INT>(w),
+                        static_cast<INT>(n)};
+    if (FAILED(src->CopyPixels(&rc, static_cast<UINT>(srcRow),
+                               static_cast<UINT>(srcRow * n),
+                               reinterpret_cast<BYTE *>(band.data()))))
+      return fail("WIC: CopyPixels failed");
+    for (UINT r = 0; r < n; ++r) {
+      const uint16_t *s = &band[static_cast<size_t>(r) * w * srcSamples];
+      std::byte *d = dst + static_cast<size_t>(y0 + r) * static_cast<size_t>(outRow);
+      if (narrow && !gray16) {
+        uint8_t *d8 = reinterpret_cast<uint8_t *>(d);
+        for (size_t i = 0, e = static_cast<size_t>(w) * 4; i < e; ++i)
+          d8[i] = narrow8(s[i]);
+      } else if (narrow) { // gray16 -> RGBA8
+        uint8_t *d8 = reinterpret_cast<uint8_t *>(d);
+        for (UINT x = 0; x < w; ++x) {
+          const uint8_t g = narrow8(s[x]);
+          d8[x * 4 + 0] = d8[x * 4 + 1] = d8[x * 4 + 2] = g;
+          d8[x * 4 + 3] = 0xFF;
+        }
+      } else { // gray16 -> RGBA16
+        for (UINT x = 0; x < w; ++x) {
+          const uint16_t px[4] = {s[x], s[x], s[x], 0xFFFF};
+          std::memcpy(d + static_cast<size_t>(x) * 8, px, 8);
+        }
       }
     }
-    return out;
   }
-  ComRef<IWICFormatConverter> conv;
-  if (FAILED(factory->CreateFormatConverter(conv.put())) ||
-      FAILED(conv->Initialize(
-          frame.get(),
-          wide ? GUID_WICPixelFormat64bppRGBA : GUID_WICPixelFormat32bppRGBA,
-          WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
-    return fail("WIC: decode/convert failed");
-  UINT w = 0, h = 0;
-  conv->GetSize(&w, &h);
-  if (w != info.width || h != info.height)
-    return fail("WIC: decoded size differs from the file header");
-  if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(out->rowStride),
-                              static_cast<UINT>(out->pixels.size()),
-                              reinterpret_cast<BYTE *>(out->pixels.data()))))
-    return fail("WIC: CopyPixels failed");
-  return out;
+  return true;
 }
 
 // Encodes `bmp` (pixel layout srcFmt) with the given container encoder into
@@ -3890,30 +3942,6 @@ inline bool encodeJpegBackend(std::vector<uint8_t> &out, const ImageBuffer &img,
 
 namespace detail {
 
-inline std::string lowerExt(const std::string &path) {
-  auto dot = path.find_last_of('.');
-  if (dot == std::string::npos)
-    return "";
-  std::string ext = path.substr(dot + 1);
-  std::transform(ext.begin(), ext.end(), ext.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return ext;
-}
-
-// Since there's no filename/extension for a memory buffer, sniff the
-// format from its magic bytes instead — same signatures libpng/libjpeg
-// themselves check internally.
-enum class ImageFormat { Unknown, Png, Jpeg };
-inline ImageFormat sniffFormat(const uint8_t *data, size_t size) {
-  static const uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47,
-                                     0x0D, 0x0A, 0x1A, 0x0A};
-  if (size >= 8 && std::memcmp(data, kPngSig, 8) == 0)
-    return ImageFormat::Png;
-  if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
-    return ImageFormat::Jpeg;
-  return ImageFormat::Unknown;
-}
-
 // Read-callback state for libpng's png_set_read_fn — tracks how far
 // we've consumed into the caller's buffer.
 struct PngMemReader {
@@ -3948,277 +3976,7 @@ inline void jpegErrorExit(j_common_ptr cinfo) {
   longjmp(err->escape, 1);
 }
 
-inline std::optional<CanvasImage>
-decodePngMemory(const uint8_t *data, size_t size, std::string *errorOut) {
-  if (size < 8 || png_sig_cmp(data, 0, 8)) {
-    if (errorOut)
-      *errorOut = "not a valid PNG buffer";
-    return std::nullopt;
-  }
-  png_structp png =
-      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-  png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info) {
-    if (png)
-      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
-    if (errorOut)
-      *errorOut = "libpng init failed";
-    return std::nullopt;
-  }
-  if (setjmp(png_jmpbuf(png))) {
-    png_destroy_read_struct(&png, &info, nullptr);
-    if (errorOut)
-      *errorOut = "libpng decode error";
-    return std::nullopt;
-  }
-
-  PngMemReader reader{data, size};
-  png_set_read_fn(png, &reader, pngMemRead);
-  png_read_info(png, info);
-
-  png_uint_32 w = png_get_image_width(png, info);
-  png_uint_32 h = png_get_image_height(png, info);
-  int bitDepth = png_get_bit_depth(png, info);
-  int colorType = png_get_color_type(png, info);
-
-  if (bitDepth == 16)
-    png_set_strip_16(png);
-  if (colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_palette_to_rgb(png);
-  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
-    png_set_expand_gray_1_2_4_to_8(png);
-  if (png_get_valid(png, info, PNG_INFO_tRNS))
-    png_set_tRNS_to_alpha(png);
-  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-  if (colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
-    png_set_gray_to_rgb(png);
-  png_set_interlace_handling(png);
-  png_read_update_info(png, info);
-
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  size_t rowBytes = png_get_rowbytes(png, info);
-  std::vector<png_bytep> rows(h);
-  for (png_uint_32 y = 0; y < h; ++y)
-    rows[y] = img.pixels.data() + y * rowBytes;
-  png_read_image(png, rows.data());
-
-  png_destroy_read_struct(&png, &info, nullptr);
-  return img;
-}
-
-inline std::optional<CanvasImage>
-decodeJpegMemory(const uint8_t *data, size_t size, std::string *errorOut) {
-  jpeg_decompress_struct cinfo;
-  JpegErrorMgr jerr;
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpegErrorExit;
-
-  if (setjmp(jerr.escape)) {
-    jpeg_destroy_decompress(&cinfo);
-    if (errorOut)
-      *errorOut = jerr.message;
-    return std::nullopt;
-  }
-
-  jpeg_create_decompress(&cinfo);
-  // jpeg_mem_src takes a non-const unsigned char* in some libjpeg
-  // versions; it never writes through it, so the cast is safe.
-  jpeg_mem_src(&cinfo, const_cast<unsigned char *>(data),
-               static_cast<unsigned long>(size));
-  jpeg_read_header(&cinfo, TRUE);
-  jpeg_start_decompress(&cinfo);
-
-  int w = static_cast<int>(cinfo.output_width);
-  int h = static_cast<int>(cinfo.output_height);
-  int channels = cinfo.output_components;
-
-  CanvasImage img(w, h);
-  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
-  unsigned char *rowPtr = row.data();
-  while (cinfo.output_scanline < cinfo.output_height) {
-    int y = static_cast<int>(cinfo.output_scanline);
-    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
-    for (int x = 0; x < w; ++x) {
-      if (channels == 1) {
-        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
-      } else {
-        dst[x * 4 + 0] = row[x * 3 + 0];
-        dst[x * 4 + 1] = row[x * 3 + 1];
-        dst[x * 4 + 2] = row[x * 3 + 2];
-      }
-      dst[x * 4 + 3] = 255;
-    }
-  }
-
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
-  return img;
-}
-
-inline std::optional<CanvasImage> decodePngFile(const std::string &path,
-                                                std::string *errorOut) {
-  FILE *fp = fopen(path.c_str(), "rb");
-  if (!fp) {
-    if (errorOut)
-      *errorOut = "failed to open file";
-    return std::nullopt;
-  }
-  png_byte header[8];
-  if (fread(header, 1, 8, fp) != 8 || png_sig_cmp(header, 0, 8)) {
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "not a valid PNG file";
-    return std::nullopt;
-  }
-  png_structp png =
-      png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-  png_infop info = png ? png_create_info_struct(png) : nullptr;
-  if (!png || !info) {
-    if (png)
-      png_destroy_read_struct(&png, info ? &info : nullptr, nullptr);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng init failed";
-    return std::nullopt;
-  }
-  if (setjmp(png_jmpbuf(png))) {
-    png_destroy_read_struct(&png, &info, nullptr);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = "libpng decode error";
-    return std::nullopt;
-  }
-  png_init_io(png, fp);
-  png_set_sig_bytes(png, 8);
-  png_read_info(png, info);
-
-  png_uint_32 w = png_get_image_width(png, info);
-  png_uint_32 h = png_get_image_height(png, info);
-  int bitDepth = png_get_bit_depth(png, info);
-  int colorType = png_get_color_type(png, info);
-
-  // Normalize every PNG variant (palette/gray/gray+alpha/RGB/RGBA, 1-16 bit)
-  // down to straight-alpha 8-bit RGBA.
-  if (bitDepth == 16)
-    png_set_strip_16(png);
-  if (colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_palette_to_rgb(png);
-  if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
-    png_set_expand_gray_1_2_4_to_8(png);
-  if (png_get_valid(png, info, PNG_INFO_tRNS))
-    png_set_tRNS_to_alpha(png);
-  if (colorType == PNG_COLOR_TYPE_RGB || colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_PALETTE)
-    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-  if (colorType == PNG_COLOR_TYPE_GRAY ||
-      colorType == PNG_COLOR_TYPE_GRAY_ALPHA)
-    png_set_gray_to_rgb(png);
-  png_set_interlace_handling(png);
-  png_read_update_info(png, info);
-
-  CanvasImage img(static_cast<int>(w), static_cast<int>(h));
-  size_t rowBytes = png_get_rowbytes(png, info);
-  std::vector<png_bytep> rows(h);
-  for (png_uint_32 y = 0; y < h; ++y)
-    rows[y] = img.pixels.data() + y * rowBytes;
-  png_read_image(png, rows.data());
-
-  png_destroy_read_struct(&png, &info, nullptr);
-  fclose(fp);
-  return img;
-}
-
-inline std::optional<CanvasImage> decodeJpegFile(const std::string &path,
-                                                 std::string *errorOut) {
-  FILE *fp = fopen(path.c_str(), "rb");
-  if (!fp) {
-    if (errorOut)
-      *errorOut = "failed to open file";
-    return std::nullopt;
-  }
-
-  jpeg_decompress_struct cinfo;
-  JpegErrorMgr jerr;
-  cinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = jpegErrorExit;
-
-  // Any libjpeg call inside this guarded region that would otherwise
-  // exit() instead longjmps back here — jpeg_create_decompress itself is
-  // included, per libjpeg's own documented pattern, since a version
-  // mismatch can in principle fail there too.
-  if (setjmp(jerr.escape)) {
-    jpeg_destroy_decompress(&cinfo);
-    fclose(fp);
-    if (errorOut)
-      *errorOut = jerr.message;
-    return std::nullopt;
-  }
-
-  jpeg_create_decompress(&cinfo);
-  jpeg_stdio_src(&cinfo, fp);
-  jpeg_read_header(&cinfo, TRUE);
-  jpeg_start_decompress(&cinfo);
-
-  int w = static_cast<int>(cinfo.output_width);
-  int h = static_cast<int>(cinfo.output_height);
-  int channels = cinfo.output_components; // 1 (gray) or 3 (RGB) — no alpha
-
-  CanvasImage img(w, h);
-  std::vector<unsigned char> row(static_cast<size_t>(w) * channels);
-  unsigned char *rowPtr = row.data();
-  while (cinfo.output_scanline < cinfo.output_height) {
-    int y = static_cast<int>(cinfo.output_scanline);
-    jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-    unsigned char *dst = img.pixels.data() + static_cast<size_t>(y) * w * 4;
-    for (int x = 0; x < w; ++x) {
-      if (channels == 1) {
-        dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
-      } else {
-        dst[x * 4 + 0] = row[x * 3 + 0];
-        dst[x * 4 + 1] = row[x * 3 + 1];
-        dst[x * 4 + 2] = row[x * 3 + 2];
-      }
-      dst[x * 4 + 3] = 255; // JPEG carries no alpha channel
-    }
-  }
-
-  jpeg_finish_decompress(&cinfo);
-  jpeg_destroy_decompress(&cinfo);
-  fclose(fp);
-  return img;
-}
-
 } // namespace detail
-
-std::optional<CanvasImage> decodeMemory(const uint8_t *data, size_t size,
-                                        std::string *errorOut) {
-  switch (detail::sniffFormat(data, size)) {
-  case detail::ImageFormat::Png:
-    return detail::decodePngMemory(data, size, errorOut);
-  case detail::ImageFormat::Jpeg:
-    return detail::decodeJpegMemory(data, size, errorOut);
-  default:
-    if (errorOut)
-      *errorOut = "unrecognized image format (not PNG or JPEG)";
-    return std::nullopt;
-  }
-}
-
-std::optional<CanvasImage> decodeFile(const std::string &path,
-                                      std::string *errorOut) {
-  std::string ext = detail::lowerExt(path);
-  if (ext == "png")
-    return detail::decodePngFile(path, errorOut);
-  if (ext == "jpg" || ext == "jpeg")
-    return detail::decodeJpegFile(path, errorOut);
-  if (errorOut)
-    *errorOut = "unsupported image extension: ." + ext;
-  return std::nullopt;
-}
 
 // ---- Image files <-> ImageBuffer: libpng / libjpeg backend -----------------
 namespace codec_detail {
@@ -4238,19 +3996,24 @@ inline std::string pngMessage(const PngDiag &d, const char *fallback) {
                       : std::string(fallback);
 }
 
-// PNG -> ImageBuffer. 16-bit files stay 16-bit (RGBA16_UNORM); everything
-// else is delivered as RGBA8. `info` is the already-probed header.
-inline std::optional<ImageBuffer> decodePngBuffer(const uint8_t *data,
-                                                  size_t size,
-                                                  const ImageInfo &info,
-                                                  std::string *err) {
-  const PixelFormat fmt = info.bufferFormat();
-  const bool wide = fmt == PixelFormat::RGBA16_UNORM;
+// libpng can narrow 16 -> 8 bits while reading (png_set_scale_16, libpng >= 1.5.4).
+// LITEUI_NO_PNG_SCALE16 turns that off, which makes decodeBackendInto narrow after
+// the read instead (the tests use it to check that path).
+#if defined(PNG_READ_SCALE_16_TO_8_SUPPORTED) && !defined(LITEUI_NO_PNG_SCALE16)
+#define LITEUI_HAS_PNG_SCALE16 1
+#endif
 
+// PNG -> the caller's memory (see decodeMemoryInto). 16-bit files stay 16-bit
+// (RGBA16_UNORM) unless `to8bit` is set, in which case libpng narrows them while
+// it reads (png_set_scale_16, the same (v + 128) / 257 as convertImage) and the
+// delivered format is RGBA8_UNORM; everything else is delivered as RGBA8. `info`
+// is the already-probed header.
+inline bool decodePngInto(const uint8_t *data, size_t size,
+                          const ImageInfo &info, bool to8bit,
+                          const ImageAllocFn &alloc, std::string *err) {
   // Everything with a destructor is declared BEFORE setjmp: libpng reports
   // errors by longjmp, which skips the destructors of anything created after
   // it (that would leak a whole picture).
-  std::optional<ImageBuffer> out;
   std::vector<png_bytep> rows;
   PngDiag diag = {};
 
@@ -4262,13 +4025,13 @@ inline std::optional<ImageBuffer> decodePngBuffer(const uint8_t *data,
       png_destroy_read_struct(&png, pinfo ? &pinfo : nullptr, nullptr);
     if (err)
       *err = "libpng init failed";
-    return std::nullopt;
+    return false;
   }
   if (setjmp(png_jmpbuf(png))) {
     png_destroy_read_struct(&png, &pinfo, nullptr);
     if (err)
       *err = pngMessage(diag, "libpng decode error");
-    return std::nullopt;
+    return false;
   }
 
   detail::PngMemReader reader{data, size};
@@ -4280,8 +4043,22 @@ inline std::optional<ImageBuffer> decodePngBuffer(const uint8_t *data,
   const int bitDepth = png_get_bit_depth(png, pinfo);
   const int colorType = png_get_color_type(png, pinfo);
 
-  // Normalize every PNG variant to straight RGBA. Unlike decodeFile this does
-  // NOT strip a 16-bit file down to 8 bits.
+  // Narrow while reading when asked (so the 16-bit picture is never held).
+  // Without png_set_scale_16, decodeBackendInto reads the file at 16 bits and
+  // narrows afterwards (to8bit is then false here).
+  bool narrowedByPng = false;
+#ifdef LITEUI_HAS_PNG_SCALE16
+  if (to8bit && bitDepth == 16) {
+    png_set_scale_16(png);
+    narrowedByPng = true;
+  }
+#endif
+  const bool wide = info.bufferFormat() == PixelFormat::RGBA16_UNORM &&
+                    !narrowedByPng;
+  const PixelFormat fmt =
+      wide ? PixelFormat::RGBA16_UNORM : PixelFormat::RGBA8_UNORM;
+
+  // Normalize every PNG variant to straight RGBA.
   if (colorType == PNG_COLOR_TYPE_PALETTE)
     png_set_palette_to_rgb(png);
   if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8)
@@ -4300,24 +4077,29 @@ inline std::optional<ImageBuffer> decodePngBuffer(const uint8_t *data,
   const size_t bpp = wide ? 8 : 4;
   bool good = w == info.width && h == info.height &&
               png_get_rowbytes(png, pinfo) == static_cast<size_t>(w) * bpp;
+  std::byte *dst = nullptr;
   if (good) {
-    out = ImageBuffer::create(w, h, fmt);
-    if (!out) {
+    try { // an exception must not cross libpng's frames or skip the cleanup
+      dst = alloc(w, h, fmt);
+    } catch (const std::exception &) {
+      dst = nullptr;
+    }
+    if (!dst) {
       png_destroy_read_struct(&png, &pinfo, nullptr);
       if (err)
         *err = "out of memory";
-      return std::nullopt;
+      return false;
     }
     rows.resize(h);
     for (png_uint_32 y = 0; y < h; ++y)
-      rows[y] = reinterpret_cast<png_bytep>(out->row(y));
+      rows[y] = reinterpret_cast<png_bytep>(dst + static_cast<size_t>(y) * w * bpp);
     png_read_image(png, rows.data());
   }
   png_destroy_read_struct(&png, &pinfo, nullptr);
   if (!good) {
     if (err)
       *err = "unexpected PNG layout";
-    return std::nullopt;
+    return false;
   }
 
   if (wide) {
@@ -4325,21 +4107,20 @@ inline std::optional<ImageBuffer> decodePngBuffer(const uint8_t *data,
     // as byte assembly + memcpy, so it is right on either endianness.
     const size_t samples = static_cast<size_t>(w) * 4;
     for (png_uint_32 y = 0; y < h; ++y) {
-      uint8_t *p = reinterpret_cast<uint8_t *>(out->row(y));
+      uint8_t *p = reinterpret_cast<uint8_t *>(dst + static_cast<size_t>(y) * w * bpp);
       for (size_t i = 0; i < samples; ++i, p += 2) {
         const uint16_t v = static_cast<uint16_t>((p[0] << 8) | p[1]);
         std::memcpy(p, &v, 2);
       }
     }
   }
-  return out;
+  return true;
 }
 
-// JPEG -> RGBA8 ImageBuffer (gray is replicated, alpha is opaque).
-inline std::optional<ImageBuffer>
-decodeJpegBuffer(const uint8_t *data, size_t size, std::string *err) {
-  std::optional<ImageBuffer> out; // declared before setjmp, see decodePngBuffer
-  std::vector<unsigned char> row;
+// JPEG -> RGBA8 in the caller's memory (gray is replicated, alpha is opaque).
+inline bool decodeJpegInto(const uint8_t *data, size_t size,
+                           const ImageAllocFn &alloc, std::string *err) {
+  std::vector<unsigned char> row; // declared before setjmp, see decodePngInto
 
   jpeg_decompress_struct cinfo;
   detail::JpegErrorMgr jerr;
@@ -4351,7 +4132,7 @@ decodeJpegBuffer(const uint8_t *data, size_t size, std::string *err) {
     jpeg_destroy_decompress(&cinfo);
     if (err)
       *err = jerr.message;
-    return std::nullopt;
+    return false;
   }
 
   jpeg_create_decompress(&cinfo);
@@ -4366,21 +4147,26 @@ decodeJpegBuffer(const uint8_t *data, size_t size, std::string *err) {
   const int w = static_cast<int>(cinfo.output_width);
   const int h = static_cast<int>(cinfo.output_height);
   const int channels = cinfo.output_components; // 1 or 3
-  out = ImageBuffer::create(static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-                            PixelFormat::RGBA8_UNORM);
+  std::byte *out = nullptr;
+  try { // an exception must not cross libjpeg's frames or skip the cleanup
+    out = alloc(static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                PixelFormat::RGBA8_UNORM);
+  } catch (const std::exception &) {
+    out = nullptr;
+  }
   if (!out) {
     jpeg_destroy_decompress(&cinfo);
     if (err)
       *err = "out of memory";
-    return std::nullopt;
+    return false;
   }
   row.resize(static_cast<size_t>(w) * channels);
   unsigned char *rowPtr = row.data();
   while (cinfo.output_scanline < cinfo.output_height) {
     const int y = static_cast<int>(cinfo.output_scanline);
     jpeg_read_scanlines(&cinfo, &rowPtr, 1);
-    uint8_t *dst =
-        reinterpret_cast<uint8_t *>(out->row(static_cast<uint32_t>(y)));
+    uint8_t *dst = reinterpret_cast<uint8_t *>(out) +
+                   static_cast<size_t>(y) * static_cast<size_t>(w) * 4;
     for (int x = 0; x < w; ++x) {
       if (channels == 1)
         dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = row[x];
@@ -4394,16 +4180,27 @@ decodeJpegBuffer(const uint8_t *data, size_t size, std::string *err) {
   }
   jpeg_finish_decompress(&cinfo);
   jpeg_destroy_decompress(&cinfo);
-  return out;
+  return true;
 }
 
-inline std::optional<ImageBuffer> decodeBackend(const uint8_t *data,
-                                                size_t size,
-                                                const ImageInfo &info,
-                                                std::string *err) {
+inline bool decodeBackendInto(const uint8_t *data, size_t size,
+                              const ImageInfo &info, bool to8bit,
+                              const ImageAllocFn &alloc, std::string *err) {
+#ifndef LITEUI_HAS_PNG_SCALE16
+  if (to8bit && info.format == ImageFileFormat::Png && info.bitDepth == 16) {
+    std::optional<ImageBuffer> wide;
+    auto keep = [&wide](uint32_t w, uint32_t h, PixelFormat f) -> std::byte * {
+      wide = ImageBuffer::create(w, h, f);
+      return wide ? wide->pixels.data() : nullptr;
+    };
+    if (!decodePngInto(data, size, info, false, keep, err))
+      return false;
+    return copyBufferInto(*wide, true, alloc, err);
+  }
+#endif
   if (info.format == ImageFileFormat::Png)
-    return decodePngBuffer(data, size, info, err);
-  return decodeJpegBuffer(data, size, err);
+    return decodePngInto(data, size, info, to8bit, alloc, err);
+  return decodeJpegInto(data, size, alloc, err);
 }
 
 // libpng write callback appending to a vector. An allocation failure must

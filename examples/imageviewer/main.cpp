@@ -10,8 +10,9 @@
 //
 // Second toolbar row (the third row is an info line):
 //   Format  cycles the in-memory working format of the image: 8-bit,
-//           FP16 (half the memory of FP32) or FP32. Files are always
-//           decoded to 8-bit sRGB first; FP16/FP32 hold them as linear light.
+//           FP16 (half the memory of FP32) or FP32. Files are decoded at
+//           their own precision (a 16-bit PNG stays 16-bit, everything else is
+//           8-bit), as display-referred sRGB; FP16/FP32 hold them as linear light.
 //   EV -/+  exposure in stops (float working formats only: an 8-bit image is
 //           already display-referred, so exposure is ignored there).
 //   Clamp   how too-bright colours are clamped for the display: per channel
@@ -46,7 +47,7 @@ namespace
   struct ViewerState
   {
     // ---- Image pipeline ------------------------------------------------
-    // master:  the best-quality pixels we have (RGBA8 for a file, RGBA32F for
+    // master:  the best-quality pixels we have (RGBA8 / RGBA16 for a file, RGBA32F for
     //          the HDR test). Format changes always start from here, so
     //          switching 8-bit -> FP16 -> 8-bit never degrades the image.
     // working: master converted to `format` (shares the pointer when the
@@ -310,22 +311,13 @@ namespace
   void loadImage(ViewerState &s, const std::string &path)
   {
     std::string err;
-    auto decoded = liteui_image::decodeFile(path, &err);
+    auto decoded = liteui_image::decodeFileBuffer(path, &err); // RGBA8, or RGBA16 for a 16-bit PNG
     if (!decoded)
     {
       s.status = "Could not open " + baseName(path) + ": " + err;
       return;
     }
-    auto buf = ImageBuffer::create(static_cast<uint32_t>(decoded->width),
-                                   static_cast<uint32_t>(decoded->height),
-                                   PixelFormat::RGBA8_UNORM);
-    if (!buf || buf->pixels.size() != decoded->pixels.size())
-    {
-      s.status = "Could not open " + baseName(path) + ": out of memory";
-      return;
-    }
-    std::memcpy(buf->pixels.data(), decoded->pixels.data(), decoded->pixels.size());
-    setMaster(s, std::make_shared<const ImageBuffer>(std::move(*buf)), baseName(path));
+    setMaster(s, std::make_shared<const ImageBuffer>(std::move(*decoded)), baseName(path));
   }
 
   // A scene-linear FP32 test image: intensity ramps 0 -> 8x white left to

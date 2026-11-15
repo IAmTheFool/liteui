@@ -2,13 +2,13 @@
 // no main, no check.hpp). Helpers live in namespace thumb_worker_cases so they cannot collide
 // with other cases; the TEST_CASEs are in it too. Cases that start threads carry the [threaded] tag.
 //
-// Real files in a temp folder, made with the app's own encoders (image_codec.hpp),
+// Real files in a temp folder, made with liteui's encoders (cases/encode_helpers.hpp),
 // decoded by the real decoder. Every wait has a timeout so a broken worker fails
 // instead of hanging; Catch2 assertions are not thread-safe, so assertions only
 // run on the main thread.
 
 #include "io/exif.hpp"
-#include "io/image_codec.hpp"
+#include "cases/encode_helpers.hpp"
 #include "workers/thumb_worker.hpp"
 
 #include <atomic>
@@ -118,7 +118,7 @@ static CanvasImage makeImage(int w, int h)
 static bool writePng(const std::string &path, int w, int h)
 {
   std::string err;
-  return encodePngFile(path, makeImage(w, h), &err);
+  return encode_helpers::writePng8(path, makeImage(w, h), &err);
 }
 
 // A JPEG of w x h; `orientation` > 0 adds an EXIF block with that orientation.
@@ -126,7 +126,7 @@ static bool writeJpeg(const std::string &path, int w, int h, int orientation)
 {
   std::vector<uint8_t> jpeg;
   std::string err;
-  if (!encodeJpegMemory(makeImage(w, h), 90, &jpeg, &err) || jpeg.size() < 2)
+  if (!encode_helpers::jpegBytes(makeImage(w, h), 90, &jpeg, &err) || jpeg.size() < 2)
     return false;
   if (orientation > 0)
   {

@@ -8,6 +8,7 @@
 // instead of hanging.
 
 #include "workers/export_worker.hpp"
+#include "cases/encode_helpers.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -89,7 +90,7 @@ static CanvasImage makeImage(int w, int h)
 static bool writePng(const std::string &path, int w, int h)
 {
   std::string err;
-  return encodePngFile(path, makeImage(w, h), &err);
+  return encode_helpers::writePng8(path, makeImage(w, h), &err);
 }
 
 static void writeText(const std::string &path, const std::string &text)

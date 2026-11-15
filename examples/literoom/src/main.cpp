@@ -30,16 +30,17 @@
 // test in tests/ (see CMakeLists.txt). Grouped by folder, lowest layer first.
 
 // core: shared vocabulary
-#include "core/pixel_math.hpp"
-#include "core/geometry.hpp"
 #include "core/adjustments.hpp"
 #include "core/auto_tone.hpp"
+#include "core/geometry.hpp"
+#include "core/image16_convert.hpp"
+#include "core/pixel_math.hpp"
 #include "core/raster_ops.hpp"
 #include "core/wide_chain.hpp"
 
 // color
-#include "color/color_mix.hpp"
 #include "color/color_grade.hpp"
+#include "color/color_mix.hpp"
 #include "color/color_pass.hpp"
 #include "color/curves.hpp"
 
@@ -49,34 +50,34 @@
 
 // masks and object selection
 #include "mask/mask.hpp"
-#include "mask/seg_basic.hpp"
 #include "mask/sam_segmenter.hpp"
+#include "mask/seg_basic.hpp"
 
 // saving and files
-#include "io/file_utils.hpp"
-#include "io/preset.hpp"
-#include "io/photo_meta.hpp"
-#include "io/minijson.hpp"
-#include "io/exif.hpp"
 #include "io/color_tag.hpp"
-#include "io/image_meta.hpp"
-#include "io/image_codec.hpp"
+#include "io/exif.hpp"
+#include "io/file_utils.hpp"
 #include "io/image_codec16.hpp"
+#include "io/image_meta.hpp"
 #include "io/image_source.hpp"
+#include "io/minijson.hpp"
+#include "io/photo_meta.hpp"
+#include "io/preset.hpp"
 
 // edit state and rendering
 #include "edit/adjustment_set.hpp"
-#include "render/render.hpp"
 #include "render/histogram.hpp"
+#include "render/render.hpp"
 #include "render/scopes.hpp"
 
 // background work
-#include "workers/latest_worker.hpp"
-#include "workers/thumb_worker.hpp"
 #include "workers/export_worker.hpp"
+#include "workers/latest_worker.hpp"
 #include "workers/lut_preview_worker.hpp"
+#include "workers/thumb_worker.hpp"
 
-constexpr float kSamSoftness = 2.0f; // logit -> coverage steepness (edge softness)
+constexpr float kSamSoftness =
+    2.0f; // logit -> coverage steepness (edge softness)
 
 // ---------------- Layout constants ----------------
 constexpr float kTitlebarH = 36.0f;
@@ -143,16 +144,19 @@ constexpr size_t kPresetRows = 24;
 // the view tree is built once, like the preset and history lists.
 constexpr int kSnapshotsActivity = 11;
 
-// Activity id of the LUTs panel. Like the preset list, its view tree is built once, with a row
-// for every LUT the library can hold (kLutMaxFiles).
+// Activity id of the LUTs panel. Like the preset list, its view tree is built
+// once, with a row for every LUT the library can hold (kLutMaxFiles).
 constexpr int kLutsActivity = 12;
 constexpr size_t kLutRows = kLutMaxFiles;
-constexpr float kLutRowH = kFilmThumbH + 12.0f; // a row with its preview of the picture
-constexpr float kLutRowNamesH = 28.0f;          // a row with no picture open: just the name
+constexpr float kLutRowH =
+    kFilmThumbH + 12.0f; // a row with its preview of the picture
+constexpr float kLutRowNamesH =
+    28.0f; // a row with no picture open: just the name
 
 // Masks, UI side: tint-bitmap sizes and overlay handle sizes. The engine
-// constants live next to their algorithms: mask_geom.hpp (radii), mask_brush.hpp,
-// mask_range.hpp, mask_object.hpp, seg_basic.hpp and mask.hpp (list limits).
+// constants live next to their algorithms: mask_geom.hpp (radii),
+// mask_brush.hpp, mask_range.hpp, mask_object.hpp, seg_basic.hpp and mask.hpp
+// (list limits).
 constexpr int kCompTintEdge = 512;    // long side of a combined mask's tint
 constexpr float kMaskHandlePx = 9.0f; // overlay handle size, screen px
 constexpr float kMaskHitPx = 12.0f;   // overlay handle grab tolerance, px
@@ -181,10 +185,10 @@ constexpr Color kColorWhite{255, 255, 255, 255}; // real white (image, glyphs)
 
 // Chrome backgrounds.
 constexpr Color kColorRootBg = kHeaderBg;
-constexpr Color kColorPanelBg = kPanelBg;             // sidebar
-constexpr Color kColorTitlebarBg = kHeaderBg;         // titlebar
-constexpr Color kColorActivityBarBg = kHeaderBg;      // activity bar, idle buttons
-constexpr Color kColorMenuHover{62, 62, 62, 255};     // menu / win-btn hover
+constexpr Color kColorPanelBg = kPanelBg;         // sidebar
+constexpr Color kColorTitlebarBg = kHeaderBg;     // titlebar
+constexpr Color kColorActivityBarBg = kHeaderBg;  // activity bar, idle buttons
+constexpr Color kColorMenuHover{62, 62, 62, 255}; // menu / win-btn hover
 constexpr Color kColorActivityHover{84, 84, 84, 255}; // button / tab hover
 constexpr Color kColorActivityActive = kIconActiveBg; // selected activity btn
 constexpr Color kColorDivider = kDivider;             // divider bg
@@ -192,10 +196,10 @@ constexpr Color kColorTrack = kTrackFill;             // slider + scroll track
 constexpr Color kColorScrollThumb = kTrackEdge;
 
 // Text.
-constexpr Color kColorTextDark = kValue;             // titles, menu labels
-constexpr Color kColorTextMid = kTitle;              // info pane, win-btn glyphs
-constexpr Color kColorTextIcon = kIconRing;          // activity bar icons
-constexpr Color kColorTextMuted = kLabel;            // section titles
+constexpr Color kColorTextDark = kValue;    // titles, menu labels
+constexpr Color kColorTextMid = kTitle;     // info pane, win-btn glyphs
+constexpr Color kColorTextIcon = kIconRing; // activity bar icons
+constexpr Color kColorTextMuted = kLabel;   // section titles
 constexpr Color kColorTextFaint{120, 120, 120, 255}; // placeholders
 
 // Dropdown menu.
@@ -223,8 +227,7 @@ constexpr Color kColorStatusHover = kPanelBg;
 constexpr Color kColorStatusError{255, 214, 102, 255};
 
 // A sidebar tab in the activity bar.
-struct Activity
-{
+struct Activity {
   int id;
   std::string title;
   std::string icon; // single glyph
@@ -232,10 +235,11 @@ struct Activity
 
 // Display color of each Color Mixer band (UI only; the math is in
 // color_mix.hpp).
-static Color mixBandColor(size_t band)
-{
+static Color mixBandColor(size_t band) {
   static const Color colors[kMixBandCount] = {
-      {230, 60, 60, 255}, {240, 140, 50, 255}, {225, 195, 40, 255}, {70, 180, 80, 255}, {50, 185, 190, 255}, {60, 110, 230, 255}, {140, 80, 210, 255}, {215, 70, 170, 255}};
+      {230, 60, 60, 255},  {240, 140, 50, 255}, {225, 195, 40, 255},
+      {70, 180, 80, 255},  {50, 185, 190, 255}, {60, 110, 230, 255},
+      {140, 80, 210, 255}, {215, 70, 170, 255}};
   return colors[band];
 }
 
@@ -260,23 +264,23 @@ static Color mixBandColor(size_t band)
 // The thread, the generation protocol and the parking slot live in
 // latest_worker.hpp (LatestWorker, tested on its own); what is specific to
 // rendering is just the job below.
-struct RenderJob
-{
+struct RenderJob {
   std::shared_ptr<const CanvasImage> src;
   RenderParams params;
-// The 16-bit twin of `src` (EditorState::source16), if the picture has one: the render starts from it
-// and reads it for the neighbor effects too; `src` is then only its 8-bit view (what the tools measure).
+  // The 16-bit twin of `src` (EditorState::source16), if the picture has one:
+  // the render starts from it and reads it for the neighbor effects too; `src`
+  // is then only its 8-bit view (what the tools measure).
   std::shared_ptr<const Image16> src16;
 };
-struct RenderResult
-{
+struct RenderResult {
   std::shared_ptr<CanvasImage> image;
 };
 
 // Worker thread only.
-static std::optional<RenderResult> runRenderJob(RenderJob &&job, WorkerCancel c)
-{
-  auto img = job.src16 ? renderToDisplay(*job.src16, job.src.get(), job.params, c.latest, c.gen)
+static std::optional<RenderResult> runRenderJob(RenderJob &&job,
+                                                WorkerCancel c) {
+  auto img = job.src16 ? renderToDisplay(*job.src16, job.src.get(), job.params,
+                                         c.latest, c.gen)
                        : renderWith(*job.src, job.params, c.latest, c.gen);
   if (!img)
     return std::nullopt; // abandoned part-way: superseded
@@ -300,8 +304,7 @@ constexpr int kEdgeMove = 16;
 
 // Aspect-ratio presets in the Crop pane. ratio (width / height): 0 = free,
 // negative = "same as the image being cropped".
-struct CropAspect
-{
+struct CropAspect {
   const char *label;
   float ratio;
 };
@@ -317,28 +320,19 @@ static const std::array<CropAspect, 6> kCropAspects = {{
 // The live (not yet applied) selection rectangle and the drag currently
 // editing it. Coordinates are in pixels of the image being shown
 // (EditorState::image), not the original.
-struct CropUi
-{
+struct CropUi {
   float l = 0, t = 0, r = 0, b = 0;
   size_t aspectIdx = 0; // index into kCropAspects
 
-  enum class Drag
-  {
-    None,
-    New,
-    Move,
-    Resize
-  } drag = Drag::None;
+  enum class Drag { None, New, Move, Resize } drag = Drag::None;
   int mask = 0;               // Resize: which edges (kEdge* bits)
   float ax = 0, ay = 0;       // New: the fixed anchor corner
   float grabX = 0, grabY = 0; // Move: pointer offset from selection's l/t
 };
 
 // Mask-overlay drag in progress (see maskPress / maskDrag).
-struct MaskUi
-{
-  enum class Drag
-  {
+struct MaskUi {
+  enum class Drag {
     None,
     Move,
     ResizeX,
@@ -360,15 +354,15 @@ struct MaskUi
   float brushDensity = 1.0f;
   float brushFlow = 1.0f;
   bool brushErase = false;
-  bool brushTint = true;      // paint the selected brush's coverage in the overlay color
+  bool brushTint =
+      true; // paint the selected brush's coverage in the overlay color
   float lastX = 0, lastY = 0; // Paint: last recorded point, document px
   float curX = 0, curY = 0;   // Paint: pointer, document px (cursor ring)
 
   // Object tool.
   bool objBg = false; // plain clicks add BACKGROUND points (touchpad-friendly
                       // alternative to right-click)
-  struct ObjPending
-  {
+  struct ObjPending {
     int mask = -1, part = -1;
     std::vector<ObjectPrompt> prompts; // original-picture fractions
   } objPending;
@@ -417,25 +411,23 @@ struct MaskUi
 
 // ---------------- Filmstrip and Before / After state ----------------
 // One picture in the open folder, as the filmstrip shows it.
-struct FilmEntry
-{
+struct FilmEntry {
   std::string path;                         // full path (UTF-8)
   std::string name;                         // file name only
   std::shared_ptr<const CanvasImage> thumb; // null until made
   bool failed = false;                      // couldn't be decoded: plain box
   bool edited = false;                      // has saved edits (a sidecar file)
-  bool selected = false;                    // in the multi-selection (Sync Settings)
-  PhotoMeta meta;                           // rating / flag / color label
-  bool scanned = false;                     // `meta` has been read from the sidecar
-  int copy = 0;                             // 0: the picture's own edits; n: virtual
-                                            // copy n (its `path` is "<file>|vc<n>",
-                                            // see virtual_copy.hpp; `name` is the file's)
+  bool selected = false; // in the multi-selection (Sync Settings)
+  PhotoMeta meta;        // rating / flag / color label
+  bool scanned = false;  // `meta` has been read from the sidecar
+  int copy = 0;          // 0: the picture's own edits; n: virtual
+                         // copy n (its `path` is "<file>|vc<n>",
+                         // see virtual_copy.hpp; `name` is the file's)
 };
 
 // The pictures of the folder the open picture lives in (JPEG / PNG, natural
 // name order), plus the strip's scroll position. UI thread only.
-struct FilmStrip
-{
+struct FilmStrip {
   std::vector<FilmEntry> files;
   std::unordered_map<std::string, size_t> byName; // lower-case name -> index
   std::string folder;
@@ -455,15 +447,9 @@ struct FilmStrip
 
 // What the canvas shows: the edited picture, the same picture with every
 // edit switched off (crop and rotation stay), or both side by side.
-enum class CompareMode
-{
-  Off,
-  Before,
-  Split
-};
+enum class CompareMode { Off, Before, Split };
 
-struct EditorState
-{
+struct EditorState {
   std::shared_ptr<CanvasImage> original; // untouched decoded pixels; null
                                          // until something is opened
   std::shared_ptr<CanvasImage> oriented; // original rotated/flipped per
@@ -482,43 +468,58 @@ struct EditorState
                                         // applied (== rotated if none) —
                                         // what adjustments are run on
   CropRect sourceCrop;                  // the crop `source` was built with
-  // The 16-bit twin of original / oriented / rotated / source, for a picture that really has more than 8
-  // bits (a 16-bit PNG); all null for any other file. Built from `original16` by the same operations, so
-// each stage has the size of its 8-bit namesake (core/wide_chain.hpp). The 8-bit chain above is unchanged
-// and is still what every tool measures; the full-resolution render (and 16-bit export) starts from the
-// twin, and the neighbor effects read it directly. The drag preview starts from previewBase16 when there is one.
+  // The 16-bit twin of original / oriented / rotated / source, for a picture
+  // that really has more than 8 bits (a 16-bit PNG); all null for any other
+  // file. Built from `original16` by the same operations, so
+  // each stage has the size of its 8-bit namesake (core/wide_chain.hpp). The
+  // 8-bit chain above is unchanged and is still what every tool measures; the
+  // full-resolution render (and 16-bit export) starts from the twin, and the
+  // neighbor effects read it directly. The drag preview starts from
+  // previewBase16 when there is one.
   std::shared_ptr<Image16> original16, oriented16, rotated16, source16;
-  std::shared_ptr<CanvasImage> image;   // source + adjustments applied —
-                                        // this is what's drawn and exported
-  std::string imagePath;                // full path of the opened file
-  exif::PhotoInfo photoInfo;            // its camera data (Info pane); see currentPhotoInfo()
-  uint64_t photoInfoSerial = ~uint64_t{0}; // the imageSerial photoInfo was read for
-  color_tag::ColorTag colorTag;            // what the open file says its color space is (Info pane); see currentColorTag()
-  uint64_t colorTagSerial = ~uint64_t{0};  // the imageSerial colorTag was read for
-  bool colorNoticePending = false;         // the open's color notice may still be wiped by a geometry job; show it again when that lands
+  std::shared_ptr<CanvasImage> image; // source + adjustments applied —
+                                      // this is what's drawn and exported
+  std::string imagePath;              // full path of the opened file
+  exif::PhotoInfo
+      photoInfo; // its camera data (Info pane); see currentPhotoInfo()
+  uint64_t photoInfoSerial =
+      ~uint64_t{0};             // the imageSerial photoInfo was read for
+  color_tag::ColorTag colorTag; // what the open file says its color space is
+                                // (Info pane); see currentColorTag()
+  uint64_t colorTagSerial =
+      ~uint64_t{0}; // the imageSerial colorTag was read for
+  bool colorNoticePending =
+      false; // the open's color notice may still be wiped by a geometry job;
+             // show it again when that lands
   float zoom = 1.0f;
   AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
   PhotoMeta meta;            // the open picture's rating / flag / color label
                              // (not an edit: no undo step, see ratePhoto)
   bool metaDirty = false;    // meta changed since the last sidecar save / load
-  SnapshotList snapshots;      // the open picture's named snapshots: saved in its
-                               // sidecar, not edits (see addSnapshot)
-  bool snapshotsDirty = false; // snapshots changed since the last sidecar save / load
+  SnapshotList snapshots;    // the open picture's named snapshots: saved in its
+                             // sidecar, not edits (see addSnapshot)
+  bool snapshotsDirty =
+      false; // snapshots changed since the last sidecar save / load
 
   // Export pane settings.
   bool exportJpeg = true;   // the format the Export dialog offers first
-  bool exportPng16 = false; // PNG export writes 16 bits per channel (the pane's "PNG  16-bit"); never set with exportJpeg
+  bool exportPng16 = false; // PNG export writes 16 bits per channel (the pane's
+                            // "PNG  16-bit"); never set with exportJpeg
   int jpegQuality = 92;     // 1..100
   bool keepMetadata = true; // carry the photo's EXIF + ICC profile into a JPEG
-  bool removeGps = false;   // ...but without the GPS location (JPEG only; needs keepMetadata)
-  bool exportResize = false; // shrink the export so its long side is exportLongEdge
-  int exportLongEdge = 2048; // px, kExportLongEdgeMin..kExportLongEdgeMax; never enlarges
-  bool exportOverwrite = false; // batch export: replace files that exist (else "-2", "-3"...)
+  bool removeGps =
+      false; // ...but without the GPS location (JPEG only; needs keepMetadata)
+  bool exportResize =
+      false; // shrink the export so its long side is exportLongEdge
+  int exportLongEdge =
+      2048; // px, kExportLongEdgeMin..kExportLongEdgeMax; never enlarges
+  bool exportOverwrite =
+      false; // batch export: replace files that exist (else "-2", "-3"...)
 
-  FilmStrip film;                         // the open folder's pictures (bottom strip)
+  FilmStrip film; // the open folder's pictures (bottom strip)
   CompareMode compare = CompareMode::Off; // Before / After view
-  float splitPos = 0.5f;                  // Split view: line position, 0..1 of width
+  float splitPos = 0.5f; // Split view: line position, 0..1 of width
   bool dirty = true;
 
   // Set by a slider drag (many events per second while held). The actual
@@ -537,10 +538,11 @@ struct EditorState
   // null for images already small enough that a preview wouldn't be
   // cheaper, in which case dragging just uses the full-resolution path.
   std::shared_ptr<CanvasImage> previewBase;
-  // The 16-bit twin of `previewBase` (box-downsampled from `source16` by the same factor, so the same
-  // size), for a picture that has a 16-bit twin; null otherwise. A drag renders it, so the preview
-// starts from the same precision as the full-resolution render that follows it. `previewBase` is
-// then only its 8-bit view.
+  // The 16-bit twin of `previewBase` (box-downsampled from `source16` by the
+  // same factor, so the same size), for a picture that has a 16-bit twin; null
+  // otherwise. A drag renders it, so the preview
+  // starts from the same precision as the full-resolution render that follows
+  // it. `previewBase` is then only its 8-bit view.
   std::shared_ptr<Image16> previewBase16;
   std::shared_ptr<CanvasImage> previewImage;
   bool dragging = false;
@@ -550,9 +552,11 @@ struct EditorState
 
   // Masks pane (activity 7). The masks themselves live in `adjust` (so they
   // are undoable); this is only which one is selected and how it is shown.
-  int maskSel = -1;          // index into adjust.masks(); read it through selMask()
-  bool maskShowTint = false; // paint the selected mask's weight in the overlay color
-  int maskTintColor = 0;     // index into kMaskTintPalette (session only, not saved)
+  int maskSel = -1; // index into adjust.masks(); read it through selMask()
+  bool maskShowTint =
+      false; // paint the selected mask's weight in the overlay color
+  int maskTintColor =
+      0; // index into kMaskTintPalette (session only, not saved)
   MaskUi mask;
 
   int activeActivity = 0; // -1 = sidebar closed
@@ -575,27 +579,24 @@ struct EditorState
   float previewDocW = 0.0f, previewDocH = 0.0f;
   bool dragIsAngle = false; // the drag in progress is the angle slider
 
-  uint64_t imageSerial = 0; // bumps on every opened file (keys segmenter caches)
+  uint64_t imageSerial =
+      0; // bumps on every opened file (keys segmenter caches)
 
   // True while `previewImage` stands in for `image`: during a drag, and after
   // it until the background full-resolution render lands (renderWorker).
-  bool showPreview() const
-  {
+  bool showPreview() const {
     return previewImage && (dragging || renderWorker.outstanding());
   }
 
-  bool previewDocActive() const
-  {
+  bool previewDocActive() const {
     return dragging && previewImage && previewDocW > 0.0f;
   }
-  float docWidth() const
-  {
+  float docWidth() const {
     if (previewDocActive())
       return previewDocW;
     return image ? static_cast<float>(image->width) : kPlaceholderW;
   }
-  float docHeight() const
-  {
+  float docHeight() const {
     if (previewDocActive())
       return previewDocH;
     return image ? static_cast<float>(image->height) : kPlaceholderH;
@@ -636,8 +637,9 @@ struct EditorState
   uint8_t hoverR = 0, hoverG = 0, hoverB = 0;
 
   // White-balance picker (a button in the Adjust pane, key W). While armed, one
-  // click on the picture sets Temperature and Tint so that spot turns gray. Read
-  // it through wbPickerActive(), which also drops it when it no longer applies.
+  // click on the picture sets Temperature and Tint so that spot turns gray.
+  // Read it through wbPickerActive(), which also drops it when it no longer
+  // applies.
   bool wbPicking = false;
 };
 
@@ -646,14 +648,12 @@ static EditorState state;
 // Shows `msg` in the status bar. Kept to one short line: newlines (library
 // error strings sometimes have them) become spaces, and long text is cut on
 // a UTF-8 boundary with an ellipsis.
-static void setStatus(std::string msg, bool isError)
-{
+static void setStatus(std::string msg, bool isError) {
   constexpr size_t kMaxLen = 110;
   for (char &c : msg)
     if (c == '\n' || c == '\r')
       c = ' ';
-  if (msg.size() > kMaxLen)
-  {
+  if (msg.size() > kMaxLen) {
     size_t cut = kMaxLen - 3;
     while (cut > 0 && (static_cast<unsigned char>(msg[cut]) & 0xC0) == 0x80)
       --cut; // don't split a multi-byte character
@@ -663,14 +663,12 @@ static void setStatus(std::string msg, bool isError)
   state.statusMsg = std::move(msg);
   state.statusIsError = isError;
 }
-static void clearStatus()
-{
+static void clearStatus() {
   state.statusMsg.clear();
   state.statusIsError = false;
 }
 
-static void setZoom(float z)
-{
+static void setZoom(float z) {
   state.zoom = std::clamp(z, kZoomMin, kZoomMax);
   state.markDirty();
 }
@@ -695,8 +693,7 @@ static void announceColorTag();
 // from there. Nothing runs while no render is outstanding, so an idle editor
 // costs nothing.
 
-static void adoptFullRender(RenderWorker::Result &&r)
-{
+static void adoptFullRender(RenderWorker::Result &&r) {
   state.image = std::move(r.image);
   state.previewImage.reset(); // the real thing replaces the stand-in
   state.histStale = true;
@@ -704,16 +701,14 @@ static void adoptFullRender(RenderWorker::Result &&r)
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust.
-static void collectFullRender()
-{
+static void collectFullRender() {
   if (auto r = renderWorker.collect())
     adoptFullRender(std::move(*r));
 }
 
 // Blocking: makes `state.image` current. For the few places that need the
 // real pixels *now* (export).
-static void finishFullRender()
-{
+static void finishFullRender() {
   if (!renderWorker.outstanding())
     return;
   adoptFullRender(renderWorker.waitForLatest());
@@ -721,8 +716,7 @@ static void finishFullRender()
 
 // A drag starts (or continues) on the preview path. A full-resolution render
 // still in flight would be for values the drag is about to change, so drop it.
-static void enterDrag(bool isAngle)
-{
+static void enterDrag(bool isAngle) {
   if (!state.dragging)
     renderWorker.invalidate();
   state.dragging = true; // switches recompute+paint to the preview path
@@ -745,11 +739,10 @@ static void enterDrag(bool isAngle)
 //    (crop, rotate, straighten, a newly opened file), because then
 //    `source`, `image`, the document size and the crop selection must all
 //    change together.
-static void updateImageFromAdjustments()
-{
+static void updateImageFromAdjustments() {
   if (!state.original)
     return;
-  clearStatus();             // the image is about to change: an old message is stale
+  clearStatus(); // the image is about to change: an old message is stale
   state.colorNoticePending = false;
   renderWorker.invalidate(); // whatever was in flight is now out of date
 
@@ -758,8 +751,7 @@ static void updateImageFromAdjustments()
   // geometryWorker instead of blocking here. geometryDirty() folds in
   // "a job is already running" (see its definition): either way, submit()
   // replaces whatever's in flight, so this is safe to call every time.
-  if (isLargeImage(*state.original) && geometryDirty())
-  {
+  if (isLargeImage(*state.original) && geometryDirty()) {
     submitGeometryJob();
     return; // keep showing the current picture until the bundle lands
   }
@@ -770,14 +762,15 @@ static void updateImageFromAdjustments()
   const bool canDefer = state.previewBase && !sourceChanged && state.image &&
                         state.image->width == state.source->width &&
                         state.image->height == state.source->height;
-  if (canDefer)
-  {
+  if (canDefer) {
     updatePreviewFromAdjustments(); // cheap stand-in, shown immediately
-    renderWorker.submit(RenderJob{state.source, state.adjust.buildRenderParams(), state.source16});
+    renderWorker.submit(RenderJob{
+        state.source, state.adjust.buildRenderParams(), state.source16});
     return;
   }
   state.image = state.source16
-                    ? renderToDisplay(*state.source16, state.source.get(), state.adjust.buildRenderParams())
+                    ? renderToDisplay(*state.source16, state.source.get(),
+                                      state.adjust.buildRenderParams())
                     : renderAdjusted(state.adjust, *state.source);
   state.previewImage.reset(); // superseded by the full-resolution result
   state.previewDocW = state.previewDocH = 0.0f;
@@ -789,27 +782,26 @@ static void updateImageFromAdjustments()
 // instead of the full-resolution original. Only touches state.previewImage;
 // state.image (and so the document size, export, and info labels) is left
 // alone until the drag ends.
-static void updatePreviewFromAdjustments()
-{
+static void updatePreviewFromAdjustments() {
   if (!state.previewBase)
     return;
-  state.previewImage = state.previewBase16
-                           ? renderToDisplay(*state.previewBase16, state.previewBase.get(), state.adjust.buildRenderParams())
-                           : renderAdjusted(state.adjust, *state.previewBase);
+  state.previewImage =
+      state.previewBase16
+          ? renderToDisplay(*state.previewBase16, state.previewBase.get(),
+                            state.adjust.buildRenderParams())
+          : renderAdjusted(state.adjust, *state.previewBase);
   state.histStale = true;
   state.markDirty();
 }
 
 // ---------------- Crop ----------------
 
-static bool cropToolActive()
-{
+static bool cropToolActive() {
   return state.activeActivity == 2 && state.image != nullptr;
 }
 
 // Width/height ratio the selection is locked to, or 0 for free-form.
-static float cropAspect()
-{
+static float cropAspect() {
   const float ratio = kCropAspects[state.crop.aspectIdx].ratio;
   if (ratio >= 0.0f)
     return ratio;
@@ -821,8 +813,7 @@ static float cropAspect()
 
 // Shrinks the selection (about its center) to the locked aspect ratio, so
 // it always stays inside where it already was.
-static void cropFitToAspect()
-{
+static void cropFitToAspect() {
   const float a = cropAspect();
   if (a <= 0.0f)
     return;
@@ -842,8 +833,7 @@ static void cropFitToAspect()
 }
 
 // Selection = the whole image being cropped (then fitted to the aspect lock).
-static void resetCropSelection()
-{
+static void resetCropSelection() {
   auto &c = state.crop;
   c.l = 0.0f;
   c.t = 0.0f;
@@ -853,8 +843,7 @@ static void resetCropSelection()
   cropFitToAspect();
 }
 
-static void setCropAspect(size_t idx)
-{
+static void setCropAspect(size_t idx) {
   state.crop.aspectIdx = idx;
   cropFitToAspect();
   state.markDirty();
@@ -866,8 +855,7 @@ static void setCropAspect(size_t idx)
 // rotate/flip/straighten, an undo/redo across any of them, or (force) when a
 // new image is opened. Also re-seeds the selection, since the image the
 // selection is measured against just changed size.
-static void syncSource(bool force)
-{
+static void syncSource(bool force) {
   if (!state.original)
     return;
   const CropRect crop = state.adjust.crop();
@@ -884,15 +872,13 @@ static void syncSource(bool force)
   if (!force && state.source && !rotateChanged && crop == state.sourceCrop)
     return;
 
-  if (orientChanged)
-  {
+  if (orientChanged) {
     state.oriented = orientImage(state.original, orient);
     state.oriented16 = wide_chain::oriented(state.original16, orient);
     state.orientedFor = orient;
     state.orientedPreview = makePreviewBase(*state.oriented);
   }
-  if (rotateChanged)
-  {
+  if (rotateChanged) {
     state.rotated = angle == 0.0f
                         ? state.oriented
                         : rotateArbitrary(*state.oriented, angle, expand);
@@ -904,7 +890,8 @@ static void syncSource(bool force)
   state.source = crop.empty() ? state.rotated : cropImage(*state.rotated, crop);
   state.source16 = wide_chain::cropped(state.rotated16, crop);
   state.previewBase = makePreviewBase(*state.source);
-  state.previewBase16 = state.source16 ? makePreviewBase(*state.source16) : nullptr;
+  state.previewBase16 =
+      state.source16 ? makePreviewBase(*state.source16) : nullptr;
   state.previewImage.reset();
   resetCropSelection();
 }
@@ -930,13 +917,13 @@ static void syncSource(bool force)
 // work only costs latency on a background thread, never a UI freeze.
 // The thread and the generation protocol live in latest_worker.hpp; this is
 // the job. `original` must never be modified afterwards (the editor's images
-// are replaced, never edited in place - the same rule RenderJob::src relies on).
+// are replaced, never edited in place - the same rule RenderJob::src relies
+// on).
 
 // Exactly the geometry-derived EditorState fields, adopted as one atomic swap
 // on the UI thread (see adoptGeometryBundle) so the picture, its document
 // size, and the crop selection always change together.
-struct GeometryBundle
-{
+struct GeometryBundle {
   std::shared_ptr<CanvasImage> oriented;
   Orient orientedFor;
   std::shared_ptr<CanvasImage> orientedPreview;
@@ -946,16 +933,17 @@ struct GeometryBundle
   std::shared_ptr<CanvasImage> source;
   CropRect sourceCrop;
   std::shared_ptr<CanvasImage> previewBase;
-  std::shared_ptr<Image16> previewBase16; // the 16-bit twin of previewBase (null for an 8-bit file or a small picture)
+  std::shared_ptr<Image16>
+      previewBase16; // the 16-bit twin of previewBase (null for an 8-bit file
+                     // or a small picture)
   std::shared_ptr<CanvasImage> image;
-  std::shared_ptr<Image16> oriented16, rotated16, source16; // the 16-bit twin (null for an 8-bit file)
+  std::shared_ptr<Image16> oriented16, rotated16,
+      source16; // the 16-bit twin (null for an 8-bit file)
 };
-struct GeometryResult
-{
+struct GeometryResult {
   GeometryBundle bundle;
 };
-struct GeometryJob
-{
+struct GeometryJob {
   // Non-const, unlike RenderJob::src: orientImage (identity case) and the rest
   // of this pipeline are written in terms of the same shared_ptr<CanvasImage>
   // type `state.original` already is, so this just carries that type through -
@@ -966,7 +954,8 @@ struct GeometryJob
   bool expand = false;
   CropRect crop;
   RenderParams renderParams;
-  std::shared_ptr<Image16> original16; // the 16-bit twin of `original`, if the picture has one
+  std::shared_ptr<Image16>
+      original16; // the 16-bit twin of `original`, if the picture has one
 };
 
 // The pipeline itself (worker thread only). Checked for cancellation between
@@ -975,8 +964,7 @@ struct GeometryJob
 // mid-render abandons within a few milliseconds rather than finishing
 // unwanted work.
 static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
-                                                    WorkerCancel c)
-{
+                                                    WorkerCancel c) {
   if (c.cancelled())
     return std::nullopt;
   GeometryBundle b;
@@ -987,14 +975,11 @@ static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
   b.orientedPreview = makePreviewBase(*b.oriented);
   if (c.cancelled())
     return std::nullopt;
-  if (job.angle == 0.0f)
-  {
+  if (job.angle == 0.0f) {
     b.rotated = b.oriented;
-  }
-  else
-  {
-    b.rotated = rotateArbitrary(*b.oriented, job.angle, job.expand, c.latest,
-                                c.gen);
+  } else {
+    b.rotated =
+        rotateArbitrary(*b.oriented, job.angle, job.expand, c.latest, c.gen);
     if (!b.rotated)
       return std::nullopt; // abandoned mid-straighten
   }
@@ -1006,12 +991,13 @@ static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
   b.source = job.crop.empty() ? b.rotated : cropImage(*b.rotated, job.crop);
   if (c.cancelled())
     return std::nullopt;
-  if (job.original16)
-  { // the 16-bit twin of the same chain; the render below starts from it
+  if (job.original16) { // the 16-bit twin of the same chain; the render below
+                        // starts from it
     b.oriented16 = wide_chain::oriented(job.original16, job.orient);
     if (c.cancelled())
       return std::nullopt;
-    b.rotated16 = wide_chain::rotated(b.oriented16, job.angle, job.expand, c.latest, c.gen);
+    b.rotated16 = wide_chain::rotated(b.oriented16, job.angle, job.expand,
+                                      c.latest, c.gen);
     if (!b.rotated16)
       return std::nullopt; // abandoned mid-straighten
     b.source16 = wide_chain::cropped(b.rotated16, job.crop);
@@ -1020,8 +1006,10 @@ static std::optional<GeometryResult> runGeometryJob(GeometryJob &&job,
   }
   b.previewBase = makePreviewBase(*b.source);
   b.previewBase16 = b.source16 ? makePreviewBase(*b.source16) : nullptr;
-  b.image = b.source16 ? renderToDisplay(*b.source16, b.source.get(), job.renderParams, c.latest, c.gen)
-                       : renderWith(*b.source, job.renderParams, c.latest, c.gen);
+  b.image = b.source16
+                ? renderToDisplay(*b.source16, b.source.get(), job.renderParams,
+                                  c.latest, c.gen)
+                : renderWith(*b.source, job.renderParams, c.latest, c.gen);
   if (!b.image)
     return std::nullopt; // abandoned mid-render
   return GeometryResult{std::move(b)};
@@ -1040,8 +1028,7 @@ static GeometryWorker geometryWorker{runGeometryJob};
 // never actually independent — but checking both directly, rather than
 // relying on that invariant, means a bug elsewhere fails safe (one wasted
 // resubmit) instead of silently letting a stale in-flight job get adopted.
-static bool geometryDirty()
-{
+static bool geometryDirty() {
   if (geometryWorker.outstanding())
     return true;
   if (!state.oriented || !state.rotated)
@@ -1058,20 +1045,18 @@ static bool geometryDirty()
   return state.adjust.crop() != state.sourceCrop;
 }
 
-static void submitGeometryJob()
-{
-  geometryWorker.submit(GeometryJob{
-      state.original, state.adjust.orient(), state.adjust.angle(),
-      state.adjust.expand(), state.adjust.crop(),
-      state.adjust.buildRenderParams(), state.original16});
+static void submitGeometryJob() {
+  geometryWorker.submit(
+      GeometryJob{state.original, state.adjust.orient(), state.adjust.angle(),
+                  state.adjust.expand(), state.adjust.crop(),
+                  state.adjust.buildRenderParams(), state.original16});
   setStatus("Applying changes...", /*isError=*/false);
 }
 
 // Swaps in every field of a finished geometry rebuild together, so the
 // picture, its document size, and the crop selection never show a
 // combination that belonged to two different requests.
-static void adoptGeometryBundle(GeometryWorker::Result &&r)
-{
+static void adoptGeometryBundle(GeometryWorker::Result &&r) {
   GeometryBundle &b = r.bundle;
   state.oriented = std::move(b.oriented);
   state.orientedFor = b.orientedFor;
@@ -1092,26 +1077,24 @@ static void adoptGeometryBundle(GeometryWorker::Result &&r)
   resetCropSelection(); // the crop UI must match the new source's dimensions
   state.histStale = true;
   clearStatus(); // the "Applying changes..." message is no longer true
-  if (state.colorNoticePending)
-  {
+  if (state.colorNoticePending) {
     state.colorNoticePending = false;
-    announceColorTag(); // a freshly opened picture's color notice, wiped by the line above
+    announceColorTag(); // a freshly opened picture's color notice, wiped by the
+                        // line above
   }
   state.markDirty();
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust, alongside
 // collectFullRender.
-static void collectGeometryJob()
-{
+static void collectGeometryJob() {
   if (auto r = geometryWorker.collect())
     adoptGeometryBundle(std::move(*r));
 }
 
 // Blocking: makes every field a geometry rebuild touches current. For the
 // one place that needs the real pixels *now* (export).
-static void finishGeometryJob()
-{
+static void finishGeometryJob() {
   if (!geometryWorker.outstanding())
     return;
   adoptGeometryBundle(geometryWorker.waitForLatest());
@@ -1127,22 +1110,19 @@ static bool geometryBusy() { return geometryWorker.outstanding(); }
 
 // Which part of the selection is under (px, py) (image coordinates)?
 // Returns kEdge* bits for a handle, kEdgeMove for the interior, 0 for none.
-static int cropHitTest(float px, float py)
-{
+static int cropHitTest(float px, float py) {
   const auto &c = state.crop;
   const float tol = kCropHitPx / state.zoom;
   const bool inX = px >= c.l - tol && px <= c.r + tol;
   const bool inY = py >= c.t - tol && py <= c.b + tol;
   int m = 0;
-  if (inY)
-  {
+  if (inY) {
     if (std::abs(px - c.l) <= tol)
       m |= kEdgeL;
     else if (std::abs(px - c.r) <= tol)
       m |= kEdgeR;
   }
-  if (inX)
-  {
+  if (inX) {
     if (std::abs(py - c.t) <= tol)
       m |= kEdgeT;
     else if (std::abs(py - c.b) <= tol)
@@ -1158,27 +1138,23 @@ static int cropHitTest(float px, float py)
 // Sets the selection to the rectangle spanned by a fixed corner (ax, ay)
 // and the pointer, honoring the aspect lock and the image bounds. Used for
 // both "drag out a new selection" and "drag a corner handle".
-static void cropDragCorner(float ax, float ay, float px, float py)
-{
+static void cropDragCorner(float ax, float ay, float px, float py) {
   auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float a = cropAspect();
   const float sx = px >= ax ? 1.0f : -1.0f;
   const float sy = py >= ay ? 1.0f : -1.0f;
   float w = std::abs(px - ax), h = std::abs(py - ay);
-  if (a > 0.0f)
-  {
+  if (a > 0.0f) {
     w = std::max(w, h * a); // grow to whichever dimension asks for more
     h = w / a;
     const float maxW = sx > 0.0f ? W - ax : ax;
     const float maxH = sy > 0.0f ? H - ay : ay;
-    if (w > maxW)
-    {
+    if (w > maxW) {
       w = maxW;
       h = w / a;
     }
-    if (h > maxH)
-    {
+    if (h > maxH) {
       h = maxH;
       w = h * a;
     }
@@ -1191,24 +1167,21 @@ static void cropDragCorner(float ax, float ay, float px, float py)
 }
 
 // Drags one edge or corner of the existing selection to the pointer.
-static void cropResize(int mask, float px, float py)
-{
+static void cropResize(int mask, float px, float py) {
   auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float minSz = std::min({kCropMinPx, W, H});
   const bool horiz = (mask & (kEdgeL | kEdgeR)) != 0;
   const bool vert = (mask & (kEdgeT | kEdgeB)) != 0;
 
-  if (horiz && vert)
-  { // corner: the opposite corner stays put
+  if (horiz && vert) { // corner: the opposite corner stays put
     cropDragCorner((mask & kEdgeL) ? c.r : c.l, (mask & kEdgeT) ? c.b : c.t, px,
                    py);
     return;
   }
 
   const float a = cropAspect();
-  if (a <= 0.0f)
-  { // free-form edge
+  if (a <= 0.0f) { // free-form edge
     if (mask & kEdgeL)
       c.l = std::clamp(px, 0.0f, c.r - minSz);
     if (mask & kEdgeR)
@@ -1222,8 +1195,7 @@ static void cropResize(int mask, float px, float py)
 
   // Aspect-locked edge: the dragged edge sets the primary dimension, and
   // the other dimension follows, centered on where the selection was.
-  if (horiz)
-  {
+  if (horiz) {
     const float cy = (c.t + c.b) / 2.0f;
     const bool left = (mask & kEdgeL) != 0;
     const float room = left ? c.r : W - c.l;
@@ -1237,9 +1209,7 @@ static void cropResize(int mask, float px, float py)
       c.r = c.l + w;
     c.t = cy - h / 2.0f;
     c.b = cy + h / 2.0f;
-  }
-  else
-  {
+  } else {
     const float cx = (c.l + c.r) / 2.0f;
     const bool top = (mask & kEdgeT) != 0;
     const float room = top ? c.b : H - c.t;
@@ -1258,8 +1228,7 @@ static void cropResize(int mask, float px, float py)
 
 // Canvas mouse handlers. (lx, ly) are canvas-local screen px; dividing by
 // the zoom gives image pixels.
-static void cropPress(float lx, float ly)
-{
+static void cropPress(float lx, float ly) {
   state.openMenu = -1; // the canvas now swallows presses that used to fall
                        // through to the workspace's "close menu" handler
   if (!cropToolActive())
@@ -1268,19 +1237,14 @@ static void cropPress(float lx, float ly)
   const float px = std::clamp(lx / state.zoom, 0.0f, state.docWidth());
   const float py = std::clamp(ly / state.zoom, 0.0f, state.docHeight());
   const int hit = cropHitTest(px, py);
-  if (hit == kEdgeMove)
-  {
+  if (hit == kEdgeMove) {
     c.drag = CropUi::Drag::Move;
     c.grabX = px - c.l;
     c.grabY = py - c.t;
-  }
-  else if (hit)
-  {
+  } else if (hit) {
     c.drag = CropUi::Drag::Resize;
     c.mask = hit;
-  }
-  else
-  {
+  } else {
     // Empty area: start a new selection here. The old one stays until the
     // pointer actually moves, so a plain click doesn't wipe it out.
     c.drag = CropUi::Drag::New;
@@ -1289,24 +1253,21 @@ static void cropPress(float lx, float ly)
   }
 }
 
-static void cropDrag(float lx, float ly)
-{
+static void cropDrag(float lx, float ly) {
   auto &c = state.crop;
   if (!cropToolActive() || c.drag == CropUi::Drag::None)
     return;
   const float W = state.docWidth(), H = state.docHeight();
   const float px = std::clamp(lx / state.zoom, 0.0f, W);
   const float py = std::clamp(ly / state.zoom, 0.0f, H);
-  switch (c.drag)
-  {
+  switch (c.drag) {
   case CropUi::Drag::New:
     cropDragCorner(c.ax, c.ay, px, py);
     break;
   case CropUi::Drag::Resize:
     cropResize(c.mask, px, py);
     break;
-  case CropUi::Drag::Move:
-  {
+  case CropUi::Drag::Move: {
     const float w = c.r - c.l, h = c.b - c.t;
     c.l = std::clamp(px - c.grabX, 0.0f, W - w);
     c.t = std::clamp(py - c.grabY, 0.0f, H - h);
@@ -1321,8 +1282,7 @@ static void cropDrag(float lx, float ly)
 }
 
 // Commits the current selection as the crop (one undo step).
-static void applyCrop()
-{
+static void applyCrop() {
   if (!state.source || geometryBusy())
     return;
   const auto &c = state.crop;
@@ -1344,8 +1304,7 @@ static void applyCrop()
 }
 
 // Drops the committed crop, restoring the full original (one undo step).
-static void removeCrop()
-{
+static void removeCrop() {
   if (geometryBusy() || state.adjust.crop().empty())
     return;
   state.adjust.setCrop(CropRect{});
@@ -1356,8 +1315,7 @@ static void removeCrop()
 
 // One undo step. `state.rotated` is what crops are measured against, so its
 // size is the (W, H) geoStep needs.
-static void applyGeoOp(GeoOp op)
-{
+static void applyGeoOp(GeoOp op) {
   if (!state.original || !state.rotated || geometryBusy())
     return;
   Orient o = state.adjust.orient();
@@ -1372,8 +1330,7 @@ static void applyGeoOp(GeoOp op)
 // Undoes every 90-degree turn and flip in one step (the crop follows,
 // staying on the same part of the picture; the straighten angle is kept,
 // still tilting the picture the same way relative to its own edges).
-static void resetOrientation()
-{
+static void resetOrientation() {
   if (!state.original || !state.rotated || geometryBusy() ||
       state.adjust.orient().identity())
     return;
@@ -1393,27 +1350,23 @@ static void resetOrientation()
 
 // Slider drag: one undo step per drag. Only records the value — the
 // resample is deferred to canvasDirtySource (see there), once per frame.
-static void setAngleFromSlider(float deg)
-{
+static void setAngleFromSlider(float deg) {
   state.adjust.setAngle(snapAngle(deg), /*coalesce=*/true);
 }
 
 // A discrete change (nudge button / reset): its own undo step, resampled at
 // full resolution on the next frame.
-static void setAngleDiscrete(float deg)
-{
+static void setAngleDiscrete(float deg) {
   if (!state.original)
     return;
   state.adjust.setAngle(snapAngle(deg), /*coalesce=*/false);
   state.markAdjustDirty();
 }
-static void nudgeAngle(float delta)
-{
+static void nudgeAngle(float delta) {
   setAngleDiscrete(state.adjust.angle() + delta);
 }
 
-static void setCornerMode(bool expand)
-{
+static void setCornerMode(bool expand) {
   if (!state.original)
     return;
   state.adjust.setExpand(expand);
@@ -1424,8 +1377,7 @@ static void setCornerMode(bool expand)
 // `orientedPreview` instead of the full-resolution picture, drawn stretched
 // to the size the full-resolution result will have (previewDoc*). The
 // full-resolution turn runs once, when the drag ends (pointer up / cancel).
-static void updateAnglePreview()
-{
+static void updateAnglePreview() {
   if (!state.orientedPreview || !state.oriented)
     return;
   const float a = state.adjust.angle();
@@ -1440,16 +1392,14 @@ static void updateAnglePreview()
   state.markDirty();
 }
 
-static void undo()
-{
+static void undo() {
   if (!state.adjust.canUndo())
     return;
   state.adjust.undo();
   updateImageFromAdjustments();
 }
 
-static void redo()
-{
+static void redo() {
   if (!state.adjust.canRedo())
     return;
   state.adjust.redo();
@@ -1467,30 +1417,30 @@ static void redo()
 // A decode already running can't be interrupted (the image libraries have no
 // cancel hook), so opening a second file queues behind it and the first
 // file's result is simply dropped when it finishes.
-struct DecodeJob
-{
+struct DecodeJob {
   std::string path;
 };
-struct DecodeResult
-{
+struct DecodeResult {
   std::string path;
-  std::optional<CanvasImage> image; // empty on failure (for a 16-bit file: its 8-bit form)
-  std::string error;                // library message when image is empty
-  std::shared_ptr<Image16> wide;    // a 16-bit PNG at full precision (upright); null for every other file
+  std::optional<CanvasImage>
+      image;         // empty on failure (for a 16-bit file: its 8-bit form)
+  std::string error; // library message when image is empty
+  std::shared_ptr<Image16> wide; // a 16-bit PNG at full precision (upright);
+                                 // null for every other file
 };
 
 // Worker thread only. Always returns a value (a failure is an empty `image`
 // plus `error`): a decode can't be cancelled part-way.
-static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel)
-{
+static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel) {
   DecodeResult r;
   r.path = job.path;
   const std::string real = vcImageOf(job.path); // a copy decodes its picture
-  // A camera's rotation (EXIF) is applied here, once: from now on the picture is upright everywhere
-  // (editor, masks, saved edits, export). A 16-bit file is read at full precision into `wide`, and its
-  // 8-bit form (what the tools measure) is made from it. See io/image_source.hpp.
-  if (auto opened = image_source::openUpright(real, exifOrientationOf(real), /*want8=*/true, &r.error))
-  {
+  // A camera's rotation (EXIF) is applied here, once: from now on the picture
+  // is upright everywhere (editor, masks, saved edits, export). A 16-bit file
+  // is read at full precision into `wide`, and its 8-bit form (what the tools
+  // measure) is made from it. See io/image_source.hpp.
+  if (auto opened = image_source::openUpright(real, exifOrientationOf(real),
+                                              /*want8=*/true, &r.error)) {
     r.image.emplace(std::move(*opened->image));
     r.wide = std::move(opened->wide);
   }
@@ -1498,13 +1448,11 @@ static std::optional<DecodeResult> runDecodeJob(DecodeJob &&job, WorkerCancel)
 }
 
 // LatestWorker plus the UI-thread bookkeeping of which file is being decoded.
-class DecodeWorker : public LatestWorker<DecodeJob, DecodeResult>
-{
+class DecodeWorker : public LatestWorker<DecodeJob, DecodeResult> {
 public:
   DecodeWorker() : LatestWorker<DecodeJob, DecodeResult>(runDecodeJob) {}
 
-  void submit(std::string path)
-  {
+  void submit(std::string path) {
     pendingPath_ = path;
     LatestWorker<DecodeJob, DecodeResult>::submit(DecodeJob{std::move(path)});
   }
@@ -1520,42 +1468,38 @@ private:
 static DecodeWorker decodeWorker;
 
 // ---------------- Object segmentation (background) ----------------
-struct SegmentRequest
-{
+struct SegmentRequest {
   std::shared_ptr<const CanvasImage> image; // the untouched original
   uint64_t imageKey = 0;                    // state.imageSerial
   std::vector<ObjectPrompt> prompts;        // original-picture fractions
   int maskIdx = -1, part = -1;              // where the result goes
-  bool prefetch = false;                    // encode only (warm the model), no result map
+  bool prefetch = false; // encode only (warm the model), no result map
 };
 
-// ---- Segmentation engine info (SAM model, with the color-grow wand of seg_basic.hpp as fallback) ----
+// ---- Segmentation engine info (SAM model, with the color-grow wand of
+// seg_basic.hpp as fallback) ----
 
 // Which engine is active, shown in the Object panel (written by the worker,
 // read by the UI thread's label poll).
 static std::mutex gSegInfoMutex;
 static std::string gSegInfo = "Engine: loads on first use";
-static void setSegInfo(std::string s)
-{
+static void setSegInfo(std::string s) {
   std::lock_guard<std::mutex> lk(gSegInfoMutex);
   gSegInfo = std::move(s);
 }
-static std::string getSegInfo()
-{
+static std::string getSegInfo() {
   std::lock_guard<std::mutex> lk(gSegInfoMutex);
   return gSegInfo;
 }
 
 // Models: $LITEROOM_MODELS, else a "models" folder next to the executable.
-static std::string samModelDir()
-{
+static std::string samModelDir() {
   if (const char *e = std::getenv("LITEROOM_MODELS"); e && *e)
     return e;
 #if defined(_WIN32)
   wchar_t wbuf[MAX_PATH];
   const DWORD n = GetModuleFileNameW(nullptr, wbuf, MAX_PATH);
-  if (n > 0 && n < MAX_PATH)
-  {
+  if (n > 0 && n < MAX_PATH) {
     std::wstring w(wbuf, n);
     const size_t slash = w.find_last_of(L"\\/");
     if (slash != std::wstring::npos)
@@ -1571,8 +1515,7 @@ static std::string samModelDir()
 #else
   char buf[4096];
   const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-  if (n > 0)
-  {
+  if (n > 0) {
     std::string p(buf, static_cast<size_t>(n));
     const size_t slash = p.find_last_of('/');
     if (slash != std::string::npos)
@@ -1587,23 +1530,18 @@ static std::string samModelDir()
 static std::shared_ptr<const ObjectMap>
 segmentObject(const CanvasImage &img, uint64_t key,
               const std::vector<ObjectPrompt> &prompts, std::string *err,
-              const std::atomic<uint64_t> *latest, uint64_t gen)
-{
+              const std::atomic<uint64_t> *latest, uint64_t gen) {
   static sam::Segmenter seg;
   static int backend = 0; // 0 untried, 1 SAM, -1 fallback
   static uint64_t encodedKey = 0;
-  if (backend == 0)
-  {
+  if (backend == 0) {
     const std::string dir = samModelDir();
     std::string e;
     if (seg.load(dir + "/mobile_sam.encoder.onnx",
-                 dir + "/mobile_sam.decoder.onnx", &e))
-    {
+                 dir + "/mobile_sam.decoder.onnx", &e)) {
       backend = 1;
       setSegInfo("Engine: MobileSAM");
-    }
-    else
-    {
+    } else {
       backend = -1;
       setSegInfo("Engine: basic color grow (" + e + "; looked in " + dir + ")");
     }
@@ -1613,8 +1551,7 @@ segmentObject(const CanvasImage &img, uint64_t key,
                ? nullptr
                : segmentObjectWand(img, key, prompts, err, latest, gen);
 
-  if (encodedKey != key)
-  {
+  if (encodedKey != key) {
     if (!seg.encode(img.pixels.data(), img.width, img.height, err))
       return nullptr;
     encodedKey = key;
@@ -1637,13 +1574,12 @@ segmentObject(const CanvasImage &img, uint64_t key,
   m->id = nextObjectMapId();
   m->a.resize(logits.size());
   for (size_t i = 0; i < logits.size(); ++i) // soft edge: sigmoid of the logit
-    m->a[i] = static_cast<uint8_t>(std::lround(
-        255.0f / (1.0f + std::exp(-logits[i] * kSamSoftness))));
+    m->a[i] = static_cast<uint8_t>(
+        std::lround(255.0f / (1.0f + std::exp(-logits[i] * kSamSoftness))));
   return m;
 }
 
-struct SegmentResult
-{
+struct SegmentResult {
   SegmentRequest req;                   // image dropped; prompts + target kept
   std::shared_ptr<const ObjectMap> map; // null on failure
   std::string error;
@@ -1651,8 +1587,7 @@ struct SegmentResult
 
 // Worker thread only. Always returns a value (null `map` + `error` on failure).
 static std::optional<SegmentResult> runSegmentJob(SegmentRequest &&req,
-                                                  WorkerCancel c)
-{
+                                                  WorkerCancel c) {
   SegmentResult r;
   r.map = segmentObject(*req.image, req.imageKey, req.prompts, &r.error,
                         c.latest, c.gen);
@@ -1669,15 +1604,12 @@ static SegmentWorker segmentWorker{runSegmentJob};
 // UI thread: commits a finished segmentation. Prompts and map land in ONE
 // undo step. A result for a mask/part that is gone (deleted, undone away) is
 // dropped.
-static void adoptSegment(SegmentWorker::Result &&r)
-{
+static void adoptSegment(SegmentWorker::Result &&r) {
 
-  if (r.req.prefetch)
-  {
+  if (r.req.prefetch) {
     if (!r.error.empty())
       setStatus("Object selection unavailable: " + r.error, true);
-    else
-    {
+    else {
       state.mask.encodedKey = r.req.imageKey;
       clearStatus();
     }
@@ -1686,8 +1618,7 @@ static void adoptSegment(SegmentWorker::Result &&r)
   }
   state.mask.objPending = {};
   state.markDirty();
-  if (!r.map)
-  {
+  if (!r.map) {
     setStatus("Object selection failed" +
                   (r.error.empty() ? std::string() : ": " + r.error),
               true);
@@ -1712,8 +1643,7 @@ static void adoptSegment(SegmentWorker::Result &&r)
 }
 
 // Polled once per frame from flushPendingAdjust.
-static void collectSegmentJob()
-{
+static void collectSegmentJob() {
   if (auto r = segmentWorker.collect())
     adoptSegment(std::move(*r));
 }
@@ -1735,15 +1665,13 @@ static void filmApplyMeta(const std::string &path, const PhotoMeta &m); // ditto
 // Opening a picture and touching nothing writes nothing. The undo history is
 // not saved.
 
-static std::filesystem::path sidecarPath(const std::string &imagePath)
-{
+static std::filesystem::path sidecarPath(const std::string &imagePath) {
   return fsPath(sidecarFileOf(imagePath));
 }
 
 // A picture's name for messages and the title bar: a virtual copy shows as
 // "photo.jpg [Copy 2]".
-static std::string pictureLabel(const std::string &path)
-{
+static std::string pictureLabel(const std::string &path) {
   std::string s = baseName(vcImageOf(path));
   if (const int n = vcCopyOf(path); n > 0)
     s += " [Copy " + std::to_string(n) + "]";
@@ -1752,14 +1680,12 @@ static std::string pictureLabel(const std::string &path)
 
 // The open picture's camera data for the Info pane (make, model, lens, ISO,
 // shutter, ...), read from the file once per opened picture: the first time the
-// pane asks after imageSerial changed. It reads the first 256 KiB of the file on
-// the UI thread, which is a fraction of a millisecond; nothing here touches the
-// render pipeline. A picture with no readable camera data (a PNG, a JPEG without
-// EXIF) gives an empty PhotoInfo.
-static const exif::PhotoInfo &currentPhotoInfo()
-{
-  if (state.photoInfoSerial != state.imageSerial)
-  {
+// pane asks after imageSerial changed. It reads the first 256 KiB of the file
+// on the UI thread, which is a fraction of a millisecond; nothing here touches
+// the render pipeline. A picture with no readable camera data (a PNG, a JPEG
+// without EXIF) gives an empty PhotoInfo.
+static const exif::PhotoInfo &currentPhotoInfo() {
+  if (state.photoInfoSerial != state.imageSerial) {
     state.photoInfoSerial = state.imageSerial;
     state.photoInfo = exif::PhotoInfo{};
     if (!state.imagePath.empty())
@@ -1768,13 +1694,12 @@ static const exif::PhotoInfo &currentPhotoInfo()
   return state.photoInfo;
 }
 
-// What the open file says its color space is, for the Info pane and the status bar: read once per
-// opened picture, like currentPhotoInfo (a PNG's color chunks, or a JPEG's ICC profile). The editor
-// converts nothing: it edits the file's numbers as they are and carries the tag into PNG exports.
-static const color_tag::ColorTag &currentColorTag()
-{
-  if (state.colorTagSerial != state.imageSerial)
-  {
+// What the open file says its color space is, for the Info pane and the status
+// bar: read once per opened picture, like currentPhotoInfo (a PNG's color
+// chunks, or a JPEG's ICC profile). The editor converts nothing: it edits the
+// file's numbers as they are and carries the tag into PNG exports.
+static const color_tag::ColorTag &currentColorTag() {
+  if (state.colorTagSerial != state.imageSerial) {
     state.colorTagSerial = state.imageSerial;
     state.colorTag = color_tag::ColorTag{};
     if (!state.imagePath.empty())
@@ -1783,24 +1708,26 @@ static const color_tag::ColorTag &currentColorTag()
   return state.colorTag;
 }
 
-// The status-bar notice for the file just opened: what it says its color space is, for every file
-// (sRGB, untagged, or something else). A picture tagged as something other than sRGB also gets the
-// reminder that nothing is converted. Short on purpose: setStatus cuts a message at 110 characters,
-// and "Color: <profile> (embedded profile, not sRGB)" is already about 50 to 90 of them, so the part
-// that matters comes first and the rest is brief.
-static void announceColorTag()
-{
+// The status-bar notice for the file just opened: what it says its color space
+// is, for every file (sRGB, untagged, or something else). A picture tagged as
+// something other than sRGB also gets the reminder that nothing is converted.
+// Short on purpose: setStatus cuts a message at 110 characters, and "Color:
+// <profile> (embedded profile, not sRGB)" is already about 50 to 90 of them, so
+// the part that matters comes first and the rest is brief.
+static void announceColorTag() {
   const color_tag::ColorTag &tag = currentColorTag();
   if (tag.text.empty())
     return; // the file could not be read
-  setStatus("Color: " + tag.text + (tag.srgb ? std::string() : std::string(". Shown as sRGB, not converted")), false);
+  setStatus("Color: " + tag.text +
+                (tag.srgb ? std::string()
+                          : std::string(". Shown as sRGB, not converted")),
+            false);
 }
 
 // Writes the sidecar for the open picture. On failure (read-only folder...)
 // the status bar says so; the change still counts as "seen" so a failing
 // disk isn't retried every frame, only on the next edit.
-static void saveSidecar()
-{
+static void saveSidecar() {
   if (!state.original || state.imagePath.empty())
     return;
   const bool editsChanged = state.adjust.version() != state.sidecarSaved;
@@ -1808,9 +1735,10 @@ static void saveSidecar()
   state.metaDirty = false;
   state.snapshotsDirty = false;
 
-  const std::string text = sidecarFileText(
-      baseName(vcImageOf(state.imagePath)), state.original->width,
-      state.original->height, state.adjust.toJson(), state.meta, state.snapshots);
+  const std::string text =
+      sidecarFileText(baseName(vcImageOf(state.imagePath)),
+                      state.original->width, state.original->height,
+                      state.adjust.toJson(), state.meta, state.snapshots);
 
   const std::filesystem::path path = sidecarPath(state.imagePath);
   std::filesystem::path tmp = path;
@@ -1820,8 +1748,7 @@ static void saveSidecar()
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
     f.write(text.data(), static_cast<std::streamsize>(text.size()));
     f.flush();
-    if (!f)
-    {
+    if (!f) {
       f.close();
       std::filesystem::remove(tmp, ec);
       setStatus("Couldn't save edits next to " + pictureLabel(state.imagePath),
@@ -1830,32 +1757,27 @@ static void saveSidecar()
     }
   }
   std::filesystem::rename(tmp, path, ec); // replaces an existing file
-  if (ec)
-  {
+  if (ec) {
     std::error_code ignore;
     std::filesystem::remove(tmp, ignore);
     setStatus("Couldn't save edits: " + ec.message(), true);
-  }
-  else if (editsChanged)
-    filmMarkEdited(state.imagePath); // the strip's "has edits" dot (a rating alone doesn't set it)
+  } else if (editsChanged)
+    filmMarkEdited(state.imagePath); // the strip's "has edits" dot (a rating
+                                     // alone doesn't set it)
 }
 
 // Saves now if anything changed since the last save / load.
-static void flushSidecar()
-{
-  if (state.original &&
-      (state.adjust.version() != state.sidecarSaved || state.metaDirty ||
-       state.snapshotsDirty))
+static void flushSidecar() {
+  if (state.original && (state.adjust.version() != state.sidecarSaved ||
+                         state.metaDirty || state.snapshotsDirty))
     saveSidecar();
 }
 
 // Per frame: saves a finished change, but not while the mouse is still
 // dragging a slider or a mask (that would write on every frame).
-static void autosaveSidecar()
-{
-  if (!state.original ||
-      (state.adjust.version() == state.sidecarSaved && !state.metaDirty &&
-       !state.snapshotsDirty))
+static void autosaveSidecar() {
+  if (!state.original || (state.adjust.version() == state.sidecarSaved &&
+                          !state.metaDirty && !state.snapshotsDirty))
     return;
   if (state.dragging || state.mask.drag != MaskUi::Drag::None)
     return;
@@ -1863,64 +1785,66 @@ static void autosaveSidecar()
 }
 
 // ---------------- 3D LUTs ----------------
-// The LUTs pane (see "LUTs" in main): the library's .cube files as a list, each with a preview of
-// the open picture under that LUT. The picture's own LUT is part of its edits
-// (AdjustmentSet::lut(), with LUT Amount as its strength); everything here is the UI around it.
-// The library and its cache are io/lut_library.hpp, the previews are
-// workers/lut_preview_worker.hpp.
-struct LutRow
-{
-  LutEntry entry;                           // name + path (hash and size arrive with the preview)
-  std::shared_ptr<const CanvasImage> thumb; // null until made, or with no picture open
-  std::string error;                        // why the file can't be used; "" if it can
-  std::string warning;                      // "may expect camera-log input"; "" if not
-  uint64_t paintVersion = 0;                // changes whenever what the row shows changes
+// The LUTs pane (see "LUTs" in main): the library's .cube files as a list, each
+// with a preview of the open picture under that LUT. The picture's own LUT is
+// part of its edits (AdjustmentSet::lut(), with LUT Amount as its strength);
+// everything here is the UI around it. The library and its cache are
+// io/lut_library.hpp, the previews are workers/lut_preview_worker.hpp.
+struct LutRow {
+  LutEntry entry; // name + path (hash and size arrive with the preview)
+  std::shared_ptr<const CanvasImage>
+      thumb;                 // null until made, or with no picture open
+  std::string error;         // why the file can't be used; "" if it can
+  std::string warning;       // "may expect camera-log input"; "" if not
+  uint64_t paintVersion = 0; // changes whenever what the row shows changes
 };
 static std::vector<LutRow> gLuts;
-static bool gLutsLoaded = false; // the folder was listed since the pane was last opened
+static bool gLutsLoaded =
+    false; // the folder was listed since the pane was last opened
 static uint64_t gLutPaintCounter = 0;
 static LutPreviewWorker lutPreviewWorker;
 static uint64_t gLutSerial = 0; // the job whose results are taken in
 
-// What the previews were made for: the picture's pixels and the edit state. A change of either
-// makes them stale. The LUTs pane's own changes (choosing a LUT, its amount) do not, because a
-// preview shows every LUT on the picture WITHOUT the one it has now (see lutPreviewsFollow).
-struct LutBuilt
-{
+// What the previews were made for: the picture's pixels and the edit state. A
+// change of either makes them stale. The LUTs pane's own changes (choosing a
+// LUT, its amount) do not, because a preview shows every LUT on the picture
+// WITHOUT the one it has now (see lutPreviewsFollow).
+struct LutBuilt {
   bool valid = false;
   const CanvasImage *source = nullptr;
   uint64_t version = 0;
 };
 static LutBuilt gLutBuilt;
-static uint64_t gLutCacheEpoch = 1; // bumped when the LUT cache is emptied (see currentLutStatus)
+static uint64_t gLutCacheEpoch =
+    1; // bumped when the LUT cache is emptied (see currentLutStatus)
 
-// Empties the library's cache: a LUT file may have changed (an import, another picture).
-static void dropLutCache()
-{
+// Empties the library's cache: a LUT file may have changed (an import, another
+// picture).
+static void dropLutCache() {
   clearLutCache();
   ++gLutCacheEpoch;
 }
 
-// Lists the library folder afresh. Rows keep what is known about a file that is still there (its
-// preview, size, warning), and the previews are only made again when the list itself changed.
-static void refreshLuts()
-{
-  std::vector<std::string> oldPaths; // taken before the rows are moved from below
+// Lists the library folder afresh. Rows keep what is known about a file that is
+// still there (its preview, size, warning), and the previews are only made
+// again when the list itself changed.
+static void refreshLuts() {
+  std::vector<std::string>
+      oldPaths; // taken before the rows are moved from below
   for (const LutRow &o : gLuts)
     oldPaths.push_back(o.entry.path);
   std::vector<LutRow> old = std::move(gLuts);
   gLuts.clear();
-  for (LutEntry &e : listLutEntries(lutDir()))
-  {
+  for (LutEntry &e : listLutEntries(lutDir())) {
     if (gLuts.size() >= kLutRows)
       break;
     LutRow r;
     r.entry = std::move(e);
     r.paintVersion = ++gLutPaintCounter;
     for (LutRow &o : old)
-      if (o.entry.path == r.entry.path)
-      {
-        r = std::move(o); // same file: keep its preview, hash and size (and its paint version)
+      if (o.entry.path == r.entry.path) {
+        r = std::move(o); // same file: keep its preview, hash and size (and its
+                          // paint version)
         break;
       }
     gLuts.push_back(std::move(r));
@@ -1929,22 +1853,20 @@ static void refreshLuts()
   for (size_t i = 0; same && i < gLuts.size(); ++i)
     same = gLuts[i].entry.path == oldPaths[i];
   gLutsLoaded = true;
-  if (!same)
-  { // a file came or went (an import, or one removed by hand): make the previews again
+  if (!same) { // a file came or went (an import, or one removed by hand): make
+               // the previews again
     lutPreviewWorker.cancel();
     gLutBuilt.valid = false;
   }
   state.markDirty();
 }
 
-// Where the open picture's LUT stands in the library. Looked up again only when the edit state or
-// the cache changed (the pane's text asks every frame).
-static LutStatus currentLutStatus()
-{
+// Where the open picture's LUT stands in the library. Looked up again only when
+// the edit state or the cache changed (the pane's text asks every frame).
+static LutStatus currentLutStatus() {
   static uint64_t forVersion = 0, forEpoch = 0;
   static LutStatus cached = LutStatus::None;
-  if (forVersion != state.adjust.version() || forEpoch != gLutCacheEpoch)
-  {
+  if (forVersion != state.adjust.version() || forEpoch != gLutCacheEpoch) {
     cached = state.adjust.lutStatus();
     forVersion = state.adjust.version();
     forEpoch = gLutCacheEpoch;
@@ -1952,18 +1874,20 @@ static LutStatus currentLutStatus()
   return cached;
 }
 
-// Says so in the status bar when the picture's LUT can't be used as it was chosen: gone from the
-// library, damaged, or a file that has changed since. True if it said something.
-static bool noteLutProblem()
-{
+// Says so in the status bar when the picture's LUT can't be used as it was
+// chosen: gone from the library, damaged, or a file that has changed since.
+// True if it said something.
+static bool noteLutProblem() {
   const std::string name = "\"" + state.adjust.lut().name + "\"";
-  switch (currentLutStatus())
-  {
+  switch (currentLutStatus()) {
   case LutStatus::Missing:
-    setStatus("LUT " + name + " is not in the LUT library: the picture shows without it", true);
+    setStatus("LUT " + name +
+                  " is not in the LUT library: the picture shows without it",
+              true);
     return true;
   case LutStatus::Unreadable:
-    setStatus("LUT " + name + " can't be read: the picture shows without it", true);
+    setStatus("LUT " + name + " can't be read: the picture shows without it",
+              true);
     return true;
   case LutStatus::HashChanged:
     setStatus("LUT " + name + " has changed since it was chosen", false);
@@ -1973,48 +1897,43 @@ static bool noteLutProblem()
   }
 }
 
-// "line 3: ..." out of "file.cube: line 3: ..." (the row already names the file).
-static std::string lutReason(const std::string &error)
-{
+// "line 3: ..." out of "file.cube: line 3: ..." (the row already names the
+// file).
+static std::string lutReason(const std::string &error) {
   const size_t k = error.find(": ");
   return k == std::string::npos ? error : error.substr(k + 2);
 }
 
 // The previews match the picture and its edits as they are right now.
-static bool lutPreviewsCurrent()
-{
+static bool lutPreviewsCurrent() {
   return gLutBuilt.valid && gLutBuilt.source == state.source.get() &&
          gLutBuilt.version == state.adjust.version();
 }
-// Call after a change made by the LUTs pane itself (`wasCurrent` = lutPreviewsCurrent() just before
-// it): the previews do not depend on it, so they stay current. An unrelated edit made in between
-// keeps them stale.
-static void lutPreviewsFollow(bool wasCurrent)
-{
+// Call after a change made by the LUTs pane itself (`wasCurrent` =
+// lutPreviewsCurrent() just before it): the previews do not depend on it, so
+// they stay current. An unrelated edit made in between keeps them stale.
+static void lutPreviewsFollow(bool wasCurrent) {
   if (wasCurrent)
     gLutBuilt.version = state.adjust.version();
 }
 
-// The LUT Amount slider's setter. The previews show every LUT at 100 %, whatever the amount is, so
-// moving it keeps them current.
-static void setLutAmount(float v)
-{
+// The LUT Amount slider's setter. The previews show every LUT at 100 %,
+// whatever the amount is, so moving it keeps them current.
+static void setLutAmount(float v) {
   const bool current = lutPreviewsCurrent();
   state.adjust.set(AdjId::LutAmount, v);
   lutPreviewsFollow(current);
 }
 
-// Once per frame (flushPendingAdjust): takes in the previews the worker has made, and, with the
-// pane open, starts a new batch when the list or the picture's look has changed since the last.
-static void pollLutPreviews()
-{
-  for (LutPreviewResult &r : lutPreviewWorker.collect())
-  {
+// Once per frame (flushPendingAdjust): takes in the previews the worker has
+// made, and, with the pane open, starts a new batch when the list or the
+// picture's look has changed since the last.
+static void pollLutPreviews() {
+  for (LutPreviewResult &r : lutPreviewWorker.collect()) {
     if (r.serial != gLutSerial)
       continue; // a batch that was replaced
     for (LutRow &row : gLuts)
-      if (row.entry.path == r.path)
-      {
+      if (row.entry.path == r.path) {
         row.entry.hash = r.hash;
         row.entry.size = r.size;
         row.thumb = std::move(r.thumb);
@@ -2034,8 +1953,8 @@ static void pollLutPreviews()
   if (lutPreviewsCurrent())
     return;
   if (gLutBuilt.valid && gLutBuilt.source != state.source.get())
-    for (LutRow &row : gLuts)
-    { // another picture: what is shown is wrong until the new previews arrive
+    for (LutRow &row : gLuts) { // another picture: what is shown is wrong until
+                                // the new previews arrive
       row.thumb.reset();
       row.paintVersion = ++gLutPaintCounter;
     }
@@ -2050,27 +1969,26 @@ static void pollLutPreviews()
   state.markDirty();
 }
 
-// Gives the picture the LUT of list row i: one undo step, "LUT: <name>" in History.
-static void applyLutRow(size_t i)
-{
+// Gives the picture the LUT of list row i: one undo step, "LUT: <name>" in
+// History.
+static void applyLutRow(size_t i) {
   if (state.dragging || !state.original || i >= gLuts.size())
     return;
   const LutRow &row = gLuts[i];
-  if (!row.error.empty())
-  {
-    setStatus("Can't use " + row.entry.name + ": " + lutReason(row.error), true);
+  if (!row.error.empty()) {
+    setStatus("Can't use " + row.entry.name + ": " + lutReason(row.error),
+              true);
     return;
   }
-  // The hash that goes into the edit is the file's own, as the library reads it now.
+  // The hash that goes into the edit is the file's own, as the library reads it
+  // now.
   const LutResolved res = acquireLut(LutRef{row.entry.name, 0});
-  if (!res.lut)
-  {
+  if (!res.lut) {
     setStatus("Couldn't read the LUT " + row.entry.name, true);
     return;
   }
   const bool current = lutPreviewsCurrent();
-  if (!state.adjust.setLut(LutRef{row.entry.name, res.hash}))
-  {
+  if (!state.adjust.setLut(LutRef{row.entry.name, res.hash})) {
     setStatus("Already using the LUT " + row.entry.name, false);
     return;
   }
@@ -2080,9 +1998,9 @@ static void applyLutRow(size_t i)
   setStatus("Applied LUT: " + row.entry.name, false);
 }
 
-// Takes the LUT off the picture (and its amount back to 0): one undo step, "Remove LUT".
-static void removeLut()
-{
+// Takes the LUT off the picture (and its amount back to 0): one undo step,
+// "Remove LUT".
+static void removeLut() {
   if (state.dragging || !state.original)
     return;
   const bool current = lutPreviewsCurrent();
@@ -2094,27 +2012,22 @@ static void removeLut()
   setStatus("Removed the LUT", false);
 }
 
-// Copies .cube files into the library (see importLutFile) and re-lists it; says what happened in
-// the status bar.
-static void importLutPaths(const std::vector<std::string> &files)
-{
+// Copies .cube files into the library (see importLutFile) and re-lists it; says
+// what happened in the status bar.
+static void importLutPaths(const std::vector<std::string> &files) {
   if (files.empty())
     return;
   size_t ok = 0, bad = 0;
   std::string lastName, firstError, logName;
-  for (const std::string &f : files)
-  {
+  for (const std::string &f : files) {
     LutEntry e;
     std::string warning, err;
-    if (importLutFile(f, lutDir(), &e, &warning, &err))
-    {
+    if (importLutFile(f, lutDir(), &e, &warning, &err)) {
       ++ok;
       lastName = e.name;
       if (!warning.empty() && logName.empty())
         logName = e.name;
-    }
-    else
-    {
+    } else {
       ++bad;
       if (firstError.empty())
         firstError = err;
@@ -2122,30 +2035,32 @@ static void importLutPaths(const std::vector<std::string> &files)
   }
   dropLutCache();
   refreshLuts();
-  if (ok == 0)
-  {
+  if (ok == 0) {
     setStatus("Couldn't import: " + firstError, true);
     return;
   }
-  if (!logName.empty()) // not a refusal: it is imported, it may just look wrong on this kind of picture
+  if (!logName.empty()) // not a refusal: it is imported, it may just look wrong
+                        // on this kind of picture
   {
-    setStatus(logName + " may expect camera-log input and look wrong on this picture", true);
+    setStatus(logName +
+                  " may expect camera-log input and look wrong on this picture",
+              true);
     return;
   }
-  std::string msg = ok == 1 ? "Imported LUT: " + lastName : "Imported " + std::to_string(ok) + " LUTs";
+  std::string msg = ok == 1 ? "Imported LUT: " + lastName
+                            : "Imported " + std::to_string(ok) + " LUTs";
   if (bad > 0)
     msg += " (" + std::to_string(bad) + " skipped: " + firstError + ")";
   setStatus(msg, bad > 0);
 }
 
-static void importLuts()
-{
-  importLutPaths(openFilesPicker("Import LUTs", {{"3D LUTs", "*.cube"}, {"All Files", "*.*"}}));
+static void importLuts() {
+  importLutPaths(openFilesPicker(
+      "Import LUTs", {{"3D LUTs", "*.cube"}, {"All Files", "*.*"}}));
 }
 
 // The line under a row's name: the table size, or why the file can't be used.
-static std::string lutRowDetail(size_t i)
-{
+static std::string lutRowDetail(size_t i) {
   if (i >= gLuts.size())
     return std::string();
   const LutRow &r = gLuts[i];
@@ -2155,18 +2070,17 @@ static std::string lutRowDetail(size_t i)
   if (r.entry.size > 0)
     s = std::to_string(r.entry.size) + "\u00B3 points";
   if (!r.warning.empty())
-    s += std::string(s.empty() ? "" : "  \u2022  ") + "may expect camera-log input";
+    s += std::string(s.empty() ? "" : "  \u2022  ") +
+         "may expect camera-log input";
   return s;
 }
 
 // What the pane says about the picture's own LUT.
-static std::string lutCurrentText()
-{
+static std::string lutCurrentText() {
   const LutRef &r = state.adjust.lut();
   if (r.empty())
     return "No LUT on this picture";
-  switch (currentLutStatus())
-  {
+  switch (currentLutStatus()) {
   case LutStatus::Missing:
     return "LUT \"" + r.name + "\" is not in the library, so it has no effect";
   case LutStatus::Unreadable:
@@ -2178,14 +2092,12 @@ static std::string lutCurrentText()
   }
 }
 
-
 // Applies the picture's saved edits, if it has any. Call right after
 // adjust.reset() + setOriginalSize() and BEFORE syncSource(), so the saved
 // crop / rotation is what gets built.
-static void loadSidecar()
-{
+static void loadSidecar() {
   state.sidecarSaved = state.adjust.version(); // pristine unless loaded below
-  state.meta = PhotoMeta{};                    // unrated unless the file says so
+  state.meta = PhotoMeta{}; // unrated unless the file says so
   state.metaDirty = false;
   state.snapshots.clear(); // none unless the file has some
   state.snapshotsDirty = false;
@@ -2195,55 +2107,50 @@ static void loadSidecar()
   if (!f)
     return; // no saved edits: the normal case
   const std::streamoff n = f.tellg();
-  if (n <= 0 || n > (64 << 20))
-  {
+  if (n <= 0 || n > (64 << 20)) {
     setStatus("Ignored saved edits: unexpected file size", true);
     return;
   }
   std::string text(static_cast<size_t>(n), '\0');
   f.seekg(0);
   f.read(text.data(), n);
-  if (!f)
-  {
+  if (!f) {
     setStatus("Ignored saved edits: couldn't read the file", true);
     return;
   }
   mj::Json root;
   std::string err;
-  if (!mj::Json::parse(text, &root, &err))
-  {
+  if (!mj::Json::parse(text, &root, &err)) {
     setStatus("Ignored saved edits: " + err, true);
     return;
   }
   const mj::Json *ver = root.find("version");
-  if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion)
-  {
+  if (!ver || !ver->isNumber() || ver->asNum(0) > kSidecarVersion) {
     setStatus("Ignored saved edits: made by a newer Literoom", true);
     return;
   }
   const mj::Json *img = root.find("image");
-  if (!img || !img->isObject() ||
-      img->find("width") == nullptr || img->find("height") == nullptr ||
+  if (!img || !img->isObject() || img->find("width") == nullptr ||
+      img->find("height") == nullptr ||
       img->find("width")->asNum(-1) != state.original->width ||
-      img->find("height")->asNum(-1) != state.original->height)
-  {
+      img->find("height")->asNum(-1) != state.original->height) {
     setStatus("Ignored saved edits: the picture's size has changed", true);
     return;
   }
   const mj::Json *edits = root.find("edits");
-  if (!edits || !state.adjust.loadJson(*edits))
-  {
+  if (!edits || !state.adjust.loadJson(*edits)) {
     setStatus("Ignored saved edits: unreadable", true);
     return;
   }
   state.sidecarSaved = state.adjust.version();
   state.meta = sidecarMetaFromRoot(root);
-  state.snapshots = sidecarSnapshotsFromJson(root.find("snapshots"),
-                                             state.original->width,
-                                             state.original->height);
-  if (edits->dump() != sidecarNeutralEditsDump()) // a rating alone isn't "edits"
+  state.snapshots = sidecarSnapshotsFromJson(
+      root.find("snapshots"), state.original->width, state.original->height);
+  if (edits->dump() !=
+      sidecarNeutralEditsDump()) // a rating alone isn't "edits"
     setStatus("Restored saved edits", false);
-  noteLutProblem(); // a LUT the library no longer has (or has changed) is worth a word
+  noteLutProblem(); // a LUT the library no longer has (or has changed) is worth
+                    // a word
 }
 
 // ---------------- Sync Settings: one look onto other pictures ----------------
@@ -2263,29 +2170,25 @@ static void loadSidecar()
 // and to the other selected pictures here, as `metaOnly` jobs (see
 // applyMetaPatch). That is a sidecarPatchMeta per picture instead of a
 // sidecarSyncLook, with the same rules and the same refusals.
-struct SyncJob
-{
+struct SyncJob {
   std::vector<std::string> paths;
-  Preset look; // only its values, curves, mix, grade and LUT are used
+  Preset look;           // only its values, curves, mix, grade and LUT are used
   bool metaOnly = false; // rate / flag / label the pictures instead
   MetaPatch patch;       // ... with this
 };
-struct SyncOutcome
-{
+struct SyncOutcome {
   std::string path;
   bool ok = false;
   std::string error; // why it was skipped
   PhotoMeta meta;    // metaOnly: the picture's meta after the patch
 };
-struct SyncResult
-{
+struct SyncResult {
   bool metaOnly = false;
   std::vector<SyncOutcome> items;
 };
 
 // 1 = text read, 0 = no sidecar, -1 = unreadable or too big. Any thread.
-static int readSidecarText(const std::string &imagePath, std::string *text)
-{
+static int readSidecarText(const std::string &imagePath, std::string *text) {
   std::ifstream f(sidecarPath(imagePath), std::ios::binary | std::ios::ate);
   if (!f)
     return 0;
@@ -2300,8 +2203,7 @@ static int readSidecarText(const std::string &imagePath, std::string *text)
 
 // Temp file, then rename, like saveSidecar. Any thread.
 static bool writeTextAtomic(const std::filesystem::path &path,
-                            const std::string &text, std::string *err)
-{
+                            const std::string &text, std::string *err) {
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   std::error_code ec;
@@ -2309,8 +2211,7 @@ static bool writeTextAtomic(const std::filesystem::path &path,
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
     f.write(text.data(), static_cast<std::streamsize>(text.size()));
     f.flush();
-    if (!f)
-    {
+    if (!f) {
       f.close();
       std::filesystem::remove(tmp, ec);
       *err = "couldn't write its saved edits";
@@ -2318,8 +2219,7 @@ static bool writeTextAtomic(const std::filesystem::path &path,
     }
   }
   std::filesystem::rename(tmp, path, ec);
-  if (ec)
-  {
+  if (ec) {
     std::error_code ignore;
     std::filesystem::remove(tmp, ignore);
     *err = ec.message();
@@ -2329,43 +2229,43 @@ static bool writeTextAtomic(const std::filesystem::path &path,
 }
 
 // Worker thread only. Always returns a value (it can't be cancelled).
-static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
-{
+static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel) {
   SyncResult res;
   res.metaOnly = job.metaOnly;
-  for (const std::string &path : job.paths)
-  {
+  for (const std::string &path : job.paths) {
     SyncOutcome o;
     o.path = path;
     std::string old;
     int w = 0, h = 0;
     const int have = readSidecarText(path, &old);
-    if (have == 0 && job.metaOnly && job.patch.applyTo(PhotoMeta{}).isDefault())
-    { // nothing to record and no file to change: not worth a decode
+    if (have == 0 && job.metaOnly &&
+        job.patch.applyTo(PhotoMeta{})
+            .isDefault()) { // nothing to record and no file to change: not
+                            // worth a decode
       o.ok = true;
       res.items.push_back(std::move(o));
       continue;
     }
     if (have < 0)
       o.error = "couldn't read its saved edits";
-    else
-    {
-      if (have == 0)
-      { // no sidecar yet: record the picture's (upright) size
+    else {
+      if (have == 0) { // no sidecar yet: record the picture's (upright) size
         std::string derr;
-        if (!image_source::uprightSize(vcImageOf(path), exifOrientationOf(vcImageOf(path)), &w, &h, &derr))
+        if (!image_source::uprightSize(vcImageOf(path),
+                                       exifOrientationOf(vcImageOf(path)), &w,
+                                       &h, &derr))
           o.error = "couldn't open it: " + derr;
       }
-      if (o.error.empty())
-      {
+      if (o.error.empty()) {
         std::string text;
         const bool built =
             job.metaOnly
-                ? sidecarPatchMeta(old, baseName(vcImageOf(path)), w, h, job.patch, &text,
-                                   &o.meta, &o.error)
-                : sidecarSyncLook(old, baseName(vcImageOf(path)), w, h, job.look.values,
-                                  job.look.curves, job.look.mix, job.look.grade,
-                                  job.look.lut, &text, &o.error);
+                ? sidecarPatchMeta(old, baseName(vcImageOf(path)), w, h,
+                                   job.patch, &text, &o.meta, &o.error)
+                : sidecarSyncLook(old, baseName(vcImageOf(path)), w, h,
+                                  job.look.values, job.look.curves,
+                                  job.look.mix, job.look.grade, job.look.lut,
+                                  &text, &o.error);
         if (built)
           o.ok = writeTextAtomic(sidecarPath(path), text, &o.error);
       }
@@ -2378,8 +2278,7 @@ static std::optional<SyncResult> runSyncJob(SyncJob &&job, WorkerCancel)
 static LatestWorker<SyncJob, SyncResult> syncWorker(runSyncJob);
 
 // True (with a status message) while a sync is running.
-static bool syncBusy()
-{
+static bool syncBusy() {
   if (!syncWorker.outstanding())
     return false;
   setStatus("Wait for the sync to finish", true);
@@ -2387,28 +2286,23 @@ static bool syncBusy()
 }
 
 // Polled once per frame from flushPendingAdjust.
-static void collectSyncJob()
-{
+static void collectSyncJob() {
   auto r = syncWorker.collect();
   if (!r)
     return;
   size_t ok = 0, bad = 0;
   std::string firstErr;
-  for (const SyncOutcome &o : r->items)
-  {
-    if (o.ok)
-    {
+  for (const SyncOutcome &o : r->items) {
+    if (o.ok) {
       ++ok;
       if (r->metaOnly)
         filmApplyMeta(o.path, o.meta); // a rating alone sets no "has edits" dot
       else
         filmMarkEdited(o.path); // the strip's "has edits" dot
-    }
-    else if (++bad == 1)
+    } else if (++bad == 1)
       firstErr = pictureLabel(o.path) + ": " + o.error;
   }
-  if (r->metaOnly)
-  {
+  if (r->metaOnly) {
     if (bad == 0)
       setStatus("Updated " + std::to_string(ok) + " selected photo(s)", false);
     else
@@ -2426,8 +2320,7 @@ static void collectSyncJob()
 }
 
 // Image > Sync Settings to Selected.
-static void syncSettings()
-{
+static void syncSettings() {
   if (state.dragging || !state.original || syncBusy())
     return;
   const FilmStrip &f = state.film;
@@ -2436,10 +2329,10 @@ static void syncSettings()
     if (f.files[i].selected && static_cast<int>(i) != f.current &&
         filmViewPos(static_cast<int>(i)) >= 0) // never one the filter hides
       job.paths.push_back(f.files[i].path);
-  if (job.paths.empty())
-  {
-    setStatus("Select other photos in the filmstrip first (Ctrl+click, Shift+click)",
-              true);
+  if (job.paths.empty()) {
+    setStatus(
+        "Select other photos in the filmstrip first (Ctrl+click, Shift+click)",
+        true);
     return;
   }
   job.look = state.adjust.currentPreset(std::string());
@@ -2461,16 +2354,14 @@ static void syncSettings()
 // is exported with the edits it has on disk when the batch reaches it.
 static ExportWorker exportWorker;
 
-struct ExportRun
-{
+struct ExportRun {
   bool active = false;
   size_t total = 0, ok = 0, bad = 0, cancelled = 0, shown = 0;
   std::string firstErr, folder;
 };
 static ExportRun exportRun;
 
-static bool exportBusy()
-{
+static bool exportBusy() {
   if (!exportWorker.busy())
     return false;
   setStatus("Wait for the export to finish (or use Stop Export)", true);
@@ -2479,8 +2370,7 @@ static bool exportBusy()
 
 // The pictures of the strip in strip order, as the filter shows them:
 // only the selected ones, or all of them.
-static std::vector<std::string> exportTargets(bool selectedOnly)
-{
+static std::vector<std::string> exportTargets(bool selectedOnly) {
   std::vector<std::string> paths;
   const FilmStrip &f = state.film;
   for (const int i : f.view)
@@ -2490,20 +2380,19 @@ static std::vector<std::string> exportTargets(bool selectedOnly)
   return paths;
 }
 
-static void startExportBatch(std::vector<std::string> paths)
-{
+static void startExportBatch(std::vector<std::string> paths) {
   if (state.dragging || exportBusy())
     return;
-  if (paths.empty())
-  {
-    setStatus("Select pictures in the filmstrip first (Ctrl+click, Shift+click), "
-              "or use Export All Shown",
-              true);
+  if (paths.empty()) {
+    setStatus(
+        "Select pictures in the filmstrip first (Ctrl+click, Shift+click), "
+        "or use Export All Shown",
+        true);
     return;
   }
   auto dir = openFolderPicker("Export to Folder");
   if (!dir)
-    return; // user cancelled
+    return;       // user cancelled
   flushSidecar(); // the open picture's latest edits must be on disk
   ExportSettings s;
   s.jpeg = state.exportJpeg;
@@ -2528,25 +2417,21 @@ static void startExportBatch(std::vector<std::string> paths)
 static void exportSelected() { startExportBatch(exportTargets(true)); }
 static void exportAllShown() { startExportBatch(exportTargets(false)); }
 
-static void stopExport()
-{
-  if (exportWorker.busy())
-  {
+static void stopExport() {
+  if (exportWorker.busy()) {
     exportWorker.cancel();
     setStatus("Stopping the export...", false);
   }
 }
 
 // Polled once per frame from flushPendingAdjust.
-static void collectExportJob()
-{
+static void collectExportJob() {
   if (!exportRun.active)
     return;
   // Ask BEFORE collecting: if the worker was already done, collect() below
   // returns the last outcomes and nothing more can arrive.
   const bool finished = !exportWorker.busy();
-  for (const ExportOutcome &o : exportWorker.collect())
-  {
+  for (const ExportOutcome &o : exportWorker.collect()) {
     if (o.ok)
       ++exportRun.ok;
     else if (o.cancelled)
@@ -2555,10 +2440,8 @@ static void collectExportJob()
       exportRun.firstErr = pictureLabel(o.path) + ": " + o.error;
   }
   const size_t handled = exportRun.ok + exportRun.bad + exportRun.cancelled;
-  if (!finished)
-  {
-    if (handled != exportRun.shown && exportRun.cancelled == 0)
-    {
+  if (!finished) {
+    if (handled != exportRun.shown && exportRun.cancelled == 0) {
       exportRun.shown = handled;
       setStatus("Exporting " + std::to_string(handled) + " of " +
                     std::to_string(exportRun.total) + "...",
@@ -2570,15 +2453,19 @@ static void collectExportJob()
   const std::string where = baseName(exportRun.folder);
   if (exportRun.cancelled > 0)
     setStatus("Export stopped: " + std::to_string(exportRun.ok) + " exported" +
-                  (exportRun.bad ? ", " + std::to_string(exportRun.bad) + " skipped" : std::string()) +
+                  (exportRun.bad
+                       ? ", " + std::to_string(exportRun.bad) + " skipped"
+                       : std::string()) +
                   ", " + std::to_string(exportRun.cancelled) + " not exported",
               exportRun.bad > 0);
   else if (exportRun.bad > 0)
     setStatus("Exported " + std::to_string(exportRun.ok) + ", skipped " +
-                  std::to_string(exportRun.bad) + " (" + exportRun.firstErr + ")",
+                  std::to_string(exportRun.bad) + " (" + exportRun.firstErr +
+                  ")",
               true);
   else
-    setStatus("Exported " + std::to_string(exportRun.ok) + " photo(s) to " + where,
+    setStatus("Exported " + std::to_string(exportRun.ok) + " photo(s) to " +
+                  where,
               false);
 }
 
@@ -2590,7 +2477,7 @@ static void collectExportJob()
 // in view, so a folder of thousands costs nothing extra. Thumbnails are made
 // by a background thread, nearest-to-the-open-picture first, and the open
 // picture's thumbnail is refreshed (edits included) when you leave it.
-constexpr float kFilmBarH = 26.0f;   // the filter bar on top of the cells
+constexpr float kFilmBarH = 26.0f;    // the filter bar on top of the cells
 constexpr float kFilmCellsH = 104.0f; // the row of thumbnails below it
 constexpr float kFilmH = kFilmBarH + kFilmCellsH;
 constexpr float kFilmCellW = 108.0f;
@@ -2598,8 +2485,7 @@ constexpr size_t kFilmMaxFiles = 5000; // a bigger folder shows its first 5000
 
 // makeThumb / ThumbWorker / kFilmThumbW,H live in thumb_worker.hpp.
 static ThumbWorker thumbWorker{
-    [](const std::string &path)
-    { return exifOrientationOf(path); }};
+    [](const std::string &path) { return exifOrientationOf(path); }};
 
 // Lists the JPEG / PNG files of `folder` into a new strip (not yet shown).
 using VcMap = std::map<std::string, std::vector<int>>; // see listVirtualCopies
@@ -2607,8 +2493,7 @@ using VcMap = std::map<std::string, std::vector<int>>; // see listVirtualCopies
 // Adds one entry. The name index is keyed by the path's own last part, so a
 // virtual copy ("photo.jpg|vc2") never collides with its picture.
 static void filmPushEntry(FilmStrip &f, const std::string &path,
-                          const std::string &name, int copy)
-{
+                          const std::string &name, int copy) {
   FilmEntry e;
   e.path = path;
   e.name = name;
@@ -2617,18 +2502,17 @@ static void filmPushEntry(FilmStrip &f, const std::string &path,
   f.files.push_back(std::move(e));
 }
 
-// A picture, then its virtual copies (`copies`: the folder's, by lower-case name).
+// A picture, then its virtual copies (`copies`: the folder's, by lower-case
+// name).
 static void filmPushWithCopies(FilmStrip &f, const std::string &path,
-                               const std::string &name, const VcMap &copies)
-{
+                               const std::string &name, const VcMap &copies) {
   filmPushEntry(f, path, name, 0);
   if (const auto it = copies.find(filmLower(name)); it != copies.end())
     for (const int n : it->second)
       filmPushEntry(f, vcPath(path, n), name, n);
 }
 
-static FilmStrip filmListFolder(const std::string &folder)
-{
+static FilmStrip filmListFolder(const std::string &folder) {
   FilmStrip f;
   f.folder = folder;
   const std::filesystem::path base = fsPath(folder);
@@ -2641,37 +2525,33 @@ static FilmStrip filmListFolder(const std::string &folder)
 // The strip shows `view`: the files that pass the filter. The open picture and
 // the one being opened always stay in, so rating the picture you are looking at
 // under a filter can't make it vanish. UI thread only.
-static void filmRebuildView()
-{
+static void filmRebuildView() {
   FilmStrip &f = state.film;
   f.view.clear();
   const bool all = !f.filter.active();
-  for (size_t i = 0; i < f.files.size(); ++i)
-  {
+  for (size_t i = 0; i < f.files.size(); ++i) {
     const int ii = static_cast<int>(i);
-    if (all || ii == f.current || ii == f.target || f.filter.matches(f.files[i].meta))
+    if (all || ii == f.current || ii == f.target ||
+        f.filter.matches(f.files[i].meta))
       f.view.push_back(ii);
   }
   f.dirty = true;
 }
 
 // Where file `i` sits in the strip, or -1 if it isn't shown.
-static int filmViewPos(int i)
-{
+static int filmViewPos(int i) {
   const std::vector<int> &v = state.film.view;
   const auto it = std::lower_bound(v.begin(), v.end(), i);
   return it != v.end() && *it == i ? static_cast<int>(it - v.begin()) : -1;
 }
 
-static void filmClampScroll()
-{
+static void filmClampScroll() {
   FilmStrip &f = state.film;
   const float total = static_cast<float>(f.view.size()) * kFilmCellW;
   f.scrollX = std::clamp(f.scrollX, 0.0f, std::max(0.0f, total - f.viewW));
 }
 
-static void filmEnsureVisible(int i)
-{
+static void filmEnsureVisible(int i) {
   FilmStrip &f = state.film;
   const int pos = i < 0 ? -1 : filmViewPos(i);
   if (pos < 0)
@@ -2688,24 +2568,20 @@ static void filmEnsureVisible(int i)
 
 // Points the thumbnail worker at the pictures that still lack one, nearest
 // to the target first.
-static void filmQueueThumbs()
-{
+static void filmQueueThumbs() {
   const FilmStrip &f = state.film;
   const int n = static_cast<int>(f.files.size());
   std::vector<std::string> todo;
-  auto want = [&](int i)
-  {
+  auto want = [&](int i) {
     const FilmEntry &e = f.files[static_cast<size_t>(i)];
     if (!e.thumb && !e.failed)
       todo.push_back(e.path);
   };
-  const int mid = std::clamp(f.target >= 0 ? f.target : f.current, 0,
-                             std::max(0, n - 1));
-  if (n > 0)
-  {
+  const int mid =
+      std::clamp(f.target >= 0 ? f.target : f.current, 0, std::max(0, n - 1));
+  if (n > 0) {
     want(mid);
-    for (int d = 1; mid - d >= 0 || mid + d < n; ++d)
-    {
+    for (int d = 1; mid - d >= 0 || mid + d < n; ++d) {
       if (mid + d < n)
         want(mid + d);
       if (mid - d >= 0)
@@ -2716,17 +2592,15 @@ static void filmQueueThumbs()
 }
 
 // A strip holding exactly `paths` (already sorted). All come from one folder.
-static void filmAdoptFiles(const std::vector<std::string> &paths)
-{
+static void filmAdoptFiles(const std::vector<std::string> &paths) {
   FilmStrip next;
   next.visible = state.film.visible;
   VcMap copies;
-  for (const std::string &p : paths)
-  {
-    // A virtual copy's path adopts its picture and all of that picture's copies.
+  for (const std::string &p : paths) {
+    // A virtual copy's path adopts its picture and all of that picture's
+    // copies.
     const std::string real = vcImageOf(p);
-    if (next.folder.empty())
-    {
+    if (next.folder.empty()) {
       std::string dir = u8ToString(fsPath(real).parent_path());
       next.folder = dir.empty() ? "." : dir;
       copies = listVirtualCopies(next.folder, kFilmMaxFiles);
@@ -2742,8 +2616,7 @@ static void filmAdoptFiles(const std::vector<std::string> &paths)
 
 // Makes the folder `folder` the filmstrip's. False (nothing changed) if it
 // holds no JPEG / PNG pictures.
-static bool filmAdoptFolder(const std::string &folder)
-{
+static bool filmAdoptFolder(const std::string &folder) {
   FilmStrip next = filmListFolder(folder);
   if (next.files.empty())
     return false;
@@ -2757,8 +2630,7 @@ static bool filmAdoptFolder(const std::string &folder)
 // The open picture changed (or was just opened): follow it. Re-lists the
 // folder if it is a different one, selects the picture, scrolls to it and
 // re-aims the thumbnail worker. Call after loadSidecar().
-static void filmSync(const std::string &imagePath)
-{
+static void filmSync(const std::string &imagePath) {
   FilmStrip &f = state.film;
   const std::filesystem::path p = fsPath(imagePath);
   std::string folder = u8ToString(p.parent_path());
@@ -2771,9 +2643,10 @@ static void filmSync(const std::string &imagePath)
   }
   FilmStrip &g = state.film;
   const auto it = g.byName.find(filmLower(u8ToString(p.filename())));
-  g.current = g.target = it == g.byName.end() ? -1 : static_cast<int>(it->second);
-  if (g.current >= 0)
-  { // the open picture's rating etc. are the editor's own (loaded with its sidecar)
+  g.current = g.target =
+      it == g.byName.end() ? -1 : static_cast<int>(it->second);
+  if (g.current >= 0) { // the open picture's rating etc. are the editor's own
+                        // (loaded with its sidecar)
     FilmEntry &cur = g.files[static_cast<size_t>(g.current)];
     cur.meta = state.meta;
     cur.scanned = true;
@@ -2787,15 +2660,13 @@ static void filmSync(const std::string &imagePath)
 
 // The open picture is about to be replaced: if it was edited, make its
 // thumbnail show the edits.
-static void filmLeave()
-{
+static void filmLeave() {
   FilmStrip &f = state.film;
   if (f.current < 0 || static_cast<size_t>(f.current) >= f.files.size() ||
       !state.image || state.adjust.version() == f.thumbVersion)
     return;
   FilmEntry &e = f.files[static_cast<size_t>(f.current)];
-  if (auto t = makeThumb(*state.image))
-  {
+  if (auto t = makeThumb(*state.image)) {
     e.thumb = std::move(t);
     e.failed = false;
   }
@@ -2804,15 +2675,13 @@ static void filmLeave()
 }
 
 // Called when a sidecar file was written for `path`.
-static void filmMarkEdited(const std::string &path)
-{
+static void filmMarkEdited(const std::string &path) {
   FilmStrip &f = state.film;
   const auto it = f.byName.find(filmLower(baseName(path)));
   if (it == f.byName.end())
     return;
   FilmEntry &e = f.files[it->second];
-  if (!e.edited)
-  {
+  if (!e.edited) {
     e.edited = true;
     f.dirty = true;
   }
@@ -2820,8 +2689,7 @@ static void filmMarkEdited(const std::string &path)
 
 // A batch rating finished for `path`: the strip shows its new rating, flag and
 // label. (If a filter is on, the picture may now appear or disappear.)
-static void filmApplyMeta(const std::string &path, const PhotoMeta &m)
-{
+static void filmApplyMeta(const std::string &path, const PhotoMeta &m) {
   FilmStrip &f = state.film;
   const auto it = f.byName.find(filmLower(baseName(path)));
   if (it == f.byName.end() || static_cast<int>(it->second) == f.current)
@@ -2835,18 +2703,15 @@ static void filmApplyMeta(const std::string &path, const PhotoMeta &m)
 }
 
 // UI thread: takes in the thumbnails the worker has made.
-static void collectThumbJobs()
-{
+static void collectThumbJobs() {
   bool metaChanged = false;
-  for (auto &r : thumbWorker.collect())
-  {
+  for (auto &r : thumbWorker.collect()) {
     FilmStrip &f = state.film;
     const auto it = f.byName.find(filmLower(baseName(r.path)));
     if (it == f.byName.end() || f.files[it->second].path != r.path)
       continue; // from a folder we have left
     FilmEntry &e = f.files[it->second];
-    if (r.thumb)
-    {
+    if (r.thumb) {
       const std::shared_ptr<const CanvasImage> raw = r.thumb;
       // The open picture's own thumbnail already shows its edits: keep that.
       if (!(static_cast<int>(it->second) == f.current &&
@@ -2854,15 +2719,15 @@ static void collectThumbJobs()
         e.thumb = std::move(r.thumb);
       // The virtual copies right after it show the same picture until opened.
       if (e.copy == 0)
-        for (size_t k = it->second + 1; k < f.files.size() && f.files[k].copy > 0; ++k)
+        for (size_t k = it->second + 1;
+             k < f.files.size() && f.files[k].copy > 0; ++k)
           if (!f.files[k].thumb)
             f.files[k].thumb = raw;
-    }
-    else if (!r.thumbSkipped)
+    } else if (!r.thumbSkipped)
       e.failed = true; // (a virtual copy is skipped on purpose: not a failure)
     e.edited = e.edited || r.edited;
-    if (!e.scanned)
-    { // only the first reading counts: after that the editor's own value is the
+    if (!e.scanned) { // only the first reading counts: after that the editor's
+                      // own value is the
       // truth (a late result could carry what the sidecar said before a rating)
       e.scanned = true;
       e.meta = r.meta;
@@ -2875,12 +2740,12 @@ static void collectThumbJobs()
 }
 
 static void adoptDecoded(DecodeWorker::Result &&r); // defined below
-static std::string gVcDeleteArmed; // path of the copy "Delete Virtual Copy" was pressed for
+static std::string
+    gVcDeleteArmed; // path of the copy "Delete Virtual Copy" was pressed for
 
 // Opens the picture at index `i` (same background decode as File > Open; a
 // virtual copy of the picture that is already open reuses its pixels instead).
-static void filmOpenIndex(int i)
-{
+static void filmOpenIndex(int i) {
   FilmStrip &f = state.film;
   if (i < 0 || static_cast<size_t>(i) >= f.files.size() || i == f.target ||
       state.dragging || syncBusy())
@@ -2892,14 +2757,17 @@ static void filmOpenIndex(int i)
   filmEnsureVisible(i);
   const std::string &path = f.files[static_cast<size_t>(i)].path;
   if (state.original && !state.imagePath.empty() && path != state.imagePath &&
-      vcImageOf(path) == vcImageOf(state.imagePath))
-  { // another set of edits for the picture on screen: same file, same pixels,
+      vcImageOf(path) ==
+          vcImageOf(state.imagePath)) { // another set of edits for the picture
+                                        // on screen: same file, same pixels,
     // so skip the decode and adopt them exactly as a finished decode would
-    decodeWorker.invalidate(); // a decode of some other file is no longer wanted
+    decodeWorker
+        .invalidate(); // a decode of some other file is no longer wanted
     DecodeWorker::Result r;
     r.path = path;
     r.image.emplace(*state.original);
-    adoptDecoded(std::move(r)); // flushes the old copy's edits, loads this one's
+    adoptDecoded(
+        std::move(r)); // flushes the old copy's edits, loads this one's
     return;
   }
   setStatus("Opening " + f.files[static_cast<size_t>(i)].name + "...", false);
@@ -2909,8 +2777,7 @@ static void filmOpenIndex(int i)
 
 // Left / Right: the previous / next picture (relative to the one asked for
 // last, so quick repeats keep moving).
-static void filmStep(int d)
-{
+static void filmStep(int d) {
   const FilmStrip &f = state.film;
   if (f.view.empty())
     return;
@@ -2923,22 +2790,20 @@ static void filmStep(int d)
   filmOpenIndex(f.view[static_cast<size_t>(pos)]);
 }
 
-static void filmScrollBy(float dx)
-{
+static void filmScrollBy(float dx) {
   state.film.scrollX += dx;
   filmClampScroll();
   state.film.dirty = true;
 }
 
-static void filmClearSelection()
-{
+static void filmClearSelection() {
   for (FilmEntry &e : state.film.files)
     e.selected = false;
   state.film.dirty = true;
 }
 
-static void filmSelectAll()
-{ // only what the strip shows: Sync Settings must not reach hidden pictures
+static void filmSelectAll() { // only what the strip shows: Sync Settings must
+                              // not reach hidden pictures
   for (FilmEntry &e : state.film.files)
     e.selected = false;
   for (int i : state.film.view)
@@ -2958,28 +2823,17 @@ constexpr std::array<Color, kLabelCount> kLabelColors = {
 static const char *const kLabelDisplay[kLabelCount] = {"Red", "Yellow", "Green",
                                                        "Blue", "Purple"};
 
-struct FilmBarItem
-{
-  enum Kind
-  {
-    None,
-    Star,
-    Pick,
-    Reject,
-    Label,
-    Clear
-  };
+struct FilmBarItem {
+  enum Kind { None, Star, Pick, Reject, Label, Clear };
   Kind kind = None;
   int n = 0; // the star count or the label number
   float x = 0.0f, w = 0.0f;
 };
 
-static std::vector<FilmBarItem> filmBarItems()
-{
+static std::vector<FilmBarItem> filmBarItems() {
   std::vector<FilmBarItem> v;
   float x = kBarPad;
-  auto add = [&](FilmBarItem::Kind k, int n, float w)
-  {
+  auto add = [&](FilmBarItem::Kind k, int n, float w) {
     FilmBarItem it;
     it.kind = k;
     it.n = n;
@@ -2996,8 +2850,7 @@ static std::vector<FilmBarItem> filmBarItems()
   x += kBarGap;
   for (int c = 1; c <= kLabelCount; ++c)
     add(FilmBarItem::Label, c, kBarBtn);
-  if (state.film.filter.active())
-  {
+  if (state.film.filter.active()) {
     x += kBarGap;
     add(FilmBarItem::Clear, 0, kBarClearW);
   }
@@ -3006,8 +2859,7 @@ static std::vector<FilmBarItem> filmBarItems()
 
 // The filter changed: re-pick what the strip shows. Nothing hidden stays
 // selected (Sync Settings would write into it unseen).
-static void filmFilterChanged()
-{
+static void filmFilterChanged() {
   FilmStrip &f = state.film;
   filmRebuildView();
   for (size_t i = 0; i < f.files.size(); ++i)
@@ -3018,15 +2870,12 @@ static void filmFilterChanged()
   f.dirty = true;
 }
 
-static void filmBarClick(float x)
-{
+static void filmBarClick(float x) {
   FilmStrip &f = state.film;
-  for (const FilmBarItem &it : filmBarItems())
-  {
+  for (const FilmBarItem &it : filmBarItems()) {
     if (x < it.x || x >= it.x + it.w)
       continue;
-    switch (it.kind)
-    {
+    switch (it.kind) {
     case FilmBarItem::Star:
       f.filter.toggleRating(it.n);
       break;
@@ -3055,30 +2904,26 @@ static void filmBarClick(float x)
 // picture in the selection, Shift+click selects the range from the last one
 // clicked (among the pictures shown). The open picture joins the selection the
 // first time, so it is part of the range.
-static void filmClick(float localX, float localY, const KeyModifiers &mods)
-{
+static void filmClick(float localX, float localY, const KeyModifiers &mods) {
   FilmStrip &f = state.film;
-  if (localY < kFilmBarH)
-  {
+  if (localY < kFilmBarH) {
     filmBarClick(localX);
     return;
   }
   const int total = static_cast<int>(f.files.size());
   const int n = static_cast<int>(f.view.size());
-  const int pos = static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
+  const int pos =
+      static_cast<int>(std::floor((localX + f.scrollX) / kFilmCellW));
   if (pos < 0 || pos >= n)
     return;
   const int i = f.view[static_cast<size_t>(pos)];
-  if (mods.ctrl || mods.shift)
-  {
+  if (mods.ctrl || mods.shift) {
     const int base = f.current >= 0 ? f.current : i;
     const bool any = std::any_of(f.files.begin(), f.files.end(),
-                                 [](const FilmEntry &e)
-                                 { return e.selected; });
+                                 [](const FilmEntry &e) { return e.selected; });
     if (!any)
       f.files[static_cast<size_t>(base)].selected = true;
-    if (mods.shift)
-    {
+    if (mods.shift) {
       const int a = f.anchor >= 0 && f.anchor < total ? f.anchor : base;
       int pa = filmViewPos(a);
       if (pa < 0)
@@ -3088,10 +2933,9 @@ static void filmClick(float localX, float localY, const KeyModifiers &mods)
       for (FilmEntry &e : f.files)
         e.selected = false;
       for (int k = std::min(pa, pos); k <= std::max(pa, pos); ++k)
-        f.files[static_cast<size_t>(f.view[static_cast<size_t>(k)])].selected = true;
-    }
-    else
-    {
+        f.files[static_cast<size_t>(f.view[static_cast<size_t>(k)])].selected =
+            true;
+    } else {
       FilmEntry &e = f.files[static_cast<size_t>(i)];
       e.selected = !e.selected;
       f.anchor = i;
@@ -3104,27 +2948,23 @@ static void filmClick(float localX, float localY, const KeyModifiers &mods)
   filmOpenIndex(i);
 }
 
-static void toggleFilmstrip()
-{
+static void toggleFilmstrip() {
   state.film.visible = !state.film.visible;
   state.film.dirty = true;
 }
 
-static bool filmstripShown()
-{
+static bool filmstripShown() {
   return state.film.visible && !state.film.files.empty();
 }
 
 // File > Open Folder: lists the folder and opens its first picture.
-static void openFolder()
-{
+static void openFolder() {
   if (syncBusy())
     return;
   auto dir = openFolderPicker("Open Folder");
   if (!dir)
     return; // user cancelled
-  if (!filmAdoptFolder(*dir))
-  {
+  if (!filmAdoptFolder(*dir)) {
     setStatus("No JPEG or PNG pictures in " + baseName(*dir), true);
     return;
   }
@@ -3132,16 +2972,14 @@ static void openFolder()
   filmOpenIndex(0);
 }
 
-static std::string starsText(int n)
-{
+static std::string starsText(int n) {
   std::string s;
   for (int i = 0; i < n; ++i)
     s += "\xE2\x98\x85"; // U+2605 BLACK STAR
   return s;
 }
 
-static void paintFilmstrip(CanvasContext &ctx)
-{
+static void paintFilmstrip(CanvasContext &ctx) {
   FilmStrip &f = state.film;
   const float W = ctx.width();
   f.viewW = W;
@@ -3158,12 +2996,10 @@ static void paintFilmstrip(CanvasContext &ctx)
     ctx.setFont("", 12.0f);
     ctx.setTextBaseline(TextBaseline::Top);
     ctx.setTextAlign(TextAlign::Center);
-    for (const FilmBarItem &it : filmBarItems())
-    {
+    for (const FilmBarItem &it : filmBarItems()) {
       const float cx = it.x + it.w / 2.0f;
       bool on = false;
-      switch (it.kind)
-      {
+      switch (it.kind) {
       case FilmBarItem::Star:
         on = it.n <= fl.minRating;
         break;
@@ -3179,13 +3015,11 @@ static void paintFilmstrip(CanvasContext &ctx)
       default:
         break;
       }
-      if (on && it.kind != FilmBarItem::Star)
-      {
+      if (on && it.kind != FilmBarItem::Star) {
         ctx.setFillColor(kColorTrack);
         ctx.fillRect(it.x, 3, it.w, kFilmBarH - 6);
       }
-      switch (it.kind)
-      {
+      switch (it.kind) {
       case FilmBarItem::Star:
         ctx.setFillColor(on ? gold : kColorTextFaint);
         ctx.fillText("\xE2\x98\x85", cx, 6);
@@ -3198,8 +3032,7 @@ static void paintFilmstrip(CanvasContext &ctx)
         ctx.setFillColor(on ? kColorTextDark : kColorTextMuted);
         ctx.fillText("Reject", cx, 6);
         break;
-      case FilmBarItem::Label:
-      {
+      case FilmBarItem::Label: {
         Color c = kLabelColors[static_cast<size_t>(it.n - 1)];
         if (!on)
           c.a = 140;
@@ -3217,15 +3050,15 @@ static void paintFilmstrip(CanvasContext &ctx)
         break;
       }
     }
-    if (fl.active())
-    {
+    if (fl.active()) {
       size_t unread = 0;
       for (const FilmEntry &e : f.files)
         unread += e.scanned ? 0 : 1;
       std::string t = std::to_string(f.view.size()) + " of " +
                       std::to_string(f.files.size());
       if (unread > 0)
-        t += " (reading ratings\u2026)"; // thumbnails bring each picture's rating in
+        t += " (reading ratings\u2026)"; // thumbnails bring each picture's
+                                         // rating in
       ctx.setTextAlign(TextAlign::End);
       ctx.setFillColor(kColorTextMuted);
       ctx.fillText(t, W - kBarPad, 6);
@@ -3235,8 +3068,7 @@ static void paintFilmstrip(CanvasContext &ctx)
   // ---- cells ----
   const float oy = kFilmBarH, H = kFilmCellsH;
   const int n = static_cast<int>(f.view.size());
-  if (n == 0)
-  {
+  if (n == 0) {
     ctx.setFont("", 12.0f);
     ctx.setTextAlign(TextAlign::Center);
     ctx.setTextBaseline(TextBaseline::Top);
@@ -3247,19 +3079,15 @@ static void paintFilmstrip(CanvasContext &ctx)
   const int first = std::max(0, static_cast<int>(f.scrollX / kFilmCellW));
   const int last =
       std::min(n - 1, static_cast<int>((f.scrollX + W) / kFilmCellW));
-  for (int p = first; p <= last; ++p)
-  {
+  for (int p = first; p <= last; ++p) {
     const int i = f.view[static_cast<size_t>(p)];
     const FilmEntry &e = f.files[static_cast<size_t>(i)];
     const float cx = static_cast<float>(p) * kFilmCellW - f.scrollX;
     const bool selected = i == f.target;
-    if (selected)
-    {
+    if (selected) {
       ctx.setFillColor(kColorActivityActive);
       ctx.fillRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
-    }
-    else if (e.selected)
-    { // picked for Sync Settings
+    } else if (e.selected) { // picked for Sync Settings
       ctx.setFillColor(kColorTrack);
       ctx.fillRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
       ctx.setStrokeColor(kColorAccent);
@@ -3267,57 +3095,52 @@ static void paintFilmstrip(CanvasContext &ctx)
       ctx.strokeRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
     }
     const float bx = cx + (kFilmCellW - kFilmThumbW) / 2.0f, by = oy + 6.0f;
-    if (e.thumb)
-    {
+    if (e.thumb) {
       const float x = bx + (kFilmThumbW - e.thumb->width) / 2.0f;
       const float y = by + (kFilmThumbH - e.thumb->height) / 2.0f;
       ctx.drawImage(*e.thumb, std::floor(x), std::floor(y));
-    }
-    else
-    {
+    } else {
       ctx.setFillColor(kColorTrack);
       ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
     }
-    if (e.meta.flag == PhotoFlag::Reject)
-    { // dimmed, like a rejected frame on a contact sheet
+    if (e.meta.flag ==
+        PhotoFlag::Reject) { // dimmed, like a rejected frame on a contact sheet
       ctx.setFillColor(Color{0, 0, 0, 130});
       ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
     }
-    if (selected)
-    {
+    if (selected) {
       ctx.setStrokeColor(kColorAccent);
       ctx.setLineWidth(2.0f);
       ctx.strokeRect(cx + 2, oy + 2, kFilmCellW - 4, H - 4);
     }
-    if (e.edited)
-    { // a dot in the thumbnail's bottom-right corner
+    if (e.edited) { // a dot in the thumbnail's bottom-right corner
       ctx.setFillColor(kColorAccent);
       ctx.beginPath();
       ctx.roundRect(bx + kFilmThumbW - 12, by + kFilmThumbH - 12, 8, 8, 4);
       ctx.fill();
     }
-    if (e.copy > 0)
-    { // "C2": this cell is virtual copy 2 of the picture before it
+    if (e.copy >
+        0) { // "C2": this cell is virtual copy 2 of the picture before it
       ctx.setFillColor(Color{0, 0, 0, 150});
       ctx.fillRect(bx + kFilmThumbW - 36, by + kFilmThumbH - 15, 20, 13);
       ctx.setFont("", 9.0f);
       ctx.setTextAlign(TextAlign::Center);
       ctx.setTextBaseline(TextBaseline::Top);
       ctx.setFillColor(Color{255, 255, 255});
-      ctx.fillText("C" + std::to_string(e.copy), bx + kFilmThumbW - 26, by + kFilmThumbH - 14);
+      ctx.fillText("C" + std::to_string(e.copy), bx + kFilmThumbW - 26,
+                   by + kFilmThumbH - 14);
     }
-    if (e.meta.rating > 0)
-    { // gold stars on the bottom-left corner
+    if (e.meta.rating > 0) { // gold stars on the bottom-left corner
       ctx.setFillColor(Color{0, 0, 0, 150});
-      ctx.fillRect(bx + 2, by + kFilmThumbH - 15, 7.0f + 9.0f * e.meta.rating, 13);
+      ctx.fillRect(bx + 2, by + kFilmThumbH - 15, 7.0f + 9.0f * e.meta.rating,
+                   13);
       ctx.setFont("", 9.0f);
       ctx.setTextAlign(TextAlign::Start);
       ctx.setTextBaseline(TextBaseline::Top);
       ctx.setFillColor(Color{255, 205, 60});
       ctx.fillText(starsText(e.meta.rating), bx + 5, by + kFilmThumbH - 14);
     }
-    if (e.meta.label > 0)
-    { // color dot, top-left
+    if (e.meta.label > 0) { // color dot, top-left
       ctx.setFillColor(Color{0, 0, 0, 150});
       ctx.beginPath();
       ctx.roundRect(bx + 3, by + 3, 14, 14, 7);
@@ -3327,8 +3150,7 @@ static void paintFilmstrip(CanvasContext &ctx)
       ctx.roundRect(bx + 5, by + 5, 10, 10, 5);
       ctx.fill();
     }
-    if (e.meta.flag != PhotoFlag::None)
-    { // "P" / "X" badge, top-right
+    if (e.meta.flag != PhotoFlag::None) { // "P" / "X" badge, top-right
       const bool pick = e.meta.flag == PhotoFlag::Pick;
       ctx.setFillColor(pick ? Color{70, 165, 90} : Color{205, 60, 60});
       ctx.beginPath();
@@ -3342,8 +3164,7 @@ static void paintFilmstrip(CanvasContext &ctx)
     }
     std::string label = e.name;
     constexpr size_t kMaxChars = 15;
-    if (label.size() > kMaxChars)
-    {
+    if (label.size() > kMaxChars) {
       size_t cut = kMaxChars - 1; // never split a UTF-8 character
       while (cut > 0 && (static_cast<unsigned char>(label[cut]) & 0xC0) == 0x80)
         --cut;
@@ -3358,11 +3179,11 @@ static void paintFilmstrip(CanvasContext &ctx)
 }
 // END filmstrip
 
-// ---------------- Rating, flag and color label (open picture + selection) ----------------
-// Not edits: no undo step, no History label, adjust.version() is not touched.
-// The open picture's value lives in state.meta, is mirrored into the strip's
-// entry, and is saved in the sidecar's "meta" object (autosaveSidecar /
-// flushSidecar look at state.metaDirty).
+// ---------------- Rating, flag and color label (open picture + selection)
+// ---------------- Not edits: no undo step, no History label, adjust.version()
+// is not touched. The open picture's value lives in state.meta, is mirrored
+// into the strip's entry, and is saved in the sidecar's "meta" object
+// (autosaveSidecar / flushSidecar look at state.metaDirty).
 //
 // A command (applyMetaPatch) changes the open picture at once. If other
 // pictures are selected in the filmstrip it changes them too, on the Sync
@@ -3371,16 +3192,14 @@ static void paintFilmstrip(CanvasContext &ctx)
 // picture is never in that batch, so it can't race with autosave. "Choose the
 // value it already has to clear it" is decided from the open picture, and the
 // result (set or clear) is then applied to every selected picture alike.
-static void setPhotoMeta(const PhotoMeta &in, const std::string &message)
-{
+static void setPhotoMeta(const PhotoMeta &in, const std::string &message) {
   const PhotoMeta m = photoMetaSanitized(in);
   if (m == state.meta)
     return;
   state.meta = m;
   state.metaDirty = true;
   FilmStrip &f = state.film;
-  if (f.current >= 0 && static_cast<size_t>(f.current) < f.files.size())
-  {
+  if (f.current >= 0 && static_cast<size_t>(f.current) < f.files.size()) {
     FilmEntry &e = f.files[static_cast<size_t>(f.current)];
     e.meta = m;
     e.scanned = true;
@@ -3392,8 +3211,7 @@ static void setPhotoMeta(const PhotoMeta &in, const std::string &message)
 }
 
 // The selected pictures other than the open one that the strip shows.
-static std::vector<std::string> metaBatchTargets()
-{
+static std::vector<std::string> metaBatchTargets() {
   const FilmStrip &f = state.film;
   std::vector<std::string> paths;
   for (size_t i = 0; i < f.files.size(); ++i)
@@ -3403,10 +3221,8 @@ static std::vector<std::string> metaBatchTargets()
   return paths;
 }
 
-static void applyMetaPatch(const MetaPatch &patch, const std::string &message)
-{
-  if (!state.original || state.imagePath.empty())
-  {
+static void applyMetaPatch(const MetaPatch &patch, const std::string &message) {
+  if (!state.original || state.imagePath.empty()) {
     setStatus("Open a picture first", true);
     return;
   }
@@ -3427,18 +3243,17 @@ static void applyMetaPatch(const MetaPatch &patch, const std::string &message)
             false);
 }
 
-static void ratePhoto(int n)
-{
+static void ratePhoto(int n) {
   n = std::clamp(n, 0, kMaxRating);
   const int v = n == state.meta.rating ? 0 : n;
   MetaPatch p;
   p.rating = v;
-  applyMetaPatch(p, v > 0 ? "Rating: " + starsText(v) : std::string("Rating cleared"));
+  applyMetaPatch(p, v > 0 ? "Rating: " + starsText(v)
+                          : std::string("Rating cleared"));
 }
 
 // Pick or Reject toggles; PhotoFlag::None clears.
-static void flagPhoto(PhotoFlag flag)
-{
+static void flagPhoto(PhotoFlag flag) {
   const PhotoFlag v = flag == state.meta.flag ? PhotoFlag::None : flag;
   MetaPatch p;
   p.flag = v;
@@ -3448,8 +3263,7 @@ static void flagPhoto(PhotoFlag flag)
 }
 
 // 1..kLabelCount toggles that color; 0 clears.
-static void labelPhoto(int c)
-{
+static void labelPhoto(int c) {
   c = std::clamp(c, 0, kLabelCount);
   const int v = c == state.meta.label ? 0 : c;
   MetaPatch p;
@@ -3458,10 +3272,8 @@ static void labelPhoto(int c)
                           : std::string("Label cleared"));
 }
 
-static void adoptDecoded(DecodeWorker::Result &&r)
-{
-  if (!r.image)
-  {
+static void adoptDecoded(DecodeWorker::Result &&r) {
+  if (!r.image) {
     // Leave whatever image is already open untouched and say what happened.
     setStatus("Couldn't open " + pictureLabel(r.path) + ": " +
                   (r.error.empty() ? std::string("unsupported or damaged image")
@@ -3487,59 +3299,56 @@ static void adoptDecoded(DecodeWorker::Result &&r)
   ++state.imageSerial;
 
   state.original = std::make_shared<CanvasImage>(std::move(*r.image));
-  state.original16 = std::move(r.wide); // null for an 8-bit file; syncSource(true) below rebuilds the twin chain
+  state.original16 =
+      std::move(r.wide); // null for an 8-bit file; syncSource(true) below
+                         // rebuilds the twin chain
   state.imagePath = std::move(r.path);
   state.zoom = 1.0f;    // start fresh at 100% on every newly opened image
   state.adjust.reset(); // and with no adjustment, crop or rotation applied yet
   state.adjust.setOriginalSize(state.original->width, state.original->height);
   state.maskSel = -1;
   state.mask.part = 0;
-  loadSidecar();             // this picture's saved edits, if any (before syncSource: crop / rotation)
+  loadSidecar(); // this picture's saved edits, if any (before syncSource: crop
+                 // / rotation)
   filmSync(state.imagePath); // the strip follows: folder, selection, thumbnails
   state.dragging = false;
   state.dragIsAngle = false;
-  state.image.reset();          // the old file's pixels: force the synchronous path
-  syncSource(true);             // source = original; builds previewBase, resets selection
-  updateImageFromAdjustments(); // builds state.image from state.source
-  state.colorNoticePending = true; // a large picture's geometry job would clear the notice when it lands
+  state.image.reset(); // the old file's pixels: force the synchronous path
+  syncSource(true); // source = original; builds previewBase, resets selection
+  updateImageFromAdjustments();    // builds state.image from state.source
+  state.colorNoticePending = true; // a large picture's geometry job would clear
+                                   // the notice when it lands
   announceColorTag();
 }
 
 // Non-blocking; polled once per frame from flushPendingAdjust.
-static void collectDecodeJob()
-{
+static void collectDecodeJob() {
   if (auto r = decodeWorker.collect())
     adoptDecoded(std::move(*r));
 }
 
-static void openImage()
-{
+static void openImage() {
   if (syncBusy())
     return;
   auto paths = openFilesPicker(
-      "Open Images",
-      {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
+      "Open Images", {{"Images", "*.png;*.jpg;*.jpeg"}, {"All Files", "*.*"}});
   if (paths.empty())
     return; // user cancelled
 
-  if (paths.size() > 1)
-  {
+  if (paths.size() > 1) {
     // The dialog also offers "All Files": keep only pictures we can show.
     paths.erase(std::remove_if(paths.begin(), paths.end(),
-                               [](const std::string &p)
-                               {
+                               [](const std::string &p) {
                                  const std::string e = fileExtLower(p);
                                  return e != "jpg" && e != "jpeg" && e != "png";
                                }),
                 paths.end());
-    if (paths.empty())
-    {
+    if (paths.empty()) {
       setStatus("No JPEG or PNG pictures selected", true);
       return;
     }
     std::sort(paths.begin(), paths.end(),
-              [](const std::string &a, const std::string &b)
-              {
+              [](const std::string &a, const std::string &b) {
                 const std::string x = baseName(a), y = baseName(b);
                 return naturalLess(x, y) || (!naturalLess(y, x) && x < y);
               });
@@ -3556,8 +3365,7 @@ static void openImage()
 // The format follows the file name the user picks (.jpg / .jpeg / .png); the
 // Export pane's format choice only decides what the dialog offers first.
 
-static void exportImage()
-{
+static void exportImage() {
   if (!state.image)
     return;            // nothing open to export
   finishGeometryJob(); // never export the stale (pre-rebuild) picture
@@ -3570,25 +3378,28 @@ static void exportImage()
   if (stem.empty())
     stem = "export";
   if (const int n = vcCopyOf(state.imagePath); n > 0)
-    stem += "-copy" + std::to_string(n); // keeps a copy's export apart from the original's
+    stem += "-copy" + std::to_string(
+                          n); // keeps a copy's export apart from the original's
 
   const bool wantJpeg = state.exportJpeg;
-  auto path = wantJpeg
-                  ? saveFilePicker("Export as JPEG", stem + "-edit.jpg",
-                                   {{"JPEG Image", "*.jpg;*.jpeg"},
-                                    {"PNG Image", "*.png"}},
-                                   "jpg")
-                  : saveFilePicker(state.exportPng16 ? "Export as PNG (16-bit)" : "Export as PNG", stem + "-edit.png",
-                                   {{"PNG Image", "*.png"},
-                                    {"JPEG Image", "*.jpg;*.jpeg"}},
-                                   "png");
+  auto path =
+      wantJpeg
+          ? saveFilePicker(
+                "Export as JPEG", stem + "-edit.jpg",
+                {{"JPEG Image", "*.jpg;*.jpeg"}, {"PNG Image", "*.png"}}, "jpg")
+          : saveFilePicker(
+                state.exportPng16 ? "Export as PNG (16-bit)" : "Export as PNG",
+                stem + "-edit.png",
+                {{"PNG Image", "*.png"}, {"JPEG Image", "*.jpg;*.jpeg"}},
+                "png");
   if (!path)
     return; // user cancelled
 
   std::string out = *path;
   bool jpeg = isJpegPath(out);
-  if (!jpeg && fileExtLower(out) != "png")
-  { // no usable extension: use the pane's format and name the file for it
+  if (!jpeg &&
+      fileExtLower(out) != "png") { // no usable extension: use the pane's
+                                    // format and name the file for it
     jpeg = wantJpeg;
     out += jpeg ? ".jpg" : ".png";
   }
@@ -3598,11 +3409,13 @@ static void exportImage()
   // The size that will be written: with "Resize", the long side is shrunk to
   // the chosen length (never enlarged). Checked here, before any work, so a
   // picture JPEG can't hold gets a message that says what to do about it.
-  const Dims outSize = fitLongEdge(state.image->width, state.image->height,
-                                   state.exportResize ? state.exportLongEdge : 0);
-  if (jpeg && !jpegSizeOk(outSize.w, outSize.h))
-  {
-    setStatus("Too large for JPEG (" + std::to_string(kJpegMaxSide) +
+  const Dims outSize =
+      fitLongEdge(state.image->width, state.image->height,
+                  state.exportResize ? state.exportLongEdge : 0);
+  if (jpeg && !liteui_image::jpegSizeOk(static_cast<uint32_t>(outSize.w),
+                                        static_cast<uint32_t>(outSize.h))) {
+    setStatus("Too large for JPEG (" +
+                  std::to_string(liteui_image::kJpegMaxSide) +
                   " px per side at most): turn on Resize, or export as PNG",
               true);
     return;
@@ -3612,44 +3425,56 @@ static void exportImage()
 
   std::string err;
   bool ok = false;
-  if (png16)
-  {
-    // The picture on screen is 8-bit, so render the current source again with the same edits, rounded to
-    // 16 bits once at the end (render_core.hpp), and scale it the same way.
+  if (png16) {
+    // The picture on screen is 8-bit, so render the current source again with
+    // the same edits, rounded to 16 bits once at the end (render_core.hpp), and
+    // scale it the same way.
     std::shared_ptr<Image16> big =
-        state.source16 ? renderToImage16(*state.source16, state.source.get(), state.adjust.buildRenderParams())
-        : state.source ? renderToImage16(*state.source, state.adjust.buildRenderParams())
-                       : nullptr;
+        state.source16 ? renderToImage16(*state.source16, state.source.get(),
+                                         state.adjust.buildRenderParams())
+        : state.source
+            ? renderToImage16(*state.source, state.adjust.buildRenderParams())
+            : nullptr;
     if (big && resized)
       big = resizeToLongEdge(big, state.exportLongEdge);
-    if (big)
-      ok = encodePng16File(out, *big, &err);
-    else
+    if (big) {
+      const std::optional<ImageBuffer> buf = toImageBuffer(*big);
+      ok = buf && liteui_image::encodePng(out, *buf, &err, exportPngOptions());
+      if (!buf)
+        err = "nothing to write";
+    } else
       err = "couldn't render the picture";
-  }
-  else
-  {
+  } else {
     const std::shared_ptr<CanvasImage> outImage =
-        resized ? resizeToLongEdge(state.image, state.exportLongEdge) : state.image;
-    ok = jpeg ? saveJpegFile(out, *outImage, state.jpegQuality,
-                             state.keepMetadata, state.removeGps,
-                             vcImageOf(state.imagePath), &err)
-              : encodePngFile(out, *outImage, &err);
+        resized ? resizeToLongEdge(state.image, state.exportLongEdge)
+                : state.image;
+    if (jpeg) {
+      ok = saveJpegFile(out, *outImage, state.jpegQuality, state.keepMetadata,
+                        state.removeGps, vcImageOf(state.imagePath), &err);
+    } else {
+      const std::optional<ImageBuffer> buf = toImageBuffer(*outImage);
+      ok = buf &&
+           liteui_image::encodePng(out, *buf, &err, exportPngOptions());
+      if (!buf)
+        err = "nothing to write";
+    }
   }
-  // A PNG export carries its source's color tags (io/color_tag.hpp). A PNG source's profile can't go
-  // into a JPEG (it is deflate-compressed), which the status says.
+  // A PNG export carries its source's color tags (io/color_tag.hpp). A PNG
+  // source's profile can't go into a JPEG (it is deflate-compressed), which the
+  // status says.
   std::string tagNote;
-  if (ok && !jpeg)
-  {
-    const std::string kept = color_tag::carryColorToPng(out, vcImageOf(state.imagePath));
+  if (ok && !jpeg) {
+    color_tag::dropEncoderColor(out); // only the source's tags may stay
+    const std::string kept =
+        color_tag::carryColorToPng(out, vcImageOf(state.imagePath));
     if (!kept.empty())
       tagNote = " [" + kept + " kept]";
-  }
-  else if (ok && jpeg && !isJpegPath(vcImageOf(state.imagePath)) &&
-           !color_tag::colorTagOf(vcImageOf(state.imagePath)).srgb)
+  } else if (ok && jpeg && !isJpegPath(vcImageOf(state.imagePath)) &&
+             !color_tag::colorTagOf(vcImageOf(state.imagePath)).srgb)
     tagNote = " (color profile not carried into JPEG)";
   if (ok)
-    setStatus("Exported " + baseName(out) + std::string(png16 ? " [16-bit]" : "") + tagNote +
+    setStatus("Exported " + baseName(out) +
+                  std::string(png16 ? " [16-bit]" : "") + tagNote +
                   (resized ? " (" + std::to_string(outSize.w) + " × " +
                                  std::to_string(outSize.h) + ")"
                            : std::string()),
@@ -3660,67 +3485,132 @@ static void exportImage()
               true);
 }
 
-static void toggleSidebar()
-{
+static void toggleSidebar() {
   state.activeActivity = (state.activeActivity == -1) ? 0 : -1;
   state.markDirty(); // the crop overlay shows only while the Crop pane is open
 }
 
 // ---------------- Small reusable pieces ----------------
 
-// ---- Pointer-event helper ---------------------------------------------------
+// ---- Pointer-event helpers
+// --------------------------------------------------- Dispatch recap
+// (liteui.hpp, "Pointer events"): a press runs the onPointerDown of EVERY view
+// in its chain, deepest first, until one calls stopPropagation(). The chain
+// holds each view under the pointer that has onPointerDown OR a click handler,
+// so a view with only onClick does not stop a press from reaching an ancestor's
+// onPointerDown.
+
+// Closes the open titlebar dropdown. Presses that stopPropagation() never reach
+// the workspace's own "close the menu" handler, so they call this themselves.
+static void closeMenus() { state.openMenu = -1; }
+
+// A press on this view belongs to it alone. Used on titlebar widgets: without
+// it the press would bubble to the titlebar's onPointerDown, which closes menus
+// and calls requestMove() (a window drag that swallows the release, so the
+// click never arrives).
+static void swallowPress(View &v) {
+  v.onPointerDown = [](PointerEvent &e) { e.stopPropagation(); };
+}
+
+// ---- Keys for a focused text field ----
+// A global shortcut is matched BEFORE the focused view's onKeyDown and a match
+// ends the dispatch (LiteUIImpl::dispatchKeyDown). So a plain-key shortcut
+// (Left, Right, Delete, Enter) would starve a focused TextInput of that key
+// even when the shortcut itself stands down (see notTyping). The name fields
+// are registered here so those shortcuts can hand the key to the field instead;
+// it runs the very onKeyDown the TextInput was built with (same shared state).
+struct TextFieldKeys {
+  std::shared_ptr<TextInputState> state;
+  std::function<void(KeyEvent)> onKeyDown;
+};
+static std::vector<TextFieldKeys> gTextFields;
+
+// Call right after `parent.addChild(std::move(textInput))`, with that input's
+// state and the view it flattened into (parent.children.back()).
+static void registerTextField(const std::shared_ptr<TextInputState> &st,
+                              const View &flattened) {
+  gTextFields.push_back({st, flattened.onKeyDown});
+}
+
+// True if a registered field has focus and took the key.
+static bool forwardKeyToTextField(const KeyEvent &e) {
+  for (const TextFieldKeys &f : gTextFields)
+    if (f.state && f.state->focused && f.onKeyDown) {
+      f.onKeyDown(e);
+      return true;
+    }
+  return false;
+}
+
 // A left-button drag gesture on one view, built on pointer events. press / drag
-// / end get the view-local point, like the old onPressAt / onDragTo /
-// onDragEnd did. The press captures the pointer, so drag and release keep
-// arriving even when the pointer leaves the view. `rightPress` (optional)
-// handles right-button presses. The shared `active` flag makes sure the drag
-// and the end only run for a gesture that actually started on this view: a
-// pointer-up can also reach a view that never saw the press.
-static void bindDrag(View &v,
-                     std::function<void(float, float)> press,
+// / end get the view-local point. The press captures the pointer, so drag and
+// release keep arriving even when the pointer leaves the view. `rightPress`
+// (optional) handles right-button presses. `hover` / `dragging` (optional) are
+// the cursors shown over the view and while it is being dragged
+// (Style::cursor).
+//
+// The gesture belongs to ONE pointer (`owner`): touch can put several fingers
+// on the same view, and only the first drives the drag; the others are ignored
+// until it ends. For the mouse the owner is always pointer 1, so nothing
+// changes.
+static void bindDrag(View &v, std::function<void(float, float)> press,
                      std::function<void(float, float)> drag,
                      std::function<void()> end,
-                     std::function<void(float, float)> rightPress = nullptr)
-{
-  auto active = std::make_shared<bool>(false);
-  v.onPointerDown = [active, press, rightPress](PointerEvent &e)
-  {
+                     std::function<void(float, float)> rightPress = nullptr,
+                     Cursor hover = Cursor::Inherit,
+                     Cursor dragging = Cursor::Inherit) {
+  auto owner = std::make_shared<std::optional<uint32_t>>();
+  v.onPointerDown = [owner, press, rightPress](PointerEvent &e) {
     e.stopPropagation(); // this view owns the press (no ancestor handlers)
-    if (e.button == MouseButton::Left)
-    {
-      *active = true;
+    if (e.button == MouseButton::Left) {
+      closeMenus(); // ...so the workspace's close-the-menu handler won't see it
+      if (*owner)
+        return; // another pointer is already dragging this view
+      *owner = e.pointerId;
       if (press)
         press(e.x, e.y);
-    }
-    else if (e.button == MouseButton::Right && rightPress)
+    } else if (e.button == MouseButton::Right && rightPress)
       rightPress(e.x, e.y);
   };
-  v.onPointerMove = [active, drag](PointerEvent &e)
-  {
-    if (*active && drag && e.held(MouseButton::Left))
+  v.onPointerMove = [owner, drag](PointerEvent &e) {
+    if (*owner == e.pointerId && drag && e.held(MouseButton::Left))
       drag(e.x, e.y);
   };
-  auto finish = [active, end]
-  {
-    if (!*active)
-      return;
-    *active = false;
+  auto finish = [owner, end](const PointerEvent &e) {
+    if (*owner != e.pointerId)
+      return; // not the pointer that owns the gesture
+    owner->reset();
     if (end)
       end();
   };
-  v.onPointerUp = [finish](PointerEvent &e)
-  {
+  v.onPointerUp = [finish](PointerEvent &e) {
     if (e.button == MouseButton::Left)
-      finish();
+      finish(e);
   };
-  v.onPointerCancel = [finish](PointerEvent &)
-  { finish(); }; // focus loss / the OS took the mouse: the release never comes
+  v.onPointerCancel = [finish](PointerEvent &e) {
+    finish(e);
+  }; // focus loss / the OS took the pointer: the release never comes
+  if (hover != Cursor::Inherit) {
+    const Cursor held = dragging == Cursor::Inherit ? hover : dragging;
+    v.style.cursor = std::function<Cursor()>(
+        [owner, hover, held] { return *owner ? held : hover; });
+  }
+}
+
+// Every view with an onClick shows the hand cursor (Style::cursor is inherited,
+// so its label does too), unless it already chose a cursor of its own. Run once
+// on the finished tree.
+static void applyClickCursors(View &v) {
+  const auto *c = std::get_if<Cursor>(&v.style.cursor);
+  if (v.onClick && c && *c == Cursor::Inherit)
+    v.style.cursor = Cursor::Pointer;
+  for (View &child : v.children)
+    applyClickCursors(child);
 }
 
 // One row of a dropdown: label, action, and an optional shortcut hint shown
 // right-aligned (display only — the real bindings are in main()).
-struct MenuItem
-{
+struct MenuItem {
   std::string label;
   std::function<void()> action;
   std::string shortcut = {}; // optional
@@ -3731,18 +3621,19 @@ struct MenuItem
 // (EditorState::openMenu); picking an item runs its action and closes the
 // menu.
 static View menuButton(const std::string &label, int id,
-                       std::vector<MenuItem> items)
-{
+                       std::vector<MenuItem> items) {
   View btn;
   btn.style.height = Size::full();
   btn.style.padding = EdgeInsets{0, 12, 0, 12};
   btn.style.justifyContent = Justify::Center;
   btn.style.alignItems = Align::Center;
   btn.style.hoverColor = kColorMenuHover;
-  btn.style.backgroundColor = std::function<Color()>([id]
-                                                     { return state.openMenu == id ? kColorMenuHover : kColorTransparent; });
-  btn.onClick = [id]
-  { state.openMenu = (state.openMenu == id) ? -1 : id; };
+  btn.style.backgroundColor = std::function<Color()>([id] {
+    return state.openMenu == id ? kColorMenuHover : kColorTransparent;
+  });
+  btn.onClick = [id] { state.openMenu = (state.openMenu == id) ? -1 : id; };
+  swallowPress(
+      btn); // also covers the dropdown rows (they are btn's descendants)
 
   Text label_;
   label_.label = label;
@@ -3763,11 +3654,9 @@ static View menuButton(const std::string &label, int id,
   dropdown.style.padding = EdgeInsets::all(4.0f);
   dropdown.style.zIndex = 100;
   dropdown.style.display = std::function<Display()>(
-      [id]
-      { return state.openMenu == id ? Display::Flex : Display::None; });
+      [id] { return state.openMenu == id ? Display::Flex : Display::None; });
 
-  for (auto &item : items)
-  {
+  for (auto &item : items) {
     View row;
     row.style.height = Size::pixel(30);
     row.style.width = Size::full();
@@ -3777,8 +3666,7 @@ static View menuButton(const std::string &label, int id,
     row.style.borderRadius = 3.0f;
     row.style.hoverColor = kColorDropdownRowHover;
     std::function<void()> action = item.action;
-    row.onClick = [action]
-    {
+    row.onClick = [action] {
       action();
       state.openMenu = -1;
     };
@@ -3788,8 +3676,7 @@ static View menuButton(const std::string &label, int id,
     t.fontSize = 13.0f;
     t.color = kColorTextDark;
     row.addChild(std::move(t));
-    if (!item.shortcut.empty())
-    {
+    if (!item.shortcut.empty()) {
       Text hint;
       hint.label = item.shortcut;
       hint.fontSize = 12.0f;
@@ -3805,8 +3692,7 @@ static View menuButton(const std::string &label, int id,
 
 // One of the three window-control buttons (minimize/maximize/close).
 static View winButton(const std::string &glyph, Color hoverBg,
-                      std::function<void()> onClick)
-{
+                      std::function<void()> onClick) {
   View v;
   v.style.width = Size::pixel(46);
   v.style.height = Size::full();
@@ -3814,6 +3700,7 @@ static View winButton(const std::string &glyph, Color hoverBg,
   v.style.alignItems = Align::Center;
   v.style.hoverColor = hoverBg;
   v.onClick = std::move(onClick);
+  swallowPress(v);
 
   Text t;
   t.label = glyph;
@@ -3829,8 +3716,7 @@ static View winButton(const std::string &glyph, Color hoverBg,
 // that case (undo()/redo() already check before doing anything).
 static View titlebarIconBtn(const std::string &glyph,
                             std::function<void()> onClick,
-                            std::function<bool()> enabled = {})
-{
+                            std::function<bool()> enabled = {}) {
   View v;
   v.style.width = Size::pixel(28);
   v.style.height = Size::pixel(28);
@@ -3839,12 +3725,14 @@ static View titlebarIconBtn(const std::string &glyph,
   v.style.alignItems = Align::Center;
   v.style.hoverColor = kColorMenuHover;
   v.onClick = std::move(onClick);
+  swallowPress(v);
 
   Text t;
   t.label = glyph;
   t.fontSize = 14.0f;
-  t.color = enabled ? Dynamic<Color>(std::function<Color()>([enabled]
-                                                            { return enabled() ? kColorTextDark : kColorTextFaint; }))
+  t.color = enabled ? Dynamic<Color>(std::function<Color()>([enabled] {
+    return enabled() ? kColorTextDark : kColorTextFaint;
+  }))
                     : Dynamic<Color>(kColorTextDark);
   v.addChild(std::move(t));
   return v;
@@ -3857,8 +3745,7 @@ static View sidebarButton(const std::string &label,
                           std::function<void()> onClick,
                           std::function<bool()> selected = {},
                           bool primary = false,
-                          std::function<bool()> enabled = {})
-{
+                          std::function<bool()> enabled = {}) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -3868,22 +3755,20 @@ static View sidebarButton(const std::string &label,
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.hoverColor = primary ? kColorAccentHover : kColorActivityHover;
   b.style.backgroundColor =
-      std::function<Color()>([selected, primary, enabled]() -> Color
-                             {
+      std::function<Color()>([selected, primary, enabled]() -> Color {
         if (enabled && !enabled())
           return kColorActivityBarBg; // dimmed: no primary fill while busy
         if (primary)
           return kColorAccent;
         return (selected && selected()) ? kColorDropdownRowHover
-                                        : kColorActivityBarBg; });
+                                        : kColorActivityBarBg;
+      });
   b.style.borderWidth = std::function<float()>(
-      [selected]
-      { return (selected && selected()) ? 1.0f : 0.0f; });
+      [selected] { return (selected && selected()) ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
   // A disabled button ignores clicks (the action functions also re-check, so
   // shortcuts are covered) and shows muted text.
-  b.onClick = [onClick = std::move(onClick), enabled]
-  {
+  b.onClick = [onClick = std::move(onClick), enabled] {
     if (!enabled || enabled())
       onClick();
   };
@@ -3893,8 +3778,9 @@ static View sidebarButton(const std::string &label,
   t.fontSize = 13.0f;
   const Color liveColor = primary ? kColorWhite : kColorTextDark;
   if (enabled)
-    t.color = std::function<Color()>([enabled, liveColor]() -> Color
-                                     { return enabled() ? liveColor : kColorTextMuted; });
+    t.color = std::function<Color()>([enabled, liveColor]() -> Color {
+      return enabled() ? liveColor : kColorTextMuted;
+    });
   else
     t.color = liveColor;
   b.addChild(std::move(t));
@@ -3904,23 +3790,23 @@ static View sidebarButton(const std::string &label,
 // What a slider row needs to know: its label, range, how to read/write the
 // value, and how to print it. Shared by the Adjust sliders (via
 // buildAdjustmentSlider) and the Straighten angle slider.
-// Export's "Resize" slider: the long side, in px, in steps of kExportLongEdgeStep.
+// Export's "Resize" slider: the long side, in px, in steps of
+// kExportLongEdgeStep.
 constexpr int kExportLongEdgeMin = 128;
 constexpr int kExportLongEdgeMax = 8192;
 constexpr int kExportLongEdgeStep = 16;
 
-struct SliderSpec
-{
+struct SliderSpec {
   std::string name;
   float lo = 0.0f, hi = 1.0f;
   std::function<float()> get;
-  std::function<void(float)> set;           // called with each new value while dragging
+  std::function<void(float)> set; // called with each new value while dragging
   std::function<std::string(float)> format; // value -> text after "name: "
-  bool isAngle = false;                     // drag drives the angle preview instead of the
-                                            // pixel-adjustment preview (see canvasDirtySource)
-  bool affectsPixels = true;                // false: the value only changes a tool setting
-                                            // (brush size...), so a drag needs no re-render
-  bool hasAccent = false;                   // tint the fill + thumb border (Color Mixer bands)
+  bool isAngle = false;      // drag drives the angle preview instead of the
+                             // pixel-adjustment preview (see canvasDirtySource)
+  bool affectsPixels = true; // false: the value only changes a tool setting
+                             // (brush size...), so a drag needs no re-render
+  bool hasAccent = false;    // tint the fill + thumb border (Color Mixer bands)
   Color accent{};
   float trackW = 150.0f;       // track length in px
   std::function<void()> onEnd; // optional: fired when a drag on it ends
@@ -3931,8 +3817,7 @@ struct SliderSpec
 // than binding a raw float& the way a standalone slider widget would —
 // that's what lets AdjustmentSet coalesce a whole drag into one undo step
 // instead of one per frame.
-static View buildSliderRow(const SliderSpec &spec)
-{
+static View buildSliderRow(const SliderSpec &spec) {
   const float kTrackW = spec.trackW;
   constexpr float kTrackH = 4.0f;
   constexpr float kThumb = 16.0f;
@@ -3948,8 +3833,7 @@ static View buildSliderRow(const SliderSpec &spec)
   const bool isBipolar = (lo < 0.0f && hi > 0.0f);
   const float anchor = isBipolar ? 0.0f : lo;
 
-  auto thumbXFor = [lo, hi, kMaxThumbX](float v)
-  {
+  auto thumbXFor = [lo, hi, kMaxThumbX](float v) {
     return std::clamp((v - lo) / (hi - lo), 0.0f, 1.0f) * kMaxThumbX;
   };
 
@@ -3959,8 +3843,7 @@ static View buildSliderRow(const SliderSpec &spec)
 
   Text rowLabel;
   rowLabel.label = std::function<std::string()>(
-      [s]
-      { return s.name + ": " + s.format(s.get()); });
+      [s] { return s.name + ": " + s.format(s.get()); });
   rowLabel.fontSize = 13.0f;
   rowLabel.color = kColorTextMid;
   group.addChild(std::move(rowLabel));
@@ -3980,18 +3863,18 @@ static View buildSliderRow(const SliderSpec &spec)
   fill.style.position = Position::Absolute;
   fill.style.top = 0.0f;
   fill.style.height = Size::pixel(kTrackH);
-  fill.style.left = std::function<float()>([s, thumbXFor, anchor, isBipolar]
-                                           {
+  fill.style.left = std::function<float()>([s, thumbXFor, anchor, isBipolar] {
     float anchorX =
         isBipolar ? thumbXFor(anchor) + kThumb / 2.0f : thumbXFor(anchor);
     float valueCenter = thumbXFor(s.get()) + kThumb / 2.0f;
-    return std::min(anchorX, valueCenter); });
-  fill.style.width = std::function<Size()>([s, thumbXFor, anchor, isBipolar]
-                                           {
+    return std::min(anchorX, valueCenter);
+  });
+  fill.style.width = std::function<Size()>([s, thumbXFor, anchor, isBipolar] {
     float anchorX =
         isBipolar ? thumbXFor(anchor) + kThumb / 2.0f : thumbXFor(anchor);
     float valueCenter = thumbXFor(s.get()) + kThumb / 2.0f;
-    return Size::pixel(std::abs(valueCenter - anchorX)); });
+    return Size::pixel(std::abs(valueCenter - anchorX));
+  });
   fill.style.backgroundColor = s.hasAccent ? s.accent : kTrackEdge;
   fill.style.borderRadius = kTrackH / 2.0f;
   track.addChild(std::move(fill));
@@ -4003,8 +3886,7 @@ static View buildSliderRow(const SliderSpec &spec)
   View thumb;
   thumb.style.position = Position::Absolute;
   thumb.style.left =
-      std::function<float()>([s, thumbXFor]
-                             { return thumbXFor(s.get()); });
+      std::function<float()>([s, thumbXFor] { return thumbXFor(s.get()); });
   thumb.style.top = -(kThumb - kTrackH) / 2.0f; // vertically centered
   thumb.style.width = Size::pixel(kThumb);
   thumb.style.height = Size::pixel(kThumb);
@@ -4013,17 +3895,14 @@ static View buildSliderRow(const SliderSpec &spec)
   thumb.style.borderColor = s.hasAccent ? s.accent : kThumbEdge;
   thumb.style.borderRadius = kThumb / 2.0f;
 
-  auto thumbPress = [grabX](float lx, float)
-  { *grabX = lx; };
-  auto thumbDrag = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float)
-  {
+  auto thumbPress = [grabX](float lx, float) { *grabX = lx; };
+  auto thumbDrag = [grabX, s, thumbXFor, lo, hi, kMaxThumbX](float lx, float) {
     if (!state.original)
       return; // no image loaded yet — nothing to adjust
     float newThumbX =
         std::clamp(thumbXFor(s.get()) + (lx - *grabX), 0.0f, kMaxThumbX);
     s.set(lo + (newThumbX / kMaxThumbX) * (hi - lo));
-    if (!s.affectsPixels)
-    {
+    if (!s.affectsPixels) {
       state.markDirty(); // just repaint (an overlay may show the setting)
       return;
     }
@@ -4037,8 +3916,7 @@ static View buildSliderRow(const SliderSpec &spec)
   // recompute (deferred to the next canvasDirtySource poll like any other
   // adjustment change — endPress polls right after this fires, so it lands
   // in the same frame the mouse is released).
-  auto thumbEnd = [s]
-  {
+  auto thumbEnd = [s] {
     if (s.onEnd)
       s.onEnd();
     if (!state.dragging)
@@ -4047,7 +3925,8 @@ static View buildSliderRow(const SliderSpec &spec)
     state.dragIsAngle = false;
     state.markAdjustDirty();
   };
-  bindDrag(thumb, thumbPress, thumbDrag, thumbEnd);
+  bindDrag(thumb, thumbPress, thumbDrag, thumbEnd, nullptr, Cursor::Grab,
+           Cursor::Grabbing);
   track.addChild(std::move(thumb));
 
   group.addChild(std::move(track));
@@ -4056,19 +3935,15 @@ static View buildSliderRow(const SliderSpec &spec)
 
 // One Adjust-pane slider for one AdjustmentSpec: adding a new adjustment to
 // kAdjustmentSpecs needs no new UI code at all.
-static View buildAdjustmentSlider(const AdjustmentSpec &spec)
-{
+static View buildAdjustmentSlider(const AdjustmentSpec &spec) {
   const AdjId id = spec.id;
   SliderSpec s;
   s.name = spec.label;
   s.lo = spec.min;
   s.hi = spec.max;
-  s.get = [id]
-  { return state.adjust.get(id); };
-  s.set = [id](float v)
-  { state.adjust.set(id, v); };
-  s.format = [](float v)
-  {
+  s.get = [id] { return state.adjust.get(id); };
+  s.set = [id](float v) { state.adjust.set(id, v); };
+  s.format = [](float v) {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
   return buildSliderRow(s);
@@ -4079,18 +3954,14 @@ static MixChan gMixChan = MixChan::Hue; // which of Hue / Sat / Lum is shown
 
 // One Color Mixer slider (a band's Hue, Saturation or Luminance), tinted in
 // the band's own color. Same undo/preview behavior as every Adjust slider.
-static View buildMixSlider(MixChan chan, size_t band)
-{
+static View buildMixSlider(MixChan chan, size_t band) {
   SliderSpec s;
   s.name = mixBandName(band);
   s.lo = static_cast<float>(kMixMin);
   s.hi = static_cast<float>(kMixMax);
-  s.get = [chan, band]
-  { return state.adjust.mix(chan, band); };
-  s.set = [chan, band](float v)
-  { state.adjust.setMix(chan, band, v); };
-  s.format = [](float v)
-  {
+  s.get = [chan, band] { return state.adjust.mix(chan, band); };
+  s.set = [chan, band](float v) { state.adjust.setMix(chan, band, v); };
+  s.format = [](float v) {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
   s.hasAccent = true;
@@ -4099,8 +3970,7 @@ static View buildMixSlider(MixChan chan, size_t band)
 }
 
 // Zeroes all 24 mixer sliders (one undo step).
-static void resetColorMix()
-{
+static void resetColorMix() {
   state.adjust.resetMix();
   state.markAdjustDirty();
 }
@@ -4117,8 +3987,7 @@ constexpr float kGradeTabW = 40.0f;
 static int gGradeMode = 0;   // 0 = 3-way, 1..4 = Shadows..Global
 static int gGradeActive = 1; // wheel shown in the H/S/L readout (Midtones)
 
-static const char *gradeRangeName(int r)
-{
+static const char *gradeRangeName(int r) {
   static const char *const n[kGradeRangeCount] = {"Shadows", "Midtones",
                                                   "Highlights", "Global"};
   return n[r];
@@ -4128,12 +3997,10 @@ static const char *gradeRangeName(int r)
 constexpr float kGradeWheelBrightness[kGradeRangeCount] = {0.62f, 1.0f, 0.80f,
                                                            1.0f};
 
-static Color gradeHsv(float h, float s, float v, uint8_t a = 255)
-{
+static Color gradeHsv(float h, float s, float v, uint8_t a = 255) {
   float c[3];
   gradeHueToRgb(h, c);
-  auto to8 = [&](float f)
-  {
+  auto to8 = [&](float f) {
     const float o = (f * s + (1.0f - s)) * v * 255.0f; // blend toward white
     return static_cast<uint8_t>(std::lround(std::clamp(o, 0.0f, 255.0f)));
   };
@@ -4141,8 +4008,7 @@ static Color gradeHsv(float h, float s, float v, uint8_t a = 255)
 }
 
 static size_t gradeHash(float v) { return std::hash<float>{}(v); }
-static size_t gradeMix(size_t a, size_t b)
-{
+static size_t gradeMix(size_t a, size_t b) {
   return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
 }
 
@@ -4150,8 +4016,7 @@ static size_t gradeMix(size_t a, size_t b)
 // angle = hue (0 at 3 o'clock, counter-clockwise), radius = saturation,
 // white in the centre. Cached in a map so the CanvasImage address stays
 // stable (liteui caches the converted surface per image).
-static const CanvasImage &gradeWheelImage(int d, float brightness)
-{
+static const CanvasImage &gradeWheelImage(int d, float brightness) {
   static std::map<std::pair<int, int>, CanvasImage> cache;
   const auto key =
       std::make_pair(d, static_cast<int>(std::lround(brightness * 100)));
@@ -4161,10 +4026,8 @@ static const CanvasImage &gradeWheelImage(int d, float brightness)
 
   CanvasImage img(d, d);
   const float R = d / 2.0f;
-  for (int y = 0; y < d; ++y)
-  {
-    for (int x = 0; x < d; ++x)
-    {
+  for (int y = 0; y < d; ++y) {
+    for (int x = 0; x < d; ++x) {
       const float dx = x + 0.5f - R, dy = y + 0.5f - R;
       const float dist = std::sqrt(dx * dx + dy * dy);
       const float alpha = std::clamp(R - dist + 0.5f, 0.0f, 1.0f); // AA rim
@@ -4184,19 +4047,16 @@ static const CanvasImage &gradeWheelImage(int d, float brightness)
 
 // Applies `fn` to a copy of the current grade and commits it (key: see
 // AdjustmentSet::setGrade).
-static void gradeEdit(const std::function<void(ColorGrade &)> &fn, int key)
-{
+static void gradeEdit(const std::function<void(ColorGrade &)> &fn, int key) {
   ColorGrade g = state.adjust.grade();
   fn(g);
   state.adjust.setGrade(g, key);
 }
 
 // Leaves the low-res drag preview and asks for one full-resolution render.
-static void gradeEndDrag()
-{
+static void gradeEndDrag() {
   state.adjust.endGradeEdit();
-  if (state.dragging)
-  {
+  if (state.dragging) {
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
@@ -4206,36 +4066,29 @@ static void gradeEndDrag()
 // A slider bound to one field (hue / sat / lum) of one wheel.
 static View buildGradeWheelSlider(const std::string &name, int range,
                                   float GradeWheel::*field, float lo, float hi,
-                                  int keyBase, float trackW, bool isSigned)
-{
+                                  int keyBase, float trackW, bool isSigned) {
   SliderSpec s;
   s.name = name;
   s.lo = lo;
   s.hi = hi;
   s.trackW = trackW;
-  s.get = [range, field]
-  { return state.adjust.grade().wheel[range].*field; };
-  s.set = [range, field, keyBase](float v)
-  {
-    gradeEdit([&](ColorGrade &g)
-              { g.wheel[range].*field = std::round(v); },
+  s.get = [range, field] { return state.adjust.grade().wheel[range].*field; };
+  s.set = [range, field, keyBase](float v) {
+    gradeEdit([&](ColorGrade &g) { g.wheel[range].*field = std::round(v); },
               keyBase + range);
     gGradeActive = range;
   };
-  s.format = [isSigned](float v)
-  {
+  s.format = [isSigned](float v) {
     const int i = static_cast<int>(std::lround(v));
     return isSigned && i > 0 ? "+" + std::to_string(i) : std::to_string(i);
   };
-  s.onEnd = []
-  { state.adjust.endGradeEdit(); };
+  s.onEnd = [] { state.adjust.endGradeEdit(); };
   return buildSliderRow(s);
 }
 
 // One hue/saturation wheel: click or drag sets hue (angle) + saturation
 // (radius); right-click resets both.
-static View buildGradeWheel(int range, int diameter, float pad)
-{
+static View buildGradeWheel(int range, int diameter, float pad) {
   const float size = static_cast<float>(diameter) + 2.0f * pad;
   View c;
   c.isCanvas = true;
@@ -4243,20 +4096,17 @@ static View buildGradeWheel(int range, int diameter, float pad)
   c.style.height = Size::pixel(size);
   c.style.flexShrink = 0;
 
-  auto apply = [range, diameter, size](float lx, float ly, bool drag)
-  {
+  auto apply = [range, diameter, size](float lx, float ly, bool drag) {
     if (!state.original)
       return; // no image loaded yet — nothing to grade
     const float R = diameter / 2.0f, cx = size / 2.0f, cy = size / 2.0f;
     const float dx = lx - cx, dy = ly - cy;
     const float dist = std::sqrt(dx * dx + dy * dy);
     gradeEdit(
-        [&](ColorGrade &g)
-        {
+        [&](ColorGrade &g) {
           GradeWheel &w = g.wheel[range];
           w.sat = std::round(std::clamp(dist / R, 0.0f, 1.0f) * 100.0f);
-          if (dist > 2.0f)
-          { // keep the old hue while sitting on the centre
+          if (dist > 2.0f) { // keep the old hue while sitting on the centre
             float hue = std::atan2(-dy, dx) * 180.0f / kGradePi;
             if (hue < 0.0f)
               hue += 360.0f;
@@ -4270,30 +4120,25 @@ static View buildGradeWheel(int range, int diameter, float pad)
     state.markAdjustDirty();
   };
   bindDrag(
-      c,
-      [apply](float lx, float ly)
-      { apply(lx, ly, false); },
-      [apply](float lx, float ly)
-      { apply(lx, ly, true); },
-      []
-      { gradeEndDrag(); });
-  c.onContextMenu = [range](PointerEvent &e) { // reset hue + sat, keep luminance
-    e.stopPropagation();
-    if (!state.original)
-      return;
-    gradeEdit(
-        [&](ColorGrade &g)
-        {
-          g.wheel[range].hue = 0.0f;
-          g.wheel[range].sat = 0.0f;
-        },
-        -1);
-    gGradeActive = range;
-    state.markAdjustDirty();
-  };
+      c, [apply](float lx, float ly) { apply(lx, ly, false); },
+      [apply](float lx, float ly) { apply(lx, ly, true); },
+      [] { gradeEndDrag(); }, nullptr, Cursor::Crosshair);
+  c.onContextMenu =
+      [range](PointerEvent &e) { // reset hue + sat, keep luminance
+        e.stopPropagation();
+        if (!state.original)
+          return;
+        gradeEdit(
+            [&](ColorGrade &g) {
+              g.wheel[range].hue = 0.0f;
+              g.wheel[range].sat = 0.0f;
+            },
+            -1);
+        gGradeActive = range;
+        state.markAdjustDirty();
+      };
 
-  c.onPaint = [range, diameter](CanvasContext &ctx)
-  {
+  c.onPaint = [range, diameter](CanvasContext &ctx) {
     const GradeWheel &w = state.adjust.grade().wheel[range];
     const float cx = ctx.width() / 2, cy = ctx.height() / 2;
     const float R = diameter / 2.0f;
@@ -4320,8 +4165,7 @@ static View buildGradeWheel(int range, int diameter, float pad)
     const float k = std::clamp(w.sat / 100.0f * 3.0f, 0.0f, 1.0f);
     const Color full = gradeHsv(w.hue, 1.0f, 1.0f);
     const Color grey{70, 70, 70};
-    auto lerp8 = [k](uint8_t a, uint8_t b)
-    {
+    auto lerp8 = [k](uint8_t a, uint8_t b) {
       return static_cast<uint8_t>(std::lround(a + (b - a) * k));
     };
     ctx.setFillColor(Color{lerp8(grey.r, full.r), lerp8(grey.g, full.g),
@@ -4345,8 +4189,7 @@ static View buildGradeWheel(int range, int diameter, float pad)
 
   // Repaint only when this wheel changed (drag, undo/redo, reset, new image).
   auto last = std::make_shared<size_t>(~size_t{0});
-  c.canvasDirtySource = [range, last]() -> bool
-  {
+  c.canvasDirtySource = [range, last]() -> bool {
     const GradeWheel &w = state.adjust.grade().wheel[range];
     size_t h = gradeHash(w.hue);
     h = gradeMix(h, gradeHash(w.sat));
@@ -4360,27 +4203,23 @@ static View buildGradeWheel(int range, int diameter, float pad)
 }
 
 // Eye icon: toggles that wheel's preview (one undo step).
-static View buildGradeEye(int range)
-{
+static View buildGradeEye(int range) {
   View c;
   c.isCanvas = true;
   c.style.width = Size::pixel(22);
   c.style.height = Size::pixel(14);
   c.style.flexShrink = 0;
-  c.onClick = [range]
-  {
+  c.onClick = [range] {
     if (!state.original)
       return;
     gradeEdit(
-        [&](ColorGrade &g)
-        {
+        [&](ColorGrade &g) {
           g.wheel[range].visible = !g.wheel[range].visible;
         },
         -1);
     state.markAdjustDirty();
   };
-  c.onPaint = [range](CanvasContext &ctx)
-  {
+  c.onPaint = [range](CanvasContext &ctx) {
     const bool on = state.adjust.grade().wheel[range].visible;
     const float cx = ctx.width() / 2, cy = ctx.height() / 2;
     const Color col = on ? Color{190, 190, 190} : Color{118, 118, 118};
@@ -4395,8 +4234,7 @@ static View buildGradeEye(int range)
     ctx.beginPath();
     ctx.arc(cx, cy, 2.2f, 0, 2 * kGradePi);
     ctx.fill();
-    if (!on)
-    {
+    if (!on) {
       ctx.beginPath();
       ctx.moveTo(cx - 8, cy + 6);
       ctx.lineTo(cx + 8, cy - 6);
@@ -4404,8 +4242,7 @@ static View buildGradeEye(int range)
     }
   };
   auto last = std::make_shared<int>(-1);
-  c.canvasDirtySource = [range, last]() -> bool
-  {
+  c.canvasDirtySource = [range, last]() -> bool {
     const int now = state.adjust.grade().wheel[range].visible ? 1 : 0;
     if (now == *last)
       return false;
@@ -4416,8 +4253,7 @@ static View buildGradeEye(int range)
 }
 
 // wheel + eye row + luminance slider, as one column
-static View buildGradeWheelBlock(int range, int diameter, float pad)
-{
+static View buildGradeWheelBlock(int range, int diameter, float pad) {
   const float size = static_cast<float>(diameter) + 2.0f * pad;
   View col;
   col.style.direction = FlexDirection::Column;
@@ -4438,8 +4274,7 @@ static View buildGradeWheelBlock(int range, int diameter, float pad)
 }
 
 // 3-way mode: big Midtones wheel on top, Shadows + Highlights below.
-static View buildGradeThreeWay()
-{
+static View buildGradeThreeWay() {
   View col;
   col.style.direction = FlexDirection::Column;
   col.style.alignItems = Align::Center;
@@ -4451,8 +4286,7 @@ static View buildGradeThreeWay()
   row.style.direction = FlexDirection::Row;
   row.style.justifyContent = Justify::Center;
   row.style.gap = 2.0f;
-  auto labeled = [](int range)
-  {
+  auto labeled = [](int range) {
     View v;
     v.style.direction = FlexDirection::Column;
     v.style.alignItems = Align::Center;
@@ -4471,8 +4305,7 @@ static View buildGradeThreeWay()
 }
 
 // Single-range mode: one large wheel + Hue / Saturation / Luminance sliders.
-static View buildGradeSingle(int range)
-{
+static View buildGradeSingle(int range) {
   View col;
   col.style.direction = FlexDirection::Column;
   col.style.alignItems = Align::Center;
@@ -4488,8 +4321,7 @@ static View buildGradeSingle(int range)
 }
 
 // Resets every wheel, Blending and Balance (one undo step).
-static void resetColorGrade()
-{
+static void resetColorGrade() {
   state.adjust.setGrade(ColorGrade{}, -1);
   state.markAdjustDirty();
 }
@@ -4503,9 +4335,10 @@ static void resetColorGrade()
 // The Masks pane (activity 7) edits `state.adjust.masks()`. Sliders go through
 // buildSliderRow like everywhere else; the shape can also be dragged on the
 // canvas (press inside = move, press a square handle = resize).
-// Undo key of a mask edit: (mask * kMaxMaskParts + part) * kMaskCtlStride + control.
-// Every control id of one mask must be different and below kMaskCtlStride, or
-// two controls would fold into one undo step (a static_assert below checks it).
+// Undo key of a mask edit: (mask * kMaxMaskParts + part) * kMaskCtlStride +
+// control. Every control id of one mask must be different and below
+// kMaskCtlStride, or two controls would fold into one undo step (a
+// static_assert below checks it).
 constexpr int kMaskCtlStride = 1000;
 constexpr int kMaskCtlMove = 90; // undo-coalescing control ids (see maskEdit)
 constexpr int kMaskCtlResizeX = 91;
@@ -4515,51 +4348,48 @@ constexpr int kMaskCtlLinStart = 94;
 constexpr int kMaskCtlBrush = 95; // one stroke = one undo step
 constexpr int kMaskCtlLumLo = 96;
 constexpr int kMaskCtlLumHi = 97;
-constexpr int kMaskCtlPolyVertex = 98; // a vertex placed / dragged = one undo step
-constexpr int kMaskCtlPolyMove = 99;   // dragging the whole polygon
-constexpr int kMaskCtlPolyLasso = 87;  // one freehand lasso = one undo step
+constexpr int kMaskCtlPolyVertex =
+    98; // a vertex placed / dragged = one undo step
+constexpr int kMaskCtlPolyMove = 99;  // dragging the whole polygon
+constexpr int kMaskCtlPolyLasso = 87; // one freehand lasso = one undo step
 constexpr int kMaskCtlRange = 84;
 constexpr int kMaskCtlFeather = 1;
 constexpr int kMaskCtlAngle = 2;
 constexpr int kMaskCtlWidth = 3;
 constexpr int kMaskCtlHeight = 4;
 constexpr int kMaskCtlLength = 5;
-constexpr int kMaskCtlAdj = 100; // + AdjId (100..100+Count-1, clear of every id below)
+constexpr int kMaskCtlAdj =
+    100; // + AdjId (100..100+Count-1, clear of every id below)
 constexpr int kMaskCtlName = 86;
 
 // ---- Mask overlay color ----
 // The tint painted over the picture for the selected mask (radial / linear
 // gradients, brush, luminosity, color range and combined bitmaps). One place,
 // so every overlay agrees. Session-only: the choice is not saved anywhere.
-struct MaskTintRgb
-{
+struct MaskTintRgb {
   uint8_t r, g, b;
   const char *name;
 };
-constexpr MaskTintRgb kMaskTintPalette[] = {
-    {255, 40, 40, "Red"},
-    {60, 220, 90, "Green"},
-    {70, 140, 255, "Blue"},
-    {255, 210, 40, "Yellow"},
-    {255, 255, 255, "White"}};
+constexpr MaskTintRgb kMaskTintPalette[] = {{255, 40, 40, "Red"},
+                                            {60, 220, 90, "Green"},
+                                            {70, 140, 255, "Blue"},
+                                            {255, 210, 40, "Yellow"},
+                                            {255, 255, 255, "White"}};
 constexpr int kMaskTintCount =
     static_cast<int>(sizeof(kMaskTintPalette) / sizeof(kMaskTintPalette[0]));
 
-static const MaskTintRgb &maskTint()
-{
+static const MaskTintRgb &maskTint() {
   const int i = std::clamp(state.maskTintColor, 0, kMaskTintCount - 1);
   return kMaskTintPalette[i];
 }
 // The overlay color with the given alpha.
-static Color maskTintColor(uint8_t alpha)
-{
+static Color maskTintColor(uint8_t alpha) {
   const MaskTintRgb &t = maskTint();
   return Color{t.r, t.g, t.b, alpha};
 }
 // Picks the overlay color. The cached tint bitmaps carry the old color, so they
 // are dropped here; they are rebuilt on the next paint.
-static void setMaskTintColor(int idx)
-{
+static void setMaskTintColor(int idx) {
   state.maskTintColor = std::clamp(idx, 0, kMaskTintCount - 1);
   state.mask.tint.reset();
   state.mask.lumTint.reset();
@@ -4567,14 +4397,12 @@ static void setMaskTintColor(int idx)
   state.markDirty();
 }
 
-static bool maskToolActive()
-{
+static bool maskToolActive() {
   return state.activeActivity == 7 && state.image != nullptr;
 }
 
 // Width of one of `n` equal chips / tabs sharing a row of the mask panel.
-static float maskChipW(int n)
-{
+static float maskChipW(int n) {
   const float inner =
       state.maskPanelW - 2.0f * kMaskPanelPad - kScrollbarThickness;
   return std::max(20.0f, (inner - 4.0f * static_cast<float>(n - 1)) /
@@ -4583,8 +4411,7 @@ static float maskChipW(int n)
 
 // The selected mask's index, or -1. Clamped here instead of at every place
 // that can shrink the list (undo, redo, open, delete).
-static int selMask()
-{
+static int selMask() {
   const int n = static_cast<int>(state.adjust.masks().size());
   if (state.maskSel >= n)
     state.maskSel = n - 1;
@@ -4593,8 +4420,7 @@ static int selMask()
   return state.maskSel;
 }
 
-static const Mask *selectedMask()
-{
+static const Mask *selectedMask() {
   const int i = selMask();
   return i < 0 ? nullptr : &state.adjust.masks()[static_cast<size_t>(i)];
 }
@@ -4605,8 +4431,7 @@ static const Mask *selectedMask()
 // The selected mask's part that the canvas and the shape sliders work on. A
 // mask can hold several parts (see MaskComposite); like selMask() this is
 // clamped on read, so undo / delete / open never need to fix it up.
-static int selPart()
-{
+static int selPart() {
   const Mask *m = selectedMask();
   if (!m || m->parts.empty())
     return 0;
@@ -4617,30 +4442,25 @@ static int selPart()
     state.mask.part = 0;
   return state.mask.part;
 }
-static const MaskPart *selectedPart()
-{
+static const MaskPart *selectedPart() {
   const Mask *m = selectedMask();
   if (!m || m->parts.empty())
     return nullptr;
   return &m->parts[static_cast<size_t>(selPart())];
 }
-static MaskType selectedPartType()
-{
+static MaskType selectedPartType() {
   const MaskPart *p = selectedPart();
   return p ? p->type() : MaskType::Count;
 }
-static bool selectedIsBrush()
-{ // the SELECTED PART is a brush
+static bool selectedIsBrush() { // the SELECTED PART is a brush
   return selectedPartType() == MaskType::Brush;
 }
-static bool selectedIsPolygon()
-{ // the SELECTED PART is a polygon / lasso
+static bool selectedIsPolygon() { // the SELECTED PART is a polygon / lasso
   return selectedPartType() == MaskType::Polygon;
 }
 // "Show mask tint": a brush that stands alone has no outline, so it keeps its
 // own switch (on by default); everything else shares the common one.
-static bool &tintFlag()
-{
+static bool &tintFlag() {
   const Mask *m = selectedMask();
   if (m && m->parts.size() == 1 && m->parts[0].type() == MaskType::Brush)
     return state.mask.brushTint;
@@ -4651,35 +4471,29 @@ static bool &tintFlag()
 // masks are STORED against the original picture). Everything on the canvas —
 // outlines, hit tests, drags — works on this form.
 template <class Shape>
-static std::optional<Shape> shapeInView(const MaskPart &p, const GeoFrame &f)
-{
+static std::optional<Shape> shapeInView(const MaskPart &p, const GeoFrame &f) {
   if (const auto *r = std::get_if<Shape>(&p.shape))
     return r->toSource(f);
   return std::nullopt;
 }
 static std::optional<RadialShape> radialInView(const MaskPart &p,
-                                               const GeoFrame &f)
-{
+                                               const GeoFrame &f) {
   return shapeInView<RadialShape>(p, f);
 }
 static std::optional<LinearShape> linearInView(const MaskPart &p,
-                                               const GeoFrame &f)
-{
+                                               const GeoFrame &f) {
   return shapeInView<LinearShape>(p, f);
 }
 static std::optional<BrushShape> brushInView(const MaskPart &p,
-                                             const GeoFrame &f)
-{
+                                             const GeoFrame &f) {
   return shapeInView<BrushShape>(p, f);
 }
 static std::optional<RectShape> rectInView(const MaskPart &p,
-                                           const GeoFrame &f)
-{
+                                           const GeoFrame &f) {
   return shapeInView<RectShape>(p, f);
 }
 static std::optional<PolygonShape> polygonInView(const MaskPart &p,
-                                                 const GeoFrame &f)
-{
+                                                 const GeoFrame &f) {
   return shapeInView<PolygonShape>(p, f);
 }
 
@@ -4687,8 +4501,7 @@ static std::optional<PolygonShape> polygonInView(const MaskPart &p,
 // (only the fields `fn` changed; see RadialShape::applySourceEdit).
 template <class Shape>
 static void editShapeInView(Mask &m, size_t part, const GeoFrame &f,
-                            const std::function<void(Shape &)> &fn)
-{
+                            const std::function<void(Shape &)> &fn) {
   if (part >= m.parts.size())
     return;
   auto *stored = std::get_if<Shape>(&m.parts[part].shape);
@@ -4700,13 +4513,11 @@ static void editShapeInView(Mask &m, size_t part, const GeoFrame &f,
   stored->applySourceEdit(before, after, f);
 }
 static void editRadialInView(Mask &m, size_t part, const GeoFrame &f,
-                             const std::function<void(RadialShape &)> &fn)
-{
+                             const std::function<void(RadialShape &)> &fn) {
   editShapeInView<RadialShape>(m, part, f, fn);
 }
 static void editLinearInView(Mask &m, size_t part, const GeoFrame &f,
-                             const std::function<void(LinearShape &)> &fn)
-{
+                             const std::function<void(LinearShape &)> &fn) {
   editShapeInView<LinearShape>(m, part, f, fn);
 }
 
@@ -4717,23 +4528,22 @@ static void editLinearInView(Mask &m, size_t part, const GeoFrame &f,
 // Does NOT recompute the picture — slider / canvas drags do that through the
 // usual markAdjustDirty path; discrete actions call maskCommitDiscrete.
 static void maskEdit(int idx, const std::function<void(Mask &)> &fn,
-                     int control)
-{
+                     int control) {
   MaskSet ms = state.adjust.masks();
   if (idx < 0 || idx >= static_cast<int>(ms.size()))
     return;
   const int part = idx == selMask() ? selPart() : 0;
   fn(ms[static_cast<size_t>(idx)]);
-  state.adjust.setMasks(
-      ms, control < 0
-              ? -1
-              : (idx * static_cast<int>(kMaxMaskParts) + part) * kMaskCtlStride + control);
+  state.adjust.setMasks(ms, control < 0
+                                ? -1
+                                : (idx * static_cast<int>(kMaxMaskParts) +
+                                   part) * kMaskCtlStride +
+                                      control);
 }
 
 // A one-off change to the selected mask (toggle, reset): its own undo step and
 // an immediate recompute.
-static void maskEditDiscrete(const std::function<void(Mask &)> &fn)
-{
+static void maskEditDiscrete(const std::function<void(Mask &)> &fn) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -4754,8 +4564,7 @@ static std::shared_ptr<TextInputState> gSnapNameState;
 // True while a name field has keyboard focus: the global shortcuts that
 // would also fire on plain keys (Y, J, Left, Right, Delete...) must stand
 // down, or typing a name would toggle views and Delete would delete the mask.
-static bool typingInTextField()
-{
+static bool typingInTextField() {
   return (gMaskNameState && gMaskNameState->focused) ||
          (gPresetNameState && gPresetNameState->focused) ||
          (gSnapNameState && gSnapNameState->focused);
@@ -4763,8 +4572,7 @@ static bool typingInTextField()
 
 // Makes the field show the selected mask's name. Cheap; polled from the
 // field's display lambda, so it also catches undo / redo.
-static void syncMaskNameField()
-{
+static void syncMaskNameField() {
   if (!gMaskNameState)
     return;
   const Mask *m = selectedMask();
@@ -4778,18 +4586,17 @@ static void syncMaskNameField()
   t.dirty = true;
 }
 
-static void renameSelectedMask(const std::string &typed)
-{
+static void renameSelectedMask(const std::string &typed) {
   const std::string s = sanitizeMaskName(typed);
-  if (gMaskNameState && gMaskNameState->text != s)
-  { // the cap (or a stripped character) changed what was typed
+  if (gMaskNameState &&
+      gMaskNameState->text !=
+          s) { // the cap (or a stripped character) changed what was typed
     gMaskNameState->text = s;
     gMaskNameState->cursor = std::min(gMaskNameState->cursor, s.size());
     gMaskNameState->dirty = true;
   }
   // Typing folds into one undo step (until Enter / another edit).
-  maskEdit(selMask(), [&](Mask &m)
-           { m.name = s; }, kMaskCtlName);
+  maskEdit(selMask(), [&](Mask &m) { m.name = s; }, kMaskCtlName);
   state.markDirty();
 }
 
@@ -4798,8 +4605,7 @@ static void renameSelectedMask(const std::string &typed)
 // io/preset.hpp). They live as small files in presetDir(); the list below is a
 // cache of what is there, re-read when the pane is opened and after every save
 // or delete (never per frame).
-struct PresetEntry
-{
+struct PresetEntry {
   std::string name;
   std::string path;
   Preset preset;
@@ -4807,13 +4613,11 @@ struct PresetEntry
 static std::vector<PresetEntry> gPresets;
 static int gPresetSel = -1; // the last preset clicked, or -1
 
-static void refreshPresets(const std::string &select = std::string())
-{
+static void refreshPresets(const std::string &select = std::string()) {
   gPresets.clear();
   gPresetSel = -1;
   const std::string dir = presetDir();
-  for (const std::string &fn : listPresetFiles(dir))
-  {
+  for (const std::string &fn : listPresetFiles(dir)) {
     if (gPresets.size() >= kPresetRows)
       break;
     Preset p;
@@ -4828,14 +4632,12 @@ static void refreshPresets(const std::string &select = std::string())
 
 // Replaces the look with preset i: one undo step, "Preset: <name>" in History.
 // Crop, rotation and masks are not touched.
-static void applyPresetEntry(size_t i)
-{
+static void applyPresetEntry(size_t i) {
   if (state.dragging || !state.original || i >= gPresets.size())
     return;
   gPresetSel = static_cast<int>(i);
   const PresetEntry &e = gPresets[i];
-  if (!state.adjust.applyPreset(e.preset))
-  {
+  if (!state.adjust.applyPreset(e.preset)) {
     setStatus("Already looks like \"" + e.name + "\"", false);
     return;
   }
@@ -4845,26 +4647,22 @@ static void applyPresetEntry(size_t i)
 }
 
 // Saves the current look under the name typed in the field.
-static void saveCurrentPreset()
-{
+static void saveCurrentPreset() {
   if (!state.original)
     return;
-  const std::string name =
-      sanitizePresetName(gPresetNameState ? gPresetNameState->text : std::string());
-  if (name.empty())
-  {
+  const std::string name = sanitizePresetName(
+      gPresetNameState ? gPresetNameState->text : std::string());
+  if (name.empty()) {
     setStatus("Type a name for the preset first", true);
     return;
   }
   std::string err;
-  if (!savePresetFile(presetDir(), state.adjust.currentPreset(name), &err))
-  {
+  if (!savePresetFile(presetDir(), state.adjust.currentPreset(name), &err)) {
     setStatus("Couldn't save preset: " + err, true);
     return;
   }
   refreshPresets(name);
-  if (gPresetNameState)
-  {
+  if (gPresetNameState) {
     gPresetNameState->text.clear();
     gPresetNameState->cursor = 0;
     gPresetNameState->scrollOffset = 0.0f;
@@ -4873,13 +4671,11 @@ static void saveCurrentPreset()
   setStatus("Saved preset: " + name, false);
 }
 
-static void deleteSelectedPreset()
-{
+static void deleteSelectedPreset() {
   if (gPresetSel < 0 || static_cast<size_t>(gPresetSel) >= gPresets.size())
     return;
   const PresetEntry e = gPresets[static_cast<size_t>(gPresetSel)];
-  if (!deletePresetFile(e.path))
-  {
+  if (!deletePresetFile(e.path)) {
     setStatus("Couldn't delete " + baseName(e.path), true);
     return;
   }
@@ -4890,14 +4686,12 @@ static void deleteSelectedPreset()
 // Keeps the name field to printable ASCII (the TextInput is ASCII-only) and
 // the preset name cap. Trimming happens on save, so typing spaces between
 // words still works.
-static void filterPresetNameField(const std::string &typed)
-{
+static void filterPresetNameField(const std::string &typed) {
   std::string s;
   for (char c : typed)
     if (c >= 0x20 && c <= 0x7E && s.size() < kPresetNameMax)
       s.push_back(c);
-  if (gPresetNameState && gPresetNameState->text != s)
-  {
+  if (gPresetNameState && gPresetNameState->text != s) {
     gPresetNameState->text = s;
     gPresetNameState->cursor = std::min(gPresetNameState->cursor, s.size());
     gPresetNameState->dirty = true;
@@ -4909,8 +4703,7 @@ static void filterPresetNameField(const std::string &typed)
 static std::optional<Preset> gSettingsClip;
 static std::string gSettingsClipFrom;
 
-static void copySettings()
-{
+static void copySettings() {
   if (!state.original)
     return;
   gSettingsClip = state.adjust.currentPreset(std::string());
@@ -4918,19 +4711,16 @@ static void copySettings()
   setStatus("Copied settings from " + gSettingsClipFrom, false);
 }
 
-static void pasteSettings()
-{
+static void pasteSettings() {
   if (state.dragging || !state.original)
     return;
-  if (!gSettingsClip)
-  {
+  if (!gSettingsClip) {
     setStatus("Copy settings from a photo first", true);
     return;
   }
   Preset p = *gSettingsClip;
   p.name = "Pasted"; // History shows "Preset: Pasted"
-  if (!state.adjust.applyPreset(p))
-  {
+  if (!state.adjust.applyPreset(p)) {
     setStatus("Already has these settings", false);
     return;
   }
@@ -4945,14 +4735,13 @@ static void pasteSettings()
 // NamedSnapshot in io/sidecar.hpp). They live in state.snapshots, are saved in
 // the picture's sidecar with everything else (snapshotsDirty makes autosave
 // write when only the list changed), and are not edits themselves: adding or
-// deleting one is not an undo step. Restoring one IS: one step, "Snapshot: <n>".
+// deleting one is not an undo step. Restoring one IS: one step, "Snapshot:
+// <n>".
 static int gSnapSel = -1; // the last snapshot clicked, or -1
 
 // "Snapshot 1", "Snapshot 2", ...: the first one no snapshot already uses.
-static std::string nextSnapshotName()
-{
-  for (size_t n = 1; n <= kMaxSnapshots + 1; ++n)
-  {
+static std::string nextSnapshotName() {
+  for (size_t n = 1; n <= kMaxSnapshots + 1; ++n) {
     const std::string cand = "Snapshot " + std::to_string(n);
     bool used = false;
     for (const NamedSnapshot &s : state.snapshots)
@@ -4965,14 +4754,12 @@ static std::string nextSnapshotName()
 
 // Keeps the name field to printable ASCII and the name cap (trimming happens
 // on save, so typing spaces between words still works).
-static void filterSnapshotNameField(const std::string &typed)
-{
+static void filterSnapshotNameField(const std::string &typed) {
   std::string s;
   for (char c : typed)
     if (c >= 0x20 && c <= 0x7E && s.size() < kSnapshotNameMax)
       s.push_back(c);
-  if (gSnapNameState && gSnapNameState->text != s)
-  {
+  if (gSnapNameState && gSnapNameState->text != s) {
     gSnapNameState->text = s;
     gSnapNameState->cursor = std::min(gSnapNameState->cursor, s.size());
     gSnapNameState->dirty = true;
@@ -4981,19 +4768,17 @@ static void filterSnapshotNameField(const std::string &typed)
 
 // Saves the picture's current edits as a snapshot named like the field (or
 // "Snapshot <n>" when it is blank).
-static void addSnapshot()
-{
+static void addSnapshot() {
   if (!state.original)
     return;
-  if (state.snapshots.size() >= kMaxSnapshots)
-  {
+  if (state.snapshots.size() >= kMaxSnapshots) {
     setStatus("A picture holds at most " + std::to_string(kMaxSnapshots) +
                   " snapshots: delete one first",
               true);
     return;
   }
-  std::string name = sanitizeSnapshotName(
-      gSnapNameState ? gSnapNameState->text : std::string());
+  std::string name = sanitizeSnapshotName(gSnapNameState ? gSnapNameState->text
+                                                         : std::string());
   if (name.empty())
     name = nextSnapshotName();
   NamedSnapshot s;
@@ -5003,16 +4788,15 @@ static void addSnapshot()
   // sidecar, so the list is bounded in bytes as well as in count.
   SnapshotList trial = state.snapshots;
   trial.push_back(s);
-  if (sidecarSnapshotsToJson(trial).dump().size() > kSnapshotsMaxBytes)
-  {
-    setStatus("Too many masks to keep another snapshot: delete one first", true);
+  if (sidecarSnapshotsToJson(trial).dump().size() > kSnapshotsMaxBytes) {
+    setStatus("Too many masks to keep another snapshot: delete one first",
+              true);
     return;
   }
   state.snapshots = std::move(trial);
   state.snapshotsDirty = true; // autosave writes it
   gSnapSel = static_cast<int>(state.snapshots.size()) - 1;
-  if (gSnapNameState)
-  {
+  if (gSnapNameState) {
     gSnapNameState->text.clear();
     gSnapNameState->cursor = 0;
     gSnapNameState->scrollOffset = 0.0f;
@@ -5024,24 +4808,22 @@ static void addSnapshot()
 
 // Puts the picture back as snapshot i describes it: one undo step. Geometry and
 // masks come back too, so the picture is refreshed exactly as after an undo.
-static void applySnapshotEntry(size_t i)
-{
+static void applySnapshotEntry(size_t i) {
   if (state.dragging || !state.original || i >= state.snapshots.size())
     return;
   gSnapSel = static_cast<int>(i);
   const NamedSnapshot &s = state.snapshots[i];
-  if (!state.adjust.restoreEdits(s.edits, s.name))
-  {
+  if (!state.adjust.restoreEdits(s.edits, s.name)) {
     setStatus("Already looks like \"" + s.name + "\"", false);
     state.markDirty();
     return;
   }
-  updateImageFromAdjustments(); // same follow-up as undo() / redo(); clears the status
+  updateImageFromAdjustments(); // same follow-up as undo() / redo(); clears the
+                                // status
   setStatus("Restored snapshot: " + s.name, false);
 }
 
-static void deleteSelectedSnapshot()
-{
+static void deleteSelectedSnapshot() {
   if (gSnapSel < 0 || static_cast<size_t>(gSnapSel) >= state.snapshots.size())
     return;
   const std::string name = state.snapshots[static_cast<size_t>(gSnapSel)].name;
@@ -5060,10 +4842,10 @@ static void deleteSelectedSnapshot()
 // (see filmOpenIndex), so switching is instant.
 
 // Puts `e` at index `at` of the strip and keeps every stored index right.
-static void filmInsertEntry(size_t at, FilmEntry e)
-{
+static void filmInsertEntry(size_t at, FilmEntry e) {
   FilmStrip &f = state.film;
-  f.files.insert(f.files.begin() + static_cast<std::ptrdiff_t>(at), std::move(e));
+  f.files.insert(f.files.begin() + static_cast<std::ptrdiff_t>(at),
+                 std::move(e));
   for (int *i : {&f.current, &f.target, &f.anchor})
     if (*i >= static_cast<int>(at))
       ++*i;
@@ -5075,12 +4857,10 @@ static void filmInsertEntry(size_t at, FilmEntry e)
 
 // Takes entry `at` out of the strip. The open picture's index is forgotten
 // (-1) when it was the one removed; the caller opens something else.
-static void filmRemoveEntry(size_t at)
-{
+static void filmRemoveEntry(size_t at) {
   FilmStrip &f = state.film;
   f.files.erase(f.files.begin() + static_cast<std::ptrdiff_t>(at));
-  for (int *i : {&f.current, &f.target, &f.anchor})
-  {
+  for (int *i : {&f.current, &f.target, &f.anchor}) {
     if (*i == static_cast<int>(at))
       *i = -1;
     else if (*i > static_cast<int>(at))
@@ -5094,29 +4874,27 @@ static void filmRemoveEntry(size_t at)
 
 // A new virtual copy of the open picture, starting from its current edits
 // (snapshots and the rating are not copied), opened at once.
-static void createVirtualCopy()
-{
+static void createVirtualCopy() {
   FilmStrip &f = state.film;
-  if (!state.original || state.imagePath.empty() || state.dragging || syncBusy())
+  if (!state.original || state.imagePath.empty() || state.dragging ||
+      syncBusy())
     return;
   const std::string real = vcImageOf(state.imagePath);
   std::vector<int> used;
-  size_t last = f.files.size(); // the last cell of this picture (it and its copies)
+  size_t last =
+      f.files.size(); // the last cell of this picture (it and its copies)
   for (size_t i = 0; i < f.files.size(); ++i)
-    if (vcImageOf(f.files[i].path) == real)
-    {
+    if (vcImageOf(f.files[i].path) == real) {
       last = i;
       if (f.files[i].copy > 0)
         used.push_back(f.files[i].copy);
     }
-  if (last == f.files.size())
-  {
+  if (last == f.files.size()) {
     setStatus("This picture is not in the filmstrip", true);
     return;
   }
   const int id = vcFreeId(used);
-  if (id == 0)
-  {
+  if (id == 0) {
     setStatus("A picture holds at most " + std::to_string(kMaxVirtualCopies) +
                   " virtual copies",
               true);
@@ -5124,12 +4902,11 @@ static void createVirtualCopy()
   }
   flushSidecar(); // the picture being copied keeps its latest edits too
   const std::string path = vcPath(real, id);
-  const std::string text =
-      sidecarFileText(baseName(real), state.original->width, state.original->height,
-                      state.adjust.toJson(), PhotoMeta{});
+  const std::string text = sidecarFileText(
+      baseName(real), state.original->width, state.original->height,
+      state.adjust.toJson(), PhotoMeta{});
   std::string err;
-  if (!writeTextAtomic(sidecarPath(path), text, &err))
-  {
+  if (!writeTextAtomic(sidecarPath(path), text, &err)) {
     setStatus("Couldn't create the virtual copy: " + err, true);
     return;
   }
@@ -5148,22 +4925,20 @@ static void createVirtualCopy()
 
 // Deletes the open virtual copy's edits file (the picture and its other copies
 // are untouched) and goes back to the original. Asks to be chosen twice.
-static void deleteVirtualCopy()
-{
+static void deleteVirtualCopy() {
   FilmStrip &f = state.film;
-  if (!state.original || state.imagePath.empty() || state.dragging || syncBusy())
+  if (!state.original || state.imagePath.empty() || state.dragging ||
+      syncBusy())
     return;
   const int n = vcCopyOf(state.imagePath);
-  if (n == 0)
-  {
+  if (n == 0) {
     setStatus("Only a virtual copy can be deleted: this is the original", true);
     return;
   }
-  if (gVcDeleteArmed != state.imagePath)
-  {
+  if (gVcDeleteArmed != state.imagePath) {
     gVcDeleteArmed = state.imagePath;
-    setStatus("Choose Delete Virtual Copy again to delete copy " + std::to_string(n) +
-                  " and its edits",
+    setStatus("Choose Delete Virtual Copy again to delete copy " +
+                  std::to_string(n) + " and its edits",
               false);
     return;
   }
@@ -5171,8 +4946,7 @@ static void deleteVirtualCopy()
   const std::string path = state.imagePath;
   std::error_code ec;
   std::filesystem::remove(sidecarPath(path), ec);
-  if (ec)
-  {
+  if (ec) {
     setStatus("Couldn't delete the virtual copy: " + ec.message(), true);
     return;
   }
@@ -5190,33 +4964,30 @@ static void deleteVirtualCopy()
   setStatus("Deleted virtual copy " + std::to_string(n), false);
 }
 
-static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m)
-{
+static void setSelectedObjectMap(std::shared_ptr<const ObjectMap> m) {
   const size_t part = static_cast<size_t>(selPart());
-  maskEditDiscrete([&](Mask &mk)
-                   {
+  maskEditDiscrete([&](Mask &mk) {
     if (part < mk.parts.size())
       if (auto *o = std::get_if<ObjectShape>(&mk.parts[part].shape))
-        o->map = m; });
+        o->map = m;
+  });
   state.maskShowTint = true;
   state.markDirty();
 }
 
-// The "Set test map" button's selection (not a segmenter): pixels brighter than the picture's mean.
-static std::shared_ptr<const ObjectMap> makeTestObjectMap()
-{
+// The "Set test map" button's selection (not a segmenter): pixels brighter than
+// the picture's mean.
+static std::shared_ptr<const ObjectMap> makeTestObjectMap() {
   if (!state.original)
     return nullptr;
   const CanvasImage &im = *state.original;
-  const int k = std::max(1, (std::max(im.width, im.height) +
-                             kObjectMapEdge - 1) /
-                                kObjectMapEdge);
+  const int k = std::max(
+      1, (std::max(im.width, im.height) + kObjectMapEdge - 1) / kObjectMapEdge);
   const int w = std::max(1, im.width / k), h = std::max(1, im.height / k);
   std::vector<int> luma(static_cast<size_t>(w) * h);
   double sum = 0;
   for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x)
-    {
+    for (int x = 0; x < w; ++x) {
       const uint8_t *p =
           &im.pixels[(static_cast<size_t>(y * k) * im.width + x * k) * 4];
       const int l = (54 * p[0] + 183 * p[1] + 19 * p[2] + 128) >> 8;
@@ -5234,15 +5005,13 @@ static std::shared_ptr<const ObjectMap> makeTestObjectMap()
   return m;
 }
 
-static bool selectedIsObject()
-{
+static bool selectedIsObject() {
   return selectedPartType() == MaskType::Object;
 }
 
 // The prompts a new click builds on: the ones still being segmented for this
 // part, else the committed ones. Original-picture fractions.
-static std::vector<ObjectPrompt> objectCurrentPrompts(int mask, int part)
-{
+static std::vector<ObjectPrompt> objectCurrentPrompts(int mask, int part) {
   const MaskUi::ObjPending &p = state.mask.objPending;
   if (p.mask == mask && p.part == part)
     return p.prompts;
@@ -5252,27 +5021,26 @@ static std::vector<ObjectPrompt> objectCurrentPrompts(int mask, int part)
   const Mask &m = ms[static_cast<size_t>(mask)];
   if (part < 0 || part >= static_cast<int>(m.parts.size()))
     return {};
-  if (const auto *o = std::get_if<ObjectShape>(&m.parts[static_cast<size_t>(part)].shape))
+  if (const auto *o =
+          std::get_if<ObjectShape>(&m.parts[static_cast<size_t>(part)].shape))
     return o->prompts;
   return {};
 }
 
-static void clearSelectedObject()
-{
+static void clearSelectedObject() {
   segmentWorker.invalidate();
   state.mask.objPending = {};
   const size_t part = static_cast<size_t>(selPart());
-  maskEditDiscrete([part](Mask &m)
-                   {
+  maskEditDiscrete([part](Mask &m) {
     if (part < m.parts.size())
       if (auto *o = std::get_if<ObjectShape>(&m.parts[part].shape)) {
         o->map.reset();
         o->prompts.clear();
-      } });
+      }
+  });
 }
 
-static void objectPrefetch()
-{
+static void objectPrefetch() {
   if (!state.original || segmentWorker.outstanding() ||
       state.mask.encodedKey == state.imageSerial)
     return;
@@ -5287,8 +5055,7 @@ static void objectPrefetch()
 // A click on the picture with an object part selected. Left click adds a
 // point (foreground, or background if "Click adds Background" is on);
 // right click adds the opposite kind; clicking an existing dot removes it.
-static void objectPress(float lx, float ly, bool rightClick)
-{
+static void objectPress(float lx, float ly, bool rightClick) {
   state.openMenu = -1;
   if (!maskToolActive() || !selectedIsObject() || !state.original)
     return;
@@ -5301,20 +5068,16 @@ static void objectPress(float lx, float ly, bool rightClick)
   // Existing dot under the pointer -> remove it.
   const float tol = kMaskHitPx / state.zoom;
   bool removed = false;
-  for (size_t k = 0; k < prompts.size(); ++k)
-  {
+  for (size_t k = 0; k < prompts.size(); ++k) {
     double sx, sy;
-    frame.toSrc(prompts[k].x * frame.origW, prompts[k].y * frame.origH, sx,
-                sy);
-    if (std::hypot(sx / frame.srcW * W - px, sy / frame.srcH * H - py) <= tol)
-    {
+    frame.toSrc(prompts[k].x * frame.origW, prompts[k].y * frame.origH, sx, sy);
+    if (std::hypot(sx / frame.srcW * W - px, sy / frame.srcH * H - py) <= tol) {
       prompts.erase(prompts.begin() + static_cast<std::ptrdiff_t>(k));
       removed = true;
       break;
     }
   }
-  if (!removed)
-  {
+  if (!removed) {
     double ox, oy; // view -> original
     frame.toOrig(px / W * frame.srcW, py / H * frame.srcH, ox, oy);
     if (ox < 0 || oy < 0 || ox >= frame.origW || oy >= frame.origH)
@@ -5327,8 +5090,7 @@ static void objectPress(float lx, float ly, bool rightClick)
     // right + objBg=false -> bg; right + objBg=true -> fg
     prompts.push_back(p);
   }
-  if (prompts.empty())
-  { // last dot removed: nothing selected any more
+  if (prompts.empty()) { // last dot removed: nothing selected any more
     clearSelectedObject();
     return;
   }
@@ -5348,10 +5110,8 @@ static void objectPress(float lx, float ly, bool rightClick)
 }
 
 // The starting shape of each kind of mask (nullopt for an unknown kind).
-static std::optional<MaskShape> newMaskShape(MaskType t)
-{
-  switch (t)
-  {
+static std::optional<MaskShape> newMaskShape(MaskType t) {
+  switch (t) {
   case MaskType::Radial:
     // Centered on the picture as it is shown now.
     return RadialShape::fromSource(RadialShape{}, state.adjust.geoFrame());
@@ -5377,13 +5137,11 @@ static std::optional<MaskShape> newMaskShape(MaskType t)
 
 static void objectPrefetch();
 
-static void addMask(MaskType t)
-{
+static void addMask(MaskType t) {
   if (!state.original)
     return;
   MaskSet ms = state.adjust.masks();
-  if (ms.size() >= kMaxMasks)
-  {
+  if (ms.size() >= kMaxMasks) {
     setStatus("Mask limit reached (" + std::to_string(kMaxMasks) + ")", true);
     return;
   }
@@ -5403,8 +5161,7 @@ static void addMask(MaskType t)
     objectPrefetch();
 }
 
-static void deleteSelectedMask()
-{
+static void deleteSelectedMask() {
   const int i = selMask();
   if (i < 0)
     return;
@@ -5419,14 +5176,12 @@ static void deleteSelectedMask()
 
 // ---- Mask list operations: duplicate, reorder, copy / paste effects ----
 // A copy of the selected mask (shapes and effects) right after it, selected.
-static void duplicateSelectedMask()
-{
+static void duplicateSelectedMask() {
   const int i = selMask();
   if (i < 0)
     return;
   MaskSet ms = state.adjust.masks();
-  if (ms.size() >= kMaxMasks)
-  {
+  if (ms.size() >= kMaxMasks) {
     setStatus("Mask limit reached (" + std::to_string(kMaxMasks) + ")", true);
     return;
   }
@@ -5443,8 +5198,7 @@ static void duplicateSelectedMask()
 
 // Masks apply in list order (later ones on top, and a luminosity range sees
 // the result of the masks before it), so order matters. dir = -1 up, +1 down.
-static void moveSelectedMask(int dir)
-{
+static void moveSelectedMask(int dir) {
   const int i = selMask();
   const int j = i + dir;
   MaskSet ms = state.adjust.masks();
@@ -5458,8 +5212,7 @@ static void moveSelectedMask(int dir)
 }
 
 // What Copy / Paste Effects moves between masks: everything but the shape.
-struct MaskEffects
-{
+struct MaskEffects {
   float amount = 100.0f;
   AdjValues adj{};
   MixValues mix{};
@@ -5468,38 +5221,35 @@ struct MaskEffects
 };
 static std::optional<MaskEffects> gMaskEffectsClip;
 
-static void copyMaskEffects()
-{
+static void copyMaskEffects() {
   const Mask *m = selectedMask();
   if (!m)
     return;
-  gMaskEffectsClip = MaskEffects{m->amount, m->adj, m->mix, m->grade, m->curves};
+  gMaskEffectsClip =
+      MaskEffects{m->amount, m->adj, m->mix, m->grade, m->curves};
   setStatus("Mask effects copied", false);
 }
 
-static void pasteMaskEffects()
-{
-  if (!gMaskEffectsClip)
-  {
+static void pasteMaskEffects() {
+  if (!gMaskEffectsClip) {
     setStatus("Copy a mask's effects first", true);
     return;
   }
   const MaskEffects fx = *gMaskEffectsClip;
-  maskEditDiscrete([&](Mask &m)
-                   {
+  maskEditDiscrete([&](Mask &m) {
     m.amount = fx.amount;
     m.adj = fx.adj;
     m.mix = fx.mix;
     m.grade = fx.grade;
-    m.curves = fx.curves; });
+    m.curves = fx.curves;
+  });
 }
 
 // ---- Parts: combining shapes inside the selected mask ----
 // Adds a part of kind `t` (joined with Add; change it with setPartOp) and
 // selects it. The combined result is what matters from here on, so the tint
 // is switched on.
-static void addPart(MaskType t)
-{
+static void addPart(MaskType t) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -5508,8 +5258,7 @@ static void addPart(MaskType t)
     return;
   MaskSet ms = state.adjust.masks();
   Mask &m = ms[static_cast<size_t>(i)];
-  if (m.parts.size() >= kMaxMaskParts)
-  {
+  if (m.parts.size() >= kMaxMaskParts) {
     setStatus("Part limit reached (" + std::to_string(kMaxMaskParts) + ")",
               true);
     return;
@@ -5526,39 +5275,35 @@ static void addPart(MaskType t)
 }
 
 // How the selected part joins the ones before it (the first part has none).
-static void setPartOp(MaskOp op)
-{
+static void setPartOp(MaskOp op) {
   const size_t j = static_cast<size_t>(selPart());
   if (j == 0)
     return;
-  maskEditDiscrete([&](Mask &m)
-                   {
+  maskEditDiscrete([&](Mask &m) {
     if (j < m.parts.size())
-      m.parts[j].op = op; });
+      m.parts[j].op = op;
+  });
 }
 
-static void removeSelectedPart()
-{
+static void removeSelectedPart() {
   const Mask *sm = selectedMask();
   if (!sm || sm->parts.size() <= 1)
     return;
   const size_t j = static_cast<size_t>(selPart());
-  maskEditDiscrete([&](Mask &m)
-                   {
+  maskEditDiscrete([&](Mask &m) {
     if (m.parts.size() > 1 && j < m.parts.size())
-      m.parts.erase(m.parts.begin() + static_cast<std::ptrdiff_t>(j)); });
+      m.parts.erase(m.parts.begin() + static_cast<std::ptrdiff_t>(j));
+  });
   state.mask.part = static_cast<int>(j) - 1; // the one before; selPart clamps
   state.markDirty();
 }
 
 // A drag on the canvas or a mask slider ended: leave the low-res preview and
 // ask for one full-resolution render (same job as gradeEndDrag).
-static void maskEndDrag()
-{
+static void maskEndDrag() {
   state.mask.drag = MaskUi::Drag::None;
   state.adjust.endMaskEdit();
-  if (state.dragging)
-  {
+  if (state.dragging) {
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
@@ -5566,8 +5311,7 @@ static void maskEndDrag()
 }
 
 // ---- Radial mask geometry on the canvas (document pixels) ----
-struct MaskGeom
-{
+struct MaskGeom {
   float cx, cy; // center
   float rx, ry; // half-axes
   float ang;    // radians, clockwise
@@ -5575,8 +5319,7 @@ struct MaskGeom
   float S;      // the shorter document side (radius unit)
 };
 
-static MaskGeom radialGeom(const RadialShape &r)
-{
+static MaskGeom radialGeom(const RadialShape &r) {
   MaskGeom g{};
   const float W = state.docWidth(), H = state.docHeight();
   g.S = std::min(W, H);
@@ -5590,8 +5333,7 @@ static MaskGeom radialGeom(const RadialShape &r)
   return g;
 }
 
-enum
-{
+enum {
   kMaskHitNone = 0,
   kMaskHitBody,
   kMaskHitX,
@@ -5602,18 +5344,15 @@ enum
 
 // What is under (px, py)? Handles (only for the selected mask) win over the
 // body. The four handles sit on the rotated axes at the ellipse outline.
-static int maskHit(const RadialShape &r, float px, float py, bool handles)
-{
+static int maskHit(const RadialShape &r, float px, float py, bool handles) {
   const MaskGeom g = radialGeom(r);
   const float tol = kMaskHitPx / state.zoom;
-  if (handles)
-  {
+  if (handles) {
     const float hx[2] = {g.cx + g.rx * g.c, g.cx - g.rx * g.c};
     const float hy[2] = {g.cy + g.rx * g.s, g.cy - g.rx * g.s};
     const float vx[2] = {g.cx - g.ry * g.s, g.cx + g.ry * g.s};
     const float vy[2] = {g.cy + g.ry * g.c, g.cy - g.ry * g.c};
-    for (int k = 0; k < 2; ++k)
-    {
+    for (int k = 0; k < 2; ++k) {
       if (std::hypot(px - hx[k], py - hy[k]) <= tol)
         return kMaskHitX;
       if (std::hypot(px - vx[k], py - vy[k]) <= tol)
@@ -5627,8 +5366,7 @@ static int maskHit(const RadialShape &r, float px, float py, bool handles)
 }
 
 // ---- Linear mask geometry on the canvas (document pixels) ----
-struct LinGeom
-{
+struct LinGeom {
   float cx, cy; // center
   float ux, uy; // unit direction of fade-out
   float len;    // half length of the ramp
@@ -5641,8 +5379,7 @@ struct LinGeom
   float ey() const { return cy + uy * len; }
 };
 
-static LinGeom linearGeom(const LinearShape &l)
-{
+static LinGeom linearGeom(const LinearShape &l) {
   LinGeom g{};
   const float W = state.docWidth(), H = state.docHeight();
   g.S = std::min(W, H);
@@ -5657,12 +5394,10 @@ static LinGeom linearGeom(const LinearShape &l)
 
 // Handles (selected mask only) sit where the axis crosses the two lines; the
 // body is the band between the lines.
-static int linearHit(const LinearShape &l, float px, float py, bool handles)
-{
+static int linearHit(const LinearShape &l, float px, float py, bool handles) {
   const LinGeom g = linearGeom(l);
   const float tol = kMaskHitPx / state.zoom;
-  if (handles)
-  {
+  if (handles) {
     if (std::hypot(px - g.ex(), py - g.ey()) <= tol)
       return kMaskHitLinEnd;
     if (std::hypot(px - g.sx(), py - g.sy()) <= tol)
@@ -5675,8 +5410,7 @@ static int linearHit(const LinearShape &l, float px, float py, bool handles)
 // ---- Rectangle mask geometry on the canvas (document pixels) ----
 // Same layout as the radial mask: a center, half-sizes along the rotated axes,
 // and four handles on the axes (here at the middle of each side).
-static MaskGeom rectGeom(const RectShape &r)
-{
+static MaskGeom rectGeom(const RectShape &r) {
   MaskGeom g{};
   const float W = state.docWidth(), H = state.docHeight();
   g.S = std::min(W, H);
@@ -5691,18 +5425,15 @@ static MaskGeom rectGeom(const RectShape &r)
 }
 
 // Handles (selected part only) win over the body, which is the rectangle.
-static int rectHit(const RectShape &r, float px, float py, bool handles)
-{
+static int rectHit(const RectShape &r, float px, float py, bool handles) {
   const MaskGeom g = rectGeom(r);
   const float tol = kMaskHitPx / state.zoom;
-  if (handles)
-  {
+  if (handles) {
     const float hx[2] = {g.cx + g.rx * g.c, g.cx - g.rx * g.c};
     const float hy[2] = {g.cy + g.rx * g.s, g.cy - g.rx * g.s};
     const float vx[2] = {g.cx - g.ry * g.s, g.cx + g.ry * g.s};
     const float vy[2] = {g.cy + g.ry * g.c, g.cy - g.ry * g.c};
-    for (int k = 0; k < 2; ++k)
-    {
+    for (int k = 0; k < 2; ++k) {
       if (std::hypot(px - hx[k], py - hy[k]) <= tol)
         return kMaskHitX;
       if (std::hypot(px - vx[k], py - vy[k]) <= tol)
@@ -5713,7 +5444,7 @@ static int rectHit(const RectShape &r, float px, float py, bool handles)
   const float u = (dx * g.c + dy * g.s) / g.rx;
   const float v = (-dx * g.s + dy * g.c) / g.ry;
   return (std::fabs(u) <= 1.0f && std::fabs(v) <= 1.0f) ? kMaskHitBody
-                                                       : kMaskHitNone;
+                                                        : kMaskHitNone;
 }
 
 // ---- Polygon / lasso tool ----
@@ -5728,15 +5459,13 @@ static int rectHit(const RectShape &r, float px, float py, bool handles)
 // (simplified while you draw). The outline is always closed.
 constexpr float kPolyClampLo = -0.25f; // vertices stay near the picture
 constexpr float kPolyClampHi = 1.25f;
-constexpr float kLassoTolPx = 1.5f;    // simplification tolerance, screen px
+constexpr float kLassoTolPx = 1.5f; // simplification tolerance, screen px
 
-static float polyClampCoord(float v)
-{
+static float polyClampCoord(float v) {
   return std::clamp(v, kPolyClampLo, kPolyClampHi);
 }
 // The polygon's vertices in document pixels (what the pointer is measured in).
-static std::vector<PolyPt> polyDocPts(const PolygonShape &view)
-{
+static std::vector<PolyPt> polyDocPts(const PolygonShape &view) {
   const float W = state.docWidth(), H = state.docHeight();
   std::vector<PolyPt> out;
   out.reserve(view.pts.size());
@@ -5745,16 +5474,13 @@ static std::vector<PolyPt> polyDocPts(const PolygonShape &view)
   return out;
 }
 // The vertex under (px, py), the closest one within the grab tolerance, or -1.
-static int polyVertexAt(const std::vector<PolyPt> &dp, float px, float py)
-{
+static int polyVertexAt(const std::vector<PolyPt> &dp, float px, float py) {
   const float tol = kMaskHitPx / state.zoom;
   int best = -1;
   float bestD = tol;
-  for (size_t i = 0; i < dp.size(); ++i)
-  {
+  for (size_t i = 0; i < dp.size(); ++i) {
     const float d = std::hypot(px - dp[i].x, py - dp[i].y);
-    if (d <= bestD)
-    {
+    if (d <= bestD) {
       bestD = d;
       best = static_cast<int>(i);
     }
@@ -5762,36 +5488,31 @@ static int polyVertexAt(const std::vector<PolyPt> &dp, float px, float py)
   return best;
 }
 // What picks an UNSELECTED polygon: a vertex, or inside a closed outline.
-static bool polygonBodyHit(const PolygonShape &view, float px, float py)
-{
+static bool polygonBodyHit(const PolygonShape &view, float px, float py) {
   const std::vector<PolyPt> dp = polyDocPts(view);
   return polyVertexAt(dp, px, py) >= 0 || polyContains(dp, px, py);
 }
 
-static void polygonEditPts(int mask, size_t part, int control,
-                           const std::function<void(std::vector<PolyPt> &)> &fn)
-{
+static void
+polygonEditPts(int mask, size_t part, int control,
+               const std::function<void(std::vector<PolyPt> &)> &fn) {
   const GeoFrame frame = state.adjust.geoFrame();
   maskEdit(
       mask,
-      [&](Mask &m)
-      {
+      [&](Mask &m) {
         editShapeInView<PolygonShape>(m, part, frame,
-                                      [&](PolygonShape &s)
-                                      { fn(s.pts); });
+                                      [&](PolygonShape &s) { fn(s.pts); });
       },
       control);
 }
 
-static void polygonDirty()
-{
+static void polygonDirty() {
   enterDrag(false); // recompute on the cheap preview path while held
   state.markAdjustDirty();
   state.markDirty();
 }
 
-static void polygonBegin(float px, float py)
-{
+static void polygonBegin(float px, float py) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -5800,7 +5521,8 @@ static void polygonBegin(float px, float py)
   if (part >= ms[static_cast<size_t>(i)].parts.size())
     return;
   const GeoFrame frame = state.adjust.geoFrame();
-  const auto view = polygonInView(ms[static_cast<size_t>(i)].parts[part], frame);
+  const auto view =
+      polygonInView(ms[static_cast<size_t>(i)].parts[part], frame);
   if (!view)
     return;
   const float W = state.docWidth(), H = state.docHeight();
@@ -5810,21 +5532,18 @@ static void polygonBegin(float px, float py)
   const std::vector<PolyPt> dp = polyDocPts(*view);
   const PolyPt here{polyClampCoord(px / W), polyClampCoord(py / H)};
 
-  if (u.polyLasso)
-  { // a new outline, drawn by dragging
+  if (u.polyLasso) { // a new outline, drawn by dragging
     u.lassoRaw.clear();
     u.lassoRaw.push_back(PolyPt{px, py});
     polygonEditPts(i, part, kMaskCtlPolyLasso,
-                   [&](std::vector<PolyPt> &pts)
-                   { pts.assign(1, here); });
+                   [&](std::vector<PolyPt> &pts) { pts.assign(1, here); });
     u.drag = MaskUi::Drag::Lasso;
     polygonDirty();
     return;
   }
 
   const int vi = polyVertexAt(dp, px, py);
-  if (vi >= 0)
-  { // grab a vertex
+  if (vi >= 0) { // grab a vertex
     u.drag = MaskUi::Drag::PolyVertex;
     u.polyIdx = vi;
     state.markDirty();
@@ -5838,23 +5557,18 @@ static void polygonBegin(float px, float py)
   const float dist = polyNearestEdge(dp, px, py, &edge, &qx, &qy);
   const bool closed = dp.size() >= 3;
   const float tol = kMaskHitPx / state.zoom;
-  const auto insertAt = [&](size_t at, PolyPt p)
-  {
+  const auto insertAt = [&](size_t at, PolyPt p) {
     bool full = false;
-    polygonEditPts(i, part, kMaskCtlPolyVertex,
-                   [&](std::vector<PolyPt> &pts)
-                   {
-                     if (pts.size() >= kPolyMaxPoints)
-                     {
-                       full = true;
-                       return;
-                     }
-                     pts.insert(pts.begin() + static_cast<std::ptrdiff_t>(
-                                                  std::min(at, pts.size())),
-                                p);
-                   });
-    if (full)
-    {
+    polygonEditPts(i, part, kMaskCtlPolyVertex, [&](std::vector<PolyPt> &pts) {
+      if (pts.size() >= kPolyMaxPoints) {
+        full = true;
+        return;
+      }
+      pts.insert(pts.begin() +
+                     static_cast<std::ptrdiff_t>(std::min(at, pts.size())),
+                 p);
+    });
+    if (full) {
       setStatus("Polygon point limit reached (" +
                     std::to_string(kPolyMaxPoints) + ")",
                 true);
@@ -5864,14 +5578,12 @@ static void polygonBegin(float px, float py)
     u.polyIdx = static_cast<int>(at);
     polygonDirty();
   };
-  if (closed && edge >= 0 && dist <= tol)
-  { // on a side: split it there
+  if (closed && edge >= 0 && dist <= tol) { // on a side: split it there
     insertAt(static_cast<size_t>(edge) + 1,
              PolyPt{polyClampCoord(qx / W), polyClampCoord(qy / H)});
     return;
   }
-  if (closed && polyContains(dp, px, py))
-  { // inside: move the whole polygon
+  if (closed && polyContains(dp, px, py)) { // inside: move the whole polygon
     u.drag = MaskUi::Drag::PolyMove;
     u.lastX = px;
     u.lastY = py;
@@ -5884,8 +5596,7 @@ static void polygonBegin(float px, float py)
     insertAt(view->pts.size(), here); // fewer than 3 points: append
 }
 
-static void polygonDragTo(float px, float py, MaskUi::Drag d)
-{
+static void polygonDragTo(float px, float py, MaskUi::Drag d) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -5894,51 +5605,39 @@ static void polygonDragTo(float px, float py, MaskUi::Drag d)
   const float W = state.docWidth(), H = state.docHeight();
   if (W <= 0 || H <= 0)
     return;
-  if (d == MaskUi::Drag::PolyVertex)
-  {
+  if (d == MaskUi::Drag::PolyVertex) {
     const size_t k = static_cast<size_t>(std::max(u.polyIdx, 0));
     const PolyPt p{polyClampCoord(px / W), polyClampCoord(py / H)};
-    polygonEditPts(i, part, kMaskCtlPolyVertex,
-                   [&](std::vector<PolyPt> &pts)
-                   {
-                     if (k < pts.size())
-                       pts[k] = p;
-                   });
-  }
-  else if (d == MaskUi::Drag::PolyMove)
-  {
+    polygonEditPts(i, part, kMaskCtlPolyVertex, [&](std::vector<PolyPt> &pts) {
+      if (k < pts.size())
+        pts[k] = p;
+    });
+  } else if (d == MaskUi::Drag::PolyMove) {
     float dx = (px - u.lastX) / W, dy = (py - u.lastY) / H;
-    polygonEditPts(i, part, kMaskCtlPolyMove,
-                   [&](std::vector<PolyPt> &pts)
-                   {
-                     if (pts.empty())
-                       return;
-                     float x0 = pts[0].x, x1 = x0, y0 = pts[0].y, y1 = y0;
-                     for (const PolyPt &p : pts)
-                     {
-                       x0 = std::min(x0, p.x);
-                       x1 = std::max(x1, p.x);
-                       y0 = std::min(y0, p.y);
-                       y1 = std::max(y1, p.y);
-                     }
-                     // Keep the whole outline within reach of the picture.
-                     dx = std::clamp(dx, kPolyClampLo - x0, kPolyClampHi - x1);
-                     dy = std::clamp(dy, kPolyClampLo - y0, kPolyClampHi - y1);
-                     for (PolyPt &p : pts)
-                     {
-                       p.x += dx;
-                       p.y += dy;
-                     }
-                   });
+    polygonEditPts(i, part, kMaskCtlPolyMove, [&](std::vector<PolyPt> &pts) {
+      if (pts.empty())
+        return;
+      float x0 = pts[0].x, x1 = x0, y0 = pts[0].y, y1 = y0;
+      for (const PolyPt &p : pts) {
+        x0 = std::min(x0, p.x);
+        x1 = std::max(x1, p.x);
+        y0 = std::min(y0, p.y);
+        y1 = std::max(y1, p.y);
+      }
+      // Keep the whole outline within reach of the picture.
+      dx = std::clamp(dx, kPolyClampLo - x0, kPolyClampHi - x1);
+      dy = std::clamp(dy, kPolyClampLo - y0, kPolyClampHi - y1);
+      for (PolyPt &p : pts) {
+        p.x += dx;
+        p.y += dy;
+      }
+    });
     u.lastX += dx * W; // by what was really applied, so a clamped edge
     u.lastY += dy * H; // does not build up a debt
-  }
-  else if (d == MaskUi::Drag::Lasso)
-  {
+  } else if (d == MaskUi::Drag::Lasso) {
     const float gap = kLassoTolPx / state.zoom;
     if (!u.lassoRaw.empty() &&
-        std::hypot(px - u.lassoRaw.back().x, py - u.lassoRaw.back().y) < gap)
-    {
+        std::hypot(px - u.lassoRaw.back().x, py - u.lassoRaw.back().y) < gap) {
       state.markDirty();
       return;
     }
@@ -5947,28 +5646,22 @@ static void polygonDragTo(float px, float py, MaskUi::Drag d)
     // Simplify the path so far; loosen the tolerance until it fits.
     float tol = kLassoTolPx / state.zoom;
     std::vector<PolyPt> simple = polySimplify(u.lassoRaw, tol);
-    for (int guard = 0; simple.size() > kPolyMaxPoints && guard < 16; ++guard)
-    {
+    for (int guard = 0; simple.size() > kPolyMaxPoints && guard < 16; ++guard) {
       tol *= 2.0f;
       simple = polySimplify(u.lassoRaw, tol);
     }
-    polygonEditPts(i, part, kMaskCtlPolyLasso,
-                   [&](std::vector<PolyPt> &pts)
-                   {
-                     pts.clear();
-                     for (const PolyPt &p : simple)
-                       pts.push_back(PolyPt{polyClampCoord(p.x / W),
-                                            polyClampCoord(p.y / H)});
-                   });
-  }
-  else
+    polygonEditPts(i, part, kMaskCtlPolyLasso, [&](std::vector<PolyPt> &pts) {
+      pts.clear();
+      for (const PolyPt &p : simple)
+        pts.push_back(PolyPt{polyClampCoord(p.x / W), polyClampCoord(p.y / H)});
+    });
+  } else
     return;
   polygonDirty();
 }
 
 // Right-click on a vertex of the selected polygon removes it.
-static void polygonRightPress(float lx, float ly)
-{
+static void polygonRightPress(float lx, float ly) {
   if (!maskToolActive() || !selectedIsPolygon())
     return;
   const int i = selMask();
@@ -5987,13 +5680,12 @@ static void polygonRightPress(float lx, float ly)
   if (vi < 0)
     return;
   const GeoFrame frame = state.adjust.geoFrame();
-  maskEditDiscrete([&](Mask &m)
-                   { editShapeInView<PolygonShape>(
-                         m, part, frame, [&](PolygonShape &s)
-                         {
-                           if (static_cast<size_t>(vi) < s.pts.size())
-                             s.pts.erase(s.pts.begin() + vi);
-                         }); });
+  maskEditDiscrete([&](Mask &m) {
+    editShapeInView<PolygonShape>(m, part, frame, [&](PolygonShape &s) {
+      if (static_cast<size_t>(vi) < s.pts.size())
+        s.pts.erase(s.pts.begin() + vi);
+    });
+  });
 }
 
 // ---- Brush painting ----
@@ -6004,18 +5696,16 @@ static void polygonRightPress(float lx, float ly)
 
 // A brush mask has no body to grab; its "pin" (where its first stroke began)
 // is what an unselected brush is picked by.
-static bool brushPinHit(const BrushShape &b, float px, float py)
-{
+static bool brushPinHit(const BrushShape &b, float px, float py) {
   if (b.strokes.empty() || b.strokes.front().pts.empty())
     return false;
   const BrushPt &p = b.strokes.front().pts.front();
   const float tol = kMaskHitPx / state.zoom;
-  return std::hypot(px - p.x * state.docWidth(), py - p.y * state.docHeight()) <=
-         tol;
+  return std::hypot(px - p.x * state.docWidth(),
+                    py - p.y * state.docHeight()) <= tol;
 }
 
-static void brushBegin(float px, float py)
-{
+static void brushBegin(float px, float py) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -6033,25 +5723,22 @@ static void brushBegin(float px, float py)
   bool full = false;
   maskEdit(
       i,
-      [&](Mask &m)
-      {
+      [&](Mask &m) {
         auto *b = part < m.parts.size()
                       ? std::get_if<BrushShape>(&m.parts[part].shape)
                       : nullptr;
         if (!b)
           return;
-        if (b->strokes.size() >= kBrushMaxStrokes)
-        {
+        if (b->strokes.size() >= kBrushMaxStrokes) {
           full = true;
           return;
         }
         b->strokes.push_back(std::move(st));
       },
       kMaskCtlBrush);
-  if (full)
-  {
-    setStatus("Brush stroke limit reached (" + std::to_string(kBrushMaxStrokes) +
-                  ")",
+  if (full) {
+    setStatus("Brush stroke limit reached (" +
+                  std::to_string(kBrushMaxStrokes) + ")",
               true);
     return;
   }
@@ -6063,8 +5750,7 @@ static void brushBegin(float px, float py)
   state.markDirty();
 }
 
-static void brushDragTo(float px, float py)
-{
+static void brushDragTo(float px, float py) {
   const int i = selMask();
   if (i < 0)
     return;
@@ -6077,15 +5763,13 @@ static void brushDragTo(float px, float py)
   // Skip points closer than a fraction of the radius: they add nothing to the
   // rendered stroke and would only bloat it (and every undo snapshot).
   const float gap = std::max(rad * kBrushPointGap, 0.5f / state.zoom);
-  if (std::hypot(px - u.lastX, py - u.lastY) >= gap)
-  {
+  if (std::hypot(px - u.lastX, py - u.lastY) >= gap) {
     const GeoFrame frame = state.adjust.geoFrame();
     const BrushPt pt =
         BrushShape::pointFromSource(BrushPt{px / W, py / H}, frame);
     maskEdit(
         i,
-        [&](Mask &m)
-        {
+        [&](Mask &m) {
           auto *b = part < m.parts.size()
                         ? std::get_if<BrushShape>(&m.parts[part].shape)
                         : nullptr;
@@ -6104,30 +5788,32 @@ static void brushDragTo(float px, float py)
   state.markDirty(); // the cursor ring follows the pointer
 }
 
-static std::shared_ptr<CanvasImage> lumTintBase(); // defined with the luminosity overlay below
+static std::shared_ptr<CanvasImage>
+lumTintBase(); // defined with the luminosity overlay below
 
 // Color of the picture at (fx, fy) (fractions of the picture on screen) as
 // it stands just BEFORE mask `sel`: the same pixels ColorRangeEval sees.
-static std::optional<std::array<float, 3>> samplePreMaskColor(int sel,
-                                                              float fx, float fy)
-{
+static std::optional<std::array<float, 3>> samplePreMaskColor(int sel, float fx,
+                                                              float fy) {
   const MaskSet &ms = state.adjust.masks();
   const auto base = lumTintBase();
   if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
     return std::nullopt;
   RenderParams rp = state.adjust.buildRenderParams();
-  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
+  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run
+                // after the masks)
   rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
                              state.adjust.geoFrame());
   const auto pre = renderWith(*base, rp);
-  const int x = std::clamp(static_cast<int>(fx * pre->width), 0, pre->width - 1);
-  const int y = std::clamp(static_cast<int>(fy * pre->height), 0, pre->height - 1);
+  const int x =
+      std::clamp(static_cast<int>(fx * pre->width), 0, pre->width - 1);
+  const int y =
+      std::clamp(static_cast<int>(fy * pre->height), 0, pre->height - 1);
   // Average a 5x5 patch so one noisy pixel doesn't pick the color.
   float sum[3] = {0, 0, 0};
   int n = 0;
   for (int dy = -2; dy <= 2; ++dy)
-    for (int dx = -2; dx <= 2; ++dx)
-    {
+    for (int dx = -2; dx <= 2; ++dx) {
       const int xx = std::clamp(x + dx, 0, pre->width - 1);
       const int yy = std::clamp(y + dy, 0, pre->height - 1);
       const uint8_t *p =
@@ -6140,8 +5826,7 @@ static std::optional<std::array<float, 3>> samplePreMaskColor(int sel,
                               sum[2] / (255.0f * n)};
 }
 
-static void colorRangePress(float px, float py)
-{
+static void colorRangePress(float px, float py) {
   const float W = state.docWidth(), H = state.docHeight();
   if (W <= 0 || H <= 0)
     return;
@@ -6149,20 +5834,18 @@ static void colorRangePress(float px, float py)
   if (!c)
     return;
   const size_t part = static_cast<size_t>(selPart());
-  maskEditDiscrete([&](Mask &m)
-                   {
+  maskEditDiscrete([&](Mask &m) {
     if (part < m.parts.size())
-      if (auto *s = std::get_if<ColorRangeShape>(&m.parts[part].shape))
-      {
+      if (auto *s = std::get_if<ColorRangeShape>(&m.parts[part].shape)) {
         s->set = true;
         s->r = (*c)[0];
         s->g = (*c)[1];
         s->b = (*c)[2];
-      } });
+      }
+  });
 }
 
-static void maskPress(float lx, float ly)
-{
+static void maskPress(float lx, float ly) {
   if (!maskToolActive())
     return;
   state.mask.drag = MaskUi::Drag::None;
@@ -6172,28 +5855,23 @@ static void maskPress(float lx, float ly)
   const int sel = selMask();
   const int selP = selPart();
   const int nMasks = static_cast<int>(ms.size());
-  const auto partCount = [&](int i)
-  {
+  const auto partCount = [&](int i) {
     return static_cast<int>(ms[static_cast<size_t>(i)].parts.size());
   };
-  const auto partAt = [&](int i, int j) -> const MaskPart &
-  {
+  const auto partAt = [&](int i, int j) -> const MaskPart & {
     return ms[static_cast<size_t>(i)].parts[static_cast<size_t>(j)];
   };
   // With a brush part selected every press paints (pick another part from
   // the list, or its pin if it is a brush).
   if (sel >= 0 && partCount(sel) > 0 &&
-      std::holds_alternative<BrushShape>(partAt(sel, selP).shape))
-  {
+      std::holds_alternative<BrushShape>(partAt(sel, selP).shape)) {
     bool picked = false;
     for (int i = nMasks - 1; i >= 0 && !picked; --i)
-      for (int j = partCount(i) - 1; j >= 0 && !picked; --j)
-      {
+      for (int j = partCount(i) - 1; j >= 0 && !picked; --j) {
         if (i == sel && j == selP)
           continue;
         if (const auto bv = brushInView(partAt(i, j), frame))
-          if (brushPinHit(*bv, px, py))
-          {
+          if (brushPinHit(*bv, px, py)) {
             state.maskSel = i;
             state.mask.part = j;
             state.markDirty();
@@ -6206,46 +5884,37 @@ static void maskPress(float lx, float ly)
   }
 
   if (sel >= 0 && partCount(sel) > 0 &&
-      std::holds_alternative<ObjectShape>(partAt(sel, selP).shape))
-  {
+      std::holds_alternative<ObjectShape>(partAt(sel, selP).shape)) {
     objectPress(lx, ly, false); // every press is a prompt, like a brush
     return;
   }
   // Polygon: every press edits the outline (see "Polygon / lasso tool").
   if (sel >= 0 && partCount(sel) > 0 &&
-      std::holds_alternative<PolygonShape>(partAt(sel, selP).shape))
-  {
+      std::holds_alternative<PolygonShape>(partAt(sel, selP).shape)) {
     polygonBegin(px, py);
     return;
   }
   // Color Range: every press samples a new color (like a brush, no handles).
   if (sel >= 0 && partCount(sel) > 0 &&
-      std::holds_alternative<ColorRangeShape>(partAt(sel, selP).shape))
-  {
+      std::holds_alternative<ColorRangeShape>(partAt(sel, selP).shape)) {
     colorRangePress(px, py);
     return;
   }
   // Tries part `j` of mask `i`; on a hit selects it and starts the matching
   // drag.
-  auto tryPart = [&](int i, int j, bool isSelected) -> bool
-  {
+  auto tryPart = [&](int i, int j, bool isSelected) -> bool {
     const MaskPart &m = partAt(i, j);
     int hit = kMaskHitNone;
     float shapeCx = 0, shapeCy = 0; // center, fraction of the picture
-    if (const auto rv = radialInView(m, frame))
-    {
+    if (const auto rv = radialInView(m, frame)) {
       hit = maskHit(*rv, px, py, isSelected);
       shapeCx = rv->cx;
       shapeCy = rv->cy;
-    }
-    else if (const auto lv = linearInView(m, frame))
-    {
+    } else if (const auto lv = linearInView(m, frame)) {
       hit = linearHit(*lv, px, py, isSelected);
       shapeCx = lv->cx;
       shapeCy = lv->cy;
-    }
-    else if (const auto bv = brushInView(m, frame))
-    {
+    } else if (const auto bv = brushInView(m, frame)) {
       // Nothing to grab on a brush: its pin only selects it.
       if (!brushPinHit(*bv, px, py))
         return false;
@@ -6253,15 +5922,11 @@ static void maskPress(float lx, float ly)
       state.mask.part = j;
       state.markDirty();
       return true;
-    }
-    else if (const auto qv = rectInView(m, frame))
-    {
+    } else if (const auto qv = rectInView(m, frame)) {
       hit = rectHit(*qv, px, py, isSelected);
       shapeCx = qv->cx;
       shapeCy = qv->cy;
-    }
-    else if (const auto pv = polygonInView(m, frame))
-    {
+    } else if (const auto pv = polygonInView(m, frame)) {
       // An unselected polygon is only picked (its vertices are edited once
       // it is selected).
       if (!polygonBodyHit(*pv, px, py))
@@ -6275,24 +5940,15 @@ static void maskPress(float lx, float ly)
       return false;
     state.maskSel = i;
     state.mask.part = j;
-    if (hit == kMaskHitX)
-    {
+    if (hit == kMaskHitX) {
       state.mask.drag = MaskUi::Drag::ResizeX;
-    }
-    else if (hit == kMaskHitY)
-    {
+    } else if (hit == kMaskHitY) {
       state.mask.drag = MaskUi::Drag::ResizeY;
-    }
-    else if (hit == kMaskHitLinEnd)
-    {
+    } else if (hit == kMaskHitLinEnd) {
       state.mask.drag = MaskUi::Drag::LinEnd;
-    }
-    else if (hit == kMaskHitLinStart)
-    {
+    } else if (hit == kMaskHitLinStart) {
       state.mask.drag = MaskUi::Drag::LinStart;
-    }
-    else
-    {
+    } else {
       state.mask.drag = MaskUi::Drag::Move;
       state.mask.grabX = px - shapeCx * state.docWidth();
       state.mask.grabY = py - shapeCy * state.docHeight();
@@ -6309,8 +5965,7 @@ static void maskPress(float lx, float ly)
       if (j != selP && tryPart(sel, j, false))
         return;
   // Otherwise clicking inside another mask selects it (topmost first).
-  for (int i = nMasks - 1; i >= 0; --i)
-  {
+  for (int i = nMasks - 1; i >= 0; --i) {
     if (i == sel)
       continue;
     for (int j = partCount(i) - 1; j >= 0; --j)
@@ -6319,8 +5974,7 @@ static void maskPress(float lx, float ly)
   }
 }
 
-static void maskDrag(float lx, float ly)
-{
+static void maskDrag(float lx, float ly) {
   if (!maskToolActive() || state.mask.drag == MaskUi::Drag::None)
     return;
   const int i = selMask();
@@ -6329,14 +5983,12 @@ static void maskDrag(float lx, float ly)
   const float W = state.docWidth(), H = state.docHeight();
   const float px = lx / state.zoom, py = ly / state.zoom;
   const MaskUi::Drag d = state.mask.drag;
-  if (d == MaskUi::Drag::Paint)
-  {
+  if (d == MaskUi::Drag::Paint) {
     brushDragTo(px, py);
     return;
   }
   if (d == MaskUi::Drag::PolyVertex || d == MaskUi::Drag::PolyMove ||
-      d == MaskUi::Drag::Lasso)
-  {
+      d == MaskUi::Drag::Lasso) {
     polygonDragTo(px, py, d);
     return;
   }
@@ -6345,10 +5997,8 @@ static void maskDrag(float lx, float ly)
   const size_t part = static_cast<size_t>(selPart());
   maskEdit(
       i,
-      [&](Mask &m)
-      {
-        editRadialInView(m, part, frame, [&](RadialShape &r)
-                         {
+      [&](Mask &m) {
+        editRadialInView(m, part, frame, [&](RadialShape &r) {
           if (d == MaskUi::Drag::Move) {
             r.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             r.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -6362,9 +6012,9 @@ static void maskDrag(float lx, float ly)
             else
               r.ry = std::clamp(std::fabs(-dx * g.s + dy * g.c) / g.S,
                                 kMaskMinRadius, kMaskMaxRadius);
-          } });
-        editShapeInView<RectShape>(m, part, frame, [&](RectShape &r)
-                                   {
+          }
+        });
+        editShapeInView<RectShape>(m, part, frame, [&](RectShape &r) {
           if (d == MaskUi::Drag::Move) {
             r.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             r.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -6378,9 +6028,9 @@ static void maskDrag(float lx, float ly)
             else if (d == MaskUi::Drag::ResizeY)
               r.ry = std::clamp(std::fabs(-dx * g.s + dy * g.c) / g.S,
                                 kMaskMinRadius, kMaskMaxRadius);
-          } });
-        editLinearInView(m, part, frame, [&](LinearShape &l)
-                         {
+          }
+        });
+        editLinearInView(m, part, frame, [&](LinearShape &l) {
           if (d == MaskUi::Drag::Move) {
             l.cx = std::clamp((px - grabX) / W, 0.0f, 1.0f);
             l.cy = std::clamp((py - grabY) / H, 0.0f, 1.0f);
@@ -6395,7 +6045,8 @@ static void maskDrag(float lx, float ly)
             l.len = std::clamp(dist / g.S, kMaskMinRadius, kMaskMaxRadius);
             if (dist > 1e-3f)
               l.angle = std::atan2(dy, dx) * (180.0f / 3.14159265358979f);
-          } });
+          }
+        });
       },
       d == MaskUi::Drag::Move      ? kMaskCtlMove
       : d == MaskUi::Drag::ResizeX ? kMaskCtlResizeX
@@ -6409,8 +6060,7 @@ static void maskDrag(float lx, float ly)
 
 // Red tint showing the mask's weight (1 = solid, 0 = clear) over the picture.
 static void paintRadialTint(CanvasContext &ctx, const RadialShape &r,
-                            bool invert)
-{
+                            bool invert) {
   const MaskGeom g = radialGeom(r);
   const float W = state.docWidth(), H = state.docHeight();
   const float inner = r.innerFrac();
@@ -6436,8 +6086,7 @@ static void paintRadialTint(CanvasContext &ctx, const RadialShape &r,
 // Outline of one radial mask; the selected one also gets its feather ring
 // and handles.
 static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
-                               bool selected)
-{
+                               bool selected) {
   const MaskGeom g = radialGeom(r);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
   constexpr float kTwoPi = 6.28318530717959f;
@@ -6457,8 +6106,7 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
   // Where the feather begins (skipped when it would sit on the outline or
   // collapse into the center).
   const float inner = r.innerFrac();
-  if (r.feather > 0.02f && inner > 0.02f)
-  {
+  if (r.feather > 0.02f && inner > 0.02f) {
     ctx.beginPath();
     ctx.ellipse(g.cx, g.cy, g.rx * inner, g.ry * inner, g.ang, 0.0f, kTwoPi);
     ctx.setLineDash({4.0f * px, 4.0f * px});
@@ -6477,8 +6125,7 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
   ctx.setFillColor(kColorWhite);
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (int k = 0; k < 4; ++k)
-  {
+  for (int k = 0; k < 4; ++k) {
     ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
     ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
   }
@@ -6494,16 +6141,14 @@ static void paintRadialOutline(CanvasContext &ctx, const RadialShape &r,
 // Outline of one rectangle mask; the selected one also gets its feather
 // rectangle, handles (middle of each side) and a ring at the center.
 static void paintRectOutline(CanvasContext &ctx, const RectShape &r,
-                             bool selected)
-{
+                             bool selected) {
   const MaskGeom g = rectGeom(r);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
   constexpr float kTwoPi = 6.28318530717959f;
   // The rectangle `k` times the half-sizes, as a closed path.
-  const auto path = [&](float k)
-  {
-    const float ax = g.rx * k * g.c, ay = g.rx * k * g.s;   // along rx
-    const float bx = -g.ry * k * g.s, by = g.ry * k * g.c;  // along ry
+  const auto path = [&](float k) {
+    const float ax = g.rx * k * g.c, ay = g.rx * k * g.s;  // along rx
+    const float bx = -g.ry * k * g.s, by = g.ry * k * g.c; // along ry
     ctx.beginPath();
     ctx.moveTo(g.cx - ax - bx, g.cy - ay - by);
     ctx.lineTo(g.cx + ax - bx, g.cy + ay - by);
@@ -6522,10 +6167,10 @@ static void paintRectOutline(CanvasContext &ctx, const RectShape &r,
   if (!selected)
     return;
 
-  // Where the feather begins (skipped when it sits on the outline or collapses).
+  // Where the feather begins (skipped when it sits on the outline or
+  // collapses).
   const float inner = r.innerFrac();
-  if (r.feather > 0.02f && inner > 0.02f)
-  {
+  if (r.feather > 0.02f && inner > 0.02f) {
     path(inner);
     ctx.setLineDash({4.0f * px, 4.0f * px});
     ctx.setStrokeColor(Color{255, 255, 255, 170});
@@ -6543,8 +6188,7 @@ static void paintRectOutline(CanvasContext &ctx, const RectShape &r,
   ctx.setFillColor(kColorWhite);
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (int k = 0; k < 4; ++k)
-  {
+  for (int k = 0; k < 4; ++k) {
     ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
     ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
   }
@@ -6561,14 +6205,12 @@ static void paintRectOutline(CanvasContext &ctx, const RectShape &r,
 // points; the selected one also shows a square handle on every vertex (the
 // first one filled, so the start of a lasso is easy to see).
 static void paintPolygonOutline(CanvasContext &ctx, const PolygonShape &view,
-                                bool selected)
-{
+                                bool selected) {
   if (view.pts.empty())
     return;
   const std::vector<PolyPt> dp = polyDocPts(view);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
-  const auto path = [&]
-  {
+  const auto path = [&] {
     ctx.beginPath();
     ctx.moveTo(dp[0].x, dp[0].y);
     for (size_t i = 1; i < dp.size(); ++i)
@@ -6576,8 +6218,7 @@ static void paintPolygonOutline(CanvasContext &ctx, const PolygonShape &view,
     if (dp.size() >= 3)
       ctx.closePath();
   };
-  if (dp.size() >= 2)
-  {
+  if (dp.size() >= 2) {
     path();
     ctx.setStrokeColor(Color{0, 0, 0, selected ? uint8_t{150} : uint8_t{90}});
     ctx.setLineWidth(px * 3.0f);
@@ -6592,8 +6233,7 @@ static void paintPolygonOutline(CanvasContext &ctx, const PolygonShape &view,
   const float hs = kMaskHandlePx * px * 0.8f;
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (size_t i = 0; i < dp.size(); ++i)
-  {
+  for (size_t i = 0; i < dp.size(); ++i) {
     ctx.setFillColor(i == 0 ? Color{255, 210, 60, 255} : kColorWhite);
     ctx.fillRect(dp[i].x - hs / 2.0f, dp[i].y - hs / 2.0f, hs, hs);
     ctx.strokeRect(dp[i].x - hs / 2.0f, dp[i].y - hs / 2.0f, hs, hs);
@@ -6604,12 +6244,10 @@ static void paintPolygonOutline(CanvasContext &ctx, const PolygonShape &view,
 // to the weight-0 line, with stops sampled from the same smoothstep the
 // renderer uses (the gradient itself is piecewise linear).
 static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
-                            bool invert)
-{
+                            bool invert) {
   const LinGeom g = linearGeom(l);
   const float W = state.docWidth(), H = state.docHeight();
-  const auto alphaAt = [invert](float t) -> Color
-  {
+  const auto alphaAt = [invert](float t) -> Color {
     float w = 1.0f - t * t * (3.0f - 2.0f * t);
     if (invert)
       w = 1.0f - w;
@@ -6617,8 +6255,7 @@ static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
   };
   CanvasGradient grad = CanvasGradient::linear(g.sx(), g.sy(), g.ex(), g.ey());
   constexpr int kStops = 8;
-  for (int k = 0; k <= kStops; ++k)
-  {
+  for (int k = 0; k <= kStops; ++k) {
     const float t = static_cast<float>(k) / kStops;
     grad.addColorStop(t, alphaAt(t));
   }
@@ -6631,23 +6268,20 @@ static void paintLinearTint(CanvasContext &ctx, const LinearShape &l,
 // Outline of one linear mask: the two lines of the ramp; the selected one
 // also gets the center line, the axis with an arrowhead, and its handles.
 static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
-                               bool selected)
-{
+                               bool selected) {
   const LinGeom g = linearGeom(l);
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
   constexpr float kTwoPi = 6.28318530717959f;
   const float W = state.docWidth(), H = state.docHeight();
   const float R = W + H;             // long enough to cross the document
   const float vx = -g.uy, vy = g.ux; // along the lines
-  const auto line = [&](float ax, float ay)
-  {
+  const auto line = [&](float ax, float ay) {
     ctx.beginPath();
     ctx.moveTo(ax - vx * R, ay - vy * R);
     ctx.lineTo(ax + vx * R, ay + vy * R);
   };
   const auto strokeTwice = [&](float wOuter, float wInner, uint8_t a1,
-                               uint8_t a2)
-  {
+                               uint8_t a2) {
     ctx.setStrokeColor(Color{0, 0, 0, a1});
     ctx.setLineWidth(px * wOuter);
     ctx.stroke();
@@ -6667,8 +6301,7 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
   strokeTwice(3.0f, selected ? 1.5f : 1.0f, a1, a2);
   line(g.ex(), g.ey());
   strokeTwice(3.0f, selected ? 1.5f : 1.0f, a1, a2);
-  if (selected)
-  {
+  if (selected) {
     line(g.cx, g.cy); // the 50% line
     ctx.setLineDash({4.0f * px, 4.0f * px});
     ctx.setStrokeColor(Color{255, 255, 255, 170});
@@ -6703,8 +6336,7 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
   ctx.setFillColor(kColorWhite);
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
-  for (int k = 0; k < 2; ++k)
-  {
+  for (int k = 0; k < 2; ++k) {
     ctx.fillRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
     ctx.strokeRect(hx[k] - hs / 2.0f, hy[k] - hs / 2.0f, hs, hs);
   }
@@ -6723,8 +6355,7 @@ static void paintLinearOutline(CanvasContext &ctx, const LinearShape &l,
 // gets adjusted. Cached until the strokes or the picture's size change (the
 // shape is compared, which is cheap next to rasterizing it).
 static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
-                                                   bool invert)
-{
+                                                   bool invert) {
   const float W = state.docWidth(), H = state.docHeight();
   const float sc =
       std::min(1.0f, static_cast<float>(kBrushTintEdge) / std::max(W, H));
@@ -6737,13 +6368,11 @@ static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
   const BrushEval ev = b.prepare(tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y)
-  {
+  for (int y = 0; y < th; ++y) {
     ev.rowWeights(y, 0, tw, wb.data());
     uint8_t *row = img->pixels.data() +
                    static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
-    for (int x = 0; x < tw; ++x)
-    {
+    for (int x = 0; x < tw; ++x) {
       float w = wb[static_cast<size_t>(x)];
       if (invert)
         w = 1.0f - w;
@@ -6761,8 +6390,7 @@ static std::shared_ptr<CanvasImage> brushTintImage(const BrushShape &b,
 }
 
 static void paintBrushTint(CanvasContext &ctx, const BrushShape &b,
-                           bool invert)
-{
+                           bool invert) {
   if (b.strokes.empty() && !invert)
     return; // nothing painted yet
   const auto img = brushTintImage(b, invert);
@@ -6772,8 +6400,7 @@ static void paintBrushTint(CanvasContext &ctx, const BrushShape &b,
 // The pin marks where a brush mask's first stroke began (all a brush has
 // for an "outline"); the selected one is drawn solid.
 static void paintBrushPin(CanvasContext &ctx, const BrushShape &b,
-                          bool selected)
-{
+                          bool selected) {
   if (b.strokes.empty() || b.strokes.front().pts.empty())
     return;
   const BrushPt &p = b.strokes.front().pts.front();
@@ -6792,13 +6419,11 @@ static void paintBrushPin(CanvasContext &ctx, const BrushShape &b,
 
 // The brush's footprint at the pointer while painting: the rim, and where the
 // feather begins.
-static void paintBrushCursor(CanvasContext &ctx)
-{
+static void paintBrushCursor(CanvasContext &ctx) {
   const MaskUi &u = state.mask;
   const float px = 1.0f / state.zoom;
   constexpr float kTwoPi = 6.28318530717959f;
-  const float r =
-      u.brushSize * std::min(state.docWidth(), state.docHeight());
+  const float r = u.brushSize * std::min(state.docWidth(), state.docHeight());
   ctx.beginPath();
   ctx.arc(u.curX, u.curY, r, 0.0f, kTwoPi);
   ctx.setStrokeColor(Color{0, 0, 0, 150});
@@ -6808,8 +6433,7 @@ static void paintBrushCursor(CanvasContext &ctx)
   ctx.setLineWidth(px * 1.5f);
   ctx.stroke();
   const float inner = std::clamp(1.0f - u.brushFeather, 0.0f, 0.99f);
-  if (u.brushFeather > 0.02f && inner > 0.02f)
-  {
+  if (u.brushFeather > 0.02f && inner > 0.02f) {
     ctx.beginPath();
     ctx.arc(u.curX, u.curY, r * inner, 0.0f, kTwoPi);
     ctx.setLineDash({4.0f * px, 4.0f * px});
@@ -6822,15 +6446,13 @@ static void paintBrushCursor(CanvasContext &ctx)
 
 // ---- Luminosity overlay ----
 static bool sameOwner(const std::weak_ptr<CanvasImage> &a,
-                      const std::shared_ptr<CanvasImage> &b)
-{
+                      const std::shared_ptr<CanvasImage> &b) {
   return !a.owner_before(b) && !b.owner_before(a);
 }
 
 // state.source box-downsampled by an integer factor to at most
 // kLumTintEdge on its long side (the source itself when already that small).
-static std::shared_ptr<CanvasImage> lumTintBase()
-{
+static std::shared_ptr<CanvasImage> lumTintBase() {
   const std::shared_ptr<CanvasImage> src = state.source;
   if (!src || src->width <= 0 || src->height <= 0)
     return nullptr;
@@ -6840,19 +6462,16 @@ static std::shared_ptr<CanvasImage> lumTintBase()
   const int longEdge = std::max(src->width, src->height);
   const int k = std::max(1, (longEdge + kLumTintEdge - 1) / kLumTintEdge);
   std::shared_ptr<CanvasImage> base = src;
-  if (k > 1)
-  {
+  if (k > 1) {
     const int w = src->width / k, h = src->height / k;
     if (w <= 0 || h <= 0)
       return nullptr;
     auto out = std::make_shared<CanvasImage>(w, h);
     const int area = k * k;
     for (int y = 0; y < h; ++y)
-      for (int x = 0; x < w; ++x)
-      {
+      for (int x = 0; x < w; ++x) {
         int sum[4] = {0, 0, 0, 0};
-        for (int dy = 0; dy < k; ++dy)
-        {
+        for (int dy = 0; dy < k; ++dy) {
           const uint8_t *row =
               &src->pixels[(static_cast<size_t>(y * k + dy) * src->width +
                             static_cast<size_t>(x * k)) *
@@ -6879,8 +6498,7 @@ static std::shared_ptr<CanvasImage> lumTintBase()
 // selects). Cached until the shape, the picture's pixels or the mask's place in
 // the list change.
 static std::shared_ptr<CanvasImage>
-luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
-{
+luminosityTintImage(const LuminosityShape &s, bool invert, int sel) {
   MaskUi &u = state.mask;
   if (u.lumTint && u.lumSel == sel && u.lumInvert == invert &&
       u.lumShape == s && sameOwner(u.lumKeyImage, state.image) &&
@@ -6891,7 +6509,8 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
   if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
     return nullptr;
   RenderParams rp = state.adjust.buildRenderParams();
-  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
+  rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run
+                // after the masks)
   rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel),
                              state.adjust.geoFrame());
   const auto pre = renderWith(*base, rp);
@@ -6899,13 +6518,11 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
   const LuminosityEval ev = s.prepare(tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y)
-  {
+  for (int y = 0; y < th; ++y) {
     const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
     ev.rowWeights(y, 0, tw, wb.data(), pre->pixels.data() + off);
     uint8_t *row = img->pixels.data() + off;
-    for (int x = 0; x < tw; ++x)
-    {
+    for (int x = 0; x < tw; ++x) {
       float w = wb[static_cast<size_t>(x)];
       if (invert)
         w = 1.0f - w;
@@ -6926,8 +6543,7 @@ luminosityTintImage(const LuminosityShape &s, bool invert, int sel)
 }
 
 static void paintLuminosityTint(CanvasContext &ctx, const LuminosityShape &s,
-                                bool invert, int sel)
-{
+                                bool invert, int sel) {
   if (const auto img = luminosityTintImage(s, invert, sel))
     ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
 }
@@ -6939,26 +6555,22 @@ static void paintLuminosityTint(CanvasContext &ctx, const LuminosityShape &s,
 // mask (see luminosityTintImage); otherwise the weights need no pixels and
 // the bitmap is sized from the document. Cached on the parts in their in-view
 // form, so a rotate / crop / edit all rebuild it.
-static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
-                                                       int sel)
-{
+static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m, int sel) {
   MaskUi &u = state.mask;
   const GeoFrame frame = state.adjust.geoFrame();
   bool usesPix = false;
   std::vector<MaskPart> view;
   view.reserve(m.parts.size());
-  for (const MaskPart &p : m.parts)
-  {
+  for (const MaskPart &p : m.parts) {
     if (maskTypeUsesPixels(p.type()))
       usesPix = true;
     view.push_back(MaskPart{maskShapeToSource(p.shape, frame), p.op});
   }
   int tw = 0, th = 0;
-  if (!usesPix)
-  {
+  if (!usesPix) {
     const float W = state.docWidth(), H = state.docHeight();
-    const float sc = std::min(1.0f, static_cast<float>(kCompTintEdge) /
-                                        std::max(W, H));
+    const float sc =
+        std::min(1.0f, static_cast<float>(kCompTintEdge) / std::max(W, H));
     tw = std::max(1, static_cast<int>(std::lround(W * sc)));
     th = std::max(1, static_cast<int>(std::lround(H * sc)));
   }
@@ -6970,14 +6582,14 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
     return u.compTint;
 
   std::shared_ptr<CanvasImage> pre;
-  if (usesPix)
-  {
+  if (usesPix) {
     const MaskSet &ms = state.adjust.masks();
     const auto base = lumTintBase();
     if (!base || sel < 0 || sel >= static_cast<int>(ms.size()))
       return nullptr;
     RenderParams rp = state.adjust.buildRenderParams();
-    rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run after the masks)
+    rp.film = {}; // the picture BEFORE the mask: no Vignette / Grain (they run
+                  // after the masks)
     rp.masks = buildMaskPasses(MaskSet(ms.begin(), ms.begin() + sel), frame);
     pre = renderWith(*base, rp);
     tw = pre->width;
@@ -6990,14 +6602,12 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
   const MaskComposite comp = prepareComposite(pp, tw, th);
   auto img = std::make_shared<CanvasImage>(tw, th);
   std::vector<float> wb(static_cast<size_t>(tw)), wb2(static_cast<size_t>(tw));
-  for (int y = 0; y < th; ++y)
-  {
+  for (int y = 0; y < th; ++y) {
     const size_t off = static_cast<size_t>(y) * static_cast<size_t>(tw) * 4;
     comp.rowWeights(y, 0, tw, wb.data(),
                     pre ? pre->pixels.data() + off : nullptr, wb2.data());
     uint8_t *row = img->pixels.data() + off;
-    for (int x = 0; x < tw; ++x)
-    {
+    for (int x = 0; x < tw; ++x) {
       float w = wb[static_cast<size_t>(x)];
       if (m.invert)
         w = 1.0f - w;
@@ -7020,14 +6630,12 @@ static std::shared_ptr<CanvasImage> compositeTintImage(const Mask &m,
   return img;
 }
 
-static void paintCompositeTint(CanvasContext &ctx, const Mask &m, int sel)
-{
+static void paintCompositeTint(CanvasContext &ctx, const Mask &m, int sel) {
   if (const auto img = compositeTintImage(m, sel))
     ctx.drawImage(*img, 0, 0, state.docWidth(), state.docHeight());
 }
 
-static void paintSelectedObjectPrompts(CanvasContext &ctx)
-{
+static void paintSelectedObjectPrompts(CanvasContext &ctx) {
   const MaskPart *part = selectedPart();
   if (!part || !std::holds_alternative<ObjectShape>(part->shape))
     return;
@@ -7039,8 +6647,7 @@ static void paintSelectedObjectPrompts(CanvasContext &ctx)
   const GeoFrame f = state.adjust.geoFrame();
   const float W = state.docWidth(), H = state.docHeight();
   const float px = 1.0f / state.zoom;
-  for (const ObjectPrompt &p : src)
-  {
+  for (const ObjectPrompt &p : src) {
     double sx, sy;
     f.toSrc(p.x * f.origW, p.y * f.origH, sx, sy);
     const float cx = static_cast<float>(sx / f.srcW) * W;
@@ -7057,8 +6664,7 @@ static void paintSelectedObjectPrompts(CanvasContext &ctx)
 
 // A part's outline / handles / pin (nothing for a luminosity range).
 static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
-                             const GeoFrame &frame, bool selected)
-{
+                             const GeoFrame &frame, bool selected) {
   if (const auto r = radialInView(p, frame))
     paintRadialOutline(ctx, *r, selected);
   else if (const auto l = linearInView(p, frame))
@@ -7071,15 +6677,13 @@ static void paintPartOutline(CanvasContext &ctx, const MaskPart &p,
     paintPolygonOutline(ctx, *pg, selected);
 }
 
-static void paintMaskOverlay(CanvasContext &ctx)
-{
+static void paintMaskOverlay(CanvasContext &ctx) {
   const MaskSet &ms = state.adjust.masks();
   const int sel = selMask();
   const int selP = selPart();
   const GeoFrame frame = state.adjust.geoFrame();
   // Unselected masks first (faint), the selected one on top.
-  for (int i = 0; i < static_cast<int>(ms.size()); ++i)
-  {
+  for (int i = 0; i < static_cast<int>(ms.size()); ++i) {
     if (i == sel)
       continue;
     for (const MaskPart &p : ms[static_cast<size_t>(i)].parts)
@@ -7090,8 +6694,7 @@ static void paintMaskOverlay(CanvasContext &ctx)
   const Mask &m = ms[static_cast<size_t>(sel)];
   if (m.parts.empty())
     return;
-  if (m.parts.size() > 1)
-  {
+  if (m.parts.size() > 1) {
     // Several parts: tint the combination, then the parts' own outlines
     // (the selected part's with its handles).
     if (state.maskShowTint)
@@ -7106,53 +6709,38 @@ static void paintMaskOverlay(CanvasContext &ctx)
     return;
   }
   const MaskPart &p = m.parts[0];
-  if (const auto r = radialInView(p, frame))
-  {
+  if (const auto r = radialInView(p, frame)) {
     if (state.maskShowTint)
       paintRadialTint(ctx, *r, m.invert);
     paintRadialOutline(ctx, *r, true);
-  }
-  else if (const auto l = linearInView(p, frame))
-  {
+  } else if (const auto l = linearInView(p, frame)) {
     if (state.maskShowTint)
       paintLinearTint(ctx, *l, m.invert);
     paintLinearOutline(ctx, *l, true);
-  }
-  else if (const auto b = brushInView(p, frame))
-  {
+  } else if (const auto b = brushInView(p, frame)) {
     if (state.mask.brushTint)
       paintBrushTint(ctx, *b, m.invert);
     paintBrushPin(ctx, *b, true);
     if (state.mask.drag == MaskUi::Drag::Paint)
       paintBrushCursor(ctx);
-  }
-  else if (const auto lm = shapeInView<LuminosityShape>(p, frame))
-  {
+  } else if (const auto lm = shapeInView<LuminosityShape>(p, frame)) {
     // No outline or handles: the tint is the whole overlay.
     if (state.maskShowTint)
       paintLuminosityTint(ctx, *lm, m.invert, sel);
-  }
-  else if (std::holds_alternative<ObjectShape>(p.shape))
-  {
+  } else if (std::holds_alternative<ObjectShape>(p.shape)) {
     if (state.maskShowTint)
       paintCompositeTint(ctx, m, sel);
     paintSelectedObjectPrompts(ctx);
-  }
-  else if (std::holds_alternative<ColorRangeShape>(p.shape))
-  {
+  } else if (std::holds_alternative<ColorRangeShape>(p.shape)) {
     // Not spatial: the tint (built from the picture before this mask) is
     // the whole overlay.
     if (state.maskShowTint)
       paintCompositeTint(ctx, m, sel);
-  }
-  else if (const auto q = rectInView(p, frame))
-  {
+  } else if (const auto q = rectInView(p, frame)) {
     if (state.maskShowTint)
       paintCompositeTint(ctx, m, sel);
     paintRectOutline(ctx, *q, true);
-  }
-  else if (const auto pg = polygonInView(p, frame))
-  {
+  } else if (const auto pg = polygonInView(p, frame)) {
     if (state.maskShowTint)
       paintCompositeTint(ctx, m, sel);
     paintPolygonOutline(ctx, *pg, true);
@@ -7163,8 +6751,7 @@ static void paintMaskOverlay(CanvasContext &ctx)
 
 // What a mask is called in the list: its first part's kind, then the next
 // one, then how many more ("Radial + Brush +1").
-static std::string maskLabel(const Mask &m)
-{
+static std::string maskLabel(const Mask &m) {
   if (m.parts.empty())
     return "Empty";
   if (!maskNameBlank(m.name))
@@ -7180,8 +6767,7 @@ static std::string maskLabel(const Mask &m)
 // One row of the mask list: "1  Radial", highlighted when selected. There are
 // kMaxMasks of these, shown only for the masks that exist (the view tree is
 // built once, so the list is a fixed set of slots).
-static View buildMaskRow(size_t i)
-{
+static View buildMaskRow(size_t i) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -7190,18 +6776,17 @@ static View buildMaskRow(size_t i)
   b.style.alignItems = Align::Center;
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([i]
-                                             { return i < state.adjust.masks().size() ? Display::Flex : Display::None; });
-  const auto isSel = [i]
-  { return selMask() == static_cast<int>(i); };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
-                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.display = std::function<Display()>([i] {
+    return i < state.adjust.masks().size() ? Display::Flex : Display::None;
+  });
+  const auto isSel = [i] { return selMask() == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
+    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
   b.style.borderWidth =
-      std::function<float()>([isSel]
-                             { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [i]
-  {
+  b.onClick = [i] {
     if (state.maskSel != static_cast<int>(i))
       state.mask.part = 0; // a different mask: start on its first part
     state.maskSel = static_cast<int>(i);
@@ -7209,8 +6794,7 @@ static View buildMaskRow(size_t i)
   };
 
   Text t;
-  t.label = std::function<std::string()>([i]() -> std::string
-                                         {
+  t.label = std::function<std::string()>([i]() -> std::string {
     const MaskSet &ms = state.adjust.masks();
     if (i >= ms.size())
       return std::string();
@@ -7220,7 +6804,8 @@ static View buildMaskRow(size_t i)
       s += "  (inverted)";
     if (!m.enabled)
       s += "  (off)";
-    return s; });
+    return s;
+  });
   t.fontSize = 13.0f;
   t.color = kColorTextDark;
   b.addChild(std::move(t));
@@ -7228,8 +6813,7 @@ static View buildMaskRow(size_t i)
 }
 
 // One row of the Presets list. Click applies the preset (undoable).
-static View buildPresetRow(size_t i)
-{
+static View buildPresetRow(size_t i) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -7239,25 +6823,24 @@ static View buildPresetRow(size_t i)
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.overflowX = Overflow::Hidden;
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([i]
-                                             { return state.activeActivity == kPresetsActivity &&
-                                                              i < gPresets.size()
-                                                          ? Display::Flex
-                                                          : Display::None; });
-  const auto isSel = [i]
-  { return gPresetSel == static_cast<int>(i); };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
-                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.display = std::function<Display()>([i] {
+    return state.activeActivity == kPresetsActivity && i < gPresets.size()
+               ? Display::Flex
+               : Display::None;
+  });
+  const auto isSel = [i] { return gPresetSel == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
+    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
   b.style.borderWidth =
-      std::function<float()>([isSel]
-                             { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [i]
-  { applyPresetEntry(i); };
+  b.onClick = [i] { applyPresetEntry(i); };
 
   Text t;
-  t.label = std::function<std::string()>([i]() -> std::string
-                                         { return i < gPresets.size() ? gPresets[i].name : std::string(); });
+  t.label = std::function<std::string()>([i]() -> std::string {
+    return i < gPresets.size() ? gPresets[i].name : std::string();
+  });
   t.fontSize = 13.0f;
   t.wrap = TextWrap::NoWrap;
   t.color = kColorTextDark;
@@ -7265,23 +6848,22 @@ static View buildPresetRow(size_t i)
   return b;
 }
 
- 
-// One row of the LUTs list: the open picture under that LUT, the LUT's name and a line about the
-// file. Click applies it (undoable). With no picture open a row is just the name.
-static View buildLutRow(size_t i)
-{
-  const auto withPicture = []
-  { return state.original != nullptr; };
-  const auto isCur = [i]
-  {
+// One row of the LUTs list: the open picture under that LUT, the LUT's name and
+// a line about the file. Click applies it (undoable). With no picture open a
+// row is just the name.
+static View buildLutRow(size_t i) {
+  const auto withPicture = [] { return state.original != nullptr; };
+  const auto isCur = [i] {
     const LutRef &r = state.adjust.lut();
-    return i < gLuts.size() && !r.empty() && filmLower(r.name) == filmLower(gLuts[i].entry.name);
+    return i < gLuts.size() && !r.empty() &&
+           filmLower(r.name) == filmLower(gLuts[i].entry.name);
   };
 
   View b;
   b.style.width = Size::full();
-  b.style.height = std::function<Size()>([withPicture]
-                                         { return Size::pixel(withPicture() ? kLutRowH : kLutRowNamesH); });
+  b.style.height = std::function<Size()>([withPicture] {
+    return Size::pixel(withPicture() ? kLutRowH : kLutRowNamesH);
+  });
   b.style.flexShrink = 0;
   b.style.borderRadius = 4.0f;
   b.style.direction = FlexDirection::Row;
@@ -7290,18 +6872,18 @@ static View buildLutRow(size_t i)
   b.style.padding = EdgeInsets{0, 10, 0, 6};
   b.style.overflowX = Overflow::Hidden;
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([i]
-                                             { return state.activeActivity == kLutsActivity &&
-                                                              i < gLuts.size()
-                                                          ? Display::Flex
-                                                          : Display::None; });
-  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color
-                                                   { return isCur() ? kColorDropdownRowHover : kColorActivityBarBg; });
-  b.style.borderWidth = std::function<float()>([isCur]
-                                               { return isCur() ? 1.0f : 0.0f; });
+  b.style.display = std::function<Display()>([i] {
+    return state.activeActivity == kLutsActivity && i < gLuts.size()
+               ? Display::Flex
+               : Display::None;
+  });
+  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color {
+    return isCur() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
+  b.style.borderWidth =
+      std::function<float()>([isCur] { return isCur() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [i]
-  { applyLutRow(i); };
+  b.onClick = [i] { applyLutRow(i); };
 
   // The preview. A click on it bubbles up to the row.
   View thumb;
@@ -7309,26 +6891,25 @@ static View buildLutRow(size_t i)
   thumb.style.width = Size::pixel(kFilmThumbW);
   thumb.style.height = Size::pixel(kFilmThumbH);
   thumb.style.flexShrink = 0;
-  thumb.style.display = std::function<Display()>([withPicture]
-                                                 { return withPicture() ? Display::Flex : Display::None; });
-  thumb.onPaint = [i](CanvasContext &ctx)
-  {
+  thumb.style.display = std::function<Display()>(
+      [withPicture] { return withPicture() ? Display::Flex : Display::None; });
+  thumb.onPaint = [i](CanvasContext &ctx) {
     ctx.setFillColor(kColorTrack);
     ctx.fillRect(0, 0, kFilmThumbW, kFilmThumbH);
-    if (i < gLuts.size() && gLuts[i].thumb)
-    {
+    if (i < gLuts.size() && gLuts[i].thumb) {
       const CanvasImage &img = *gLuts[i].thumb;
       ctx.drawImage(img, std::floor((kFilmThumbW - img.width) / 2.0f),
                     std::floor((kFilmThumbH - img.height) / 2.0f));
     }
   };
-  // Repaint when this row's picture changed, or when the canvas has just been shown again.
-  auto last = std::make_shared<std::array<uint64_t, 3>>(std::array<uint64_t, 3>{~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}});
-  thumb.canvasDirtySource = [i, last, withPicture]() -> bool
-  {
-    const std::array<uint64_t, 3> now{i < gLuts.size() ? gLuts[i].paintVersion : 0,
-                                      withPicture() ? 1u : 0u,
-                                      state.activeActivity == kLutsActivity ? 1u : 0u};
+  // Repaint when this row's picture changed, or when the canvas has just been
+  // shown again.
+  auto last = std::make_shared<std::array<uint64_t, 3>>(
+      std::array<uint64_t, 3>{~uint64_t{0}, ~uint64_t{0}, ~uint64_t{0}});
+  thumb.canvasDirtySource = [i, last, withPicture]() -> bool {
+    const std::array<uint64_t, 3> now{
+        i < gLuts.size() ? gLuts[i].paintVersion : 0, withPicture() ? 1u : 0u,
+        state.activeActivity == kLutsActivity ? 1u : 0u};
     if (now == *last)
       return false;
     *last = now;
@@ -7343,16 +6924,17 @@ static View buildLutRow(size_t i)
   col.style.overflowX = Overflow::Hidden;
 
   Text name;
-  name.label = std::function<std::string()>([i]() -> std::string
-                                            { return i < gLuts.size() ? gLuts[i].entry.name : std::string(); });
+  name.label = std::function<std::string()>([i]() -> std::string {
+    return i < gLuts.size() ? gLuts[i].entry.name : std::string();
+  });
   name.fontSize = 13.0f;
   name.wrap = TextWrap::NoWrap;
   name.color = kColorTextDark;
   col.addChild(std::move(name));
 
   Text detail;
-  detail.label = std::function<std::string()>([i]() -> std::string
-                                              { return lutRowDetail(i); });
+  detail.label = std::function<std::string()>(
+      [i]() -> std::string { return lutRowDetail(i); });
   detail.fontSize = 11.0f;
   detail.wrap = TextWrap::NoWrap;
   detail.color = kColorTextMuted;
@@ -7362,10 +6944,8 @@ static View buildLutRow(size_t i)
   return b;
 }
 
-
 // One row of the Snapshots list. Click restores the snapshot (undoable).
-static View buildSnapshotRow(size_t i)
-{
+static View buildSnapshotRow(size_t i) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(28);
@@ -7375,25 +6955,25 @@ static View buildSnapshotRow(size_t i)
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.overflowX = Overflow::Hidden;
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([i]
-                                             { return state.activeActivity == kSnapshotsActivity &&
-                                                              i < state.snapshots.size()
-                                                          ? Display::Flex
-                                                          : Display::None; });
-  const auto isSel = [i]
-  { return gSnapSel == static_cast<int>(i); };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
-                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.display = std::function<Display()>([i] {
+    return state.activeActivity == kSnapshotsActivity &&
+                   i < state.snapshots.size()
+               ? Display::Flex
+               : Display::None;
+  });
+  const auto isSel = [i] { return gSnapSel == static_cast<int>(i); };
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
+    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
   b.style.borderWidth =
-      std::function<float()>([isSel]
-                             { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [i]
-  { applySnapshotEntry(i); };
+  b.onClick = [i] { applySnapshotEntry(i); };
 
   Text t;
-  t.label = std::function<std::string()>([i]() -> std::string
-                                         { return i < state.snapshots.size() ? state.snapshots[i].name : std::string(); });
+  t.label = std::function<std::string()>([i]() -> std::string {
+    return i < state.snapshots.size() ? state.snapshots[i].name : std::string();
+  });
   t.fontSize = 13.0f;
   t.wrap = TextWrap::NoWrap;
   t.color = kColorTextDark;
@@ -7405,14 +6985,12 @@ static View buildSnapshotRow(size_t i)
 // Row r shows step (n - 1 - r): newest at the top, the untouched picture at
 // the bottom. There are kMaxUndoSteps + 1 rows, shown only for steps that
 // exist (the view tree is built once, like the mask list).
-static size_t historyStepForRow(size_t r)
-{
+static size_t historyStepForRow(size_t r) {
   const size_t n = state.adjust.historySize();
   return r < n ? n - 1 - r : n; // n = "no such step"
 }
 
-static void jumpToHistory(size_t step)
-{
+static void jumpToHistory(size_t step) {
   if (state.dragging || step >= state.adjust.historySize() ||
       step == state.adjust.historyIndex())
     return;
@@ -7420,8 +6998,7 @@ static void jumpToHistory(size_t step)
   updateImageFromAdjustments(); // same follow-up as undo() / redo()
 }
 
-static View buildHistoryRow(size_t r)
-{
+static View buildHistoryRow(size_t r) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(26);
@@ -7431,38 +7008,39 @@ static View buildHistoryRow(size_t r)
   b.style.padding = EdgeInsets{0, 10, 0, 10};
   b.style.overflowX = Overflow::Hidden;
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([r]
-                                             { return state.activeActivity == kHistoryActivity &&
-                                                              r < state.adjust.historySize()
-                                                          ? Display::Flex
-                                                          : Display::None; });
-  const auto isCur = [r]
-  { return historyStepForRow(r) == state.adjust.historyIndex(); };
-  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color
-                                                   { return isCur() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.display = std::function<Display()>([r] {
+    return state.activeActivity == kHistoryActivity &&
+                   r < state.adjust.historySize()
+               ? Display::Flex
+               : Display::None;
+  });
+  const auto isCur = [r] {
+    return historyStepForRow(r) == state.adjust.historyIndex();
+  };
+  b.style.backgroundColor = std::function<Color()>([isCur]() -> Color {
+    return isCur() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
   b.style.borderWidth =
-      std::function<float()>([isCur]
-                             { return isCur() ? 1.0f : 0.0f; });
+      std::function<float()>([isCur] { return isCur() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [r]
-  { jumpToHistory(historyStepForRow(r)); };
+  b.onClick = [r] { jumpToHistory(historyStepForRow(r)); };
 
   Text t;
-  t.label = std::function<std::string()>([r]() -> std::string
-                                         {
+  t.label = std::function<std::string()>([r]() -> std::string {
     // Skip the diffing entirely while the pane is closed.
     if (state.activeActivity != kHistoryActivity)
       return std::string();
     const size_t s = historyStepForRow(r);
     return s < state.adjust.historySize() ? state.adjust.historyLabel(s)
-                                          : std::string(); });
+                                          : std::string();
+  });
   t.fontSize = 13.0f;
   t.wrap = TextWrap::NoWrap;
   // Steps ahead of the current one (what Redo would bring back) are dimmed.
-  t.color = std::function<Color()>([r]() -> Color
-                                   { return historyStepForRow(r) > state.adjust.historyIndex()
-                                                ? kColorTextMuted
-                                                : kColorTextDark; });
+  t.color = std::function<Color()>([r]() -> Color {
+    return historyStepForRow(r) > state.adjust.historyIndex() ? kColorTextMuted
+                                                              : kColorTextDark;
+  });
   b.addChild(std::move(t));
   return b;
 }
@@ -7470,8 +7048,7 @@ static View buildHistoryRow(size_t r)
 // One row of the selected mask's PART list: "1   Radial", "2   Subtract:
 // Brush". Shown only while the mask has more than one part (a one-part mask
 // looks exactly as it always did).
-static View buildPartRow(size_t j)
-{
+static View buildPartRow(size_t j) {
   View b;
   b.style.width = Size::full();
   b.style.height = Size::pixel(26);
@@ -7480,30 +7057,27 @@ static View buildPartRow(size_t j)
   b.style.alignItems = Align::Center;
   b.style.padding = EdgeInsets{0, 10, 0, 18};
   b.style.hoverColor = kColorActivityHover;
-  b.style.display = std::function<Display()>([j]
-                                             {
+  b.style.display = std::function<Display()>([j] {
     const Mask *m = selectedMask();
     return m && m->parts.size() > 1 && j < m->parts.size() ? Display::Flex
-                                                           : Display::None; });
-  const auto isSel = [j]
-  {
+                                                           : Display::None;
+  });
+  const auto isSel = [j] {
     return selMask() >= 0 && static_cast<size_t>(selPart()) == j;
   };
-  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color
-                                                   { return isSel() ? kColorDropdownRowHover : kColorActivityBarBg; });
+  b.style.backgroundColor = std::function<Color()>([isSel]() -> Color {
+    return isSel() ? kColorDropdownRowHover : kColorActivityBarBg;
+  });
   b.style.borderWidth =
-      std::function<float()>([isSel]
-                             { return isSel() ? 1.0f : 0.0f; });
+      std::function<float()>([isSel] { return isSel() ? 1.0f : 0.0f; });
   b.style.borderColor = kColorDividerHover;
-  b.onClick = [j]
-  {
+  b.onClick = [j] {
     state.mask.part = static_cast<int>(j);
     state.markDirty(); // move the handles to it
   };
 
   Text t;
-  t.label = std::function<std::string()>([j]() -> std::string
-                                         {
+  t.label = std::function<std::string()>([j]() -> std::string {
     const Mask *m = selectedMask();
     if (!m || j >= m->parts.size())
       return std::string();
@@ -7511,7 +7085,8 @@ static View buildPartRow(size_t j)
     if (j > 0)
       s += std::string(maskOpName(m->parts[j].op)) + ": ";
     s += maskTypeName(m->parts[j].type());
-    return s; });
+    return s;
+  });
   t.fontSize = 12.0f;
   t.color = kColorTextDark;
   b.addChild(std::move(t));
@@ -7524,87 +7099,78 @@ template <class Shape>
 static SliderSpec maskShapeSlider(const char *name, float lo, float hi,
                                   std::function<float(const Shape &)> get,
                                   std::function<void(Shape &, float)> set,
-                                  int control)
-{
+                                  int control) {
   SliderSpec s;
   s.name = name;
   s.lo = lo;
   s.hi = hi;
   s.trackW = kMaskTrackW;
   // The sliders show and edit the shape as it sits in the picture on screen.
-  s.get = [get]
-  {
+  s.get = [get] {
     const MaskPart *p = selectedPart();
     const auto r =
         p ? shapeInView<Shape>(*p, state.adjust.geoFrame()) : std::nullopt;
     return r ? get(*r) : 0.0f;
   };
-  s.set = [set, control](float v)
-  {
+  s.set = [set, control](float v) {
     const GeoFrame frame = state.adjust.geoFrame();
     const size_t part = static_cast<size_t>(selPart());
-    maskEdit(selMask(), [&](Mask &m)
-             { editShapeInView<Shape>(m, part, frame,
-                                      [&](Shape &r)
-                                      { set(r, v); }); }, control);
+    maskEdit(
+        selMask(),
+        [&](Mask &m) {
+          editShapeInView<Shape>(m, part, frame, [&](Shape &r) { set(r, v); });
+        },
+        control);
   };
-  s.format = [](float v)
-  {
+  s.format = [](float v) {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return s;
 }
 static SliderSpec
 maskRadialSlider(const char *name, float lo, float hi,
                  std::function<float(const RadialShape &)> get,
-                 std::function<void(RadialShape &, float)> set, int control)
-{
+                 std::function<void(RadialShape &, float)> set, int control) {
   return maskShapeSlider<RadialShape>(name, lo, hi, std::move(get),
                                       std::move(set), control);
 }
 static SliderSpec
 maskLinearSlider(const char *name, float lo, float hi,
                  std::function<float(const LinearShape &)> get,
-                 std::function<void(LinearShape &, float)> set, int control)
-{
+                 std::function<void(LinearShape &, float)> set, int control) {
   return maskShapeSlider<LinearShape>(name, lo, hi, std::move(get),
                                       std::move(set), control);
 }
 
 // The mask's own copy of one Adjust slider (Exposure, Contrast, ...): one per
 // kAdjustmentSpecs entry, so a new global adjustment appears here too.
-static View buildMaskAdjustmentSlider(const AdjustmentSpec &spec)
-{
+static View buildMaskAdjustmentSlider(const AdjustmentSpec &spec) {
   const AdjId id = spec.id;
   SliderSpec s;
   s.name = spec.label;
   s.lo = spec.min;
   s.hi = spec.max;
   s.trackW = kMaskTrackW;
-  s.get = [id]
-  {
+  s.get = [id] {
     const Mask *m = selectedMask();
     return m ? m->adj[static_cast<size_t>(id)] : 0.0f;
   };
-  s.set = [id](float v)
-  {
-    maskEdit(selMask(), [&](Mask &m)
-             { m.adj[static_cast<size_t>(id)] = std::round(v); }, kMaskCtlAdj + static_cast<int>(id));
+  s.set = [id](float v) {
+    maskEdit(
+        selMask(),
+        [&](Mask &m) { m.adj[static_cast<size_t>(id)] = std::round(v); },
+        kMaskCtlAdj + static_cast<int>(id));
   };
-  s.format = [](float v)
-  {
+  s.format = [](float v) {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 // END maskui
 
-static void paintCropOverlay(CanvasContext &ctx)
-{
+static void paintCropOverlay(CanvasContext &ctx) {
   const auto &c = state.crop;
   const float W = state.docWidth(), H = state.docHeight();
   const float px = 1.0f / state.zoom; // one screen pixel, in image units
@@ -7619,8 +7185,7 @@ static void paintCropOverlay(CanvasContext &ctx)
   ctx.setLineWidth(px);
   ctx.setStrokeColor(Color{255, 255, 255, 110});
   ctx.beginPath();
-  for (int i = 1; i <= 2; ++i)
-  {
+  for (int i = 1; i <= 2; ++i) {
     const float x = c.l + sw * static_cast<float>(i) / 3.0f;
     const float y = c.t + sh * static_cast<float>(i) / 3.0f;
     ctx.moveTo(x, c.t);
@@ -7642,8 +7207,7 @@ static void paintCropOverlay(CanvasContext &ctx)
   ctx.setStrokeColor(Color{60, 60, 60, 255});
   ctx.setLineWidth(px);
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j)
-    {
+    for (int j = 0; j < 3; ++j) {
       if (i == 1 && j == 1)
         continue; // center: no handle
       if ((i == 1 && !midX) || (j == 1 && !midY))
@@ -7658,16 +7222,14 @@ static void paintCropOverlay(CanvasContext &ctx)
 // "Before" is state.source: the picture with its crop and rotation but none
 // of the slider, curve, color or mask edits. Keeping the geometry means the
 // canvas doesn't change size, so the comparison is pixel for pixel.
-static void toggleBefore()
-{
+static void toggleBefore() {
   if (!state.image)
     return;
   state.compare = state.compare == CompareMode::Before ? CompareMode::Off
                                                        : CompareMode::Before;
   state.markDirty();
 }
-static void toggleSplit()
-{
+static void toggleSplit() {
   if (!state.image)
     return;
   state.compare = state.compare == CompareMode::Split ? CompareMode::Off
@@ -7675,8 +7237,7 @@ static void toggleSplit()
   state.markDirty();
 }
 // Dragging in the canvas moves the split line.
-static void splitFromX(float localX)
-{
+static void splitFromX(float localX) {
   const float w = state.docWidth() * state.zoom;
   if (w <= 0.0f)
     return;
@@ -7686,8 +7247,7 @@ static void splitFromX(float localX)
 
 // A small dark pill with `text`, its left (or, if alignRight, right) edge at x.
 static void paintCompareLabel(CanvasContext &ctx, const std::string &text,
-                              float x, float y, bool alignRight)
-{
+                              float x, float y, bool alignRight) {
   ctx.setFont("", 12.0f, FontWeight::SemiBold);
   const float w = ctx.measureText(text).width + 16.0f, h = 22.0f;
   const float left = alignRight ? x - w : x;
@@ -7702,12 +7262,10 @@ static void paintCompareLabel(CanvasContext &ctx, const std::string &text,
 }
 
 // Screen-space decoration over the canvas: labels and the split line.
-static void paintCompareOverlay(CanvasContext &ctx)
-{
+static void paintCompareOverlay(CanvasContext &ctx) {
   const float W = state.docWidth() * state.zoom;
   const float H = state.docHeight() * state.zoom;
-  if (state.compare == CompareMode::Before)
-  {
+  if (state.compare == CompareMode::Before) {
     paintCompareLabel(ctx, "Before", 10.0f, 10.0f, false);
     return;
   }
@@ -7727,8 +7285,7 @@ static void paintCompareOverlay(CanvasContext &ctx)
 // in document space (stretched to docW x docH like the preview), so it
 // lines up at any zoom. computeHistogram builds it.
 static void computeHistogram();
-static void paintClipOverlay(CanvasContext &ctx, float docW, float docH)
-{
+static void paintClipOverlay(CanvasContext &ctx, float docW, float docH) {
   if (!state.clipShadowsOn && !state.clipHighlightsOn)
     return;
   if (state.histStale)
@@ -7737,8 +7294,7 @@ static void paintClipOverlay(CanvasContext &ctx, float docW, float docH)
     ctx.drawImage(*state.clipOverlay, 0, 0, docW, docH);
 }
 
-static void paintCanvas(CanvasContext &ctx)
-{
+static void paintCanvas(CanvasContext &ctx) {
   LITEUI_PROF_START(profAppPaint);
   ctx.setFillColor(state.image ? kColorWhite : kColorCanvasPlaceholderBg);
   ctx.fillRect(0, 0, ctx.width(), ctx.height());
@@ -7751,8 +7307,7 @@ static void paintCanvas(CanvasContext &ctx)
   // below), so a plain ctx.scale(zoom, zoom) here is all that's needed.
   // A straightened image with "Keep full canvas" has transparent corners;
   // a neutral backdrop keeps them from reading as part of a white picture.
-  if (state.adjust.expand() && state.adjust.angle() != 0.0f)
-  {
+  if (state.adjust.expand() && state.adjust.angle() != 0.0f) {
     ctx.setFillColor(kColorEmptyCorner);
     ctx.fillRect(0, 0, ctx.width(), ctx.height());
   }
@@ -7761,34 +7316,26 @@ static void paintCanvas(CanvasContext &ctx)
   ctx.scale(state.zoom, state.zoom);
   const float docW = state.docWidth(), docH = state.docHeight();
   // The picture as edited.
-  const auto drawAfter = [&]()
-  {
-    if (state.showPreview())
-    {
+  const auto drawAfter = [&]() {
+    if (state.showPreview()) {
       // Mid-drag (or awaiting the background full-res render) preview: smaller
       // image stretched to the full document size
       // (bilinear), so layout/zoom are unaffected by its lower resolution.
       ctx.drawImage(*state.previewImage, 0, 0, docW, docH);
-    }
-    else
-    {
+    } else {
       ctx.drawImage(*state.image, 0, 0);
     }
   };
   // The same picture with every edit off (crop and rotation kept).
-  const auto drawBefore = [&]()
-  {
+  const auto drawBefore = [&]() {
     if (state.source)
       ctx.drawImage(*state.source, 0, 0, docW, docH);
     else
       drawAfter();
   };
-  if (state.compare == CompareMode::Before)
-  {
+  if (state.compare == CompareMode::Before) {
     drawBefore();
-  }
-  else if (state.compare == CompareMode::Split)
-  {
+  } else if (state.compare == CompareMode::Split) {
     const float x = docW * state.splitPos;
     ctx.save();
     ctx.beginPath();
@@ -7802,9 +7349,7 @@ static void paintCanvas(CanvasContext &ctx)
     ctx.clip();
     drawAfter();
     ctx.restore();
-  }
-  else
-  {
+  } else {
     drawAfter();
     paintClipOverlay(ctx, docW, docH);
     if (cropToolActive())
@@ -7821,8 +7366,7 @@ static void paintCanvas(CanvasContext &ctx)
 // ---------------- RGB readout under the cursor ----------------
 // Both return true only when the readout changed, so LiteUI repaints only
 // then (see View::onPointerMove: a change marks the canvas dirty).
-static bool hoverClear()
-{
+static bool hoverClear() {
   const bool was = state.hoverValid;
   state.hoverValid = false;
   return was;
@@ -7830,8 +7374,7 @@ static bool hoverClear()
 
 // Samples the picture the canvas is showing: the original in Before (or the
 // left half of Split), else the edited image / mid-drag preview.
-static bool hoverSample(float lx, float ly)
-{
+static bool hoverSample(float lx, float ly) {
   if (state.dragging)
     return false; // a drag is running: leave the readout alone
   const float docW = state.docWidth(), docH = state.docHeight();
@@ -7843,14 +7386,16 @@ static bool hoverSample(float lx, float ly)
   const bool before =
       state.compare == CompareMode::Before ||
       (state.compare == CompareMode::Split && dx < docW * state.splitPos);
-  const CanvasImage *img =
-      (before && state.source)
-          ? state.source.get()
-          : (state.showPreview() ? state.previewImage.get() : state.image.get());
+  const CanvasImage *img = (before && state.source)
+                               ? state.source.get()
+                               : (state.showPreview() ? state.previewImage.get()
+                                                      : state.image.get());
   if (!img || img->width <= 0 || img->height <= 0)
     return hoverClear();
-  const int ix = std::clamp(static_cast<int>(dx / docW * img->width), 0, img->width - 1);
-  const int iy = std::clamp(static_cast<int>(dy / docH * img->height), 0, img->height - 1);
+  const int ix =
+      std::clamp(static_cast<int>(dx / docW * img->width), 0, img->width - 1);
+  const int iy =
+      std::clamp(static_cast<int>(dy / docH * img->height), 0, img->height - 1);
   const uint8_t *px =
       img->pixels.data() + (static_cast<size_t>(iy) * img->width + ix) * 4;
   if (px[3] == 0)
@@ -7876,25 +7421,21 @@ constexpr int kWbPatchRadius = 2;
 // True while the picker is armed and still makes sense. It only works in the
 // Adjust pane (activity 1) on a shown picture, outside Before / After; once any
 // of those stops being true it disarms itself, so it can never wake up later.
-static bool wbPickerActive()
-{
+static bool wbPickerActive() {
   if (!state.wbPicking)
     return false;
   if (state.activeActivity != 1 || !state.image ||
-      state.compare != CompareMode::Off)
-  {
+      state.compare != CompareMode::Off) {
     state.wbPicking = false;
     return false;
   }
   return true;
 }
 
-static void toggleWbPicker()
-{
+static void toggleWbPicker() {
   if (state.dragging)
     return;
-  if (state.wbPicking)
-  {
+  if (state.wbPicking) {
     state.wbPicking = false;
     clearStatus();
     state.markDirty();
@@ -7902,14 +7443,14 @@ static void toggleWbPicker()
   }
   if (!state.image)
     return;
-  if (state.compare != CompareMode::Off)
-  {
+  if (state.compare != CompareMode::Off) {
     setStatus("Leave Before / After to pick a white balance", true);
     return;
   }
   state.activeActivity = 1; // the picker lives in the Adjust pane
   state.wbPicking = true;
-  setStatus("White balance: click a neutral gray in the picture (Esc cancels)", false);
+  setStatus("White balance: click a neutral gray in the picture (Esc cancels)",
+            false);
   state.markDirty();
 }
 
@@ -7917,8 +7458,7 @@ static void toggleWbPicker()
 // will receive it: `source` (what the adjustments run on) through the current
 // tone tables, before any white balance. False if the point is outside the
 // picture or the patch has no visible pixel (straighten's empty corners).
-static bool wbSampleSpot(float lx, float ly, float out[3])
-{
+static bool wbSampleSpot(float lx, float ly, float out[3]) {
   const float docW = state.docWidth(), docH = state.docHeight();
   const CanvasImage *src = state.source.get();
   if (!src || src->width <= 0 || src->height <= 0 || docW <= 0.0f ||
@@ -7927,16 +7467,17 @@ static bool wbSampleSpot(float lx, float ly, float out[3])
   const float dx = lx / state.zoom, dy = ly / state.zoom;
   if (dx < 0.0f || dy < 0.0f || dx >= docW || dy >= docH)
     return false;
-  const int cx = std::clamp(static_cast<int>(dx / docW * src->width), 0, src->width - 1);
-  const int cy = std::clamp(static_cast<int>(dy / docH * src->height), 0, src->height - 1);
+  const int cx =
+      std::clamp(static_cast<int>(dx / docW * src->width), 0, src->width - 1);
+  const int cy =
+      std::clamp(static_cast<int>(dy / docH * src->height), 0, src->height - 1);
   const auto luts = state.adjust.buildChannelLuts();
   double sum[3] = {0, 0, 0};
   int count = 0;
   for (int y = std::max(0, cy - kWbPatchRadius);
        y <= std::min(src->height - 1, cy + kWbPatchRadius); ++y)
     for (int x = std::max(0, cx - kWbPatchRadius);
-         x <= std::min(src->width - 1, cx + kWbPatchRadius); ++x)
-    {
+         x <= std::min(src->width - 1, cx + kWbPatchRadius); ++x) {
       const uint8_t *p =
           src->pixels.data() + (static_cast<size_t>(y) * src->width + x) * 4;
       if (p[3] == 0)
@@ -7957,12 +7498,10 @@ static bool wbSampleSpot(float lx, float ly, float out[3])
 // the crop and mask tools never see it). A click that cannot be used (outside
 // the picture, too dark, clipped) keeps the picker armed so you can try again;
 // a pick that sets the white balance disarms it.
-static bool wbPress(float lx, float ly)
-{
+static bool wbPress(float lx, float ly) {
   if (!wbPickerActive())
     return false;
-  if (geometryBusy())
-  {
+  if (geometryBusy()) {
     setStatus("Wait for the changes to finish applying", true);
     return true;
   }
@@ -7970,26 +7509,25 @@ static bool wbPress(float lx, float ly)
   if (!wbSampleSpot(lx, ly, c))
     return true;
   const WbPick pick = solveWhiteBalance(c[0], c[1], c[2]);
-  if (pick.status == WbPickStatus::Clipped)
-  {
-    setStatus("That spot is clipped (pure white): pick a gray that is not blown out", true);
+  if (pick.status == WbPickStatus::Clipped) {
+    setStatus(
+        "That spot is clipped (pure white): pick a gray that is not blown out",
+        true);
     return true;
   }
-  if (!pick.usable())
-  {
-    setStatus("That spot is too dark to read a color: pick a brighter gray", true);
+  if (!pick.usable()) {
+    setStatus("That spot is too dark to read a color: pick a brighter gray",
+              true);
     return true;
   }
   state.wbPicking = false;
   state.markDirty();
-  if (!state.adjust.setWhiteBalance(pick.temperature, pick.tint))
-  {
+  if (!state.adjust.setWhiteBalance(pick.temperature, pick.tint)) {
     setStatus("White balance is already set for that spot", false);
     return true;
   }
   state.markAdjustDirty(); // re-render through the normal (drag-safe) path
-  auto sgn = [](float v)
-  {
+  auto sgn = [](float v) {
     const int i = static_cast<int>(std::lround(v));
     return (i > 0 ? "+" : "") + std::to_string(i);
   };
@@ -8012,36 +7550,32 @@ static bool wbPress(float lx, float ly)
 // picture: the shown one already has the tone sliders applied, so its histogram
 // would change every time Auto Tone ran. Reading `source` makes the answer the
 // same whatever the sliders say, so pressing it twice is a no-op.
-static void autoTone()
-{
+static void autoTone() {
   if (state.dragging || !state.source)
     return;
-  if (geometryBusy())
-  {
+  if (geometryBusy()) {
     setStatus("Wait for the changes to finish applying", true);
     return;
   }
   const histogram::Counts c = histogram::compute(state.source.get());
   const AutoTone at = solveAutoTone(c.l);
-  if (at.status == AutoToneStatus::NoPixels)
-  {
+  if (at.status == AutoToneStatus::NoPixels) {
     setStatus("Auto Tone: nothing to measure in this picture", true);
     return;
   }
-  if (at.status == AutoToneStatus::Flat)
-  {
-    setStatus("Auto Tone: this picture has almost no tonal range to adjust", true);
+  if (at.status == AutoToneStatus::Flat) {
+    setStatus("Auto Tone: this picture has almost no tonal range to adjust",
+              true);
     return;
   }
-  if (!state.adjust.setAutoTone(at.exposure, at.contrast, at.whites, at.blacks))
-  {
+  if (!state.adjust.setAutoTone(at.exposure, at.contrast, at.whites,
+                                at.blacks)) {
     setStatus("Auto Tone: the tone is already set for this picture", false);
     return;
   }
   state.markAdjustDirty(); // re-render through the normal (drag-safe) path
   state.markDirty();
-  auto sgn = [](float v)
-  {
+  auto sgn = [](float v) {
     const int i = static_cast<int>(std::lround(v));
     return (i > 0 ? "+" : "") + std::to_string(i);
   };
@@ -8059,16 +7593,16 @@ static void autoTone()
 // histogram canvas both call it from their dirty polls, and whichever is
 // polled first (the sidebar, so usually the histogram) does the work — so the
 // histogram never lags a frame behind the picture.
-static void flushPendingAdjust()
-{
+static void flushPendingAdjust() {
   collectFullRender();  // a finished background render, if any
   collectGeometryJob(); // a finished background geometry rebuild, if any
   collectDecodeJob();   // a finished background file decode, if any
   collectSegmentJob();
-  collectSyncJob();  // a finished Sync Settings batch, if any
+  collectSyncJob();   // a finished Sync Settings batch, if any
   collectExportJob(); // progress / the end of a batch export, if any
-  pollLutPreviews();  // LUT previews: results in, a new batch when the picture or its look changed
-  autosaveSidecar(); // a finished change, once the mouse is released
+  pollLutPreviews();  // LUT previews: results in, a new batch when the picture
+                      // or its look changed
+  autosaveSidecar();  // a finished change, once the mouse is released
   if (!state.adjustDirty)
     return;
   state.adjustDirty = false;
@@ -8090,8 +7624,7 @@ static void refreshHistogramIfStale();
 // currently on screen (the mid-drag preview, or the full-resolution result).
 // The counting and the overlay are histogram.hpp; this only picks the image
 // and stores the results where the histogram and canvas painters read them.
-static void computeHistogram()
-{
+static void computeHistogram() {
   const CanvasImage *img =
       state.showPreview() ? state.previewImage.get() : state.image.get();
   const histogram::Counts c = histogram::compute(img);
@@ -8114,35 +7647,30 @@ static float gHistCanvasW = 0.0f;
 // Luma as gray bars, R/G/B as thin colored outlines on top. Bar heights use
 // sqrt scaling and are normalized to the tallest bin among 1..254, so a pile
 // of clipped pixels in bin 0/255 doesn't flatten the rest of the graph.
-static void paintHistogramBars(CanvasContext &ctx, float W, float H)
-{
+static void paintHistogramBars(CanvasContext &ctx, float W, float H) {
   uint32_t peak = 1;
   for (int i = 1; i < 255; ++i)
     peak = std::max(
         {peak, state.histL[i], state.histR[i], state.histG[i], state.histB[i]});
   const float invPeak = 1.0f / std::sqrt(static_cast<float>(peak));
   const float binW = W / 256.0f;
-  auto heightOf = [&](uint32_t v)
-  {
+  auto heightOf = [&](uint32_t v) {
     return std::min(1.0f, std::sqrt(static_cast<float>(v)) * invPeak) *
            (H - 2.0f);
   };
 
   ctx.setFillColor(Color{170, 170, 175, 255});
-  for (int i = 0; i < 256; ++i)
-  {
+  for (int i = 0; i < 256; ++i) {
     const float h = heightOf(state.histL[i]);
     if (h > 0.0f)
       ctx.fillRect(static_cast<float>(i) * binW, H - h, binW + 0.5f, h);
   }
 
-  auto outline = [&](const std::array<uint32_t, 256> &bins, Color c)
-  {
+  auto outline = [&](const std::array<uint32_t, 256> &bins, Color c) {
     ctx.setStrokeColor(c);
     ctx.setLineWidth(1.0f);
     ctx.beginPath();
-    for (int i = 0; i < 256; ++i)
-    {
+    for (int i = 0; i < 256; ++i) {
       const float x = (static_cast<float>(i) + 0.5f) * binW;
       const float y = H - heightOf(bins[i]);
       if (i == 0)
@@ -8160,18 +7688,16 @@ static void paintHistogramBars(CanvasContext &ctx, float W, float H)
 // The two clipping triangles in the top corners of the pinned canvas. They
 // stay in every view (histogram, waveform, vectorscope): clipping is a
 // property of the picture, not of the way it is plotted.
-static void paintClipTriangles(CanvasContext &ctx, float W)
-{
+static void paintClipTriangles(CanvasContext &ctx, float W) {
   // Clipping triangles. Dark: nothing clipped. Otherwise colored by which
   // channels clip (white = all three). White outline: that overlay is on.
-  auto triangle = [&](bool left, uint8_t mask, bool overlayOn)
-  {
+  auto triangle = [&](bool left, uint8_t mask, bool overlayOn) {
     const float s = kHistTriPx, m = 3.0f;
-    const Color c = mask ? histogram::clipChannelColor(mask, false) : Color{90, 90, 95, 255};
+    const Color c = mask ? histogram::clipChannelColor(mask, false)
+                         : Color{90, 90, 95, 255};
     const float x0 = left ? m : W - m;
     const float dx = left ? s : -s;
-    auto path = [&]
-    {
+    auto path = [&] {
       ctx.beginPath();
       ctx.moveTo(x0, m);
       ctx.lineTo(x0 + dx, m);
@@ -8181,8 +7707,7 @@ static void paintClipTriangles(CanvasContext &ctx, float W)
     path();
     ctx.setFillColor(c);
     ctx.fill();
-    if (overlayOn)
-    {
+    if (overlayOn) {
       path();
       ctx.setStrokeColor(kColorWhite);
       ctx.setLineWidth(1.0f);
@@ -8196,12 +7721,10 @@ static void paintClipTriangles(CanvasContext &ctx, float W)
 // Waveform or vectorscope: the picture scopes::render made, stretched over the
 // canvas (the waveform fills it, the vectorscope is a centered square), plus a
 // faint graticule and the view's name in the bottom-left corner.
-static void paintScope(CanvasContext &ctx, float W, float H)
-{
+static void paintScope(CanvasContext &ctx, float W, float H) {
   const bool wave = state.scopeKind == scopes::Kind::Waveform;
   float x0 = 0.0f, y0 = 0.0f, w = W, h = H;
-  if (!wave)
-  {
+  if (!wave) {
     const float side = std::min(W, H);
     x0 = (W - side) / 2.0f;
     y0 = (H - side) / 2.0f;
@@ -8213,18 +7736,14 @@ static void paintScope(CanvasContext &ctx, float W, float H)
   ctx.setLineWidth(1.0f);
   ctx.setStrokeColor(Color{255, 255, 255, 40});
   ctx.beginPath();
-  if (wave)
-  {
+  if (wave) {
     // Quarter lines of the 0..255 level axis.
-    for (int q = 1; q <= 3; ++q)
-    {
+    for (int q = 1; q <= 3; ++q) {
       const float y = std::floor(y0 + h * static_cast<float>(q) / 4.0f) + 0.5f;
       ctx.moveTo(0.0f, y);
       ctx.lineTo(W, y);
     }
-  }
-  else
-  {
+  } else {
     // Outer ring (full saturation), half ring, the two axes, and the skin-tone
     // line (the I axis, 123 degrees from +Cb toward red).
     const float cx = x0 + w / 2.0f, cy = y0 + h / 2.0f, r = w / 2.0f - 1.0f;
@@ -8250,8 +7769,7 @@ static void paintScope(CanvasContext &ctx, float W, float H)
 
 // The pinned canvas: the histogram, or the waveform / vectorscope picked with
 // a click (cycleScope), always with the clipping triangles on top.
-static void paintHistogram(CanvasContext &ctx)
-{
+static void paintHistogram(CanvasContext &ctx) {
   const float W = ctx.width(), H = ctx.height();
   gHistCanvasW = W;
   ctx.setFillColor(Color{34, 34, 38, 255});
@@ -8263,8 +7781,7 @@ static void paintHistogram(CanvasContext &ctx)
   paintClipTriangles(ctx, W);
 }
 
-static void refreshHistogramIfStale()
-{
+static void refreshHistogramIfStale() {
   flushPendingAdjust();
   if (state.histStale)
     computeHistogram();
@@ -8273,16 +7790,14 @@ static void refreshHistogramIfStale()
 // Turns the shadow / highlight overlays on or off. Recomputing right away
 // rebuilds the overlay, bumps histVersion (so the histogram repaints its
 // triangles) and the canvas is told to repaint.
-static void setClipping(bool shadows, bool highlights)
-{
+static void setClipping(bool shadows, bool highlights) {
   state.clipShadowsOn = shadows;
   state.clipHighlightsOn = highlights;
   computeHistogram();
   state.markDirty();
 }
 // J: both on, or both off if either is currently on.
-static void toggleClipping()
-{
+static void toggleClipping() {
   if (!state.image)
     return;
   const bool on = !(state.clipShadowsOn || state.clipHighlightsOn);
@@ -8291,8 +7806,7 @@ static void toggleClipping()
 
 // Shift+J: switch between classic red/blue and per-channel colors. If no
 // overlay is on yet, turn both on so the key always shows something.
-static void toggleChannelClipping()
-{
+static void toggleChannelClipping() {
   if (!state.image)
     return;
   state.clipPerChannel = !state.clipPerChannel;
@@ -8306,8 +7820,7 @@ static void toggleChannelClipping()
 // Waveform -> Vectorscope -> Histogram. computeHistogram() rebuilds the scope
 // picture for the new view and bumps histVersion, so the canvas repaints; its
 // height follows scopeKind (see where the canvas is built).
-static void cycleScope()
-{
+static void cycleScope() {
   if (!state.image)
     return;
   state.scopeKind = scopes::nextKind(state.scopeKind);
@@ -8319,33 +7832,28 @@ static void cycleScope()
 // Mapping between canvas-local screen px and curve units (0..255, y up).
 static float curvePlotPx() { return kCurveSizePx - 2.0f * kCurvePadPx; }
 
-static CurvePoint curveFromLocal(float lx, float ly)
-{
+static CurvePoint curveFromLocal(float lx, float ly) {
   const float plot = curvePlotPx();
   return {
       std::clamp((lx - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f),
       std::clamp(255.0f - (ly - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f)};
 }
 
-static void curveToLocal(float x, float y, float &lx, float &ly)
-{
+static void curveToLocal(float x, float y, float &lx, float &ly) {
   const float plot = curvePlotPx();
   lx = kCurvePadPx + x / 255.0f * plot;
   ly = kCurvePadPx + (255.0f - y) / 255.0f * plot;
 }
 
 // Index of the point within kCurveHitPx of (lx, ly), nearest wins; -1 if none.
-static int curveHit(const CurvePoints &pts, float lx, float ly)
-{
+static int curveHit(const CurvePoints &pts, float lx, float ly) {
   int hit = -1;
   float best = kCurveHitPx * kCurveHitPx;
-  for (size_t i = 0; i < pts.size(); ++i)
-  {
+  for (size_t i = 0; i < pts.size(); ++i) {
     float px, py;
     curveToLocal(pts[i].x, pts[i].y, px, py);
     const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly);
-    if (d2 <= best)
-    {
+    if (d2 <= best) {
       best = d2;
       hit = static_cast<int>(i);
     }
@@ -8353,36 +7861,31 @@ static int curveHit(const CurvePoints &pts, float lx, float ly)
   return hit;
 }
 
-static int gCurveActive = -1;                             // point being dragged, or -1
+static int gCurveActive = -1; // point being dragged, or -1
 static CurveChannel gCurveChannel = CurveChannel::Master; // curve being edited
 // Set by UI-only changes (channel switch, selecting a point) that don't
 // change the picture, so the curve canvas still repaints; consumed by its
 // dirty poll.
 static bool gCurveUiDirty = false;
 
-static const CurvePoints &curveActiveCurve()
-{
+static const CurvePoints &curveActiveCurve() {
   return state.adjust.curve(gCurveChannel);
 }
 // (point - mouse) in curve units at press, so a grabbed point doesn't jump
 // to the cursor's exact position.
 static float gCurveGrabDx = 0.0f, gCurveGrabDy = 0.0f;
 
-static void curvePress(float lx, float ly)
-{
+static void curvePress(float lx, float ly) {
   if (!state.original)
     return;
   CurvePoints pts = curveActiveCurve();
   int hit = curveHit(pts, lx, ly);
   gCurveGrabDx = gCurveGrabDy = 0.0f;
-  if (hit >= 0)
-  {
+  if (hit >= 0) {
     const CurvePoint m = curveFromLocal(lx, ly);
     gCurveGrabDx = pts[hit].x - m.x;
     gCurveGrabDy = pts[hit].y - m.y;
-  }
-  else
-  {
+  } else {
     if (pts.size() >= kCurveMaxPoints)
       return;
     const CurvePoint m = curveFromLocal(lx, ly);
@@ -8400,8 +7903,7 @@ static void curvePress(float lx, float ly)
   gCurveUiDirty = true; // show the selected point
 }
 
-static void curveDrag(float lx, float ly)
-{
+static void curveDrag(float lx, float ly) {
   if (gCurveActive < 0 || !state.original)
     return;
   CurvePoints pts = curveActiveCurve();
@@ -8416,41 +7918,35 @@ static void curveDrag(float lx, float ly)
   state.markAdjustDirty();
 }
 
-static void curveEnd()
-{
+static void curveEnd() {
   gCurveActive = -1;
   gCurveUiDirty = true;
   state.adjust.endCurveEdit();
-  if (state.dragging)
-  { // leave preview mode: one full-resolution recompute
+  if (state.dragging) { // leave preview mode: one full-resolution recompute
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
   }
 }
 
-static void curveRightPress(float lx, float ly)
-{
+static void curveRightPress(float lx, float ly) {
   if (!state.original)
     return;
   CurvePoints pts = curveActiveCurve();
-  if (curveRemove(pts, curveHit(pts, lx, ly)))
-  {
+  if (curveRemove(pts, curveHit(pts, lx, ly))) {
     state.adjust.setCurve(gCurveChannel, pts, false);
     state.markAdjustDirty();
   }
 }
 
-static void setCurveChannel(CurveChannel ch)
-{
+static void setCurveChannel(CurveChannel ch) {
   gCurveActive = -1;
   gCurveChannel = ch;
   gCurveUiDirty = true;
 }
 
 // Resets the curve being edited (one undo step).
-static void resetCurve()
-{
+static void resetCurve() {
   gCurveActive = -1;
   state.adjust.setCurve(gCurveChannel, identityCurve(), false);
   gCurveUiDirty = true;
@@ -8458,18 +7954,15 @@ static void resetCurve()
 }
 
 // Resets all four curves (one undo step).
-static void resetAllCurves()
-{
+static void resetAllCurves() {
   gCurveActive = -1;
   state.adjust.resetAllCurves();
   gCurveUiDirty = true;
   state.markAdjustDirty();
 }
 
-static const char *curveChannelName(CurveChannel ch)
-{
-  switch (ch)
-  {
+static const char *curveChannelName(CurveChannel ch) {
+  switch (ch) {
   case CurveChannel::Red:
     return "Red";
   case CurveChannel::Green:
@@ -8482,10 +7975,8 @@ static const char *curveChannelName(CurveChannel ch)
 }
 
 // Line/tint color for a curve: white for the master, channel color otherwise.
-static Color curveChannelColor(CurveChannel ch, uint8_t alpha)
-{
-  switch (ch)
-  {
+static Color curveChannelColor(CurveChannel ch, uint8_t alpha) {
+  switch (ch) {
   case CurveChannel::Red:
     return Color{235, 70, 70, alpha};
   case CurveChannel::Green:
@@ -8498,10 +7989,8 @@ static Color curveChannelColor(CurveChannel ch, uint8_t alpha)
 }
 
 // The histogram that matches a curve: luma for the master, else that channel.
-static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch)
-{
-  switch (ch)
-  {
+static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch) {
+  switch (ch) {
   case CurveChannel::Red:
     return state.histR;
   case CurveChannel::Green:
@@ -8516,8 +8005,7 @@ static const std::array<uint32_t, 256> &curveHistogram(CurveChannel ch)
 // Dark plot with the edited channel's histogram faintly behind it, a quarter
 // grid, the identity diagonal, every non-straight curve (the others dimmed in
 // their own color), and the edited curve's control points.
-static void paintCurve(CanvasContext &ctx)
-{
+static void paintCurve(CanvasContext &ctx) {
   const float W = ctx.width(), H = ctx.height();
   const float pad = kCurvePadPx, plot = curvePlotPx();
   ctx.setFillColor(Color{34, 34, 38, 255});
@@ -8529,8 +8017,7 @@ static void paintCurve(CanvasContext &ctx)
     peak = std::max(peak, hist[i]);
   const float invPeak = 1.0f / std::sqrt(static_cast<float>(peak));
   ctx.setFillColor(curveChannelColor(gCurveChannel, 45));
-  for (int i = 0; i < 256; ++i)
-  {
+  for (int i = 0; i < 256; ++i) {
     const float hh =
         std::min(1.0f, std::sqrt(static_cast<float>(hist[i])) * invPeak) * plot;
     if (hh > 0.0f)
@@ -8541,8 +8028,7 @@ static void paintCurve(CanvasContext &ctx)
   ctx.setLineWidth(1.0f);
   ctx.setStrokeColor(Color{255, 255, 255, 30});
   ctx.beginPath();
-  for (int q = 0; q <= 4; ++q)
-  {
+  for (int q = 0; q <= 4; ++q) {
     const float t = pad + plot * static_cast<float>(q) / 4.0f;
     ctx.moveTo(t, pad);
     ctx.lineTo(t, pad + plot);
@@ -8559,14 +8045,12 @@ static void paintCurve(CanvasContext &ctx)
 
   // Draws one curve as a polyline. Non-edited, non-straight curves first (dim),
   // so the edited curve ends up on top.
-  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width)
-  {
+  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width) {
     const auto lut = curveToLut(state.adjust.curve(ch));
     ctx.setStrokeColor(curveChannelColor(ch, alpha));
     ctx.setLineWidth(width);
     ctx.beginPath();
-    for (int i = 0; i < 256; ++i)
-    {
+    for (int i = 0; i < 256; ++i) {
       float lx, ly;
       curveToLocal(static_cast<float>(i), lut[i], lx, ly);
       if (i == 0)
@@ -8577,8 +8061,7 @@ static void paintCurve(CanvasContext &ctx)
     ctx.stroke();
   };
   const CurvePoints straight = identityCurve();
-  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
-  {
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
     const auto ch = static_cast<CurveChannel>(c);
     if (ch != gCurveChannel && !(state.adjust.curve(ch) == straight))
       strokeCurve(ch, 110, 1.0f);
@@ -8587,8 +8070,7 @@ static void paintCurve(CanvasContext &ctx)
 
   const CurvePoints &pts = curveActiveCurve();
   ctx.setLineWidth(1.0f);
-  for (size_t i = 0; i < pts.size(); ++i)
-  {
+  for (size_t i = 0; i < pts.size(); ++i) {
     float lx, ly;
     curveToLocal(pts[i].x, pts[i].y, lx, ly);
     const bool active = static_cast<int>(i) == gCurveActive;
@@ -8615,12 +8097,11 @@ constexpr int kMaskCtlCurve = 80; // + channel                       (80..83)
 
 // All control ids of one mask, as inclusive ranges. They must not overlap and
 // must stay in 0..kMaskCtlStride-1, or two different controls would fold into
-// one undo step. (Adj used to be 10+AdjId, which overlapped the Color Mixer ids.)
+// one undo step. (Adj used to be 10+AdjId, which overlapped the Color Mixer
+// ids.)
 static_assert(
-    []
-    {
-      struct R
-      {
+    [] {
+      struct R {
         int lo, hi;
       };
       constexpr int kMixN = static_cast<int>(kMixChanCount * kMixBandCount);
@@ -8651,8 +8132,7 @@ static_assert(
           {kMaskCtlPolyLasso, kMaskCtlPolyLasso},
           {kMaskCtlAdj, kMaskCtlAdj + static_cast<int>(AdjId::Count) - 1}};
       constexpr int n = static_cast<int>(sizeof(r) / sizeof(r[0]));
-      for (int i = 0; i < n; ++i)
-      {
+      for (int i = 0; i < n; ++i) {
         if (r[i].lo < 0 || r[i].hi >= kMaskCtlStride || r[i].lo > r[i].hi)
           return false;
         for (int j = i + 1; j < n; ++j)
@@ -8664,71 +8144,64 @@ static_assert(
     "mask control ids overlap or exceed kMaskCtlStride (see maskEdit)");
 constexpr float kMaskCurveSizePx = 240.0f;
 
-static MixChan gMaskMixChan = MixChan::Hue;              // Mix: Hue / Sat / Lum
-static int gMaskGradeRange = 1;                          // Grade: 0..3 (Midtones)
+static MixChan gMaskMixChan = MixChan::Hue; // Mix: Hue / Sat / Lum
+static int gMaskGradeRange = 1;             // Grade: 0..3 (Midtones)
 static CurveChannel gMaskCurveCh = CurveChannel::Master; // Curve: channel
 static int gMaskCurveActive = -1;                        // point being dragged
 static bool gMaskCurveUiDirty = false;                   // repaint-only change
 static float gMaskCurveGrabDx = 0.0f, gMaskCurveGrabDy = 0.0f;
 
-static std::string maskIntText(float v)
-{
+static std::string maskIntText(float v) {
   return std::to_string(static_cast<int>(std::lround(v)));
 }
-static std::string maskSignedText(float v)
-{
+static std::string maskSignedText(float v) {
   const int i = static_cast<int>(std::lround(v));
   return i > 0 ? "+" + std::to_string(i) : std::to_string(i);
 }
 
 // Amount: how strongly all of this mask's adjustments apply (Lightroom's
 // mask "Amount"). 100 = full, 0 = the mask does nothing.
-static View buildMaskAmountSlider()
-{
+static View buildMaskAmountSlider() {
   SliderSpec s;
   s.name = "Amount";
   s.lo = 0.0f;
   s.hi = 100.0f;
   s.trackW = kMaskTrackW;
-  s.get = []
-  {
+  s.get = [] {
     const Mask *m = selectedMask();
     return m ? m->amount : 100.0f;
   };
-  s.set = [](float v)
-  {
-    maskEdit(selMask(), [&](Mask &m)
-             { m.amount = std::round(v); }, kMaskCtlAmount);
+  s.set = [](float v) {
+    maskEdit(
+        selMask(), [&](Mask &m) { m.amount = std::round(v); }, kMaskCtlAmount);
   };
   s.format = maskIntText;
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 
 // One Color Mixer slider (a band's Hue / Saturation / Luminance) of the mask.
-static View buildMaskMixSlider(MixChan chan, size_t band)
-{
+static View buildMaskMixSlider(MixChan chan, size_t band) {
   SliderSpec s;
   s.name = mixBandName(band);
   s.lo = static_cast<float>(kMixMin);
   s.hi = static_cast<float>(kMixMax);
   s.trackW = kMaskTrackW;
-  s.get = [chan, band]
-  {
+  s.get = [chan, band] {
     const Mask *m = selectedMask();
     return m ? m->mix[mixIndex(chan, band)] : 0.0f;
   };
-  s.set = [chan, band](float v)
-  {
-    maskEdit(selMask(), [&](Mask &m)
-             { m.mix[mixIndex(chan, band)] = std::round(v); }, kMaskCtlMix + static_cast<int>(chan) * static_cast<int>(kMixBandCount) + static_cast<int>(band));
+  s.set = [chan, band](float v) {
+    maskEdit(
+        selMask(),
+        [&](Mask &m) { m.mix[mixIndex(chan, band)] = std::round(v); },
+        kMaskCtlMix + static_cast<int>(chan) * static_cast<int>(kMixBandCount) +
+            static_cast<int>(band));
   };
   s.format = maskSignedText;
   s.hasAccent = true;
   s.accent = mixBandColor(band);
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 
@@ -8736,58 +8209,59 @@ static View buildMaskMixSlider(MixChan chan, size_t band)
 // fieldIdx (0 hue, 1 sat, 2 lum) only keeps the undo keys apart.
 static View buildMaskGradeSlider(const char *name, int range,
                                  float GradeWheel::*field, int fieldIdx,
-                                 float lo, float hi, bool isSigned)
-{
+                                 float lo, float hi, bool isSigned) {
   SliderSpec s;
   s.name = name;
   s.lo = lo;
   s.hi = hi;
   s.trackW = kMaskTrackW;
-  s.get = [range, field]
-  {
+  s.get = [range, field] {
     const Mask *m = selectedMask();
     return m ? m->grade.wheel[static_cast<size_t>(range)].*field : 0.0f;
   };
-  s.set = [range, field, fieldIdx](float v)
-  {
-    maskEdit(selMask(), [&](Mask &m)
-             { m.grade.wheel[static_cast<size_t>(range)].*field = std::round(v); }, kMaskCtlGrade + fieldIdx * 4 + range);
+  s.set = [range, field, fieldIdx](float v) {
+    maskEdit(
+        selMask(),
+        [&](Mask &m) {
+          m.grade.wheel[static_cast<size_t>(range)].*field = std::round(v);
+        },
+        kMaskCtlGrade + fieldIdx * 4 + range);
   };
-  s.format = [isSigned](float v)
-  { return isSigned ? maskSignedText(v) : maskIntText(v); };
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.format = [isSigned](float v) {
+    return isSigned ? maskSignedText(v) : maskIntText(v);
+  };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 
 // Blending (0..100) or Balance (-100..100), shared by the mask's ranges.
-static View buildMaskGradeShared(bool balance)
-{
+static View buildMaskGradeShared(bool balance) {
   SliderSpec s;
   s.name = balance ? "Balance" : "Blending";
   s.lo = balance ? -100.0f : 0.0f;
   s.hi = 100.0f;
   s.trackW = kMaskTrackW;
-  s.get = [balance]
-  {
+  s.get = [balance] {
     const Mask *m = selectedMask();
     if (!m)
       return 0.0f;
     return balance ? m->grade.balance : m->grade.blending;
   };
-  s.set = [balance](float v)
-  {
-    maskEdit(selMask(), [&](Mask &m)
-             {
-      if (balance)
-        m.grade.balance = std::round(v);
-      else
-        m.grade.blending = std::round(v); }, balance ? kMaskCtlBalance : kMaskCtlBlend);
+  s.set = [balance](float v) {
+    maskEdit(
+        selMask(),
+        [&](Mask &m) {
+          if (balance)
+            m.grade.balance = std::round(v);
+          else
+            m.grade.blending = std::round(v);
+        },
+        balance ? kMaskCtlBalance : kMaskCtlBlend);
   };
-  s.format = [balance](float v)
-  { return balance ? maskSignedText(v) : maskIntText(v); };
-  s.onEnd = []
-  { state.adjust.endMaskEdit(); };
+  s.format = [balance](float v) {
+    return balance ? maskSignedText(v) : maskIntText(v);
+  };
+  s.onEnd = [] { state.adjust.endMaskEdit(); };
   return buildSliderRow(s);
 }
 
@@ -8796,30 +8270,25 @@ static View buildMaskGradeShared(bool balance)
 // right-click = delete) but on the selected mask's own curves, and a bit
 // larger (kMaskCurveSizePx).
 static float mcPlotPx() { return kMaskCurveSizePx - 2.0f * kCurvePadPx; }
-static CurvePoint mcFromLocal(float lx, float ly)
-{
+static CurvePoint mcFromLocal(float lx, float ly) {
   const float plot = mcPlotPx();
   return {
       std::clamp((lx - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f),
       std::clamp(255.0f - (ly - kCurvePadPx) / plot * 255.0f, 0.0f, 255.0f)};
 }
-static void mcToLocal(float x, float y, float &lx, float &ly)
-{
+static void mcToLocal(float x, float y, float &lx, float &ly) {
   const float plot = mcPlotPx();
   lx = kCurvePadPx + x / 255.0f * plot;
   ly = kCurvePadPx + (255.0f - y) / 255.0f * plot;
 }
-static int mcHit(const CurvePoints &pts, float lx, float ly)
-{
+static int mcHit(const CurvePoints &pts, float lx, float ly) {
   int hit = -1;
   float best = kCurveHitPx * kCurveHitPx;
-  for (size_t i = 0; i < pts.size(); ++i)
-  {
+  for (size_t i = 0; i < pts.size(); ++i) {
     float px, py;
     mcToLocal(pts[i].x, pts[i].y, px, py);
     const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly);
-    if (d2 <= best)
-    {
+    if (d2 <= best) {
       best = d2;
       hit = static_cast<int>(i);
     }
@@ -8828,34 +8297,29 @@ static int mcHit(const CurvePoints &pts, float lx, float ly)
 }
 
 // The curve being edited, copied (empty list if no mask is selected).
-static CurvePoints maskCurveCopy()
-{
+static CurvePoints maskCurveCopy() {
   const Mask *m = selectedMask();
   return m ? m->curves[static_cast<size_t>(gMaskCurveCh)] : CurvePoints{};
 }
 // coalesce = true folds a drag into one undo step; false = its own step.
-static void maskCurveCommit(const CurvePoints &pts, bool coalesce)
-{
+static void maskCurveCommit(const CurvePoints &pts, bool coalesce) {
   const CurveChannel ch = gMaskCurveCh;
-  maskEdit(selMask(), [&](Mask &m)
-           { m.curves[static_cast<size_t>(ch)] = pts; }, coalesce ? kMaskCtlCurve + static_cast<int>(ch) : -1);
+  maskEdit(
+      selMask(), [&](Mask &m) { m.curves[static_cast<size_t>(ch)] = pts; },
+      coalesce ? kMaskCtlCurve + static_cast<int>(ch) : -1);
 }
 
-static void maskCurvePress(float lx, float ly)
-{
+static void maskCurvePress(float lx, float ly) {
   if (!state.original || !selectedMask())
     return;
   CurvePoints pts = maskCurveCopy();
   int hit = mcHit(pts, lx, ly);
   gMaskCurveGrabDx = gMaskCurveGrabDy = 0.0f;
-  if (hit >= 0)
-  {
+  if (hit >= 0) {
     const CurvePoint m = mcFromLocal(lx, ly);
     gMaskCurveGrabDx = pts[static_cast<size_t>(hit)].x - m.x;
     gMaskCurveGrabDy = pts[static_cast<size_t>(hit)].y - m.y;
-  }
-  else
-  {
+  } else {
     if (pts.size() >= kCurveMaxPoints)
       return;
     const CurvePoint m = mcFromLocal(lx, ly);
@@ -8869,8 +8333,7 @@ static void maskCurvePress(float lx, float ly)
   gMaskCurveUiDirty = true;
 }
 
-static void maskCurveDrag(float lx, float ly)
-{
+static void maskCurveDrag(float lx, float ly) {
   if (gMaskCurveActive < 0 || !state.original || !selectedMask())
     return;
   CurvePoints pts = maskCurveCopy();
@@ -8887,33 +8350,28 @@ static void maskCurveDrag(float lx, float ly)
   state.markAdjustDirty();
 }
 
-static void maskCurveEnd()
-{
+static void maskCurveEnd() {
   gMaskCurveActive = -1;
   gMaskCurveUiDirty = true;
   state.adjust.endMaskEdit();
-  if (state.dragging)
-  { // leave preview mode: one full-resolution recompute
+  if (state.dragging) { // leave preview mode: one full-resolution recompute
     state.dragging = false;
     state.dragIsAngle = false;
     state.markAdjustDirty();
   }
 }
 
-static void maskCurveRightPress(float lx, float ly)
-{
+static void maskCurveRightPress(float lx, float ly) {
   if (!state.original || !selectedMask())
     return;
   CurvePoints pts = maskCurveCopy();
-  if (curveRemove(pts, mcHit(pts, lx, ly)))
-  {
+  if (curveRemove(pts, mcHit(pts, lx, ly))) {
     maskCurveCommit(pts, false);
     state.markAdjustDirty();
   }
 }
 
-static void paintMaskCurve(CanvasContext &ctx)
-{
+static void paintMaskCurve(CanvasContext &ctx) {
   const float W = ctx.width(), H = ctx.height();
   const float pad = kCurvePadPx, plot = mcPlotPx();
   ctx.setFillColor(Color{34, 34, 38, 255});
@@ -8922,8 +8380,7 @@ static void paintMaskCurve(CanvasContext &ctx)
   ctx.setLineWidth(1.0f);
   ctx.setStrokeColor(Color{255, 255, 255, 30});
   ctx.beginPath();
-  for (int q = 0; q <= 4; ++q)
-  {
+  for (int q = 0; q <= 4; ++q) {
     const float t = pad + plot * static_cast<float>(q) / 4.0f;
     ctx.moveTo(t, pad);
     ctx.lineTo(t, pad + plot);
@@ -8940,14 +8397,12 @@ static void paintMaskCurve(CanvasContext &ctx)
   const Mask *m = selectedMask();
   if (!m)
     return;
-  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width)
-  {
+  auto strokeCurve = [&](CurveChannel ch, uint8_t alpha, float width) {
     const auto lut = curveToLut(m->curves[static_cast<size_t>(ch)]);
     ctx.setStrokeColor(curveChannelColor(ch, alpha));
     ctx.setLineWidth(width);
     ctx.beginPath();
-    for (int i = 0; i < 256; ++i)
-    {
+    for (int i = 0; i < 256; ++i) {
       float lx, ly;
       mcToLocal(static_cast<float>(i), lut[static_cast<size_t>(i)], lx, ly);
       if (i == 0)
@@ -8958,8 +8413,7 @@ static void paintMaskCurve(CanvasContext &ctx)
     ctx.stroke();
   };
   const CurvePoints straight = identityCurve();
-  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
-  {
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
     const auto ch = static_cast<CurveChannel>(c);
     if (ch != gMaskCurveCh && !(m->curves[static_cast<size_t>(c)] == straight))
       strokeCurve(ch, 110, 1.0f);
@@ -8968,8 +8422,7 @@ static void paintMaskCurve(CanvasContext &ctx)
 
   const CurvePoints &pts = m->curves[static_cast<size_t>(gMaskCurveCh)];
   ctx.setLineWidth(1.0f);
-  for (size_t i = 0; i < pts.size(); ++i)
-  {
+  for (size_t i = 0; i < pts.size(); ++i) {
     float lx, ly;
     mcToLocal(pts[i].x, pts[i].y, lx, ly);
     const bool active = static_cast<int>(i) == gMaskCurveActive;
@@ -8982,17 +8435,14 @@ static void paintMaskCurve(CanvasContext &ctx)
   }
 }
 
-static View buildMaskCurveCanvas()
-{
+static View buildMaskCurveCanvas() {
   View c;
   c.isCanvas = true;
   c.style.width = Size::pixel(kMaskCurveSizePx);
   c.style.height = Size::pixel(kMaskCurveSizePx);
   c.style.flexShrink = 0;
-  c.onPaint = [](CanvasContext &ctx)
-  { paintMaskCurve(ctx); };
-  c.canvasDirtySource = []
-  {
+  c.onPaint = [](CanvasContext &ctx) { paintMaskCurve(ctx); };
+  c.canvasDirtySource = [] {
     // Repaint on any edit (the version moves with every change, undo and
     // redo too), a different mask / tab, or a UI-only change (channel,
     // selected point).
@@ -9011,15 +8461,10 @@ static View buildMaskCurveCanvas()
     return true;
   };
   bindDrag(
-      c,
-      [](float lx, float ly)
-      { maskCurvePress(lx, ly); },
-      [](float lx, float ly)
-      { maskCurveDrag(lx, ly); },
-      []
-      { maskCurveEnd(); },
-      [](float lx, float ly)
-      { maskCurveRightPress(lx, ly); });
+      c, [](float lx, float ly) { maskCurvePress(lx, ly); },
+      [](float lx, float ly) { maskCurveDrag(lx, ly); }, [] { maskCurveEnd(); },
+      [](float lx, float ly) { maskCurveRightPress(lx, ly); },
+      Cursor::Crosshair);
   return c;
 }
 
@@ -9029,10 +8474,8 @@ static View buildMaskCurveCanvas()
 // which aren't usable in constant expressions. So it's checked once at
 // startup instead, and a mistake aborts with a message naming the bad entry
 // rather than silently moving the wrong slider.
-static void verifyAdjustmentSpecs()
-{
-  for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i)
-  {
+static void verifyAdjustmentSpecs() {
+  for (size_t i = 0; i < kAdjustmentSpecs.size(); ++i) {
     const AdjustmentSpec &s = kAdjustmentSpecs[i];
     const char *problem = nullptr;
     if (static_cast<size_t>(s.id) != i)
@@ -9042,36 +8485,26 @@ static void verifyAdjustmentSpecs()
       problem = "has min >= max";
     else if (s.stage == AdjustmentSpec::Stage::Tone && !s.apply)
       problem = "is a Tone adjustment with no apply function";
-    if (problem)
-    {
-      std::fprintf(stderr, "literoom: kAdjustmentSpecs[%zu] (\"%s\") %s\n",
-                   i, std::string(s.label).c_str(), problem);
+    if (problem) {
+      std::fprintf(stderr, "literoom: kAdjustmentSpecs[%zu] (\"%s\") %s\n", i,
+                   std::string(s.label).c_str(), problem);
       std::abort();
     }
   }
 }
 
-int main()
-{
+int main() {
   verifyAdjustmentSpecs();
   LiteUI ui("Literoom", -1, -1, /*hideTitlebar=*/true);
   // A finished background render wakes the (otherwise sleeping) event loop.
-  renderWorker.setNotify([&ui]
-                         { ui.wake(); });
-  geometryWorker.setNotify([&ui]
-                           { ui.wake(); });
-  thumbWorker.setNotify([&ui]
-                        { ui.wake(); });
-  decodeWorker.setNotify([&ui]
-                         { ui.wake(); });
-  segmentWorker.setNotify([&ui]
-                          { ui.wake(); });
-  syncWorker.setNotify([&ui]
-                       { ui.wake(); });
-  exportWorker.setNotify([&ui]
-                         { ui.wake(); });
-  lutPreviewWorker.setNotify([&ui]
-                             { ui.wake(); });
+  renderWorker.setNotify([&ui] { ui.wake(); });
+  geometryWorker.setNotify([&ui] { ui.wake(); });
+  thumbWorker.setNotify([&ui] { ui.wake(); });
+  decodeWorker.setNotify([&ui] { ui.wake(); });
+  segmentWorker.setNotify([&ui] { ui.wake(); });
+  syncWorker.setNotify([&ui] { ui.wake(); });
+  exportWorker.setNotify([&ui] { ui.wake(); });
+  lutPreviewWorker.setNotify([&ui] { ui.wake(); });
 
   // ---- Keyboard shortcuts ----
   // LiteUI's addShortcut is global: it fires whatever has focus, so these work
@@ -9079,8 +8512,7 @@ int main()
   // Zoom uses the unshifted Ctrl+= / Ctrl+-: on Linux LiteUI reports shifted
   // symbols like '+' as Key::Unknown, so Ctrl+Shift+= can't be bound there.
   {
-    auto withMods = [](bool ctrl, bool shift)
-    {
+    auto withMods = [](bool ctrl, bool shift) {
       KeyModifiers m;
       m.ctrl = ctrl;
       m.shift = shift;
@@ -9092,27 +8524,31 @@ int main()
     const KeyModifiers ctrlShift = withMods(true, true);
     // Edits and dialogs are ignored mid-drag (a slider or crop handle is
     // being held): changing the image under the drag would fight it.
-    auto idle = [](std::function<void()> fn)
-    {
-      return [fn = std::move(fn)]
-      {
+    auto idle = [](std::function<void()> fn) {
+      return [fn = std::move(fn)] {
         if (!state.dragging)
           fn();
       };
     };
     // Plain-key shortcuts must not fire while the mask name field is being
     // typed in (see typingInTextField).
-    auto notTyping = [idle](std::function<void()> fn)
-    {
-      return idle([fn = std::move(fn)]
-                  {
+    auto notTyping = [idle](std::function<void()> fn) {
+      return idle([fn = std::move(fn)] {
         if (!typingInTextField())
-          fn(); });
+          fn();
+      });
     };
-    auto zoomIn = []
-    { setZoom(state.zoom * kZoomStep); };
-    auto zoomOut = []
-    { setZoom(state.zoom / kZoomStep); };
+    // Left / Right / Delete / Enter are also the keys a text field edits with.
+    // While one has focus it gets the key (see forwardKeyToTextField);
+    // otherwise the shortcut runs.
+    auto fieldFirst = [none](Key key, std::function<void()> fn) {
+      return [key, none, fn = std::move(fn)] {
+        if (!forwardKeyToTextField(KeyEvent{key, none}))
+          fn();
+      };
+    };
+    auto zoomIn = [] { setZoom(state.zoom * kZoomStep); };
+    auto zoomOut = [] { setZoom(state.zoom / kZoomStep); };
 
     ui.addShortcut(ctrlShift, Key::C, notTyping(copySettings));
     ui.addShortcut(ctrlShift, Key::V, notTyping(idle(pasteSettings)));
@@ -9125,67 +8561,66 @@ int main()
     ui.addShortcut(ctrl, Key::A, notTyping(filmSelectAll));
     ui.addShortcut(ctrl, Key::E, idle(exportImage));
     ui.addShortcut(ctrlShift, Key::E, notTyping(idle(exportSelected)));
-    ui.addShortcut(ctrl, Key::Q, [&ui]
-                   { ui.requestClose(); });
+    ui.addShortcut(ctrl, Key::Q, [&ui] { ui.requestClose(); });
     ui.addShortcut(ctrl, Key::B, toggleSidebar);
     ui.addShortcut(ctrl, Key::Equal, zoomIn);
     ui.addShortcut(ctrlShift, Key::Equal,
                    zoomIn); // '+' on layouts that report it
     ui.addShortcut(ctrl, Key::Minus, zoomOut);
-    ui.addShortcut(ctrl, Key::N0, []
-                   { setZoom(1.0f); });
+    ui.addShortcut(ctrl, Key::N0, [] { setZoom(1.0f); });
     ui.addShortcut(ctrl, Key::LeftBracket,
-                   idle([]
-                        { applyGeoOp(GeoOp::RotateCCW); }));
+                   idle([] { applyGeoOp(GeoOp::RotateCCW); }));
     ui.addShortcut(ctrl, Key::RightBracket,
-                   idle([]
-                        { applyGeoOp(GeoOp::RotateCW); }));
+                   idle([] { applyGeoOp(GeoOp::RotateCW); }));
     ui.addShortcut(ctrlShift, Key::O, idle(openFolder));
-    ui.addShortcut(none, Key::Left, notTyping([]
-                                              { filmStep(-1); }));
-    ui.addShortcut(none, Key::Right, notTyping([]
-                                               { filmStep(1); }));
+    ui.addShortcut(
+        ctrlShift, Key::N,
+        notTyping(idle(createVirtualCopy))); // listed in the Image menu
+    ui.addShortcut(none, Key::Left,
+                   fieldFirst(Key::Left, notTyping([] { filmStep(-1); })));
+    ui.addShortcut(none, Key::Right,
+                   fieldFirst(Key::Right, notTyping([] { filmStep(1); })));
     ui.addShortcut(none, Key::F6, toggleFilmstrip);
-    ui.addShortcut(none, Key::Backslash, notTyping(toggleBefore));       // Before / After
-    ui.addShortcut(none, Key::Y, notTyping(toggleSplit));                // split view
-    ui.addShortcut(none, Key::J, notTyping(toggleClipping));             // clipping warnings
-    ui.addShortcut(shiftOnly, Key::J, notTyping(toggleChannelClipping)); // per-channel colors
-    ui.addShortcut(none, Key::W, notTyping(toggleWbPicker)); // white-balance picker
-    ui.addShortcut(none, Key::A, notTyping(autoTone));       // Auto Tone
+    ui.addShortcut(none, Key::Backslash,
+                   notTyping(toggleBefore));              // Before / After
+    ui.addShortcut(none, Key::Y, notTyping(toggleSplit)); // split view
+    ui.addShortcut(none, Key::J,
+                   notTyping(toggleClipping)); // clipping warnings
+    ui.addShortcut(shiftOnly, Key::J,
+                   notTyping(toggleChannelClipping)); // per-channel colors
+    ui.addShortcut(none, Key::W,
+                   notTyping(toggleWbPicker));         // white-balance picker
+    ui.addShortcut(none, Key::A, notTyping(autoTone)); // Auto Tone
     // Rating (0 clears, 1-5), flag (P pick, X reject, U unflag) and color label
     // (6 red, 7 yellow, 8 green, 9 blue) of the open picture. Not edits.
     for (int s = 0; s <= kMaxRating; ++s)
       ui.addShortcut(none, static_cast<Key>(static_cast<int>(Key::N0) + s),
-                     notTyping([s]
-                               { ratePhoto(s); }));
-    ui.addShortcut(none, Key::P, notTyping([]
-                                           { flagPhoto(PhotoFlag::Pick); }));
-    ui.addShortcut(none, Key::X, notTyping([]
-                                           { flagPhoto(PhotoFlag::Reject); }));
-    ui.addShortcut(none, Key::U, notTyping([]
-                                           { flagPhoto(PhotoFlag::None); }));
+                     notTyping([s] { ratePhoto(s); }));
+    ui.addShortcut(none, Key::P, notTyping([] { flagPhoto(PhotoFlag::Pick); }));
+    ui.addShortcut(none, Key::X,
+                   notTyping([] { flagPhoto(PhotoFlag::Reject); }));
+    ui.addShortcut(none, Key::U, notTyping([] { flagPhoto(PhotoFlag::None); }));
     for (int c = 1; c <= 4; ++c)
       ui.addShortcut(none, static_cast<Key>(static_cast<int>(Key::N0) + 5 + c),
-                     notTyping([c]
-                               { labelPhoto(c); }));
-    ui.addShortcut(none, Key::Escape, []
-                   {
-                     state.openMenu = -1;
-                     if (state.wbPicking)
-                     {
-                       state.wbPicking = false; // cancel the picker
-                       clearStatus();
-                       state.markDirty();
-                     } });
-    ui.addShortcut(none, Key::Delete, notTyping([]
-                                                {
-                     if (maskToolActive())
-                       deleteSelectedMask(); }));
-    ui.addShortcut(none, Key::Enter, idle([]
-                                          {
-                                            if (cropToolActive())
-                                              applyCrop(); // commit the selection, like the button
-                                          }));
+                     notTyping([c] { labelPhoto(c); }));
+    ui.addShortcut(none, Key::Escape, [] {
+      state.openMenu = -1;
+      if (state.wbPicking) {
+        state.wbPicking = false; // cancel the picker
+        clearStatus();
+        state.markDirty();
+      }
+    });
+    ui.addShortcut(none, Key::Delete, fieldFirst(Key::Delete, notTyping([] {
+                                                   if (maskToolActive())
+                                                     deleteSelectedMask();
+                                                 })));
+    ui.addShortcut(
+        none, Key::Enter,
+        fieldFirst(Key::Enter, idle([] {
+                     if (cropToolActive())
+                       applyCrop(); // commit the selection, like the button
+                   })));
   }
 
   const std::vector<Activity> activities = {
@@ -9222,8 +8657,7 @@ int main()
   titlebar.style.borderWidth = 0.0f;
   // Empty space in the titlebar (i.e. not over a button) drags the
   // window, and also closes any open dropdown menu.
-  titlebar.onPointerDown = [&](PointerEvent &e)
-  {
+  titlebar.onPointerDown = [&](PointerEvent &e) {
     if (e.button != MouseButton::Left)
       return;
     e.stopPropagation();
@@ -9248,71 +8682,57 @@ int main()
                      {"Export Selected...", exportSelected, "Ctrl+Shift+E"},
                      {"Export All Shown...", exportAllShown},
                      {"Stop Export", stopExport},
-                     {"Exit", [&]
-                      { ui.requestClose(); }, "Ctrl+Q"},
+                     {"Exit", [&] { ui.requestClose(); }, "Ctrl+Q"},
                  }));
   titlebar.addChild(menuButton(
       "View", 1,
       {
-          {"Zoom In", []
-           { setZoom(state.zoom * kZoomStep); }, "Ctrl+="},
-          {"Zoom Out", []
-           { setZoom(state.zoom / kZoomStep); }, "Ctrl+-"},
-          {"Actual Size (100%)", []
-           { setZoom(1.0f); }, "Ctrl+0"},
+          {"Zoom In", [] { setZoom(state.zoom * kZoomStep); }, "Ctrl+="},
+          {"Zoom Out", [] { setZoom(state.zoom / kZoomStep); }, "Ctrl+-"},
+          {"Actual Size (100%)", [] { setZoom(1.0f); }, "Ctrl+0"},
           {"Toggle Sidebar", toggleSidebar, "Ctrl+B"},
           {"Toggle Filmstrip", toggleFilmstrip, "F6"},
-          {"Previous Image", []
-           { filmStep(-1); }, "Left"},
-          {"Next Image", []
-           { filmStep(1); }, "Right"},
+          {"Previous Image", [] { filmStep(-1); }, "Left"},
+          {"Next Image", [] { filmStep(1); }, "Right"},
           {"Before / After", toggleBefore, "\\"},
           {"Before | After Split", toggleSplit, "Y"},
           {"Clipping Warnings", toggleClipping, "J"},
           {"Clipping: Per-Channel Colors", toggleChannelClipping, "Shift+J"},
       }));
 
-  titlebar.addChild(
-      menuButton("Image", 2,
-                 {
-                     {"Rotate Left 90\u00B0",
-                      []
-                      { applyGeoOp(GeoOp::RotateCCW); }, "Ctrl+["},
-                     {"Rotate Right 90\u00B0",
-                      []
-                      { applyGeoOp(GeoOp::RotateCW); }, "Ctrl+]"},
-                     {"Flip Horizontal", []
-                      { applyGeoOp(GeoOp::FlipH); }},
-                     {"Flip Vertical", []
-                      { applyGeoOp(GeoOp::FlipV); }},
-                     {"Auto Tone", autoTone, "A"},
-                     {"Copy Settings", copySettings, "Ctrl+Shift+C"},
-                     {"Paste Settings", pasteSettings, "Ctrl+Shift+V"},
-                     {"Select All Photos", filmSelectAll, "Ctrl+A"},
-                     {"Sync Settings to Selected", syncSettings, "Ctrl+Shift+S"},
-                     {"Create Virtual Copy", createVirtualCopy, "Ctrl+Shift+N"},
-                     {"Delete Virtual Copy", deleteVirtualCopy},
-                 }));
+  titlebar.addChild(menuButton(
+      "Image", 2,
+      {
+          {"Rotate Left 90\u00B0", [] { applyGeoOp(GeoOp::RotateCCW); },
+           "Ctrl+["},
+          {"Rotate Right 90\u00B0", [] { applyGeoOp(GeoOp::RotateCW); },
+           "Ctrl+]"},
+          {"Flip Horizontal", [] { applyGeoOp(GeoOp::FlipH); }},
+          {"Flip Vertical", [] { applyGeoOp(GeoOp::FlipV); }},
+          {"Auto Tone", autoTone, "A"},
+          {"Copy Settings", copySettings, "Ctrl+Shift+C"},
+          {"Paste Settings", pasteSettings, "Ctrl+Shift+V"},
+          {"Select All Photos", filmSelectAll, "Ctrl+A"},
+          {"Sync Settings to Selected", syncSettings, "Ctrl+Shift+S"},
+          {"Create Virtual Copy", createVirtualCopy, "Ctrl+Shift+N"},
+          {"Delete Virtual Copy", deleteVirtualCopy},
+      }));
 
   { // Photo: rating, flag and color label of the open picture (see ratePhoto)
     std::vector<MenuItem> photo;
     for (int s = 1; s <= kMaxRating; ++s)
-      photo.push_back({"Rate " + starsText(s), [s]
-                       { ratePhoto(s); }, std::to_string(s)});
-    photo.push_back({"Clear Rating", []
-                     { ratePhoto(0); }, "0"});
-    photo.push_back({"Flag as Pick", []
-                     { flagPhoto(PhotoFlag::Pick); }, "P"});
-    photo.push_back({"Flag as Rejected", []
-                     { flagPhoto(PhotoFlag::Reject); }, "X"});
-    photo.push_back({"Remove Flag", []
-                     { flagPhoto(PhotoFlag::None); }, "U"});
+      photo.push_back(
+          {"Rate " + starsText(s), [s] { ratePhoto(s); }, std::to_string(s)});
+    photo.push_back({"Clear Rating", [] { ratePhoto(0); }, "0"});
+    photo.push_back({"Flag as Pick", [] { flagPhoto(PhotoFlag::Pick); }, "P"});
+    photo.push_back(
+        {"Flag as Rejected", [] { flagPhoto(PhotoFlag::Reject); }, "X"});
+    photo.push_back({"Remove Flag", [] { flagPhoto(PhotoFlag::None); }, "U"});
     for (int c = 1; c <= kLabelCount; ++c)
-      photo.push_back({std::string("Label ") + kLabelDisplay[c - 1], [c]
-                       { labelPhoto(c); },
+      photo.push_back({std::string("Label ") + kLabelDisplay[c - 1],
+                       [c] { labelPhoto(c); },
                        c <= 4 ? std::to_string(5 + c) : std::string()});
-    photo.push_back({"Clear Label", []
-                     { labelPhoto(0); }});
+    photo.push_back({"Clear Label", [] { labelPhoto(0); }});
     titlebar.addChild(menuButton("Photo", 3, std::move(photo)));
   }
 
@@ -9321,11 +8741,9 @@ int main()
   titlebar.addChild(std::move(undoRedoGap));
 
   titlebar.addChild(
-      titlebarIconBtn("\u21B6", undo, []
-                      { return state.adjust.canUndo(); }));
+      titlebarIconBtn("\u21B6", undo, [] { return state.adjust.canUndo(); }));
   titlebar.addChild(
-      titlebarIconBtn("\u21B7", redo, []
-                      { return state.adjust.canRedo(); }));
+      titlebarIconBtn("\u21B7", redo, [] { return state.adjust.canRedo(); }));
 
   View titlebarSpacer;
   titlebarSpacer.style.flexGrow = 1;
@@ -9333,15 +8751,13 @@ int main()
   titlebar.addChild(std::move(titlebarSpacer));
 
   titlebar.addChild(
-      winButton("\u2500", kColorMenuHover, [&]
-                { ui.requestMinimize(); }));
-  titlebar.addChild(winButton("\u25A1", kColorMenuHover, [&]
-                              {
+      winButton("\u2500", kColorMenuHover, [&] { ui.requestMinimize(); }));
+  titlebar.addChild(winButton("\u25A1", kColorMenuHover, [&] {
     ui.requestMaximize();
-    state.maximized = !state.maximized; }));
+    state.maximized = !state.maximized;
+  }));
   titlebar.addChild(
-      winButton("\u00D7", kColorCloseHover, [&]
-                { ui.requestClose(); }));
+      winButton("\u00D7", kColorCloseHover, [&] { ui.requestClose(); }));
 
   root.addChild(std::move(titlebar));
 
@@ -9353,8 +8769,7 @@ int main()
   workspace.style.flexGrow = 1;
   // Clicking anywhere in the workspace that isn't itself a button
   // (e.g. the canvas, or blank sidebar space) closes an open menu too.
-  workspace.onPointerDown = [](PointerEvent &e)
-  {
+  workspace.onPointerDown = [](PointerEvent &e) {
     if (e.button == MouseButton::Left)
       state.openMenu = -1;
   };
@@ -9370,8 +8785,7 @@ int main()
   activityBar.style.padding = EdgeInsets::all(6.0f);
   activityBar.style.gap = 10.0f;
 
-  for (const auto &item : activities)
-  {
+  for (const auto &item : activities) {
     View button;
     button.style.width = Size::pixel(32);
     button.style.height = Size::pixel(32);
@@ -9381,11 +8795,11 @@ int main()
     button.style.hoverColor = kColorActivityHover;
 
     int id = item.id;
-    button.style.backgroundColor = std::function<Color()>([id]
-                                                          { return state.activeActivity == id ? kColorActivityActive
-                                                                                              : kColorActivityBarBg; });
-    button.onClick = [id]
-    {
+    button.style.backgroundColor = std::function<Color()>([id] {
+      return state.activeActivity == id ? kColorActivityActive
+                                        : kColorActivityBarBg;
+    });
+    button.onClick = [id] {
       state.activeActivity = (state.activeActivity == id) ? -1 : id;
       // The wheels are laid out for a minimum sidebar width.
       if (state.activeActivity == 6 && state.sidebarWidth < kGradePaneW)
@@ -9416,8 +8830,9 @@ int main()
   sidebarShell.style.padding = EdgeInsets::all(12.0f);
   sidebarShell.style.overflowX = Overflow::Hidden;
   sidebarShell.style.overflowY = Overflow::Visible;
-  sidebarShell.style.width = std::function<Size()>([]
-                                                   { return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f); });
+  sidebarShell.style.width = std::function<Size()>([] {
+    return Size::pixel(state.activeActivity != -1 ? state.sidebarWidth : 0.0f);
+  });
 
   // Body: all the panes live here, and this is the part that scrolls.
   View sidebar;
@@ -9430,12 +8845,12 @@ int main()
 
   Text sidebarTitle;
   sidebarTitle.label =
-      std::function<std::string()>([activities]() -> std::string
-                                   {
+      std::function<std::string()>([activities]() -> std::string {
         for (const auto &a : activities)
           if (a.id == state.activeActivity)
             return a.title;
-        return ""; });
+        return "";
+      });
   sidebarTitle.fontSize = 12.0f;
   sidebarTitle.fontWeight = FontWeight::SemiBold;
   sidebarTitle.color = kColorTextMuted;
@@ -9449,22 +8864,20 @@ int main()
   View histogram;
   histogram.isCanvas = true;
   histogram.style.width = Size::full();
-  histogram.style.height = std::function<Size()>(
-      []
-      {
-        return Size::pixel(state.scopeKind == scopes::Kind::Histogram
-                               ? kHistHeightPx
-                               : kScopeHeightPx);
-      });
+  histogram.style.height = std::function<Size()>([] {
+    return Size::pixel(state.scopeKind == scopes::Kind::Histogram
+                           ? kHistHeightPx
+                           : kScopeHeightPx);
+  });
   histogram.style.flexShrink = 0;
   histogram.style.margin = EdgeInsets{0, 0, 12, 0};
-  histogram.onPaint = [](CanvasContext &ctx)
-  { paintHistogram(ctx); };
-  histogram.onPointerDown = [](PointerEvent &e)
-  {
+  histogram.onPaint = [](CanvasContext &ctx) { paintHistogram(ctx); };
+  histogram.style.cursor = Cursor::Pointer;
+  histogram.onPointerDown = [](PointerEvent &e) {
     if (e.button != MouseButton::Left)
       return;
     e.stopPropagation();
+    closeMenus();
     const float lx = e.x, ly = e.y;
     if (!state.image)
       return;
@@ -9477,8 +8890,7 @@ int main()
     else
       cycleScope();
   };
-  histogram.canvasDirtySource = []
-  {
+  histogram.canvasDirtySource = [] {
     static uint32_t lastPainted = 0;
     static int lastActivity = -2;
     // Sidebar is polled before the canvas: do the pending recompute now.
@@ -9500,95 +8912,102 @@ int main()
   infoPane.style.width = Size::full();
   infoPane.style.gap = 6.0f;
   infoPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 0 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 0 ? Display::Flex : Display::None; });
 
   Text infoName;
-  infoName.label = std::function<std::string()>([]
-                                                { return state.image ? ("File: " + pictureLabel(state.imagePath))
-                                                                     : std::string("No image open"); });
+  infoName.label = std::function<std::string()>([] {
+    return state.image ? ("File: " + pictureLabel(state.imagePath))
+                       : std::string("No image open");
+  });
   infoName.fontSize = 13.0f;
   infoName.color = kColorTextMid;
   infoPane.addChild(std::move(infoName));
 
   Text infoDims;
-  infoDims.label = std::function<std::string()>([]
-                                                {
+  infoDims.label = std::function<std::string()>([] {
     if (!state.image)
       return std::string();
     return "Size: " + std::to_string(state.image->width) + " x " +
-           std::to_string(state.image->height) + " px"; });
+           std::to_string(state.image->height) + " px";
+  });
   infoDims.fontSize = 13.0f;
   infoDims.color = kColorTextMid;
   infoPane.addChild(std::move(infoDims));
 
   Text infoZoom;
-  infoZoom.label = std::function<std::string()>([]
-                                                { return "Zoom: " +
-                                                         std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%"; });
+  infoZoom.label = std::function<std::string()>([] {
+    return "Zoom: " +
+           std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
+  });
   infoZoom.fontSize = 13.0f;
   infoZoom.color = kColorTextMid;
   infoPane.addChild(std::move(infoZoom));
 
   Text infoColor;
-  infoColor.label = std::function<std::string()>([]
-                                                 {
+  infoColor.label = std::function<std::string()>([] {
     if (!state.image)
       return std::string();
     const std::string &t = currentColorTag().text;
-    return t.empty() ? t : "Color: " + t; });
+    return t.empty() ? t : "Color: " + t;
+  });
   infoColor.fontSize = 13.0f;
   infoColor.color = kColorTextMid;
-  infoColor.style.display = std::function<Display()>([]
-                                                     { return state.image && !currentColorTag().text.empty() ? Display::Flex : Display::None; });
+  infoColor.style.display = std::function<Display()>([] {
+    return state.image && !currentColorTag().text.empty() ? Display::Flex
+                                                          : Display::None;
+  });
   infoPane.addChild(std::move(infoColor));
 
   // Camera data from the file's EXIF block. Each row hides itself when the file
   // doesn't say; a picture with none of it gets one muted line instead. GPS is
   // never shown.
-  const auto infoRow = [](std::function<std::string()> text, bool muted = false)
-  {
+  const auto infoRow = [](std::function<std::string()> text,
+                          bool muted = false) {
     Text row;
     row.label = text;
     row.fontSize = 13.0f;
     row.color = muted ? kColorTextMuted : kColorTextMid;
-    row.style.display = std::function<Display()>([text]
-                                                 { return text().empty() ? Display::None : Display::Flex; });
+    row.style.display = std::function<Display()>(
+        [text] { return text().empty() ? Display::None : Display::Flex; });
     return row;
   };
-  infoPane.addChild(infoRow([]() -> std::string
-                            {
+  infoPane.addChild(infoRow([]() -> std::string {
     if (!state.image)
       return {};
     const std::string s = exif::describeCamera(currentPhotoInfo());
-    return s.empty() ? s : "Camera: " + s; }));
-  infoPane.addChild(infoRow([]() -> std::string
-                            {
+    return s.empty() ? s : "Camera: " + s;
+  }));
+  infoPane.addChild(infoRow([]() -> std::string {
     if (!state.image)
       return {};
     const std::string &s = currentPhotoInfo().lens;
-    return s.empty() ? s : "Lens: " + s; }));
-  infoPane.addChild(infoRow([]() -> std::string
-                            {
+    return s.empty() ? s : "Lens: " + s;
+  }));
+  infoPane.addChild(infoRow([]() -> std::string {
     if (!state.image)
       return {};
     const std::string s = exif::describeExposure(currentPhotoInfo());
-    return s.empty() ? s : "Exposure: " + s; }));
-  infoPane.addChild(infoRow([]() -> std::string
-                            {
+    return s.empty() ? s : "Exposure: " + s;
+  }));
+  infoPane.addChild(infoRow([]() -> std::string {
     if (!state.image)
       return {};
-    const std::string s = exif::describeFocalLength(currentPhotoInfo().focalLength);
-    return s.empty() ? s : "Focal length: " + s; }));
-  infoPane.addChild(infoRow([]() -> std::string
-                            {
+    const std::string s =
+        exif::describeFocalLength(currentPhotoInfo().focalLength);
+    return s.empty() ? s : "Focal length: " + s;
+  }));
+  infoPane.addChild(infoRow([]() -> std::string {
     if (!state.image)
       return {};
     const std::string &s = currentPhotoInfo().dateTaken;
-    return s.empty() ? s : "Taken: " + s; }));
+    return s.empty() ? s : "Taken: " + s;
+  }));
   infoPane.addChild(infoRow(
-      []() -> std::string
-      { return state.image && currentPhotoInfo().empty() ? "No camera data in this file" : std::string(); },
+      []() -> std::string {
+        return state.image && currentPhotoInfo().empty()
+                   ? "No camera data in this file"
+                   : std::string();
+      },
       true));
 
   sidebar.addChild(std::move(infoPane));
@@ -9598,16 +9017,18 @@ int main()
   historyPane.style.width = Size::full();
   historyPane.style.direction = FlexDirection::Column;
   historyPane.style.gap = 2.0f;
-  historyPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == kHistoryActivity ? Display::Flex : Display::None; });
+  historyPane.style.display = std::function<Display()>([] {
+    return state.activeActivity == kHistoryActivity ? Display::Flex
+                                                    : Display::None;
+  });
 
   Text historyHint;
-  historyHint.label = std::function<std::string()>([]() -> std::string
-                                                   { return state.image
-                                                                ? "Click a step to go back to it. Dimmed steps are ahead of "
-                                                                  "you: a new edit discards them."
-                                                                : "Open an image to see its edit history."; });
+  historyHint.label = std::function<std::string()>([]() -> std::string {
+    return state.image
+               ? "Click a step to go back to it. Dimmed steps are ahead of "
+                 "you: a new edit discards them."
+               : "Open an image to see its edit history.";
+  });
   historyHint.fontSize = 12.0f;
   historyHint.color = kColorTextMuted;
   historyHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -9619,23 +9040,26 @@ int main()
 
   // -- "Snapshots" pane: named copies of every edit on this picture. Click one
   // to restore it (one undo step); type a name and Save to keep the current
-  // state. They are saved in the picture's edits file, not in the presets folder.
+  // state. They are saved in the picture's edits file, not in the presets
+  // folder.
   View snapshotsPane;
   snapshotsPane.style.width = Size::full();
   snapshotsPane.style.direction = FlexDirection::Column;
   snapshotsPane.style.gap = 6.0f;
-  snapshotsPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == kSnapshotsActivity ? Display::Flex : Display::None; });
+  snapshotsPane.style.display = std::function<Display()>([] {
+    return state.activeActivity == kSnapshotsActivity ? Display::Flex
+                                                      : Display::None;
+  });
 
   Text snapshotsHint;
-  snapshotsHint.label = std::function<std::string()>([]() -> std::string
-                                                     { return state.original
-                                                                  ? "A snapshot is a named copy of every edit on this picture: "
-                                                                    "sliders, curves, Color Mix, Color Grading, crop, rotation "
-                                                                    "and masks. Restoring one replaces all of them and can be "
-                                                                    "undone. Snapshots are saved with the picture's edits."
-                                                                  : "Open an image to keep snapshots of its edits."; });
+  snapshotsHint.label = std::function<std::string()>([]() -> std::string {
+    return state.original
+               ? "A snapshot is a named copy of every edit on this picture: "
+                 "sliders, curves, Color Mix, Color Grading, crop, rotation "
+                 "and masks. Restoring one replaces all of them and can be "
+                 "undone. Snapshots are saved with the picture's edits."
+               : "Open an image to keep snapshots of its edits.";
+  });
   snapshotsHint.fontSize = 12.0f;
   snapshotsHint.color = kColorTextMuted;
   snapshotsHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -9656,89 +9080,85 @@ int main()
     ti.style.borderWidth = 1.0f;
     ti.style.borderRadius = 4.0f;
     ti.style.backgroundColor = kColorActivityBarBg;
-    ti.onChange = [](const std::string &s)
-    { filterSnapshotNameField(s); };
-    ti.onSubmit = [](const std::string &)
-    { addSnapshot(); }; // Enter saves, like the button
+    ti.onChange = [](const std::string &s) { filterSnapshotNameField(s); };
+    ti.onSubmit = [](const std::string &) {
+      addSnapshot();
+    }; // Enter saves, like the button
     gSnapNameState = ti.state;
     snapshotsPane.addChild(std::move(ti));
+    registerTextField(gSnapNameState, snapshotsPane.children.back());
   }
-  snapshotsPane.addChild(sidebarButton(
-      "Save snapshot", addSnapshot, {}, true,
-      []
-      { return state.original != nullptr && state.snapshots.size() < kMaxSnapshots; }));
+  snapshotsPane.addChild(
+      sidebarButton("Save snapshot", addSnapshot, {}, true, [] {
+        return state.original != nullptr &&
+               state.snapshots.size() < kMaxSnapshots;
+      }));
 
   Text snapshotsEmpty;
-  snapshotsEmpty.label = std::string("No snapshots yet. Name the current state and save it.");
+  snapshotsEmpty.label =
+      std::string("No snapshots yet. Name the current state and save it.");
   snapshotsEmpty.fontSize = 12.0f;
   snapshotsEmpty.color = kColorTextMuted;
   snapshotsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
   snapshotsEmpty.style.display = std::function<Display()>(
-      []
-      { return state.snapshots.empty() ? Display::Flex : Display::None; });
+      [] { return state.snapshots.empty() ? Display::Flex : Display::None; });
   snapshotsPane.addChild(std::move(snapshotsEmpty));
 
   for (size_t i = 0; i < kMaxSnapshots; ++i)
     snapshotsPane.addChild(buildSnapshotRow(i));
 
   snapshotsPane.addChild(sidebarButton(
-      "Delete selected snapshot", deleteSelectedSnapshot, {}, false,
-      []
-      { return gSnapSel >= 0 && static_cast<size_t>(gSnapSel) < state.snapshots.size(); }));
+      "Delete selected snapshot", deleteSelectedSnapshot, {}, false, [] {
+        return gSnapSel >= 0 &&
+               static_cast<size_t>(gSnapSel) < state.snapshots.size();
+      }));
 
   sidebar.addChild(std::move(snapshotsPane));
 
   // -- "Adjust" pane: one slider row per entry in kAdjustmentSpecs. Adding
   // a new adjustment later is a one-line addition to that table — this
-  // loop, the render pass (renderAdjusted), and buildAdjustmentSlider all need no
-  // changes.
+  // loop, the render pass (renderAdjusted), and buildAdjustmentSlider all need
+  // no changes.
   View adjustPane;
   adjustPane.style.width = Size::full();
   adjustPane.style.direction = FlexDirection::Column;
   adjustPane.style.gap = 16.0f;
   adjustPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 1 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 1 ? Display::Flex : Display::None; });
 
-  auto sectionLabel = [](const char *text)
-  {
+  auto sectionLabel = [](const char *text) {
     Text h;
     h.label = std::string(text);
     h.fontSize = 12.0f;
     h.color = kColorTextMuted;
     return h;
   };
-  bool colorHeaderAdded = false, filtersHeaderAdded = false, detailHeaderAdded = false,
-       effectsHeaderAdded = false;
+  bool colorHeaderAdded = false, filtersHeaderAdded = false,
+       detailHeaderAdded = false, effectsHeaderAdded = false;
   adjustPane.addChild(sectionLabel("Tone"));
   adjustPane.addChild(sidebarButton(
       "Auto Tone (A)", [] { autoTone(); }, {}, false,
       [] { return state.source != nullptr && !state.dragging; }));
-  for (const auto &spec : kAdjustmentSpecs)
-  {
+  for (const auto &spec : kAdjustmentSpecs) {
     // LUT Amount is the LUTs pane's slider (it only scales the chosen LUT).
     if (spec.id == AdjId::LutAmount)
       continue;
-    if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
-    {
+    if (!colorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color) {
       adjustPane.addChild(sectionLabel("Color"));
       colorHeaderAdded = true;
     }
     // Filters are Color-stage entries; AdjId::Greyscale starts their block.
-    if (!filtersHeaderAdded && spec.id == AdjId::Greyscale)
-    {
+    if (!filtersHeaderAdded && spec.id == AdjId::Greyscale) {
       adjustPane.addChild(sectionLabel("Filters"));
       filtersHeaderAdded = true;
     }
-    if (!detailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
-    {
+    if (!detailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail) {
       adjustPane.addChild(sectionLabel("Detail"));
       detailHeaderAdded = true;
     }
     // Vignette and Grain (Stage::Effects, the end of the table): the very last
     // step of the render, after the masks.
-    if (!effectsHeaderAdded && spec.stage == AdjustmentSpec::Stage::Effects)
-    {
+    if (!effectsHeaderAdded && spec.stage == AdjustmentSpec::Stage::Effects) {
       adjustPane.addChild(sectionLabel("Effects"));
       effectsHeaderAdded = true;
     }
@@ -9761,20 +9181,19 @@ int main()
   presetsPane.style.width = Size::full();
   presetsPane.style.direction = FlexDirection::Column;
   presetsPane.style.gap = 6.0f;
-  presetsPane.style.display = std::function<Display()>(
-      []
-      {
-        static bool wasShown = false;
-        const bool shown = state.activeActivity == kPresetsActivity;
-        if (shown && !wasShown)
-          refreshPresets();
-        wasShown = shown;
-        return shown ? Display::Flex : Display::None;
-      });
+  presetsPane.style.display = std::function<Display()>([] {
+    static bool wasShown = false;
+    const bool shown = state.activeActivity == kPresetsActivity;
+    if (shown && !wasShown)
+      refreshPresets();
+    wasShown = shown;
+    return shown ? Display::Flex : Display::None;
+  });
 
   Text presetsHint;
   presetsHint.label = std::string(
-      "A preset is a look: sliders, curves, Color Mix, Color Grading and the LUT. "
+      "A preset is a look: sliders, curves, Color Mix, Color Grading and the "
+      "LUT. "
       "Crop, rotation and masks are not included. Applying one replaces the "
       "current look and can be undone.");
   presetsHint.fontSize = 12.0f;
@@ -9797,35 +9216,36 @@ int main()
     ti.style.borderWidth = 1.0f;
     ti.style.borderRadius = 4.0f;
     ti.style.backgroundColor = kColorActivityBarBg;
-    ti.onChange = [](const std::string &s)
-    { filterPresetNameField(s); };
-    ti.onSubmit = [](const std::string &)
-    { saveCurrentPreset(); }; // Enter saves, like the button
+    ti.onChange = [](const std::string &s) { filterPresetNameField(s); };
+    ti.onSubmit = [](const std::string &) {
+      saveCurrentPreset();
+    }; // Enter saves, like the button
     gPresetNameState = ti.state;
     presetsPane.addChild(std::move(ti));
+    registerTextField(gPresetNameState, presetsPane.children.back());
   }
-  presetsPane.addChild(sidebarButton(
-      "Save current look", saveCurrentPreset, {}, true,
-      []
-      { return state.original != nullptr; }));
+  presetsPane.addChild(sidebarButton("Save current look", saveCurrentPreset, {},
+                                     true,
+                                     [] { return state.original != nullptr; }));
 
   Text presetsEmpty;
-  presetsEmpty.label = std::string("No presets yet. Name the current look and save it.");
+  presetsEmpty.label =
+      std::string("No presets yet. Name the current look and save it.");
   presetsEmpty.fontSize = 12.0f;
   presetsEmpty.color = kColorTextMuted;
   presetsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
   presetsEmpty.style.display = std::function<Display()>(
-      []
-      { return gPresets.empty() ? Display::Flex : Display::None; });
+      [] { return gPresets.empty() ? Display::Flex : Display::None; });
   presetsPane.addChild(std::move(presetsEmpty));
 
   for (size_t i = 0; i < kPresetRows; ++i)
     presetsPane.addChild(buildPresetRow(i));
 
   presetsPane.addChild(sidebarButton(
-      "Delete selected preset", deleteSelectedPreset, {}, false,
-      []
-      { return gPresetSel >= 0 && static_cast<size_t>(gPresetSel) < gPresets.size(); }));
+      "Delete selected preset", deleteSelectedPreset, {}, false, [] {
+        return gPresetSel >= 0 &&
+               static_cast<size_t>(gPresetSel) < gPresets.size();
+      }));
 
   Text presetsFolder;
   presetsFolder.label = "Saved in " + presetDir();
@@ -9836,30 +9256,31 @@ int main()
 
   sidebar.addChild(std::move(presetsPane));
 
-  // -- "LUTs" pane: 3D color lookup tables (.cube files made for ordinary sRGB / Rec.709
-  // pictures). Click one to apply it (one undo step); LUT Amount sets its strength. Import copies
-  // files into the library folder. Each row previews the open picture under that LUT (made on a
-  // background worker; see pollLutPreviews). The list is re-read each time the pane is opened.
+  // -- "LUTs" pane: 3D color lookup tables (.cube files made for ordinary sRGB
+  // / Rec.709 pictures). Click one to apply it (one undo step); LUT Amount sets
+  // its strength. Import copies files into the library folder. Each row
+  // previews the open picture under that LUT (made on a background worker; see
+  // pollLutPreviews). The list is re-read each time the pane is opened.
   View lutsPane;
   lutsPane.style.width = Size::full();
   lutsPane.style.direction = FlexDirection::Column;
   lutsPane.style.gap = 6.0f;
-  lutsPane.style.display = std::function<Display()>(
-      []
-      {
-        static bool wasShown = false;
-        const bool shown = state.activeActivity == kLutsActivity;
-        if (shown && !wasShown)
-          refreshLuts();
-        wasShown = shown;
-        return shown ? Display::Flex : Display::None;
-      });
+  lutsPane.style.display = std::function<Display()>([] {
+    static bool wasShown = false;
+    const bool shown = state.activeActivity == kLutsActivity;
+    if (shown && !wasShown)
+      refreshLuts();
+    wasShown = shown;
+    return shown ? Display::Flex : Display::None;
+  });
 
   Text lutsHint;
-  lutsHint.label = std::string(
-      "A LUT remaps colors. Click one to apply it to this picture; it can be undone. LUT Amount "
-      "sets how much of it is used. Presets, Copy / Paste Settings and Sync Settings carry the LUT "
-      "too. Made for camera-log footage? It may look wrong here.");
+  lutsHint.label =
+      std::string("A LUT remaps colors. Click one to apply it to this picture; "
+                  "it can be undone. LUT Amount "
+                  "sets how much of it is used. Presets, Copy / Paste Settings "
+                  "and Sync Settings carry the LUT "
+                  "too. Made for camera-log footage? It may look wrong here.");
   lutsHint.fontSize = 12.0f;
   lutsHint.color = kColorTextMuted;
   lutsHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -9868,8 +9289,8 @@ int main()
   lutsPane.addChild(sidebarButton("Import LUT...", importLuts, {}, true));
 
   Text lutsCurrent;
-  lutsCurrent.label = std::function<std::string()>([]() -> std::string
-                                                   { return lutCurrentText(); });
+  lutsCurrent.label = std::function<std::string()>(
+      []() -> std::string { return lutCurrentText(); });
   lutsCurrent.fontSize = 13.0f;
   lutsCurrent.color = kColorTextDark;
   lutsCurrent.style.margin = EdgeInsets{6, 0, 0, 0};
@@ -9880,24 +9301,23 @@ int main()
     s.name = "LUT Amount";
     s.lo = 0.0f;
     s.hi = 100.0f;
-    s.get = []
-    { return state.adjust.get(AdjId::LutAmount); };
-    s.set = [](float v)
-    { setLutAmount(v); };
-    s.format = [](float v)
-    { return std::to_string(static_cast<int>(std::lround(v))); };
+    s.get = [] { return state.adjust.get(AdjId::LutAmount); };
+    s.set = [](float v) { setLutAmount(v); };
+    s.format = [](float v) {
+      return std::to_string(static_cast<int>(std::lround(v)));
+    };
     View amountBox;
     amountBox.style.width = Size::full();
     amountBox.style.direction = FlexDirection::Column;
-    amountBox.style.display = std::function<Display()>([]
-                                                       { return state.adjust.lut().empty() ? Display::None : Display::Flex; });
+    amountBox.style.display = std::function<Display()>([] {
+      return state.adjust.lut().empty() ? Display::None : Display::Flex;
+    });
     amountBox.addChild(buildSliderRow(s));
     lutsPane.addChild(std::move(amountBox));
   }
-  lutsPane.addChild(sidebarButton(
-      "Remove LUT", removeLut, {}, false,
-      []
-      { return !state.adjust.lut().empty() && !state.dragging; }));
+  lutsPane.addChild(sidebarButton("Remove LUT", removeLut, {}, false, [] {
+    return !state.adjust.lut().empty() && !state.dragging;
+  }));
 
   Text lutsEmpty;
   lutsEmpty.label = std::string("No LUTs yet. Import a .cube file.");
@@ -9905,8 +9325,7 @@ int main()
   lutsEmpty.color = kColorTextMuted;
   lutsEmpty.style.margin = EdgeInsets{6, 0, 0, 0};
   lutsEmpty.style.display = std::function<Display()>(
-      []
-      { return gLuts.empty() ? Display::Flex : Display::None; });
+      [] { return gLuts.empty() ? Display::Flex : Display::None; });
   lutsPane.addChild(std::move(lutsEmpty));
 
   for (size_t i = 0; i < kLutRows; ++i)
@@ -9921,7 +9340,6 @@ int main()
 
   sidebar.addChild(std::move(lutsPane));
 
-
   // -- "Curve" pane: tone curves — RGB (master) plus per-channel R, G, B, one
   // tab each. Click the plot to add a point, drag to move it, right-click a
   // point to delete it. The whole gesture (add + drag, or a plain drag) is one
@@ -9932,8 +9350,7 @@ int main()
   curvePane.style.direction = FlexDirection::Column;
   curvePane.style.gap = 8.0f;
   curvePane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 4 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 4 ? Display::Flex : Display::None; });
 
   // Channel tabs. A bullet after a name marks a curve that has been changed,
   // so an edit on a channel you've since switched away from isn't forgotten.
@@ -9942,8 +9359,7 @@ int main()
   curveTabs.style.gap = 4.0f;
   curveTabs.style.width = Size::pixel(kCurveSizePx);
   curveTabs.style.flexShrink = 0;
-  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
-  {
+  for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
     const auto ch = static_cast<CurveChannel>(c);
     View tab;
     tab.style.width = Size::pixel(kCurveTabW);
@@ -9953,25 +9369,24 @@ int main()
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([ch]() -> Color
-                                                       { return gCurveChannel == ch ? kColorDropdownRowHover : kColorActivityBarBg; });
+    tab.style.backgroundColor = std::function<Color()>([ch]() -> Color {
+      return gCurveChannel == ch ? kColorDropdownRowHover : kColorActivityBarBg;
+    });
     tab.style.borderWidth = std::function<float()>(
-        [ch]
-        { return gCurveChannel == ch ? 1.0f : 0.0f; });
+        [ch] { return gCurveChannel == ch ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [ch]
-    { setCurveChannel(ch); };
+    tab.onClick = [ch] { setCurveChannel(ch); };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([ch]() -> std::string
-                                                 {
+    tabText.label = std::function<std::string()>([ch]() -> std::string {
       std::string name = ch == CurveChannel::Master  ? "RGB"
                          : ch == CurveChannel::Red   ? "R"
                          : ch == CurveChannel::Green ? "G"
                                                      : "B";
       if (!(state.adjust.curve(ch) == identityCurve()))
         name += " \u2022";
-      return name; });
+      return name;
+    });
     tabText.fontSize = 12.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = ch == CurveChannel::Master  ? kColorTextDark
@@ -9988,10 +9403,8 @@ int main()
   curveCanvas.style.width = Size::pixel(kCurveSizePx);
   curveCanvas.style.height = Size::pixel(kCurveSizePx);
   curveCanvas.style.flexShrink = 0;
-  curveCanvas.onPaint = [](CanvasContext &ctx)
-  { paintCurve(ctx); };
-  curveCanvas.canvasDirtySource = []
-  {
+  curveCanvas.onPaint = [](CanvasContext &ctx) { paintCurve(ctx); };
+  curveCanvas.canvasDirtySource = [] {
     static uint32_t lastPainted = 0;
     static int lastActivity = -2;
     // Every image recompute bumps histVersion, which covers curve edits,
@@ -10007,20 +9420,13 @@ int main()
     return true;
   };
   bindDrag(
-      curveCanvas,
-      [](float lx, float ly)
-      { curvePress(lx, ly); },
-      [](float lx, float ly)
-      { curveDrag(lx, ly); },
-      []
-      { curveEnd(); },
-      [](float lx, float ly)
-      { curveRightPress(lx, ly); });
+      curveCanvas, [](float lx, float ly) { curvePress(lx, ly); },
+      [](float lx, float ly) { curveDrag(lx, ly); }, [] { curveEnd(); },
+      [](float lx, float ly) { curveRightPress(lx, ly); }, Cursor::Crosshair);
   curvePane.addChild(std::move(curveCanvas));
 
   Text curveInfo;
-  curveInfo.label = std::function<std::string()>([]() -> std::string
-                                                 {
+  curveInfo.label = std::function<std::string()>([]() -> std::string {
     const auto &p = curveActiveCurve();
     const std::string name = curveChannelName(gCurveChannel);
     if (gCurveActive >= 0 && gCurveActive < static_cast<int>(p.size()))
@@ -10028,7 +9434,8 @@ int main()
              std::to_string(static_cast<int>(std::lround(p[gCurveActive].x))) +
              "  Out " +
              std::to_string(static_cast<int>(std::lround(p[gCurveActive].y)));
-    return name + ": " + std::to_string(p.size()) + " points"; });
+    return name + ": " + std::to_string(p.size()) + " points";
+  });
   curveInfo.fontSize = 13.0f;
   curveInfo.color = kColorTextMid;
   curvePane.addChild(std::move(curveInfo));
@@ -10058,16 +9465,14 @@ int main()
   mixPane.style.direction = FlexDirection::Column;
   mixPane.style.gap = 12.0f;
   mixPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 5 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 5 ? Display::Flex : Display::None; });
 
   View mixTabs;
   mixTabs.style.direction = FlexDirection::Row;
   mixTabs.style.gap = 6.0f;
   mixTabs.style.width = Size::pixel(3.0f * kMixTabW + 2.0f * 6.0f);
   mixTabs.style.flexShrink = 0;
-  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
-  {
+  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
     const auto chan = static_cast<MixChan>(c);
     View tab;
     tab.style.width = Size::pixel(kMixTabW);
@@ -10077,24 +9482,23 @@ int main()
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([chan]() -> Color
-                                                       { return gMixChan == chan ? kColorDropdownRowHover : kColorActivityBarBg; });
+    tab.style.backgroundColor = std::function<Color()>([chan]() -> Color {
+      return gMixChan == chan ? kColorDropdownRowHover : kColorActivityBarBg;
+    });
     tab.style.borderWidth = std::function<float()>(
-        [chan]
-        { return gMixChan == chan ? 1.0f : 0.0f; });
+        [chan] { return gMixChan == chan ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [chan]
-    { gMixChan = chan; };
+    tab.onClick = [chan] { gMixChan = chan; };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([chan]() -> std::string
-                                                 {
+    tabText.label = std::function<std::string()>([chan]() -> std::string {
       std::string name = chan == MixChan::Hue          ? "Hue"
                          : chan == MixChan::Saturation ? "Sat"
                                                        : "Lum";
       if (mixChanAnyNonZero(state.adjust.mixValues(), chan))
         name += " \u2022";
-      return name; });
+      return name;
+    });
     tabText.fontSize = 12.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = kColorTextDark;
@@ -10104,16 +9508,14 @@ int main()
   mixPane.addChild(std::move(mixTabs));
 
   // One group of eight sliders per tab; only the selected tab's is displayed.
-  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
-  {
+  for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
     const auto chan = static_cast<MixChan>(c);
     View group;
     group.style.width = Size::full();
     group.style.direction = FlexDirection::Column;
     group.style.gap = 12.0f;
     group.style.display = std::function<Display()>(
-        [chan]
-        { return gMixChan == chan ? Display::Flex : Display::None; });
+        [chan] { return gMixChan == chan ? Display::Flex : Display::None; });
     for (size_t band = 0; band < kMixBandCount; ++band)
       group.addChild(buildMixSlider(chan, band));
     mixPane.addChild(std::move(group));
@@ -10130,8 +9532,7 @@ int main()
   gradePane.style.direction = FlexDirection::Column;
   gradePane.style.gap = 10.0f;
   gradePane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 6 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 6 ? Display::Flex : Display::None; });
 
   // Mode tabs: 3-Way | Shadows | Mid | High | Global. A bullet marks a range
   // that has been adjusted.
@@ -10139,8 +9540,7 @@ int main()
   gradeTabs.style.direction = FlexDirection::Row;
   gradeTabs.style.gap = 4.0f;
   gradeTabs.style.flexShrink = 0;
-  for (int m = 0; m < 5; ++m)
-  {
+  for (int m = 0; m < 5; ++m) {
     View tab;
     tab.style.width = Size::pixel(kGradeTabW);
     tab.style.height = Size::pixel(26);
@@ -10149,28 +9549,27 @@ int main()
     tab.style.justifyContent = Justify::Center;
     tab.style.alignItems = Align::Center;
     tab.style.hoverColor = kColorActivityHover;
-    tab.style.backgroundColor = std::function<Color()>([m]() -> Color
-                                                       { return gGradeMode == m ? kColorDropdownRowHover : kColorActivityBarBg; });
+    tab.style.backgroundColor = std::function<Color()>([m]() -> Color {
+      return gGradeMode == m ? kColorDropdownRowHover : kColorActivityBarBg;
+    });
     tab.style.borderWidth =
-        std::function<float()>([m]
-                               { return gGradeMode == m ? 1.0f : 0.0f; });
+        std::function<float()>([m] { return gGradeMode == m ? 1.0f : 0.0f; });
     tab.style.borderColor = kColorDividerHover;
-    tab.onClick = [m]
-    {
+    tab.onClick = [m] {
       gGradeMode = m;
       if (m > 0)
         gGradeActive = m - 1;
     };
 
     Text tabText;
-    tabText.label = std::function<std::string()>([m]() -> std::string
-                                                 {
+    tabText.label = std::function<std::string()>([m]() -> std::string {
       static const char *const names[5] = {"3-Way", "Shad", "Mid", "High",
                                            "Glob"};
       std::string name = names[m];
       if (m > 0 && !state.adjust.grade().wheel[m - 1].neutral())
         name += "\u2022";
-      return name; });
+      return name;
+    });
     tabText.fontSize = 11.0f;
     tabText.fontWeight = FontWeight::SemiBold;
     tabText.color = kColorTextDark;
@@ -10181,8 +9580,7 @@ int main()
 
   // H:13 S:72 L:+1 for the wheel touched last
   Text gradeReadout;
-  gradeReadout.label = std::function<std::string()>([]() -> std::string
-                                                    {
+  gradeReadout.label = std::function<std::string()>([]() -> std::string {
     const int r = gGradeMode > 0 ? gGradeMode - 1 : gGradeActive;
     const GradeWheel &w = state.adjust.grade().wheel[r];
     char buf[64];
@@ -10190,17 +9588,16 @@ int main()
                   static_cast<int>(std::lround(w.hue)),
                   static_cast<int>(std::lround(w.sat)),
                   static_cast<int>(std::lround(w.lum)));
-    return buf; });
+    return buf;
+  });
   gradeReadout.fontSize = 12.0f;
   gradeReadout.color = kColorTextMid;
   gradePane.addChild(std::move(gradeReadout));
 
   // One body per mode; only the selected one is displayed.
-  auto modeBody = [](int m, View body)
-  {
+  auto modeBody = [](int m, View body) {
     body.style.display = std::function<Display()>(
-        [m]
-        { return gGradeMode == m ? Display::Flex : Display::None; });
+        [m] { return gGradeMode == m ? Display::Flex : Display::None; });
     return body;
   };
   gradePane.addChild(modeBody(0, buildGradeThreeWay()));
@@ -10212,34 +9609,25 @@ int main()
   blending.name = "Blending";
   blending.lo = 0;
   blending.hi = 100;
-  blending.get = []
-  { return state.adjust.grade().blending; };
-  blending.set = [](float v)
-  {
-    gradeEdit([&](ColorGrade &g)
-              { g.blending = std::round(v); }, 16);
+  blending.get = [] { return state.adjust.grade().blending; };
+  blending.set = [](float v) {
+    gradeEdit([&](ColorGrade &g) { g.blending = std::round(v); }, 16);
   };
-  blending.format = [](float v)
-  {
+  blending.format = [](float v) {
     return std::to_string(static_cast<int>(std::lround(v)));
   };
-  blending.onEnd = []
-  { state.adjust.endGradeEdit(); };
+  blending.onEnd = [] { state.adjust.endGradeEdit(); };
   gradePane.addChild(buildSliderRow(blending));
 
   SliderSpec balance = blending;
   balance.name = "Balance";
   balance.lo = -100;
   balance.hi = 100;
-  balance.get = []
-  { return state.adjust.grade().balance; };
-  balance.set = [](float v)
-  {
-    gradeEdit([&](ColorGrade &g)
-              { g.balance = std::round(v); }, 17);
+  balance.get = [] { return state.adjust.grade().balance; };
+  balance.set = [](float v) {
+    gradeEdit([&](ColorGrade &g) { g.balance = std::round(v); }, 17);
   };
-  balance.format = [](float v)
-  {
+  balance.format = [](float v) {
     const int i = static_cast<int>(std::lround(v));
     return i > 0 ? "+" + std::to_string(i) : std::to_string(i);
   };
@@ -10257,20 +9645,20 @@ int main()
   maskPane.style.direction = FlexDirection::Column;
   maskPane.style.gap = 6.0f;
   maskPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 7 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 7 ? Display::Flex : Display::None; });
 
   Text maskHint;
-  maskHint.label = std::function<std::string()>([]() -> std::string
-                                                { return state.image
-                                                             ? "Add a mask, then adjust it in the panel on the right. "
-                                                               "Drag the shape on the image to move it, or its square "
-                                                               "handles to resize (on a linear gradient they also turn "
-                                                               "it). With a brush, drag on the image to paint. With a "
-                                                               "polygon, click to place points (right-click a point "
-                                                               "to remove it) or switch on Freehand lasso and drag. "
-                                                               "Pick another mask from the list."
-                                                             : "Open an image to add masks."; });
+  maskHint.label = std::function<std::string()>([]() -> std::string {
+    return state.image
+               ? "Add a mask, then adjust it in the panel on the right. "
+                 "Drag the shape on the image to move it, or its square "
+                 "handles to resize (on a linear gradient they also turn "
+                 "it). With a brush, drag on the image to paint. With a "
+                 "polygon, click to place points (right-click a point "
+                 "to remove it) or switch on Freehand lasso and drag. "
+                 "Pick another mask from the list."
+               : "Open an image to add masks.";
+  });
   maskHint.fontSize = 12.0f;
   maskHint.color = kColorTextMuted;
   maskHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -10278,45 +9666,29 @@ int main()
 
   // One button per kind of mask.
   maskPane.addChild(sidebarButton(
-      "+ Radial Gradient", []
-      { addMask(MaskType::Radial); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Radial Gradient", [] { addMask(MaskType::Radial); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Linear Gradient", []
-      { addMask(MaskType::Linear); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Linear Gradient", [] { addMask(MaskType::Linear); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Rectangle", []
-      { addMask(MaskType::Rectangle); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Rectangle", [] { addMask(MaskType::Rectangle); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Polygon / Lasso", []
-      { addMask(MaskType::Polygon); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Polygon / Lasso", [] { addMask(MaskType::Polygon); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Brush", []
-      { addMask(MaskType::Brush); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Brush", [] { addMask(MaskType::Brush); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Luminosity Range", []
-      { addMask(MaskType::Luminosity); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Luminosity Range", [] { addMask(MaskType::Luminosity); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Object", []
-      { addMask(MaskType::Object); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Object", [] { addMask(MaskType::Object); }, {}, true,
+      [] { return state.original != nullptr; }));
   maskPane.addChild(sidebarButton(
-      "+ Color Range", []
-      { addMask(MaskType::ColorRange); }, {}, true,
-      []
-      { return state.original != nullptr; }));
+      "+ Color Range", [] { addMask(MaskType::ColorRange); }, {}, true,
+      [] { return state.original != nullptr; }));
 
   for (size_t i = 0; i < kMaxMasks; ++i)
     maskPane.addChild(buildMaskRow(i));
@@ -10330,28 +9702,26 @@ int main()
   maskEditor.style.direction = FlexDirection::Column;
   maskEditor.style.gap = 12.0f;
   maskEditor.style.display = std::function<Display()>(
-      []
-      { return selMask() >= 0 ? Display::Flex : Display::None; });
+      [] { return selMask() >= 0 ? Display::Flex : Display::None; });
 
   // Equal-width chip / tab: `n` of them share a row of the panel.
   const auto maskChipFn = [](std::function<std::string()> label, int n,
                              std::function<void()> onClick,
-                             std::function<bool()> selected)
-  {
+                             std::function<bool()> selected) {
     View c;
-    c.style.width = std::function<Size()>([n]
-                                          { return Size::pixel(maskChipW(n)); });
+    c.style.width =
+        std::function<Size()>([n] { return Size::pixel(maskChipW(n)); });
     c.style.height = Size::pixel(26);
     c.style.flexShrink = 0;
     c.style.borderRadius = 4.0f;
     c.style.justifyContent = Justify::Center;
     c.style.alignItems = Align::Center;
     c.style.hoverColor = kColorActivityHover;
-    c.style.backgroundColor = std::function<Color()>([selected]() -> Color
-                                                     { return selected() ? kColorDropdownRowHover : kColorActivityBarBg; });
-    c.style.borderWidth = std::function<float()>(
-        [selected]
-        { return selected() ? 1.0f : 0.0f; });
+    c.style.backgroundColor = std::function<Color()>([selected]() -> Color {
+      return selected() ? kColorDropdownRowHover : kColorActivityBarBg;
+    });
+    c.style.borderWidth =
+        std::function<float()>([selected] { return selected() ? 1.0f : 0.0f; });
     c.style.borderColor = kColorDividerHover;
     c.onClick = std::move(onClick);
     Text t;
@@ -10366,12 +9736,10 @@ int main()
   // Same chip with a fixed label.
   const auto maskChip = [maskChipFn](const char *label, int n,
                                      std::function<void()> onClick,
-                                     std::function<bool()> selected)
-  {
+                                     std::function<bool()> selected) {
     const std::string text = label;
-    return maskChipFn([text]
-                      { return text; },
-                      n, std::move(onClick), std::move(selected));
+    return maskChipFn([text] { return text; }, n, std::move(onClick),
+                      std::move(selected));
   };
 
   View maskFlags;
@@ -10380,44 +9748,36 @@ int main()
   maskFlags.style.flexShrink = 0;
   maskFlags.addChild(maskChip(
       "On", 3,
-      []
-      { maskEditDiscrete([](Mask &m)
-                         { m.enabled = !m.enabled; }); },
-      []
-      {
+      [] { maskEditDiscrete([](Mask &m) { m.enabled = !m.enabled; }); },
+      [] {
         const Mask *m = selectedMask();
         return m && m->enabled;
       }));
   maskFlags.addChild(maskChip(
       "Invert", 3,
-      []
-      { maskEditDiscrete([](Mask &m)
-                         { m.invert = !m.invert; }); },
-      []
-      {
+      [] { maskEditDiscrete([](Mask &m) { m.invert = !m.invert; }); },
+      [] {
         const Mask *m = selectedMask();
         return m && m->invert;
       }));
   maskFlags.addChild(maskChip(
       "Tint", 3,
-      []
-      {
+      [] {
         bool &flag = tintFlag();
         flag = !flag;
         state.markDirty();
       },
-      []
-      { return tintFlag(); }));
+      [] { return tintFlag(); }));
 
   // Name field. TextInput is Canvas-backed and wires up the caret, click to
   // place it, arrows, Backspace / Delete, Ctrl+V and Enter itself.
   View maskNameRow;
   maskNameRow.style.width = Size::full();
   maskNameRow.style.flexShrink = 0;
-  maskNameRow.style.display = std::function<Display()>([]() -> Display
-                                                       {
+  maskNameRow.style.display = std::function<Display()>([]() -> Display {
     syncMaskNameField(); // polled every cycle: follows selection and undo
-    return Display::Flex; });
+    return Display::Flex;
+  });
   {
     TextInput ti;
     ti.placeholder = "Name this mask";
@@ -10432,12 +9792,13 @@ int main()
     ti.style.borderWidth = 1.0f;
     ti.style.borderRadius = 4.0f;
     ti.style.backgroundColor = kColorActivityBarBg;
-    ti.onChange = [](const std::string &s)
-    { renameSelectedMask(s); };
-    ti.onSubmit = [](const std::string &)
-    { state.adjust.endMaskEdit(); }; // Enter closes the undo step
+    ti.onChange = [](const std::string &s) { renameSelectedMask(s); };
+    ti.onSubmit = [](const std::string &) {
+      state.adjust.endMaskEdit();
+    }; // Enter closes the undo step
     gMaskNameState = ti.state;
     maskNameRow.addChild(std::move(ti));
+    registerTextField(gMaskNameState, maskNameRow.children.back());
   }
   maskEditor.addChild(std::move(maskNameRow));
 
@@ -10450,22 +9811,19 @@ int main()
   maskTintRow.style.flexShrink = 0;
   for (int k = 0; k < kMaskTintCount; ++k)
     maskTintRow.addChild(maskChip(
-        kMaskTintPalette[k].name, kMaskTintCount,
-        [k]
-        { setMaskTintColor(k); },
-        [k]
-        { return state.maskTintColor == k; }));
+        kMaskTintPalette[k].name, kMaskTintCount, [k] { setMaskTintColor(k); },
+        [k] { return state.maskTintColor == k; }));
   maskEditor.addChild(std::move(maskTintRow));
 
   // The three tab bodies. Only the one picked in state.maskTab is shown.
-  const auto maskTabView = [](int tab)
-  {
+  const auto maskTabView = [](int tab) {
     View v;
     v.style.width = Size::full();
     v.style.direction = FlexDirection::Column;
     v.style.gap = 12.0f;
-    v.style.display = std::function<Display()>([tab]() -> Display
-                                               { return state.maskTab == tab ? Display::Flex : Display::None; });
+    v.style.display = std::function<Display()>([tab]() -> Display {
+      return state.maskTab == tab ? Display::Flex : Display::None;
+    });
     return v;
   };
   View maskTabEffect = maskTabView(0);
@@ -10486,50 +9844,40 @@ int main()
   opRow.style.width = Size::full();
   opRow.style.direction = FlexDirection::Column;
   opRow.style.gap = 6.0f;
-  opRow.style.display = std::function<Display()>(
-      []() -> Display
-      { return selPart() > 0 ? Display::Flex : Display::None; });
+  opRow.style.display = std::function<Display()>([]() -> Display {
+    return selPart() > 0 ? Display::Flex : Display::None;
+  });
   for (const MaskOp op : {MaskOp::Add, MaskOp::Subtract, MaskOp::Intersect})
     opRow.addChild(sidebarButton(
-        maskOpName(op), [op]
-        { setPartOp(op); },
-        [op]
-        {
+        maskOpName(op), [op] { setPartOp(op); },
+        [op] {
           const MaskPart *p = selectedPart();
           return p && selPart() > 0 && p->op == op;
         }));
   partsSec.addChild(std::move(opRow));
-  partsSec.addChild(sidebarButton("+ Part: Radial",
-                                  []
-                                  { addPart(MaskType::Radial); }));
-  partsSec.addChild(sidebarButton("+ Part: Linear",
-                                  []
-                                  { addPart(MaskType::Linear); }));
-  partsSec.addChild(sidebarButton("+ Part: Rectangle",
-                                  []
-                                  { addPart(MaskType::Rectangle); }));
-  partsSec.addChild(sidebarButton("+ Part: Polygon",
-                                  []
-                                  { addPart(MaskType::Polygon); }));
-  partsSec.addChild(sidebarButton("+ Part: Brush",
-                                  []
-                                  { addPart(MaskType::Brush); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Radial", [] { addPart(MaskType::Radial); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Linear", [] { addPart(MaskType::Linear); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Rectangle", [] { addPart(MaskType::Rectangle); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Polygon", [] { addPart(MaskType::Polygon); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Brush", [] { addPart(MaskType::Brush); }));
   partsSec.addChild(sidebarButton("+ Part: Luminosity",
-                                  []
-                                  { addPart(MaskType::Luminosity); }));
-  partsSec.addChild(sidebarButton("+ Part: Object",
-                                  []
-                                  { addPart(MaskType::Object); }));
+                                  [] { addPart(MaskType::Luminosity); }));
+  partsSec.addChild(
+      sidebarButton("+ Part: Object", [] { addPart(MaskType::Object); }));
   partsSec.addChild(sidebarButton("+ Part: Color Range",
-                                  []
-                                  { addPart(MaskType::ColorRange); }));
+                                  [] { addPart(MaskType::ColorRange); }));
 
   View removeRow;
   removeRow.style.width = Size::full();
-  removeRow.style.display = std::function<Display()>([]() -> Display
-                                                     {
+  removeRow.style.display = std::function<Display()>([]() -> Display {
     const Mask *m = selectedMask();
-    return m && m->parts.size() > 1 ? Display::Flex : Display::None; });
+    return m && m->parts.size() > 1 ? Display::Flex : Display::None;
+  });
   removeRow.addChild(sidebarButton("Remove Part", removeSelectedPart));
   partsSec.addChild(std::move(removeRow));
   maskTabParts.addChild(std::move(partsSec));
@@ -10539,33 +9887,26 @@ int main()
   radialShape.style.width = Size::full();
   radialShape.style.direction = FlexDirection::Column;
   radialShape.style.gap = 12.0f;
-  radialShape.style.display = std::function<Display()>([]() -> Display
-                                                       { return selectedPartType() == MaskType::Radial ? Display::Flex
-                                                                                                       : Display::None; });
+  radialShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Radial ? Display::Flex
+                                                  : Display::None;
+  });
   radialShape.addChild(sectionLabel("Shape"));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Width", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RadialShape &r)
-      { return r.rx * 100.0f; },
-      [](RadialShape &r, float v)
-      { r.rx = v / 100.0f; }, kMaskCtlWidth)));
+      [](const RadialShape &r) { return r.rx * 100.0f; },
+      [](RadialShape &r, float v) { r.rx = v / 100.0f; }, kMaskCtlWidth)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Height", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RadialShape &r)
-      { return r.ry * 100.0f; },
-      [](RadialShape &r, float v)
-      { r.ry = v / 100.0f; }, kMaskCtlHeight)));
+      [](const RadialShape &r) { return r.ry * 100.0f; },
+      [](RadialShape &r, float v) { r.ry = v / 100.0f; }, kMaskCtlHeight)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
-      "Angle", -90.0f, 90.0f, [](const RadialShape &r)
-      { return r.angle; },
-      [](RadialShape &r, float v)
-      { r.angle = v; }, kMaskCtlAngle)));
+      "Angle", -90.0f, 90.0f, [](const RadialShape &r) { return r.angle; },
+      [](RadialShape &r, float v) { r.angle = v; }, kMaskCtlAngle)));
   radialShape.addChild(buildSliderRow(maskRadialSlider(
       "Feather", 0.0f, 100.0f,
-      [](const RadialShape &r)
-      { return r.feather * 100.0f; },
-      [](RadialShape &r, float v)
-      { r.feather = v / 100.0f; },
+      [](const RadialShape &r) { return r.feather * 100.0f; },
+      [](RadialShape &r, float v) { r.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskTabShape.addChild(std::move(radialShape));
 
@@ -10573,105 +9914,97 @@ int main()
   rectShape.style.width = Size::full();
   rectShape.style.direction = FlexDirection::Column;
   rectShape.style.gap = 12.0f;
-  rectShape.style.display = std::function<Display()>([]() -> Display
-                                                     { return selectedPartType() == MaskType::Rectangle ? Display::Flex
-                                                                                                        : Display::None; });
+  rectShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Rectangle ? Display::Flex
+                                                     : Display::None;
+  });
   rectShape.addChild(sectionLabel("Shape"));
   rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
       "Width", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RectShape &r)
-      { return r.rx * 100.0f; },
-      [](RectShape &r, float v)
-      { r.rx = v / 100.0f; }, kMaskCtlWidth)));
+      [](const RectShape &r) { return r.rx * 100.0f; },
+      [](RectShape &r, float v) { r.rx = v / 100.0f; }, kMaskCtlWidth)));
   rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
       "Height", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const RectShape &r)
-      { return r.ry * 100.0f; },
-      [](RectShape &r, float v)
-      { r.ry = v / 100.0f; }, kMaskCtlHeight)));
+      [](const RectShape &r) { return r.ry * 100.0f; },
+      [](RectShape &r, float v) { r.ry = v / 100.0f; }, kMaskCtlHeight)));
   rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
-      "Angle", -90.0f, 90.0f, [](const RectShape &r)
-      { return r.angle; },
-      [](RectShape &r, float v)
-      { r.angle = v; }, kMaskCtlAngle)));
+      "Angle", -90.0f, 90.0f, [](const RectShape &r) { return r.angle; },
+      [](RectShape &r, float v) { r.angle = v; }, kMaskCtlAngle)));
   rectShape.addChild(buildSliderRow(maskShapeSlider<RectShape>(
       "Feather", 0.0f, 100.0f,
-      [](const RectShape &r)
-      { return r.feather * 100.0f; },
-      [](RectShape &r, float v)
-      { r.feather = v / 100.0f; },
-      kMaskCtlFeather)));
+      [](const RectShape &r) { return r.feather * 100.0f; },
+      [](RectShape &r, float v) { r.feather = v / 100.0f; }, kMaskCtlFeather)));
   maskTabShape.addChild(std::move(rectShape));
 
   View polyShape;
   polyShape.style.width = Size::full();
   polyShape.style.direction = FlexDirection::Column;
   polyShape.style.gap = 12.0f;
-  polyShape.style.display = std::function<Display()>([]() -> Display
-                                                     { return selectedPartType() == MaskType::Polygon ? Display::Flex
-                                                                                                      : Display::None; });
+  polyShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Polygon ? Display::Flex
+                                                   : Display::None;
+  });
   polyShape.addChild(sectionLabel("Polygon"));
   {
     Text t;
-    t.label = std::function<std::string()>([]() -> std::string
-                                           {
+    t.label = std::function<std::string()>([]() -> std::string {
       const MaskPart *p = selectedPart();
       const auto *s = p ? std::get_if<PolygonShape>(&p->shape) : nullptr;
       const size_t n = s ? s->pts.size() : 0;
       if (state.mask.polyLasso)
-        return "Drag on the picture to draw an outline (it replaces the current one)";
+        return "Drag on the picture to draw an outline (it replaces the "
+               "current one)";
       if (n == 0)
         return "Click the picture to place the first point";
       if (n < 3)
-        return std::to_string(n) + " point(s): add at least 3 to select an area";
-      return std::to_string(n) + " points. Click outside to add one, drag a point or side, "
-                                 "drag inside to move, right-click a point to remove it"; });
+        return std::to_string(n) +
+               " point(s): add at least 3 to select an area";
+      return std::to_string(n) +
+             " points. Click outside to add one, drag a point or side, "
+             "drag inside to move, right-click a point to remove it";
+    });
     t.fontSize = 12.0f;
     t.color = kColorTextMuted;
     polyShape.addChild(std::move(t));
   }
   polyShape.addChild(buildSliderRow(maskShapeSlider<PolygonShape>(
       "Feather", 0.0f, 100.0f,
-      [](const PolygonShape &s)
-      { return s.feather * 100.0f; },
-      [](PolygonShape &s, float v)
-      { s.feather = v / 100.0f; },
+      [](const PolygonShape &s) { return s.feather * 100.0f; },
+      [](PolygonShape &s, float v) { s.feather = v / 100.0f; },
       kMaskCtlFeather)));
   polyShape.addChild(sidebarButton(
       "Freehand lasso",
-      []
-      { state.mask.polyLasso = !state.mask.polyLasso; state.markDirty(); },
-      []
-      { return state.mask.polyLasso; }));
-  polyShape.addChild(sidebarButton("Clear points", []
-                                   {
+      [] {
+        state.mask.polyLasso = !state.mask.polyLasso;
+        state.markDirty();
+      },
+      [] { return state.mask.polyLasso; }));
+  polyShape.addChild(sidebarButton("Clear points", [] {
     const size_t part = static_cast<size_t>(selPart());
     const GeoFrame frame = state.adjust.geoFrame();
     maskEditDiscrete([&](Mask &m) {
       editShapeInView<PolygonShape>(m, part, frame,
                                     [](PolygonShape &s) { s.pts.clear(); });
-    }); }));
+    });
+  }));
   maskTabShape.addChild(std::move(polyShape));
 
   View linearShape;
   linearShape.style.width = Size::full();
   linearShape.style.direction = FlexDirection::Column;
   linearShape.style.gap = 12.0f;
-  linearShape.style.display = std::function<Display()>([]() -> Display
-                                                       { return selectedPartType() == MaskType::Linear ? Display::Flex
-                                                                                                       : Display::None; });
+  linearShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Linear ? Display::Flex
+                                                  : Display::None;
+  });
   linearShape.addChild(sectionLabel("Shape"));
   linearShape.addChild(buildSliderRow(maskLinearSlider(
       "Length", kMaskMinRadius * 100.0f, kMaskMaxRadius * 100.0f,
-      [](const LinearShape &l)
-      { return l.len * 100.0f; },
-      [](LinearShape &l, float v)
-      { l.len = v / 100.0f; }, kMaskCtlLength)));
+      [](const LinearShape &l) { return l.len * 100.0f; },
+      [](LinearShape &l, float v) { l.len = v / 100.0f; }, kMaskCtlLength)));
   linearShape.addChild(buildSliderRow(maskLinearSlider(
-      "Angle", -180.0f, 180.0f, [](const LinearShape &l)
-      { return l.angle; },
-      [](LinearShape &l, float v)
-      { l.angle = v; }, kMaskCtlAngle)));
+      "Angle", -180.0f, 180.0f, [](const LinearShape &l) { return l.angle; },
+      [](LinearShape &l, float v) { l.angle = v; }, kMaskCtlAngle)));
   maskTabShape.addChild(std::move(linearShape));
 
   // Luminosity range (shown for a luminosity mask): which brightnesses it
@@ -10680,30 +10013,25 @@ int main()
   lumShape.style.width = Size::full();
   lumShape.style.direction = FlexDirection::Column;
   lumShape.style.gap = 12.0f;
-  lumShape.style.display = std::function<Display()>([]() -> Display
-                                                    { return selectedPartType() == MaskType::Luminosity ? Display::Flex
-                                                                                                        : Display::None; });
+  lumShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Luminosity ? Display::Flex
+                                                      : Display::None;
+  });
   lumShape.addChild(sectionLabel("Range"));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Min", 0.0f, 100.0f,
-      [](const LuminosityShape &l)
-      { return l.lo * 100.0f; },
-      [](LuminosityShape &l, float v)
-      { l.setLo(v / 100.0f); },
+      [](const LuminosityShape &l) { return l.lo * 100.0f; },
+      [](LuminosityShape &l, float v) { l.setLo(v / 100.0f); },
       kMaskCtlLumLo)));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Max", 0.0f, 100.0f,
-      [](const LuminosityShape &l)
-      { return l.hi * 100.0f; },
-      [](LuminosityShape &l, float v)
-      { l.setHi(v / 100.0f); },
+      [](const LuminosityShape &l) { return l.hi * 100.0f; },
+      [](LuminosityShape &l, float v) { l.setHi(v / 100.0f); },
       kMaskCtlLumHi)));
   lumShape.addChild(buildSliderRow(maskShapeSlider<LuminosityShape>(
       "Smoothness", 0.0f, 100.0f,
-      [](const LuminosityShape &l)
-      { return l.feather * 100.0f; },
-      [](LuminosityShape &l, float v)
-      { l.feather = v / 100.0f; },
+      [](const LuminosityShape &l) { return l.feather * 100.0f; },
+      [](LuminosityShape &l, float v) { l.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskTabShape.addChild(std::move(lumShape));
 
@@ -10711,36 +10039,33 @@ int main()
   crShape.style.width = Size::full();
   crShape.style.direction = FlexDirection::Column;
   crShape.style.gap = 12.0f;
-  crShape.style.display = std::function<Display()>([]() -> Display
-                                                   { return selectedPartType() == MaskType::ColorRange ? Display::Flex
-                                                                                                       : Display::None; });
+  crShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::ColorRange ? Display::Flex
+                                                      : Display::None;
+  });
   crShape.addChild(sectionLabel("Color Range"));
   {
     View hint;
     Text t;
-    t.label = std::function<std::string()>([]() -> std::string
-                                           {
+    t.label = std::function<std::string()>([]() -> std::string {
       const MaskPart *p = selectedPart();
       const auto *s = p ? std::get_if<ColorRangeShape>(&p->shape) : nullptr;
       return s && s->set ? "Click the picture to pick another color"
-                         : "Click the picture to pick a color"; });
+                         : "Click the picture to pick a color";
+    });
     t.fontSize = 12.0f;
     t.color = kColorTextMuted;
     crShape.addChild(std::move(t));
   }
   crShape.addChild(buildSliderRow(maskShapeSlider<ColorRangeShape>(
       "Range", 0.0f, 100.0f,
-      [](const ColorRangeShape &s)
-      { return s.range * 100.0f; },
-      [](ColorRangeShape &s, float v)
-      { s.range = v / 100.0f; },
+      [](const ColorRangeShape &s) { return s.range * 100.0f; },
+      [](ColorRangeShape &s, float v) { s.range = v / 100.0f; },
       kMaskCtlRange)));
   crShape.addChild(buildSliderRow(maskShapeSlider<ColorRangeShape>(
       "Smoothness", 0.0f, 100.0f,
-      [](const ColorRangeShape &s)
-      { return s.feather * 100.0f; },
-      [](ColorRangeShape &s, float v)
-      { s.feather = v / 100.0f; },
+      [](const ColorRangeShape &s) { return s.feather * 100.0f; },
+      [](ColorRangeShape &s, float v) { s.feather = v / 100.0f; },
       kMaskCtlFeather)));
   maskTabShape.addChild(std::move(crShape));
 
@@ -10748,16 +10073,14 @@ int main()
   // strokes already painted keep the values they were painted with.
   const auto brushSlider = [](const char *name, float lo, float hi,
                               std::function<float()> get,
-                              std::function<void(float)> set)
-  {
+                              std::function<void(float)> set) {
     SliderSpec s;
     s.name = name;
     s.lo = lo;
     s.hi = hi;
     s.get = std::move(get);
     s.set = std::move(set);
-    s.format = [](float v)
-    {
+    s.format = [](float v) {
       return std::to_string(static_cast<int>(std::lround(v)));
     };
     s.affectsPixels = false;
@@ -10768,89 +10091,82 @@ int main()
   brushShape.style.width = Size::full();
   brushShape.style.direction = FlexDirection::Column;
   brushShape.style.gap = 12.0f;
-  brushShape.style.display = std::function<Display()>(
-      []() -> Display
-      { return selectedIsBrush() ? Display::Flex : Display::None; });
+  brushShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedIsBrush() ? Display::Flex : Display::None;
+  });
   brushShape.addChild(sidebarButton(
       "Erase",
-      []
-      {
+      [] {
         state.mask.brushErase = !state.mask.brushErase;
         state.markDirty();
       },
-      []
-      { return state.mask.brushErase; }));
+      [] { return state.mask.brushErase; }));
   brushShape.addChild(brushSlider(
       "Size", 1.0f, kBrushMaxSize * 100.0f,
-      []
-      { return state.mask.brushSize * 100.0f; },
-      [](float v)
-      {
+      [] { return state.mask.brushSize * 100.0f; },
+      [](float v) {
         state.mask.brushSize =
             std::clamp(v / 100.0f, kBrushMinSize, kBrushMaxSize);
       }));
   brushShape.addChild(brushSlider(
-      "Feather", 0.0f, 100.0f, []
-      { return state.mask.brushFeather * 100.0f; },
-      [](float v)
-      { state.mask.brushFeather = std::clamp(v / 100.0f, 0.0f, 1.0f); }));
+      "Feather", 0.0f, 100.0f, [] { return state.mask.brushFeather * 100.0f; },
+      [](float v) {
+        state.mask.brushFeather = std::clamp(v / 100.0f, 0.0f, 1.0f);
+      }));
   brushShape.addChild(brushSlider(
-      "Density", 1.0f, 100.0f, []
-      { return state.mask.brushDensity * 100.0f; },
-      [](float v)
-      { state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
+      "Density", 1.0f, 100.0f, [] { return state.mask.brushDensity * 100.0f; },
+      [](float v) {
+        state.mask.brushDensity = std::clamp(v / 100.0f, 0.01f, 1.0f);
+      }));
   brushShape.addChild(brushSlider(
-      "Flow", 1.0f, 100.0f, []
-      { return state.mask.brushFlow * 100.0f; },
-      [](float v)
-      { state.mask.brushFlow = std::clamp(v / 100.0f, 0.01f, 1.0f); }));
-  brushShape.addChild(sidebarButton("Clear Strokes", []
-                                    {
+      "Flow", 1.0f, 100.0f, [] { return state.mask.brushFlow * 100.0f; },
+      [](float v) {
+        state.mask.brushFlow = std::clamp(v / 100.0f, 0.01f, 1.0f);
+      }));
+  brushShape.addChild(sidebarButton("Clear Strokes", [] {
     const size_t part = static_cast<size_t>(selPart());
     maskEditDiscrete([part](Mask &m) {
       if (part < m.parts.size())
         if (auto *b = std::get_if<BrushShape>(&m.parts[part].shape))
           b->strokes.clear();
-    }); }));
-  maskEditor.addChild(std::move(brushShape)); // pinned above the tabs: size/feather
-                                              // are used while painting
+    });
+  }));
+  maskEditor.addChild(
+      std::move(brushShape)); // pinned above the tabs: size/feather
+                              // are used while painting
 
   View objectShape;
   objectShape.style.width = Size::full();
   objectShape.style.direction = FlexDirection::Column;
   objectShape.style.gap = 12.0f;
-  objectShape.style.display = std::function<Display()>([]() -> Display
-                                                       { return selectedPartType() == MaskType::Object ? Display::Flex
-                                                                                                       : Display::None; });
-  objectShape.addChild(sidebarButton("Set test map (bright areas)", []
-                                     {
-  if (auto m = makeTestObjectMap())
-    setSelectedObjectMap(std::move(m)); }));
+  objectShape.style.display = std::function<Display()>([]() -> Display {
+    return selectedPartType() == MaskType::Object ? Display::Flex
+                                                  : Display::None;
+  });
+  objectShape.addChild(sidebarButton("Set test map (bright areas)", [] {
+    if (auto m = makeTestObjectMap())
+      setSelectedObjectMap(std::move(m));
+  }));
   objectShape.addChild(buildSliderRow(maskShapeSlider<ObjectShape>(
       "Feather", 0.0f, 100.0f,
-      [](const ObjectShape &o)
-      { return o.feather * 100.0f; },
-      [](ObjectShape &o, float v)
-      { o.feather = v / 100.0f; },
+      [](const ObjectShape &o) { return o.feather * 100.0f; },
+      [](ObjectShape &o, float v) { o.feather = v / 100.0f; },
       kMaskCtlFeather)));
   objectShape.addChild(buildSliderRow(maskShapeSlider<ObjectShape>(
       "Grow", -100.0f, 100.0f,
-      [](const ObjectShape &o)
-      { return o.grow * 100.0f; },
-      [](ObjectShape &o, float v)
-      { o.grow = v / 100.0f; },
-      kMaskCtlWidth)));
+      [](const ObjectShape &o) { return o.grow * 100.0f; },
+      [](ObjectShape &o, float v) { o.grow = v / 100.0f; }, kMaskCtlWidth)));
   objectShape.addChild(sidebarButton(
       "Click adds: Background",
-      []
-      { state.mask.objBg = !state.mask.objBg; state.markDirty(); },
-      []
-      { return state.mask.objBg; }));
+      [] {
+        state.mask.objBg = !state.mask.objBg;
+        state.markDirty();
+      },
+      [] { return state.mask.objBg; }));
   objectShape.addChild(sidebarButton("Clear selection", clearSelectedObject));
   {
     Text segInfo;
-    segInfo.label = std::function<std::string()>([]
-                                                 { return getSegInfo(); });
+    segInfo.label = std::function<std::string()>([] { return getSegInfo(); });
     segInfo.fontSize = 11.0f;
     segInfo.color = kColorTextFaint;
     objectShape.addChild(std::move(segInfo));
@@ -10860,22 +10176,21 @@ int main()
   // ---- Effect tab ----
   // A second row of chips picks Basic / Mix / Grade / Curve; a bullet marks
   // a section that has been changed for this mask.
-  const auto chipRow = []
-  {
+  const auto chipRow = [] {
     View r;
     r.style.direction = FlexDirection::Row;
     r.style.gap = 4.0f;
     r.style.flexShrink = 0;
     return r;
   };
-  const auto maskFxView = [](int fx)
-  {
+  const auto maskFxView = [](int fx) {
     View v;
     v.style.width = Size::full();
     v.style.direction = FlexDirection::Column;
     v.style.gap = 12.0f;
-    v.style.display = std::function<Display()>([fx]() -> Display
-                                               { return state.maskFx == fx ? Display::Flex : Display::None; });
+    v.style.display = std::function<Display()>([fx]() -> Display {
+      return state.maskFx == fx ? Display::Flex : Display::None;
+    });
     return v;
   };
   View fxBasic = maskFxView(0);
@@ -10885,45 +10200,43 @@ int main()
 
   // Basic: Amount plus the same table as the Adjust pane.
   fxBasic.addChild(buildMaskAmountSlider());
-  bool maskColorHeaderAdded = false, maskFiltersHeaderAdded = false, maskDetailHeaderAdded = false;
+  bool maskColorHeaderAdded = false, maskFiltersHeaderAdded = false,
+       maskDetailHeaderAdded = false;
   fxBasic.addChild(sectionLabel("Tone"));
-  for (const auto &spec : kAdjustmentSpecs)
-  {
+  for (const auto &spec : kAdjustmentSpecs) {
     // Vignette and Grain are global only (renderWith applies them after the
     // masks), and so is the 3D LUT: a mask gets no sliders for them.
-    if (spec.stage == AdjustmentSpec::Stage::Effects || spec.id == AdjId::LutAmount)
+    if (spec.stage == AdjustmentSpec::Stage::Effects ||
+        spec.id == AdjId::LutAmount)
       continue;
-    if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color)
-    {
+    if (!maskColorHeaderAdded && spec.stage == AdjustmentSpec::Stage::Color) {
       fxBasic.addChild(sectionLabel("Color"));
       maskColorHeaderAdded = true;
     }
-    if (!maskFiltersHeaderAdded && spec.id == AdjId::Greyscale)
-    {
+    if (!maskFiltersHeaderAdded && spec.id == AdjId::Greyscale) {
       fxBasic.addChild(sectionLabel("Filters"));
       maskFiltersHeaderAdded = true;
     }
-    if (!maskDetailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail)
-    {
+    if (!maskDetailHeaderAdded && spec.stage == AdjustmentSpec::Stage::Detail) {
       fxBasic.addChild(sectionLabel("Detail"));
       maskDetailHeaderAdded = true;
     }
     fxBasic.addChild(buildMaskAdjustmentSlider(spec));
   }
-  fxBasic.addChild(sidebarButton("Reset Basic", []
-                                 { maskEditDiscrete([](Mask &m)
-                                                    { m.adj.fill(0.0f);
-                                                      m.amount = 100.0f; }); }));
+  fxBasic.addChild(sidebarButton("Reset Basic", [] {
+    maskEditDiscrete([](Mask &m) {
+      m.adj.fill(0.0f);
+      m.amount = 100.0f;
+    });
+  }));
 
   // Mix: Hue / Sat / Lum chips, eight band sliders each.
   {
     View chanRow = chipRow();
-    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
-    {
+    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
       const auto chan = static_cast<MixChan>(c);
       chanRow.addChild(maskChipFn(
-          [chan]() -> std::string
-          {
+          [chan]() -> std::string {
             std::string name = chan == MixChan::Hue          ? "Hue"
                                : chan == MixChan::Saturation ? "Sat"
                                                              : "Lum";
@@ -10932,28 +10245,26 @@ int main()
               name += " \u2022";
             return name;
           },
-          3, [chan]
-          { gMaskMixChan = chan; },
-          [chan]
-          { return gMaskMixChan == chan; }));
+          3, [chan] { gMaskMixChan = chan; },
+          [chan] { return gMaskMixChan == chan; }));
     }
     fxMix.addChild(std::move(chanRow));
-    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c)
-    {
+    for (int c = 0; c < static_cast<int>(kMixChanCount); ++c) {
       const auto chan = static_cast<MixChan>(c);
       View group;
       group.style.width = Size::full();
       group.style.direction = FlexDirection::Column;
       group.style.gap = 12.0f;
-      group.style.display = std::function<Display()>([chan]() -> Display
-                                                     { return gMaskMixChan == chan ? Display::Flex : Display::None; });
+      group.style.display = std::function<Display()>([chan]() -> Display {
+        return gMaskMixChan == chan ? Display::Flex : Display::None;
+      });
       for (size_t band = 0; band < kMixBandCount; ++band)
         group.addChild(buildMaskMixSlider(chan, band));
       fxMix.addChild(std::move(group));
     }
-    fxMix.addChild(sidebarButton("Reset Color Mix", []
-                                 { maskEditDiscrete([](Mask &m)
-                                                    { m.mix.fill(0.0f); }); }));
+    fxMix.addChild(sidebarButton("Reset Color Mix", [] {
+      maskEditDiscrete([](Mask &m) { m.mix.fill(0.0f); });
+    }));
   }
 
   // Grade: one chip per range, Hue / Saturation / Luminance sliders for the
@@ -10964,48 +10275,46 @@ int main()
     View rangeRow = chipRow();
     for (int r = 0; r < static_cast<int>(kGradeRangeCount); ++r)
       rangeRow.addChild(maskChipFn(
-          [r]() -> std::string
-          {
+          [r]() -> std::string {
             std::string name = rangeShort[r];
             const Mask *m = selectedMask();
             if (m && !m->grade.wheel[static_cast<size_t>(r)].neutral())
               name += " \u2022";
             return name;
           },
-          4, [r]
-          { gMaskGradeRange = r; },
-          [r]
-          { return gMaskGradeRange == r; }));
+          4, [r] { gMaskGradeRange = r; },
+          [r] { return gMaskGradeRange == r; }));
     fxGrade.addChild(std::move(rangeRow));
-    for (int r = 0; r < static_cast<int>(kGradeRangeCount); ++r)
-    {
+    for (int r = 0; r < static_cast<int>(kGradeRangeCount); ++r) {
       View group;
       group.style.width = Size::full();
       group.style.direction = FlexDirection::Column;
       group.style.gap = 12.0f;
-      group.style.display = std::function<Display()>([r]() -> Display
-                                                     { return gMaskGradeRange == r ? Display::Flex : Display::None; });
-      group.addChild(buildMaskGradeSlider("Hue", r, &GradeWheel::hue, 0, 0.0f, 359.0f, false));
-      group.addChild(buildMaskGradeSlider("Saturation", r, &GradeWheel::sat, 1, 0.0f, 100.0f, false));
-      group.addChild(buildMaskGradeSlider("Luminance", r, &GradeWheel::lum, 2, -100.0f, 100.0f, true));
+      group.style.display = std::function<Display()>([r]() -> Display {
+        return gMaskGradeRange == r ? Display::Flex : Display::None;
+      });
+      group.addChild(buildMaskGradeSlider("Hue", r, &GradeWheel::hue, 0, 0.0f,
+                                          359.0f, false));
+      group.addChild(buildMaskGradeSlider("Saturation", r, &GradeWheel::sat, 1,
+                                          0.0f, 100.0f, false));
+      group.addChild(buildMaskGradeSlider("Luminance", r, &GradeWheel::lum, 2,
+                                          -100.0f, 100.0f, true));
       fxGrade.addChild(std::move(group));
     }
     fxGrade.addChild(buildMaskGradeShared(false));
     fxGrade.addChild(buildMaskGradeShared(true));
-    fxGrade.addChild(sidebarButton("Reset Color Grading", []
-                                   { maskEditDiscrete([](Mask &m)
-                                                      { m.grade = ColorGrade{}; }); }));
+    fxGrade.addChild(sidebarButton("Reset Color Grading", [] {
+      maskEditDiscrete([](Mask &m) { m.grade = ColorGrade{}; });
+    }));
   }
 
   // Curve: RGB / R / G / B chips, the plot, a readout and resets.
   {
     View chRow = chipRow();
-    for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c)
-    {
+    for (int c = 0; c < static_cast<int>(kCurveChannelCount); ++c) {
       const auto ch = static_cast<CurveChannel>(c);
       chRow.addChild(maskChipFn(
-          [ch]() -> std::string
-          {
+          [ch]() -> std::string {
             std::string name = ch == CurveChannel::Master  ? "RGB"
                                : ch == CurveChannel::Red   ? "R"
                                : ch == CurveChannel::Green ? "G"
@@ -11015,50 +10324,54 @@ int main()
               name += " \u2022";
             return name;
           },
-          4, [ch]
-          {
+          4,
+          [ch] {
             gMaskCurveActive = -1;
             gMaskCurveCh = ch;
-            gMaskCurveUiDirty = true; },
-          [ch]
-          { return gMaskCurveCh == ch; }));
+            gMaskCurveUiDirty = true;
+          },
+          [ch] { return gMaskCurveCh == ch; }));
     }
     fxCurve.addChild(std::move(chRow));
     fxCurve.addChild(buildMaskCurveCanvas());
 
     Text curveInfo;
-    curveInfo.label = std::function<std::string()>([]() -> std::string
-                                                   {
+    curveInfo.label = std::function<std::string()>([]() -> std::string {
       const CurvePoints p = maskCurveCopy();
       const std::string name = curveChannelName(gMaskCurveCh);
-      if (gMaskCurveActive >= 0 && gMaskCurveActive < static_cast<int>(p.size()))
+      if (gMaskCurveActive >= 0 &&
+          gMaskCurveActive < static_cast<int>(p.size()))
         return name + ": In " +
-               std::to_string(static_cast<int>(std::lround(p[static_cast<size_t>(gMaskCurveActive)].x))) +
+               std::to_string(static_cast<int>(
+                   std::lround(p[static_cast<size_t>(gMaskCurveActive)].x))) +
                "  Out " +
-               std::to_string(static_cast<int>(std::lround(p[static_cast<size_t>(gMaskCurveActive)].y)));
-      return name + ": " + std::to_string(p.size()) + " points"; });
+               std::to_string(static_cast<int>(
+                   std::lround(p[static_cast<size_t>(gMaskCurveActive)].y)));
+      return name + ": " + std::to_string(p.size()) + " points";
+    });
     curveInfo.fontSize = 13.0f;
     curveInfo.color = kColorTextMid;
     fxCurve.addChild(std::move(curveInfo));
 
     Text curveHint;
-    curveHint.label = std::string("Click: add   Drag: move   Right-click: delete");
+    curveHint.label =
+        std::string("Click: add   Drag: move   Right-click: delete");
     curveHint.fontSize = 11.0f;
     curveHint.color = kColorTextFaint;
     fxCurve.addChild(std::move(curveHint));
 
-    fxCurve.addChild(sidebarButton("Reset Curve", []
-                                   {
+    fxCurve.addChild(sidebarButton("Reset Curve", [] {
       gMaskCurveActive = -1;
       gMaskCurveUiDirty = true;
-      maskEditDiscrete([](Mask &m)
-                       { m.curves[static_cast<size_t>(gMaskCurveCh)] = identityCurve(); }); }));
-    fxCurve.addChild(sidebarButton("Reset All Curves", []
-                                   {
+      maskEditDiscrete([](Mask &m) {
+        m.curves[static_cast<size_t>(gMaskCurveCh)] = identityCurve();
+      });
+    }));
+    fxCurve.addChild(sidebarButton("Reset All Curves", [] {
       gMaskCurveActive = -1;
       gMaskCurveUiDirty = true;
-      maskEditDiscrete([](Mask &m)
-                       { m.curves = identityCurves(); }); }));
+      maskEditDiscrete([](Mask &m) { m.curves = identityCurves(); });
+    }));
   }
 
   View fxTabs = chipRow();
@@ -11066,14 +10379,12 @@ int main()
     static const char *const fxNames[4] = {"Basic", "Mix", "Grade", "Curve"};
     for (int t = 0; t < 4; ++t)
       fxTabs.addChild(maskChipFn(
-          [t]() -> std::string
-          {
+          [t]() -> std::string {
             std::string name = fxNames[t];
             const Mask *m = selectedMask();
             bool changed = false;
             if (m)
-              switch (t)
-              {
+              switch (t) {
               case 0:
                 changed = m->amount != 100.0f;
                 for (float v : m->adj)
@@ -11093,10 +10404,7 @@ int main()
               name += " \u2022";
             return name;
           },
-          4, [t]
-          { state.maskFx = t; },
-          [t]
-          { return state.maskFx == t; }));
+          4, [t] { state.maskFx = t; }, [t] { return state.maskFx == t; }));
   }
   maskTabEffect.addChild(std::move(fxTabs));
   maskTabEffect.addChild(std::move(fxBasic));
@@ -11113,10 +10421,8 @@ int main()
     const char *const tabNames[3] = {"Effect", "Shape", "Parts"};
     for (int t = 0; t < 3; ++t)
       maskTabs.addChild(maskChip(
-          tabNames[t], 3, [t]
-          { state.maskTab = t; },
-          [t]
-          { return state.maskTab == t; }));
+          tabNames[t], 3, [t] { state.maskTab = t; },
+          [t] { return state.maskTab == t; }));
   }
   maskEditor.addChild(std::move(maskTabs));
   maskEditor.addChild(std::move(maskTabEffect));
@@ -11124,25 +10430,18 @@ int main()
   maskEditor.addChild(std::move(maskTabParts));
   // Mask list operations. Order matters: masks apply top to bottom.
   View maskOps1 = chipRow();
+  maskOps1.addChild(
+      maskChip("Duplicate", 3, duplicateSelectedMask, [] { return false; }));
   maskOps1.addChild(maskChip(
-      "Duplicate", 3, duplicateSelectedMask, []
-      { return false; }));
+      "Move Up", 3, [] { moveSelectedMask(-1); }, [] { return false; }));
   maskOps1.addChild(maskChip(
-      "Move Up", 3, []
-      { moveSelectedMask(-1); }, []
-      { return false; }));
-  maskOps1.addChild(maskChip(
-      "Move Down", 3, []
-      { moveSelectedMask(+1); }, []
-      { return false; }));
+      "Move Down", 3, [] { moveSelectedMask(+1); }, [] { return false; }));
   maskEditor.addChild(std::move(maskOps1));
   View maskOps2 = chipRow();
-  maskOps2.addChild(maskChip(
-      "Copy Effects", 2, copyMaskEffects, []
-      { return false; }));
-  maskOps2.addChild(maskChip(
-      "Paste Effects", 2, pasteMaskEffects, []
-      { return false; }));
+  maskOps2.addChild(
+      maskChip("Copy Effects", 2, copyMaskEffects, [] { return false; }));
+  maskOps2.addChild(
+      maskChip("Paste Effects", 2, pasteMaskEffects, [] { return false; }));
   maskEditor.addChild(std::move(maskOps2));
   maskEditor.addChild(sidebarButton("Delete Mask", deleteSelectedMask));
   // maskEditor is added to the right-hand panel below (after the canvas).
@@ -11157,15 +10456,15 @@ int main()
   cropPane.style.direction = FlexDirection::Column;
   cropPane.style.gap = 6.0f;
   cropPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 2 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 2 ? Display::Flex : Display::None; });
 
   Text cropHint;
-  cropHint.label = std::function<std::string()>([]() -> std::string
-                                                { return state.image
-                                                             ? "Drag on the image to choose an area. Drag the handles to "
-                                                               "resize, or the inside to move."
-                                                             : "Open an image to crop it."; });
+  cropHint.label = std::function<std::string()>([]() -> std::string {
+    return state.image
+               ? "Drag on the image to choose an area. Drag the handles to "
+                 "resize, or the inside to move."
+               : "Open an image to crop it.";
+  });
   cropHint.fontSize = 12.0f;
   cropHint.color = kColorTextMuted;
   cropHint.style.margin = EdgeInsets{0, 0, 6, 0};
@@ -11180,35 +10479,31 @@ int main()
 
   for (size_t i = 0; i < kCropAspects.size(); ++i)
     cropPane.addChild(sidebarButton(
-        kCropAspects[i].label, [i]
-        { setCropAspect(i); },
-        [i]
-        { return state.crop.aspectIdx == i; }));
+        kCropAspects[i].label, [i] { setCropAspect(i); },
+        [i] { return state.crop.aspectIdx == i; }));
 
   Text cropInfo;
-  cropInfo.label = std::function<std::string()>([]() -> std::string
-                                                {
+  cropInfo.label = std::function<std::string()>([]() -> std::string {
     if (!state.image)
       return std::string();
     const int w = static_cast<int>(std::lround(state.crop.r - state.crop.l));
     const int h = static_cast<int>(std::lround(state.crop.b - state.crop.t));
     return "Selection: " + std::to_string(w) + " x " + std::to_string(h) +
-           " px"; });
+           " px";
+  });
   cropInfo.fontSize = 13.0f;
   cropInfo.color = kColorTextMid;
   cropInfo.style.margin = EdgeInsets{8, 0, 4, 0};
   cropPane.addChild(std::move(cropInfo));
 
   cropPane.addChild(sidebarButton("Apply Crop", applyCrop, {}, true,
-                                  []
-                                  { return !geometryBusy(); }));
-  cropPane.addChild(sidebarButton("Reset Selection", []
-                                  {
+                                  [] { return !geometryBusy(); }));
+  cropPane.addChild(sidebarButton("Reset Selection", [] {
     resetCropSelection();
-    state.markDirty(); }));
+    state.markDirty();
+  }));
   cropPane.addChild(sidebarButton("Remove Crop", removeCrop, {}, false,
-                                  []
-                                  { return !geometryBusy(); }));
+                                  [] { return !geometryBusy(); }));
 
   sidebar.addChild(std::move(cropPane));
 
@@ -11219,36 +10514,31 @@ int main()
   rotatePane.style.direction = FlexDirection::Column;
   rotatePane.style.gap = 6.0f;
   rotatePane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 3 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 3 ? Display::Flex : Display::None; });
 
   Text rotateHint;
-  rotateHint.label = std::function<std::string()>([]() -> std::string
-                                                  { return state.image ? "Turn or flip the whole image, or straighten it with "
-                                                                         "the angle slider. Straightening clears any crop."
-                                                                       : "Open an image to rotate it."; });
+  rotateHint.label = std::function<std::string()>([]() -> std::string {
+    return state.image ? "Turn or flip the whole image, or straighten it with "
+                         "the angle slider. Straightening clears any crop."
+                       : "Open an image to rotate it.";
+  });
   rotateHint.fontSize = 12.0f;
   rotateHint.color = kColorTextMuted;
   rotateHint.style.margin = EdgeInsets{0, 0, 6, 0};
   rotatePane.addChild(std::move(rotateHint));
 
-  const auto geoIdle = []
-  { return !geometryBusy(); };
+  const auto geoIdle = [] { return !geometryBusy(); };
   rotatePane.addChild(sidebarButton(
-      "\u21BA  Rotate Left 90\u00B0", []
-      { applyGeoOp(GeoOp::RotateCCW); }, {},
+      "\u21BA  Rotate Left 90\u00B0", [] { applyGeoOp(GeoOp::RotateCCW); }, {},
       false, geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u21BB  Rotate Right 90\u00B0", []
-      { applyGeoOp(GeoOp::RotateCW); }, {},
+      "\u21BB  Rotate Right 90\u00B0", [] { applyGeoOp(GeoOp::RotateCW); }, {},
       false, geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u2194  Flip Horizontal", []
-      { applyGeoOp(GeoOp::FlipH); }, {}, false,
+      "\u2194  Flip Horizontal", [] { applyGeoOp(GeoOp::FlipH); }, {}, false,
       geoIdle));
   rotatePane.addChild(sidebarButton(
-      "\u2195  Flip Vertical", []
-      { applyGeoOp(GeoOp::FlipV); }, {}, false,
+      "\u2195  Flip Vertical", [] { applyGeoOp(GeoOp::FlipV); }, {}, false,
       geoIdle));
   rotatePane.addChild(sidebarButton("Reset Turns & Flips", resetOrientation, {},
                                     false, geoIdle));
@@ -11266,11 +10556,9 @@ int main()
   angleSlider.name = "Angle";
   angleSlider.lo = -kAngleMax;
   angleSlider.hi = kAngleMax;
-  angleSlider.get = []
-  { return state.adjust.angle(); };
+  angleSlider.get = [] { return state.adjust.angle(); };
   angleSlider.set = setAngleFromSlider;
-  angleSlider.format = [](float v)
-  {
+  angleSlider.format = [](float v) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.1f\u00B0", static_cast<double>(v));
     return std::string(buf);
@@ -11280,8 +10568,7 @@ int main()
 
   // Fine adjustment: the track is ~0.6 degrees per pixel, too coarse for
   // levelling a horizon, so step buttons sit right under it.
-  auto nudgeBtn = [](const std::string &label, float delta)
-  {
+  auto nudgeBtn = [](const std::string &label, float delta) {
     View v;
     v.style.width = Size::pixel(36);
     v.style.height = Size::pixel(26);
@@ -11291,8 +10578,7 @@ int main()
     v.style.alignItems = Align::Center;
     v.style.backgroundColor = kColorActivityBarBg;
     v.style.hoverColor = kColorActivityHover;
-    v.onClick = [delta]
-    { nudgeAngle(delta); };
+    v.onClick = [delta] { nudgeAngle(delta); };
     Text t;
     t.label = label;
     t.fontSize = 11.0f;
@@ -11318,18 +10604,13 @@ int main()
   rotatePane.addChild(std::move(cornersTitle));
 
   rotatePane.addChild(sidebarButton(
-      "Auto-crop empty corners", []
-      { setCornerMode(false); },
-      []
-      { return !state.adjust.expand(); }));
+      "Auto-crop empty corners", [] { setCornerMode(false); },
+      [] { return !state.adjust.expand(); }));
   rotatePane.addChild(sidebarButton(
-      "Keep full canvas", []
-      { setCornerMode(true); },
-      []
-      { return state.adjust.expand(); }));
+      "Keep full canvas", [] { setCornerMode(true); },
+      [] { return state.adjust.expand(); }));
   rotatePane.addChild(
-      sidebarButton("Reset Angle", []
-                    { setAngleDiscrete(0.0f); }));
+      sidebarButton("Reset Angle", [] { setAngleDiscrete(0.0f); }));
 
   sidebar.addChild(std::move(rotatePane));
 
@@ -11340,45 +10621,53 @@ int main()
   exportPane.style.direction = FlexDirection::Column;
   exportPane.style.gap = 6.0f;
   exportPane.style.display = std::function<Display()>(
-      []
-      { return state.activeActivity == 8 ? Display::Flex : Display::None; });
+      [] { return state.activeActivity == 8 ? Display::Flex : Display::None; });
 
   Text exportHint;
-  exportHint.label = std::function<std::string()>([]() -> std::string
-                                                  { return state.image ? "Saves the picture as you see it, with every edit, "
-                                                                         "crop and rotation applied."
-                                                                       : "Open an image to export it."; });
+  exportHint.label = std::function<std::string()>([]() -> std::string {
+    return state.image ? "Saves the picture as you see it, with every edit, "
+                         "crop and rotation applied."
+                       : "Open an image to export it.";
+  });
   exportHint.fontSize = 12.0f;
   exportHint.color = kColorTextMuted;
   exportHint.style.margin = EdgeInsets{0, 0, 6, 0};
   exportPane.addChild(std::move(exportHint));
 
   exportPane.addChild(sidebarButton(
-      "PNG  (lossless)", []
-      { state.exportJpeg = false; state.exportPng16 = false; },
-      []
-      { return !state.exportJpeg && !state.exportPng16; }));
+      "PNG  (lossless)",
+      [] {
+        state.exportJpeg = false;
+        state.exportPng16 = false;
+      },
+      [] { return !state.exportJpeg && !state.exportPng16; }));
   exportPane.addChild(sidebarButton(
-      "PNG  16-bit", []
-      { state.exportJpeg = false; state.exportPng16 = true; },
-      []
-      { return !state.exportJpeg && state.exportPng16; }));
+      "PNG  16-bit",
+      [] {
+        state.exportJpeg = false;
+        state.exportPng16 = true;
+      },
+      [] { return !state.exportJpeg && state.exportPng16; }));
   exportPane.addChild(sidebarButton(
-      "JPEG", []
-      { state.exportJpeg = true; state.exportPng16 = false; },
-      []
-      { return state.exportJpeg; }));
+      "JPEG",
+      [] {
+        state.exportJpeg = true;
+        state.exportPng16 = false;
+      },
+      [] { return state.exportJpeg; }));
 
   Text png16Hint;
-  png16Hint.label = std::function<std::string()>([]() -> std::string
-                                                 { return "16 bits per channel: smooth gradients survive heavy edits. "
-                                                          "Larger files, and not every program opens them."; });
+  png16Hint.label = std::function<std::string()>([]() -> std::string {
+    return "16 bits per channel: smooth gradients survive heavy edits. "
+           "Larger files, and not every program opens them.";
+  });
   png16Hint.fontSize = 11.0f;
   png16Hint.color = kColorTextMuted;
   png16Hint.style.margin = EdgeInsets{4, 0, 0, 0};
-  png16Hint.style.display = std::function<Display()>(
-      []
-      { return !state.exportJpeg && state.exportPng16 ? Display::Flex : Display::None; });
+  png16Hint.style.display = std::function<Display()>([] {
+    return !state.exportJpeg && state.exportPng16 ? Display::Flex
+                                                  : Display::None;
+  });
   exportPane.addChild(std::move(png16Hint));
 
   View jpegOptions;
@@ -11387,36 +10676,32 @@ int main()
   jpegOptions.style.gap = 6.0f;
   jpegOptions.style.margin = EdgeInsets{6, 0, 0, 0};
   jpegOptions.style.display = std::function<Display()>(
-      []
-      { return state.exportJpeg ? Display::Flex : Display::None; });
+      [] { return state.exportJpeg ? Display::Flex : Display::None; });
 
   SliderSpec qualitySlider;
   qualitySlider.name = "Quality";
   qualitySlider.lo = 1.0f;
   qualitySlider.hi = 100.0f;
-  qualitySlider.get = []
-  { return static_cast<float>(state.jpegQuality); };
-  qualitySlider.set = [](float v)
-  { state.jpegQuality = std::clamp(static_cast<int>(std::lround(v)), 1, 100); };
-  qualitySlider.format = [](float v)
-  { return std::to_string(static_cast<int>(std::lround(v))); };
+  qualitySlider.get = [] { return static_cast<float>(state.jpegQuality); };
+  qualitySlider.set = [](float v) {
+    state.jpegQuality = std::clamp(static_cast<int>(std::lround(v)), 1, 100);
+  };
+  qualitySlider.format = [](float v) {
+    return std::to_string(static_cast<int>(std::lround(v)));
+  };
   qualitySlider.affectsPixels = false; // a setting, not an edit: no re-render
   jpegOptions.addChild(buildSliderRow(qualitySlider));
 
   jpegOptions.addChild(sidebarButton(
-      "Keep EXIF & color profile", []
-      { state.keepMetadata = !state.keepMetadata; },
-      []
-      { return state.keepMetadata; }));
+      "Keep EXIF & color profile",
+      [] { state.keepMetadata = !state.keepMetadata; },
+      [] { return state.keepMetadata; }));
   // Only meaningful with the metadata kept (without it there is no GPS block to
   // carry), so it is dimmed otherwise.
   jpegOptions.addChild(sidebarButton(
-      "Remove location (GPS)", []
-      { state.removeGps = !state.removeGps; },
-      []
-      { return state.removeGps && state.keepMetadata; },
-      false, []
-      { return state.keepMetadata; }));
+      "Remove location (GPS)", [] { state.removeGps = !state.removeGps; },
+      [] { return state.removeGps && state.keepMetadata; }, false,
+      [] { return state.keepMetadata; }));
   exportPane.addChild(std::move(jpegOptions));
 
   // Resize applies to both formats, so it sits outside the JPEG-only options.
@@ -11426,38 +10711,35 @@ int main()
   resizeOptions.style.gap = 6.0f;
   resizeOptions.style.margin = EdgeInsets{6, 0, 0, 0};
   resizeOptions.addChild(sidebarButton(
-      "Resize to long edge", []
-      { state.exportResize = !state.exportResize; },
-      []
-      { return state.exportResize; }));
+      "Resize to long edge", [] { state.exportResize = !state.exportResize; },
+      [] { return state.exportResize; }));
 
   View resizeDetail;
   resizeDetail.style.width = Size::full();
   resizeDetail.style.direction = FlexDirection::Column;
   resizeDetail.style.gap = 6.0f;
   resizeDetail.style.display = std::function<Display()>(
-      []
-      { return state.exportResize ? Display::Flex : Display::None; });
+      [] { return state.exportResize ? Display::Flex : Display::None; });
 
   SliderSpec edgeSlider;
   edgeSlider.name = "Long edge";
   edgeSlider.lo = static_cast<float>(kExportLongEdgeMin);
   edgeSlider.hi = static_cast<float>(kExportLongEdgeMax);
-  edgeSlider.get = []
-  { return static_cast<float>(state.exportLongEdge); };
-  edgeSlider.set = [](float v)
-  {
-    const int stepped = static_cast<int>(std::lround(v / kExportLongEdgeStep)) * kExportLongEdgeStep;
-    state.exportLongEdge = std::clamp(stepped, kExportLongEdgeMin, kExportLongEdgeMax);
+  edgeSlider.get = [] { return static_cast<float>(state.exportLongEdge); };
+  edgeSlider.set = [](float v) {
+    const int stepped = static_cast<int>(std::lround(v / kExportLongEdgeStep)) *
+                        kExportLongEdgeStep;
+    state.exportLongEdge =
+        std::clamp(stepped, kExportLongEdgeMin, kExportLongEdgeMax);
   };
-  edgeSlider.format = [](float v)
-  { return std::to_string(static_cast<int>(std::lround(v))) + " px"; };
+  edgeSlider.format = [](float v) {
+    return std::to_string(static_cast<int>(std::lround(v))) + " px";
+  };
   edgeSlider.affectsPixels = false; // a setting, not an edit: no re-render
   resizeDetail.addChild(buildSliderRow(edgeSlider));
 
   Text resizeInfo;
-  resizeInfo.label = std::function<std::string()>([]() -> std::string
-                                                  {
+  resizeInfo.label = std::function<std::string()>([]() -> std::string {
     if (!state.image)
       return "";
     const int w = state.image->width, h = state.image->height;
@@ -11467,7 +10749,8 @@ int main()
              " px: exported at full size (" + std::to_string(w) + " × " +
              std::to_string(h) + ").";
     return "Exports at " + std::to_string(d.w) + " × " + std::to_string(d.h) +
-           " px (from " + std::to_string(w) + " × " + std::to_string(h) + ")."; });
+           " px (from " + std::to_string(w) + " × " + std::to_string(h) + ").";
+  });
   resizeInfo.fontSize = 12.0f;
   resizeInfo.color = kColorTextMuted;
   resizeDetail.addChild(std::move(resizeInfo));
@@ -11477,9 +10760,8 @@ int main()
   View exportGap;
   exportGap.style.height = Size::pixel(6);
   exportPane.addChild(std::move(exportGap));
-  exportPane.addChild(sidebarButton(
-      "Export...", exportImage, {}, true, []
-      { return state.image != nullptr; }));
+  exportPane.addChild(sidebarButton("Export...", exportImage, {}, true,
+                                    [] { return state.image != nullptr; }));
 
   // Batch export: the same settings, applied to the filmstrip's pictures.
   View batchOptions;
@@ -11488,30 +10770,30 @@ int main()
   batchOptions.style.gap = 6.0f;
   batchOptions.style.margin = EdgeInsets{12, 0, 0, 0};
   Text batchHint;
-  batchHint.label = std::function<std::string()>([]() -> std::string
-                                                 {
+  batchHint.label = std::function<std::string()>([]() -> std::string {
     if (exportWorker.busy())
       return "Exporting " + std::to_string(exportWorker.done()) + " of " +
              std::to_string(exportWorker.total()) + "...";
     return "Batch: exports the picked filmstrip photos (Ctrl+click, "
-           "Shift+click) to one folder, each with its own edits."; });
+           "Shift+click) to one folder, each with its own edits.";
+  });
   batchHint.fontSize = 12.0f;
   batchHint.color = kColorTextMuted;
   batchOptions.addChild(std::move(batchHint));
   batchOptions.addChild(sidebarButton(
-      "Overwrite existing files", []
-      { state.exportOverwrite = !state.exportOverwrite; },
-      []
-      { return state.exportOverwrite; }));
-  batchOptions.addChild(sidebarButton(
-      "Export Selected...", exportSelected, {}, true, []
-      { return !state.film.files.empty() && !exportWorker.busy(); }));
-  batchOptions.addChild(sidebarButton(
-      "Export All Shown...", exportAllShown, {}, false, []
-      { return !state.film.files.empty() && !exportWorker.busy(); }));
-  batchOptions.addChild(sidebarButton(
-      "Stop Export", stopExport, {}, false, []
-      { return exportWorker.busy(); }));
+      "Overwrite existing files",
+      [] { state.exportOverwrite = !state.exportOverwrite; },
+      [] { return state.exportOverwrite; }));
+  batchOptions.addChild(
+      sidebarButton("Export Selected...", exportSelected, {}, true, [] {
+        return !state.film.files.empty() && !exportWorker.busy();
+      }));
+  batchOptions.addChild(
+      sidebarButton("Export All Shown...", exportAllShown, {}, false, [] {
+        return !state.film.files.empty() && !exportWorker.busy();
+      }));
+  batchOptions.addChild(sidebarButton("Stop Export", stopExport, {}, false,
+                                      [] { return exportWorker.busy(); }));
   exportPane.addChild(std::move(batchOptions));
   sidebar.addChild(std::move(exportPane));
 
@@ -11524,18 +10806,19 @@ int main()
   vDivider.style.flexShrink = 0;
   vDivider.style.backgroundColor = kColorDivider;
   vDivider.style.hoverColor = kColorDividerHover;
-  vDivider.style.width = std::function<Size()>([]
-                                               { return Size::pixel(state.activeActivity != -1 ? kDividerW : 0.0f); });
+  vDivider.style.width = std::function<Size()>([] {
+    return Size::pixel(state.activeActivity != -1 ? kDividerW : 0.0f);
+  });
 
-  auto updateSidebarWidth = [](float localX)
-  {
+  auto updateSidebarWidth = [](float localX) {
     float next = state.sidebarWidth + localX - kDividerW / 2.0f;
     state.sidebarWidth = std::clamp(next, kMinSidebarW, kMaxSidebarW);
   };
   {
-    auto resize = [updateSidebarWidth](float localX, float)
-    { updateSidebarWidth(localX); };
-    bindDrag(vDivider, resize, resize, nullptr);
+    auto resize = [updateSidebarWidth](float localX, float) {
+      updateSidebarWidth(localX);
+    };
+    bindDrag(vDivider, resize, resize, nullptr, nullptr, Cursor::ResizeEW);
   }
 
   workspace.addChild(std::move(vDivider));
@@ -11566,25 +10849,20 @@ int main()
   // "no image" placeholder below is workspace's other child for that
   // same slot and shows exactly when this one doesn't.
   viewport.style.display = std::function<Display()>(
-      []
-      { return state.image ? Display::Flex : Display::None; });
+      [] { return state.image ? Display::Flex : Display::None; });
 
   View canvas;
   canvas.isCanvas = true;
   canvas.style.width = std::function<Size()>(
-      []
-      { return Size::pixel(state.docWidth() * state.zoom); });
+      [] { return Size::pixel(state.docWidth() * state.zoom); });
   canvas.style.height = std::function<Size()>(
-      []
-      { return Size::pixel(state.docHeight() * state.zoom); });
+      [] { return Size::pixel(state.docHeight() * state.zoom); });
   canvas.style.borderWidth = 1.0f;
   canvas.style.borderColor = kColorCanvasBorder;
   canvas.style.backgroundColor = kColorWhite;
 
-  canvas.onPaint = [](CanvasContext &ctx)
-  { paintCanvas(ctx); };
-  canvas.canvasDirtySource = []
-  {
+  canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx); };
+  canvas.canvasDirtySource = [] {
     // Polled once per frame (see liteui.hpp's checkForUpdates) — the right
     // place to do the deferred, expensive part of a slider drag exactly
     // once per frame, no matter how many pointer-move events fired since the
@@ -11596,8 +10874,7 @@ int main()
   };
   // RGB readout under the cursor. Pointer moves have no return value; a
   // change just marks the canvas dirty so the next poll repaints it.
-  canvas.onPointerLeave = [](PointerEvent &)
-  {
+  canvas.onPointerLeave = [](PointerEvent &) {
     if (hoverClear())
       state.dirty = true;
   };
@@ -11606,15 +10883,15 @@ int main()
   // While comparing, the canvas does nothing but move the split line.
   // `pressed` marks a left press that started on this canvas, so moves and
   // the release of some other gesture crossing it are not taken for a drag.
-  auto pressed = std::make_shared<bool>(false);
-  canvas.onPointerDown = [pressed](PointerEvent &e)
-  {
+  // (one pointer owns the gesture, as in bindDrag: a second finger is ignored)
+  auto pressed = std::make_shared<std::optional<uint32_t>>();
+  canvas.onPointerDown = [pressed](PointerEvent &e) {
     e.stopPropagation();
+    if (e.button == MouseButton::Left)
+      closeMenus(); // this press never reaches the workspace's handler
     const float lx = e.x, ly = e.y;
-    if (e.button == MouseButton::Right)
-    {
-      if (state.compare == CompareMode::Off)
-      {
+    if (e.button == MouseButton::Right) {
+      if (state.compare == CompareMode::Off) {
         objectPress(lx, ly, true);
         polygonRightPress(lx, ly);
       }
@@ -11622,29 +10899,27 @@ int main()
     }
     if (e.button != MouseButton::Left)
       return;
-    *pressed = true;
-    if (state.compare != CompareMode::Off)
-    {
+    if (*pressed)
+      return; // another pointer is already dragging on the canvas
+    *pressed = e.pointerId;
+    if (state.compare != CompareMode::Off) {
       if (state.compare == CompareMode::Split)
         splitFromX(lx);
       return;
     }
-    if (wbPress(lx, ly))
-    {
+    if (wbPress(lx, ly)) {
       state.openMenu = -1; // same as cropPress: a canvas press closes any menu
       return;
     }
     cropPress(lx, ly);
     maskPress(lx, ly);
   };
-  canvas.onPointerMove = [pressed](PointerEvent &e)
-  {
+  canvas.onPointerMove = [pressed](PointerEvent &e) {
     if (hoverSample(e.x, e.y))
       state.dirty = true;
-    if (!*pressed || !e.held(MouseButton::Left))
+    if (*pressed != e.pointerId || !e.held(MouseButton::Left))
       return;
-    if (state.compare != CompareMode::Off)
-    {
+    if (state.compare != CompareMode::Off) {
       if (state.compare == CompareMode::Split)
         splitFromX(e.x);
       return;
@@ -11652,26 +10927,34 @@ int main()
     cropDrag(e.x, e.y);
     maskDrag(e.x, e.y);
   };
-  auto endCanvasDrag = [pressed]
-  {
-    if (!*pressed)
+  auto endCanvasDrag = [pressed](const PointerEvent &e) {
+    if (*pressed != e.pointerId)
       return;
-    *pressed = false;
+    pressed->reset();
     state.crop.drag = CropUi::Drag::None;
     if (state.mask.drag != MaskUi::Drag::None)
       maskEndDrag();
   };
-  canvas.onPointerUp = [endCanvasDrag](PointerEvent &e)
-  {
+  canvas.onPointerUp = [endCanvasDrag](PointerEvent &e) {
     if (e.button == MouseButton::Left)
-      endCanvasDrag();
+      endCanvasDrag(e);
   };
-  canvas.onPointerCancel = [endCanvasDrag](PointerEvent &)
-  { endCanvasDrag(); };
+  canvas.onPointerCancel = [endCanvasDrag](PointerEvent &e) {
+    endCanvasDrag(e);
+  };
+  // Cursor: the split line drags sideways; the tools and the picker aim.
+  canvas.style.cursor = std::function<Cursor()>([]() -> Cursor {
+    if (state.compare == CompareMode::Split)
+      return Cursor::ResizeEW;
+    if (state.compare != CompareMode::Off)
+      return Cursor::Default;
+    if (wbPickerActive() || cropToolActive() || maskToolActive())
+      return Cursor::Crosshair;
+    return Cursor::Default;
+  });
   // Wheel zoom. A notched wheel steps by kZoomStep; a trackpad (precise
   // pixel deltas) zooms continuously. +dy = wheel down = zoom out.
-  canvas.onWheel = [](WheelEvent &e)
-  {
+  canvas.onWheel = [](WheelEvent &e) {
     if (e.dy == 0.0f)
       return;
     const float f = e.precise ? std::pow(kZoomStep, -e.dy / 40.0f)
@@ -11691,8 +10974,7 @@ int main()
   noImagePlaceholder.style.justifyContent = Justify::Center;
   noImagePlaceholder.style.alignItems = Align::Center;
   noImagePlaceholder.style.display = std::function<Display()>(
-      []
-      { return state.image ? Display::None : Display::Flex; });
+      [] { return state.image ? Display::None : Display::Flex; });
 
   Text noImageText;
   noImageText.label = std::string("No image selected");
@@ -11708,31 +10990,27 @@ int main()
   filmstrip.style.width = Size::full();
   filmstrip.style.flexShrink = 0;
   filmstrip.style.height = std::function<Size()>(
-      []
-      { return Size::pixel(filmstripShown() ? kFilmH : 0.0f); });
+      [] { return Size::pixel(filmstripShown() ? kFilmH : 0.0f); });
   filmstrip.style.display = std::function<Display()>(
-      []
-      { return filmstripShown() ? Display::Flex : Display::None; });
-  filmstrip.onPaint = [](CanvasContext &ctx)
-  { paintFilmstrip(ctx); };
-  filmstrip.canvasDirtySource = []
-  {
+      [] { return filmstripShown() ? Display::Flex : Display::None; });
+  filmstrip.onPaint = [](CanvasContext &ctx) { paintFilmstrip(ctx); };
+  filmstrip.style.cursor = Cursor::Pointer;
+  filmstrip.canvasDirtySource = [] {
     collectThumbJobs();
     const bool d = state.film.dirty;
     state.film.dirty = false;
     return d;
   };
-  filmstrip.onPointerDown = [](PointerEvent &e)
-  {
+  filmstrip.onPointerDown = [](PointerEvent &e) {
     if (e.button != MouseButton::Left)
       return;
     e.stopPropagation();
+    closeMenus();
     filmClick(e.x, e.y, e.mods); // modifiers now come with the event
   };
   // Wheel: two cells per notch; a trackpad scrolls by its pixel delta (and
   // honours sideways swipes).
-  filmstrip.onWheel = [](WheelEvent &e)
-  {
+  filmstrip.onWheel = [](WheelEvent &e) {
     if (e.precise)
       filmScrollBy(std::abs(e.dx) > std::abs(e.dy) ? e.dx : e.dy);
     else if (e.dy != 0.0f)
@@ -11748,8 +11026,7 @@ int main()
   // ---- Right-hand panel: the selected mask's controls ----
   // Only on the Masks pane with a mask selected, so every other pane keeps
   // the full canvas width. Drag its divider to resize.
-  const auto maskPanelShown = []
-  { return maskToolActive() && selMask() >= 0; };
+  const auto maskPanelShown = [] { return maskToolActive() && selMask() >= 0; };
 
   View rDivider;
   rDivider.style.height = Size::full();
@@ -11757,18 +11034,20 @@ int main()
   rDivider.style.backgroundColor = kColorDivider;
   rDivider.style.hoverColor = kColorDividerHover;
   rDivider.style.width = Size::pixel(kDividerW);
-  rDivider.style.display = std::function<Display()>([maskPanelShown]() -> Display
-                                                    { return maskPanelShown() ? Display::Flex : Display::None; });
-  const auto updateMaskPanelWidth = [](float localX)
-  {
+  rDivider.style.display =
+      std::function<Display()>([maskPanelShown]() -> Display {
+        return maskPanelShown() ? Display::Flex : Display::None;
+      });
+  const auto updateMaskPanelWidth = [](float localX) {
     // The panel sits to the right, so it grows as the divider moves LEFT.
     const float next = state.maskPanelW - (localX - kDividerW / 2.0f);
     state.maskPanelW = std::clamp(next, kMinMaskPanelW, kMaxMaskPanelW);
   };
   {
-    auto resize = [updateMaskPanelWidth](float localX, float)
-    { updateMaskPanelWidth(localX); };
-    bindDrag(rDivider, resize, resize, nullptr);
+    auto resize = [updateMaskPanelWidth](float localX, float) {
+      updateMaskPanelWidth(localX);
+    };
+    bindDrag(rDivider, resize, resize, nullptr, nullptr, Cursor::ResizeEW);
   }
   workspace.addChild(std::move(rDivider));
 
@@ -11780,18 +11059,20 @@ int main()
   maskPanel.style.padding = EdgeInsets::all(kMaskPanelPad);
   maskPanel.style.overflowX = Overflow::Hidden;
   maskPanel.style.overflowY = Overflow::Visible;
-  maskPanel.style.width = std::function<Size()>([]
-                                                { return Size::pixel(state.maskPanelW); });
-  maskPanel.style.display = std::function<Display()>([maskPanelShown]() -> Display
-                                                     { return maskPanelShown() ? Display::Flex : Display::None; });
+  maskPanel.style.width =
+      std::function<Size()>([] { return Size::pixel(state.maskPanelW); });
+  maskPanel.style.display =
+      std::function<Display()>([maskPanelShown]() -> Display {
+        return maskPanelShown() ? Display::Flex : Display::None;
+      });
 
   Text maskPanelTitle;
-  maskPanelTitle.label = std::function<std::string()>([]() -> std::string
-                                                      {
+  maskPanelTitle.label = std::function<std::string()>([]() -> std::string {
     const Mask *m = selectedMask();
     if (!m)
       return std::string();
-    return "MASK " + std::to_string(selMask() + 1) + "  " + maskLabel(*m); });
+    return "MASK " + std::to_string(selMask() + 1) + "  " + maskLabel(*m);
+  });
   maskPanelTitle.fontSize = 12.0f;
   maskPanelTitle.fontWeight = FontWeight::SemiBold;
   maskPanelTitle.color = kColorTextMuted;
@@ -11826,8 +11107,7 @@ int main()
   statusBar.style.padding = EdgeInsets{0, 10, 0, 12};
 
   Text statusLeft;
-  statusLeft.label = std::function<std::string()>([]
-                                                  {
+  statusLeft.label = std::function<std::string()>([] {
     std::string s = state.image
                         ? pictureLabel(state.imagePath) + "  —  " +
                               std::to_string(state.image->width) + " x " +
@@ -11839,18 +11119,17 @@ int main()
       s += "     •     Before | After (Y to close, drag to move the line)";
     if (!state.statusMsg.empty())
       s += "     •     " + state.statusMsg;
-    return s; });
+    return s;
+  });
   statusLeft.fontSize = 12.0f;
   statusLeft.wrap = TextWrap::NoWrap; // one line, even with a long message
   statusLeft.color = std::function<Color()>(
-      []
-      { return state.statusIsError ? kColorStatusError : kColorWhite; });
+      [] { return state.statusIsError ? kColorStatusError : kColorWhite; });
   statusBar.addChild(std::move(statusLeft));
 
   // Right side of the status bar: zoom controls.
   auto statusGlyphBtn = [](const std::string &label,
-                           std::function<void()> onClick)
-  {
+                           std::function<void()> onClick) {
     View v;
     v.style.width = Size::pixel(20);
     v.style.height = Size::pixel(20);
@@ -11886,20 +11165,20 @@ int main()
   rgbSwatch.style.height = Size::pixel(12);
   rgbSwatch.style.flexShrink = 0;
   rgbSwatch.style.borderRadius = 2.0f;
-  rgbSwatch.style.backgroundColor = std::function<Color()>([]() -> Color
-                                                           { return state.hoverValid
-                                                                        ? Color{state.hoverR, state.hoverG, state.hoverB, 255}
-                                                                        : Color{0, 0, 0, 0}; });
+  rgbSwatch.style.backgroundColor = std::function<Color()>([]() -> Color {
+    return state.hoverValid
+               ? Color{state.hoverR, state.hoverG, state.hoverB, 255}
+               : Color{0, 0, 0, 0};
+  });
   rgbReadout.addChild(std::move(rgbSwatch));
 
   Text rgbText;
-  rgbText.label = std::function<std::string()>([]
-                                               {
+  rgbText.label = std::function<std::string()>([] {
     if (!state.hoverValid)
       return std::string();
     return "R " + std::to_string(state.hoverR) + "  G " +
-           std::to_string(state.hoverG) + "  B " +
-           std::to_string(state.hoverB); });
+           std::to_string(state.hoverG) + "  B " + std::to_string(state.hoverB);
+  });
   rgbText.fontSize = 12.0f;
   rgbText.wrap = TextWrap::NoWrap;
   rgbText.color = kColorWhite;
@@ -11907,12 +11186,10 @@ int main()
   zoomControls.addChild(std::move(rgbReadout));
 
   zoomControls.addChild(
-      statusGlyphBtn("-", []
-                     { setZoom(state.zoom / kZoomStep); }));
+      statusGlyphBtn("-", [] { setZoom(state.zoom / kZoomStep); }));
 
   Text zoomLabel;
-  zoomLabel.label = []
-  {
+  zoomLabel.label = [] {
     return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 12.0f;
@@ -11921,8 +11198,7 @@ int main()
   zoomControls.addChild(std::move(zoomLabel));
 
   zoomControls.addChild(
-      statusGlyphBtn("+", []
-                     { setZoom(state.zoom * kZoomStep); }));
+      statusGlyphBtn("+", [] { setZoom(state.zoom * kZoomStep); }));
 
   View zoomResetSpacer;
   zoomResetSpacer.style.width = Size::pixel(6);
@@ -11934,8 +11210,7 @@ int main()
   zoomResetBtn.style.hoverColor = kColorStatusHover;
   zoomResetBtn.style.borderRadius = 3.0f;
   zoomResetBtn.style.padding = EdgeInsets{2, 6, 2, 6};
-  zoomResetBtn.onClick = []
-  { setZoom(1.0f); };
+  zoomResetBtn.onClick = [] { setZoom(1.0f); };
   {
     Text t;
     t.label = std::string("100%");
@@ -11949,6 +11224,7 @@ int main()
 
   root.addChild(std::move(statusBar));
 
+  applyClickCursors(root);
   ui.setRoot(std::move(root));
   ui.run();
   flushSidecar();            // edits made since the last autosave
@@ -11957,8 +11233,8 @@ int main()
   decodeWorker.shutdown();   // ditto (waits out a decode still running)
   thumbWorker.shutdown();    // ditto
   segmentWorker.shutdown();
-  syncWorker.shutdown(); // ditto (finishes the batch it is writing)
-  exportWorker.shutdown(); // ditto (abandons the picture it is rendering)
+  syncWorker.shutdown();       // ditto (finishes the batch it is writing)
+  exportWorker.shutdown();     // ditto (abandons the picture it is rendering)
   lutPreviewWorker.shutdown(); // ditto
   return 0;
 }

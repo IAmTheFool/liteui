@@ -96,7 +96,7 @@ static std::vector<std::string> typesOf(const Bytes &png)
   std::vector<std::string> t;
   forEachPngChunk(png.data(), png.size(), [&](const uint8_t *type, const uint8_t *data, size_t len, size_t, bool)
                   {
-    CHECK(crc32(type, len + 4) == be32(data + len)); // every chunk has a valid CRC
+    CHECK(liteui_image::crc32(type, len + 4) == be32(data + len)); // every chunk has a valid CRC
     t.emplace_back(reinterpret_cast<const char *>(type), 4);
     return true; });
   return t;
@@ -214,11 +214,11 @@ static bool inflateStored(const uint8_t *z, size_t n, Bytes *out)
 TEST_CASE("color_tag: checksums", "[color_tag]")
 {
   const Bytes digits = bytesOf("123456789");
-  CHECK(crc32(digits.data(), digits.size()) == 0xCBF43926u);
+  CHECK(liteui_image::crc32(digits.data(), digits.size()) == 0xCBF43926u);
   const Bytes iend = bytesOf("IEND");
-  CHECK(crc32(iend.data(), iend.size()) == 0xAE426082u);
+  CHECK(liteui_image::crc32(iend.data(), iend.size()) == 0xAE426082u);
   // incremental, like zlib
-  CHECK(crc32(digits.data() + 4, 5, crc32(digits.data(), 4)) == 0xCBF43926u);
+  CHECK(liteui_image::crc32(digits.data() + 4, 5, liteui_image::crc32(digits.data(), 4)) == 0xCBF43926u);
   const Bytes wiki = bytesOf("Wikipedia");
   CHECK(adler32(wiki.data(), wiki.size()) == 0x11E60398u);
   CHECK(adler32(nullptr, 0) == 1u);

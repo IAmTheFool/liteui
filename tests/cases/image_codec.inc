@@ -1203,3 +1203,274 @@ TEST_CASE("Image codec: PNG chunk CRCs and IDAT are enforced on every platform",
   CHECK(liteui_image::decodeMemoryBuffer(png.data(), png.size(), &err).has_value());
 }
 
+
+// ---- DecodeOptions::to8bit and decodeXxxInto ---------------------------------
+
+namespace codec_test {
+// A 256 x 256 RGBA16 picture whose 262144 samples run through every 16-bit value (i % 65536, four times over).
+inline ImageBuffer everyValue16() {
+  auto b = ImageBuffer::create(256, 256, PixelFormat::RGBA16_UNORM);
+  REQUIRE(b.has_value());
+  for (size_t i = 0; i < 256u * 256u * 4u; ++i) {
+    const uint16_t v = static_cast<uint16_t>(i % 65536u);
+    std::memcpy(b->pixels.data() + i * 2, &v, 2);
+  }
+  return std::move(*b);
+}
+inline uint16_t sample16(const ImageBuffer &b, size_t i) {
+  uint16_t v;
+  std::memcpy(&v, b.pixels.data() + i * 2, 2);
+  return v;
+}
+struct AllocLog {
+  int calls = 0;
+  uint32_t w = 0, h = 0;
+  PixelFormat format = PixelFormat::RGBA8_UNORM;
+  std::vector<std::byte> store;
+  liteui_image::ImageAllocFn fn() {
+    return [this](uint32_t cw, uint32_t ch, PixelFormat f) -> std::byte * {
+      ++calls;
+      w = cw;
+      h = ch;
+      format = f;
+      store.assign(static_cast<size_t>(cw) * ch * bytesPerPixel(f), std::byte{0xEE});
+      return store.data();
+    };
+  }
+};
+} // namespace codec_test
+
+TEST_CASE("Image codec: to8bit narrows a 16-bit PNG to the nearest byte, for every sample value", "[image][codec][png]") {
+  const ImageBuffer src = codec_test::everyValue16();
+  codec_test::Bytes png;
+  REQUIRE(liteui_image::encodePngMemory(png, src));
+  std::string err;
+
+  liteui_image::DecodeOptions opt;
+  opt.to8bit = true;
+  auto narrow = liteui_image::decodeMemoryBuffer(png.data(), png.size(), &err, opt);
+  REQUIRE(narrow.has_value());
+  CHECK(narrow->format == PixelFormat::RGBA8_UNORM);
+  CHECK((narrow->width == 256u && narrow->height == 256u));
+  size_t wrong = 0;
+  for (size_t i = 0; i < 256u * 256u * 4u; ++i) {
+    const uint32_t v = codec_test::sample16(src, i);
+    const uint8_t want = static_cast<uint8_t>((v + 128u) / 257u);
+    if (static_cast<uint8_t>(narrow->pixels[i]) != want) ++wrong;
+  }
+  CHECK(wrong == 0);
+
+  // Without the option the 16 bits are untouched, and the file-reading twin agrees.
+  auto wide = liteui_image::decodeMemoryBuffer(png.data(), png.size(), &err);
+  REQUIRE(wide.has_value());
+  CHECK(wide->format == PixelFormat::RGBA16_UNORM);
+  size_t differ = 0;
+  for (size_t i = 0; i < 256u * 256u * 4u; ++i)
+    if (codec_test::sample16(*wide, i) != codec_test::sample16(src, i)) ++differ;
+  CHECK(differ == 0);
+
+  // The 8-bit CanvasImage API gives the same bytes as the option.
+  auto canvas = liteui_image::decodeMemory(png.data(), png.size(), &err);
+  REQUIRE(canvas.has_value());
+  REQUIRE(canvas->pixels.size() == narrow->pixels.size());
+  CHECK(std::memcmp(canvas->pixels.data(), narrow->pixels.data(), narrow->pixels.size()) == 0);
+}
+
+TEST_CASE("Image codec: to8bit changes nothing for files that are already 8-bit", "[image][codec]") {
+  auto tiny = ImageBuffer::create(7, 5, PixelFormat::RGBA8_UNORM);
+  REQUIRE(tiny.has_value());
+  for (size_t i = 0; i < tiny->pixels.size(); ++i) tiny->pixels[i] = static_cast<std::byte>((i * 37 + 11) & 0xFF);
+  codec_test::Bytes png, jpg;
+  REQUIRE(liteui_image::encodePngMemory(png, *tiny));
+  REQUIRE(liteui_image::encodeJpegMemory(jpg, *tiny));
+  liteui_image::DecodeOptions opt;
+  opt.to8bit = true;
+  for (const codec_test::Bytes *file : {&png, &jpg}) {
+    auto a = liteui_image::decodeMemoryBuffer(file->data(), file->size());
+    auto b = liteui_image::decodeMemoryBuffer(file->data(), file->size(), nullptr, opt);
+    REQUIRE((a && b));
+    CHECK((a->format == PixelFormat::RGBA8_UNORM && b->format == PixelFormat::RGBA8_UNORM));
+    CHECK(a->pixels == b->pixels);
+  }
+}
+
+TEST_CASE("Image codec: decodeMemoryInto writes into the caller's memory, asking for it exactly once", "[image][codec]") {
+  using codec_test::AllocLog;
+  std::string err;
+  auto small8 = ImageBuffer::create(9, 4, PixelFormat::RGBA8_UNORM);
+  REQUIRE(small8.has_value());
+  for (size_t i = 0; i < small8->pixels.size(); ++i) small8->pixels[i] = static_cast<std::byte>((i * 53 + 7) & 0xFF);
+  codec_test::Bytes png8, jpg, png16;
+  REQUIRE(liteui_image::encodePngMemory(png8, *small8));
+  REQUIRE(liteui_image::encodeJpegMemory(jpg, *small8));
+  REQUIRE(liteui_image::encodePngMemory(png16, codec_test::everyValue16()));
+
+  struct Case { const codec_test::Bytes *file; bool to8; PixelFormat want; uint32_t w, h; };
+  const Case cases[] = {
+      {&png8, false, PixelFormat::RGBA8_UNORM, 9, 4},
+      {&jpg, false, PixelFormat::RGBA8_UNORM, 9, 4},
+      {&png16, false, PixelFormat::RGBA16_UNORM, 256, 256},
+      {&png16, true, PixelFormat::RGBA8_UNORM, 256, 256},
+  };
+  for (const Case &c : cases) {
+    AllocLog log;
+    liteui_image::DecodeOptions opt;
+    opt.to8bit = c.to8;
+    REQUIRE(liteui_image::decodeMemoryInto(c.file->data(), c.file->size(), log.fn(), &err, opt));
+    CHECK(log.calls == 1);
+    CHECK((log.w == c.w && log.h == c.h && log.format == c.want));
+    // The bytes the caller's memory holds are exactly what the ImageBuffer API returns.
+    auto ref = liteui_image::decodeMemoryBuffer(c.file->data(), c.file->size(), &err, opt);
+    REQUIRE(ref.has_value());
+    REQUIRE(ref->pixels.size() == log.store.size());
+    CHECK(std::memcmp(ref->pixels.data(), log.store.data(), log.store.size()) == 0);
+  }
+
+  // Refused up front: the allocator is never called (nothing was written, nothing to free).
+  {
+    codec_test::Bytes cut(png8.begin(), png8.begin() + static_cast<std::ptrdiff_t>(png8.size() / 2));
+    AllocLog log;
+    CHECK(!liteui_image::decodeMemoryInto(cut.data(), cut.size(), log.fn(), &err));
+    CHECK(log.calls == 0);
+    codec_test::Bytes bad = png8;
+    bad[bad.size() / 2] ^= 0x5A; // a chunk CRC no longer matches
+    AllocLog log2;
+    CHECK(!liteui_image::decodeMemoryInto(bad.data(), bad.size(), log2.fn(), &err));
+    CHECK(log2.calls == 0);
+    const uint8_t junk[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    AllocLog log3;
+    CHECK(!liteui_image::decodeMemoryInto(junk, sizeof junk, log3.fn(), &err));
+    CHECK(log3.calls == 0);
+  }
+  // An allocator that says no (or is empty) makes the decode fail, for both codecs.
+  {
+    auto refuse = [](uint32_t, uint32_t, PixelFormat) -> std::byte * { return nullptr; };
+    for (const codec_test::Bytes *file : {&png8, &jpg, &png16}) {
+      err.clear();
+      CHECK(!liteui_image::decodeMemoryInto(file->data(), file->size(), refuse, &err));
+      CHECK(err == "out of memory");
+    }
+    err.clear();
+    CHECK(!liteui_image::decodeMemoryInto(png8.data(), png8.size(), liteui_image::ImageAllocFn{}, &err));
+    CHECK(err == "no allocator");
+    // ... and an allocator that throws does not escape the call.
+    auto thrower = [](uint32_t, uint32_t, PixelFormat) -> std::byte * { throw std::bad_alloc(); };
+    for (const codec_test::Bytes *file : {&png8, &jpg}) CHECK(!liteui_image::decodeMemoryInto(file->data(), file->size(), thrower, &err));
+  }
+}
+
+TEST_CASE("Image codec: the copy-after-decode path (used where a backend can only return an ImageBuffer) agrees", "[image][codec][png]") {
+  // copyBufferInto hands a decoded ImageBuffer to the caller's memory and narrows when asked (libpng uses it when
+  // LITEUI_NO_PNG_SCALE16 is set; WIC now decodes into the caller's memory directly). It must give the same bytes
+  // as the path that narrows while reading.
+  codec_test::Bytes png;
+  REQUIRE(liteui_image::encodePngMemory(png, codec_test::everyValue16()));
+  std::string err;
+  auto wide = liteui_image::decodeMemoryBuffer(png.data(), png.size(), &err);
+  liteui_image::DecodeOptions opt;
+  opt.to8bit = true;
+  auto native = liteui_image::decodeMemoryBuffer(png.data(), png.size(), &err, opt);
+  REQUIRE((wide && native));
+
+  codec_test::AllocLog log;
+  REQUIRE(liteui_image::codec_detail::copyBufferInto(*wide, true, log.fn(), &err));
+  CHECK((log.calls == 1 && log.format == PixelFormat::RGBA8_UNORM));
+  REQUIRE(log.store.size() == native->pixels.size());
+  CHECK(std::memcmp(log.store.data(), native->pixels.data(), log.store.size()) == 0);
+
+  codec_test::AllocLog keep;
+  REQUIRE(liteui_image::codec_detail::copyBufferInto(*wide, false, keep.fn(), &err));
+  CHECK(keep.format == PixelFormat::RGBA16_UNORM);
+  REQUIRE(keep.store.size() == wide->pixels.size());
+  CHECK(std::memcmp(keep.store.data(), wide->pixels.data(), keep.store.size()) == 0);
+
+  auto refuse = [](uint32_t, uint32_t, PixelFormat) -> std::byte * { return nullptr; };
+  CHECK(!liteui_image::codec_detail::copyBufferInto(*wide, true, refuse, &err));
+}
+
+// ---- to8bit across several bands ---------------------------------------------
+// The WIC backend pulls a 16-bit file in bands of about 1 MB and narrows each band into the caller's memory. The
+// pictures above are far smaller than one band, so these are tall enough for several, with a last band that is
+// shorter than the others (a wrong row offset, or a band dropped or repeated, shows up as a wrong sample).
+
+TEST_CASE("Image codec: to8bit over several bands, RGBA16 with a ragged last band", "[image][codec][png]") {
+  const uint32_t w = 513, h = 700; // 4104-byte rows: bands of 255 rows, so 255 + 255 + 190
+  auto src = ImageBuffer::create(w, h, PixelFormat::RGBA16_UNORM);
+  REQUIRE(src.has_value());
+  for (size_t i = 0; i < size_t(w) * h * 4; ++i) {
+    const uint16_t v = static_cast<uint16_t>((i * 7919u + i / 5u) & 0xFFFFu);
+    std::memcpy(src->pixels.data() + i * 2, &v, 2);
+  }
+  codec_test::Bytes png;
+  REQUIRE(liteui_image::encodePngMemory(png, *src));
+  std::string err;
+  liteui_image::DecodeOptions opt;
+  opt.to8bit = true;
+  codec_test::AllocLog log;
+  REQUIRE(liteui_image::decodeMemoryInto(png.data(), png.size(), log.fn(), &err, opt));
+  INFO(err);
+  CHECK((log.calls == 1 && log.format == PixelFormat::RGBA8_UNORM && log.w == w && log.h == h));
+  REQUIRE(log.store.size() == size_t(w) * h * 4);
+  size_t wrong = 0;
+  for (size_t i = 0; i < size_t(w) * h * 4; ++i) {
+    const uint32_t v = codec_test::sample16(*src, i);
+    if (static_cast<uint8_t>(log.store[i]) != static_cast<uint8_t>((v + 128u) / 257u)) ++wrong;
+  }
+  CHECK(wrong == 0);
+}
+
+TEST_CASE("Image codec: 16-bit gray over several bands, kept at 16 bits and narrowed", "[image][codec][png]") {
+  static const codec_test::Case cases[] = {{"gray 16-bit", 0, 16, false, 0}, {"gray 16-bit interlaced", 0, 16, true, 0}};
+  for (const auto &c : cases) {
+    INFO(c.name);
+    const uint32_t w = 700, h = 800; // 1400-byte gray rows: bands of 748 rows, so 748 + 52
+    auto b = codec_test::build(c, w, h, 99);
+    std::string err;
+    auto wide = liteui_image::decodeMemoryBuffer(b.png.data(), b.png.size(), &err);
+    INFO(err);
+    REQUIRE(wide.has_value());
+    REQUIRE(wide->format == PixelFormat::RGBA16_UNORM);
+    const auto expect = codec_test::expectedRgba(w, h, b.spec, b.px);
+    const long bad = codec_test::firstMismatch(*wide, expect);
+    INFO("first mismatch: " << codec_test::describeMismatch(*wide, expect, bad));
+    CHECK(bad == -1);
+
+    liteui_image::DecodeOptions opt;
+    opt.to8bit = true;
+    auto narrow = liteui_image::decodeMemoryBuffer(b.png.data(), b.png.size(), &err, opt);
+    REQUIRE(narrow.has_value());
+    REQUIRE(narrow->format == PixelFormat::RGBA8_UNORM);
+    size_t wrong = 0;
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x)
+        for (int ch = 0; ch < 4; ++ch) {
+          const uint32_t v = codec_test::sampleAt(*wide, x, y, ch);
+          if (codec_test::sampleAt(*narrow, x, y, ch) != (v + 128u) / 257u) ++wrong;
+        }
+    CHECK(wrong == 0);
+  }
+}
+
+TEST_CASE("Image codec: to8bit for 16-bit gray at small sizes", "[image][codec][png]") {
+  // 16-bit gray takes its own path on Windows (WIC cannot widen it exactly); cover it with to8bit as well.
+  static const codec_test::Case cases[] = {{"gray 16-bit", 0, 16, false, 0}, {"gray 16-bit interlaced", 0, 16, true, 0}};
+  uint32_t seed = 500;
+  for (const auto &c : cases)
+    for (auto [w, h] : codec_test::caseSizes()) {
+      INFO(c.name << " " << w << "x" << h);
+      auto b = codec_test::build(c, w, h, seed++);
+      std::string err;
+      auto wide = liteui_image::decodeMemoryBuffer(b.png.data(), b.png.size(), &err);
+      liteui_image::DecodeOptions opt;
+      opt.to8bit = true;
+      auto narrow = liteui_image::decodeMemoryBuffer(b.png.data(), b.png.size(), &err, opt);
+      REQUIRE((wide && narrow));
+      REQUIRE(narrow->format == PixelFormat::RGBA8_UNORM);
+      bool ok = true;
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+          for (int ch = 0; ch < 4; ++ch)
+            ok &= codec_test::sampleAt(*narrow, x, y, ch) == (codec_test::sampleAt(*wide, x, y, ch) + 128u) / 257u;
+      CHECK(ok);
+    }
+}

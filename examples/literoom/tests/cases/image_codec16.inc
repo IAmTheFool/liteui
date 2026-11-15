@@ -2,16 +2,18 @@
 // #define LITEUI_IMPLEMENTATION. Helpers and TEST_CASEs live in namespace image_codec16_cases
 // so they cannot collide with other cases.
 //
-// image_codec16_test.cpp - 16-bit PNG reading and writing (libpng on Linux, WIC on Windows), the PNG
-// header parser, and the widen / narrow conversions.
+// image_codec16_test.cpp - 16-bit PNG reading (liteui's decodeFileBuffer, through decodeImage16) and
+// writing (libpng on Linux, WIC on Windows), what liteui's header probe says about the vectors, and the
+// widen / narrow conversions.
 //  * The decoder is checked against PNG files made by an independent writer (image_codec16_vectors.hpp:
 //    its own zlib + chunk code, distinctive 16-bit values, so a byte-order slip cannot hide).
-//  * The encoder is checked by reading its output with liteui's own decoder (which reduces to 8 bits: the
-//    high byte must be right) and by a round trip.
+//  * The encoder is checked by reading its output with liteui's 8-bit decoder (every sample must come back
+//    as the nearest byte) and by a round trip.
 // Links liteui like image_codec_test does.
 
 #include "io/color_tag.hpp"
 #include "io/image_codec16.hpp"
+#include "cases/encode_helpers.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -87,50 +89,42 @@ static void checkVector(const TempDir &d, const char *name, const uint8_t (&png)
   CHECK(same);
 }
 
-TEST_CASE("image_codec16: headerParser", "[image_codec16]")
+// What liteui's header probe says about the vectors (the PNG header parser that used to live in
+// image_codec16.hpp is gone: image_source and decodeImage16 ask liteui).
+TEST_CASE("image_codec16: probeReportsTheHeader", "[image_codec16]")
 {
-  CHECK(!parsePngHeader(nullptr, 100).ok());
-  CHECK(!parsePngHeader(kPng_RGBA16, 20).ok()); // too short
-  const PngHeader a = parsePngHeader(kPng_RGBA16, sizeof kPng_RGBA16);
-  CHECK((a.ok() && a.width == 3 && a.height == 2 && a.bitDepth == 16 && a.colorType == 6));
-  const PngHeader b = parsePngHeader(kPng_RGB16, sizeof kPng_RGB16);
-  CHECK((b.ok() && b.bitDepth == 16 && b.colorType == 2));
-  const PngHeader g = parsePngHeader(kPng_GRAY16, sizeof kPng_GRAY16);
-  CHECK((g.ok() && g.colorType == 0 && g.bitDepth == 16));
-  const PngHeader e = parsePngHeader(kPng_RGBA8, sizeof kPng_RGBA8);
-  CHECK((e.ok() && e.bitDepth == 8 && e.colorType == 6));
-  const PngHeader i = parsePngHeader(kPng_INTER16, sizeof kPng_INTER16);
-  CHECK((i.ok() && i.width == 5 && i.height == 4 && i.bitDepth == 16));
-  // Damaged starts: bad signature, wrong first chunk, absurd values.
-  uint8_t bad[33];
-  std::copy(kPng_RGBA16, kPng_RGBA16 + 33, bad);
-  uint8_t t[33];
-  std::copy(bad, bad + 33, t);
-  t[1] = 'X';
-  CHECK(!parsePngHeader(t, 33).ok());
-  std::copy(bad, bad + 33, t);
-  t[12] = 'J';
-  CHECK(!parsePngHeader(t, 33).ok());
-  std::copy(bad, bad + 33, t);
-  t[24] = 12; // bit depth 12 does not exist
-  CHECK(!parsePngHeader(t, 33).ok());
-  std::copy(bad, bad + 33, t);
-  t[25] = 5; // neither does color type 5
-  CHECK(!parsePngHeader(t, 33).ok());
-  std::copy(bad, bad + 33, t);
-  t[16] = t[17] = t[18] = t[19] = 0; // width 0
-  CHECK(!parsePngHeader(t, 33).ok());
-  // From a file: missing and non-PNG files are "not ok", not errors.
   TempDir d("hdr");
-  CHECK(!readPngHeader(d.file("nope.png")).ok());
+  struct V { const char *name; const uint8_t *png; size_t n; uint32_t w, h; int depth; bool alpha; };
+  const V vs[] = {
+      {"rgba16", kPng_RGBA16, sizeof kPng_RGBA16, 3, 2, 16, true},
+      {"rgb16", kPng_RGB16, sizeof kPng_RGB16, 3, 2, 16, false},
+      {"gray16", kPng_GRAY16, sizeof kPng_GRAY16, 3, 2, 16, false},
+      {"graya16", kPng_GRAYA16, sizeof kPng_GRAYA16, 3, 2, 16, true},
+      {"rgba8", kPng_RGBA8, sizeof kPng_RGBA8, 3, 2, 8, true},
+      {"inter16", kPng_INTER16, sizeof kPng_INTER16, 5, 4, 16, true},
+  };
+  for (const V &v : vs)
+  {
+    const std::string p = d.file(std::string(v.name) + ".png");
+    {
+      std::ofstream f(fsPath(p), std::ios::binary);
+      f.write(reinterpret_cast<const char *>(v.png), static_cast<std::streamsize>(v.n));
+    }
+    std::string err;
+    const auto info = liteui_image::probeFile(p, &err);
+    CHECK(info.has_value());
+    if (!info)
+      continue;
+    CHECK((info->format == liteui_image::ImageFileFormat::Png && info->width == v.w && info->height == v.h));
+    CHECK((info->bitDepth == v.depth && info->hasAlpha == v.alpha && !info->truncated));
+  }
+  // Missing and non-PNG files are "no header", not crashes.
+  CHECK(!liteui_image::probeFile(d.file("nope.png")).has_value());
   {
     std::ofstream f(fsPath(d.file("text.png")));
     f << "this is not a png file at all, just some text of enough length";
   }
-  CHECK(!readPngHeader(d.file("text.png")).ok());
-  writeBytes(d.file("ok.png"), kPng_GRAYA16);
-  const PngHeader ga = readPngHeader(d.file("ok.png"));
-  CHECK((ga.ok() && ga.colorType == 4 && ga.bitDepth == 16 && ga.width == 3));
+  CHECK(!liteui_image::probeFile(d.file("text.png")).has_value());
 }
 
 TEST_CASE("image_codec16: decodeVectors", "[image_codec16]")
@@ -170,9 +164,9 @@ TEST_CASE("image_codec16: roundTrip", "[image_codec16]")
     }
     const std::string p = d.file("rt.png");
     std::string err;
-    CHECK(encodePng16File(p, im, &err));
-    const PngHeader h = readPngHeader(p);
-    CHECK((h.ok() && h.bitDepth == 16 && h.colorType == 6 && static_cast<int>(h.width) == sz.first && static_cast<int>(h.height) == sz.second));
+    CHECK(encode_helpers::writePng16(p, im, &err));
+    const auto h = liteui_image::probeFile(p, &err);
+    CHECK((h && h->bitDepth == 16 && h->hasAlpha && static_cast<int>(h->width) == sz.first && static_cast<int>(h->height) == sz.second));
     const auto back = decodeImage16(p, &err);
     CHECK(back.has_value());
     if (back)
@@ -180,8 +174,8 @@ TEST_CASE("image_codec16: roundTrip", "[image_codec16]")
   }
 }
 
-// The encoder's byte order, checked against a decoder that is not ours: liteui's own (libpng strips a
-// 16-bit sample to its HIGH byte; WIC rounds), so each 8-bit value must be within one of v / 257.
+// The encoder's byte order, checked against a decoder that is not ours: liteui's own 8-bit one (a 16-bit
+// sample comes back as the nearest byte), so each 8-bit value must be within one of v / 257.
 TEST_CASE("image_codec16: encoderByteOrder", "[image_codec16]")
 {
   TempDir d("order");
@@ -195,7 +189,7 @@ TEST_CASE("image_codec16: encoderByteOrder", "[image_codec16]")
     p[3] = 65535;
   }
   const std::string p = d.file("order.png");
-  CHECK(encodePng16File(p, im, nullptr));
+  CHECK(encode_helpers::writePng16(p, im, nullptr));
   const auto eight = liteui_image::decodeFile(p, nullptr);
   CHECK(eight.has_value());
   if (!eight)
@@ -221,7 +215,8 @@ TEST_CASE("image_codec16: fallbackIsTheEightBitDecoder", "[image_codec16]")
   if (direct && wide)
     for (size_t i = 0; i < wide->pixels.size(); ++i)
       CHECK((wide->pixels[i] == direct->pixels[i] * 257));
-  // And a 16-bit file read through the editor's 8-bit decoder is the narrowed form of the 16-bit read.
+  // And a 16-bit file read through the editor's 8-bit decoder is EXACTLY the narrowed form of the 16-bit read
+  // (liteui narrows with the same rule as narrow16, on both platforms).
   const std::string q = d.file("sixteen.png");
   writeBytes(q, kPng_RGBA16);
   const auto d8 = liteui_image::decodeFile(q, nullptr);
@@ -229,7 +224,7 @@ TEST_CASE("image_codec16: fallbackIsTheEightBitDecoder", "[image_codec16]")
   CHECK((d8 && d16 && d8->pixels.size() == d16->pixels.size()));
   if (d8 && d16)
     for (size_t i = 0; i < d16->pixels.size(); ++i)
-      CHECK((d8->pixels[i] == within(d16->pixels[i] / 257.0, 1.01)));
+      CHECK(d8->pixels[i] == narrow16(d16->pixels[i]));
 }
 
 TEST_CASE("image_codec16: errors", "[image_codec16]")
@@ -264,13 +259,13 @@ TEST_CASE("image_codec16: errors", "[image_codec16]")
   // Writing: bad folder, empty picture, a picture whose buffer is too small.
   const Image16 im = randomImage(4, 4, 3);
   err.clear();
-  CHECK((!encodePng16File(d.file("no_such_dir/x.png"), im, &err) && !err.empty()));
-  CHECK(!encodePng16File(d.file("no_such_dir/x.png"), im, nullptr));
+  CHECK((!encode_helpers::writePng16(d.file("no_such_dir/x.png"), im, &err) && !err.empty()));
+  CHECK(!encode_helpers::writePng16(d.file("no_such_dir/x.png"), im, nullptr));
   err.clear();
-  CHECK((!encodePng16File(d.file("empty.png"), Image16(), &err) && !err.empty()));
+  CHECK((!encode_helpers::writePng16(d.file("empty.png"), Image16(), &err) && !err.empty()));
   Image16 shortBuf(4, 4);
   shortBuf.pixels.resize(10);
-  CHECK(!encodePng16File(d.file("short.png"), shortBuf, nullptr));
+  CHECK(!encode_helpers::writePng16(d.file("short.png"), shortBuf, nullptr));
   CHECK((!fs::exists(fsPath(d.file("empty.png"))) && !fs::exists(fsPath(d.file("short.png")))));
 }
 
@@ -302,7 +297,7 @@ TEST_CASE("image_codec16: colorTagsSurviveTheEncoder", "[image_codec16]")
   std::string err;
   // A tagged source PNG: encode, then give it a profile chunk.
   const std::string src = d.file("src.png");
-  CHECK(encodePng16File(src, im, &err));
+  CHECK(encode_helpers::writePng16(src, im, &err));
   color_tag::PngColor tags;
   const std::string name = "Display P3 test";
   tags.iccp.assign(name.begin(), name.end());
@@ -317,13 +312,13 @@ TEST_CASE("image_codec16: colorTagsSurviveTheEncoder", "[image_codec16]")
 
   // The export: untagged out of the encoder, tagged after carrying the source's tags.
   const std::string out = d.file("out.png");
-  CHECK(encodePng16File(out, im, &err));
+  CHECK(encode_helpers::writePng16(out, im, &err));
   CHECK(color_tag::colorTagOf(out).text == "untagged (assumed sRGB)");
   CHECK(color_tag::carryColorToPng(out, src) == "Display P3 test (embedded profile, not sRGB)");
   const auto back = decodeImage16(out, &err);
   CHECK((back.has_value() && back->pixels == im.pixels));
-  const PngHeader h = readPngHeader(out);
-  CHECK((h.ok() && h.bitDepth == 16 && h.colorType == 6 && h.width == 37 && h.height == 23));
+  const auto h = liteui_image::probeFile(out, &err);
+  CHECK((h && h->bitDepth == 16 && h->hasAlpha && h->width == 37 && h->height == 23));
   const auto narrow = liteui_image::decodeFile(out, &err); // liteui's decoder reads the tagged file too
   CHECK((narrow.has_value() && narrow->width == 37 && narrow->height == 23));
   CHECK(color_tag::colorTagOf(out).text == color_tag::colorTagOf(src).text);

@@ -14,8 +14,10 @@
 // Not carried: the profile of a PNG source exported as JPEG (it is stored deflate-compressed; reading it
 // would need an inflater).
 //
-// The PNG work is a byte splice like exif::embed: no libpng, no zlib, no liteui, so it behaves the same
-// on Windows and Linux and is tested with synthetic files. The chunks go right after IHDR, as the PNG
+// The PNG work is a byte splice like exif::embed: no libpng, no zlib, so it behaves the same
+// on Windows and Linux and is tested with synthetic files. The only thing taken from liteui.hpp is its
+// inline crc32 (declarations only: no LITEUI_IMPLEMENTATION and no platform library is needed for it).
+// The chunks go right after IHDR, as the PNG
 // specification wants (before PLTE and IDAT; iCCP and sRGB never both, iCCP wins).
 #pragma once
 #include <algorithm>
@@ -33,6 +35,7 @@
 
 #include "io/exif.hpp"
 #include "io/file_utils.hpp" // fsPath, readFilePrefix, isJpegPath
+#include "liteui.hpp"        // liteui_image::crc32
 
 namespace color_tag
 {
@@ -47,26 +50,7 @@ namespace color_tag
   constexpr size_t kProfileNameMax = 79; // the PNG limit for an iCCP profile name
 
   // ------------------------------------------------------------ checksums
-  // CRC-32 as PNG uses it. `crc` is the value so far (0 to start), like zlib's crc32().
-  inline uint32_t crc32(const uint8_t *p, size_t n, uint32_t crc = 0)
-  {
-    static const std::array<uint32_t, 256> table = []
-    {
-      std::array<uint32_t, 256> t{};
-      for (uint32_t i = 0; i < 256; ++i)
-      {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k)
-          c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-        t[i] = c;
-      }
-      return t;
-    }();
-    crc = ~crc;
-    for (size_t i = 0; i < n; ++i)
-      crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    return ~crc;
-  }
+  // The PNG chunk CRC is liteui_image::crc32 (liteui.hpp): 0 to start, like zlib's crc32().
 
   inline uint32_t adler32(const uint8_t *p, size_t n)
   {
@@ -161,7 +145,7 @@ namespace color_tag
     putBe32(c, static_cast<uint32_t>(n));
     c.insert(c.end(), type, type + 4);
     c.insert(c.end(), data, data + n);
-    putBe32(c, crc32(c.data() + 4, n + 4)); // over the type and the data
+    putBe32(c, liteui_image::crc32(c.data() + 4, n + 4)); // over the type and the data
     return c;
   }
 
@@ -191,7 +175,7 @@ namespace color_tag
         return true;
       if (!fits)
         return false;
-      if (crc32(type, len + 4) != be32(data + len))
+      if (liteui_image::crc32(type, len + 4) != be32(data + len))
         return true;
       std::vector<uint8_t> *dst = nullptr;
       bool sizeOk = false;
@@ -574,6 +558,22 @@ namespace color_tag
     if (!c.any() || !insertColorIntoFile(pngPath, c))
       return {};
     return text;
+  }
+
+  // Takes the color chunks the PNG encoder wrote on its own out of a file it just wrote.
+  //   * Linux: liteui's libpng backend writes none, so there is nothing to do (returns true at once).
+  //   * Windows: WIC always writes gAMA + cHRM chunks of its own. An export must come out of the encoder
+  //     untagged, so that the source's tags (or none) are the only ones it carries (nothing is ever
+  //     invented). Call it right after liteui_image::encodePng, before carryColorToPng. Best effort: the
+  //     PNG is valid either way, and false only says that the chunks are still there.
+  inline bool dropEncoderColor(const std::string &pngPath)
+  {
+#if defined(_WIN32)
+    return insertColorIntoFile(pngPath, PngColor{});
+#else
+    (void)pngPath;
+    return true;
+#endif
   }
 
 } // namespace color_tag

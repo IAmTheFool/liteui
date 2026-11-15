@@ -21,11 +21,11 @@
 // from the UI thread only. setNotify() must be called before the first start().
 #pragma once
 #include "core/geometry.hpp"
+#include "core/image16_convert.hpp"
 #include "core/raster_ops.hpp"
 #include "edit/adjustment_set.hpp"
 #include "io/color_tag.hpp"
 #include "io/file_utils.hpp"
-#include "io/image_codec.hpp"
 #include "io/image_codec16.hpp"
 #include "io/image_meta.hpp"
 #include "io/image_source.hpp"
@@ -46,6 +46,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stop_token>
 #include <string>
@@ -62,12 +63,19 @@ constexpr std::streamoff kExportMaxSidecarBytes = std::streamoff{64} << 20;
 // because the pixels already are; picture size updated; see
 // embedSourceMetadata). With `removeGps` as well, the GPS location is cut out
 // of that EXIF block. A picture JPEG can't hold (see jpegSizeOk) is refused by
-// encodeJpegMemory.
+// liteui_image::encodeJpegMemory.
 inline bool saveJpegFile(const std::string &path, const CanvasImage &img,
                          int quality, bool keepMetadata, bool removeGps,
                          const std::string &sourcePath, std::string *errorOut) {
+  const std::optional<ImageBuffer> buf = toImageBuffer(img);
+  if (!buf) {
+    if (errorOut)
+      *errorOut = "nothing to write";
+    return false;
+  }
   std::vector<uint8_t> jpeg;
-  if (!encodeJpegMemory(img, std::clamp(quality, 1, 100), &jpeg, errorOut))
+  if (!liteui_image::encodeJpegMemory(jpeg, *buf, std::clamp(quality, 1, 100),
+                                      errorOut))
     return false;
   // The color profile is not personal data: it is carried even without
   // keepMetadata.
@@ -275,7 +283,8 @@ exportPicture(const std::string &path, const ExportSettings &s,
 
   const Dims size =
       fitLongEdge(px.width(), px.height(), s.resize ? s.longEdge : 0);
-  if (s.jpeg && !jpegSizeOk(size.w, size.h))
+  if (s.jpeg && !liteui_image::jpegSizeOk(static_cast<uint32_t>(size.w),
+                                          static_cast<uint32_t>(size.h)))
     return fail("too large for JPEG (turn on Resize, or export as PNG)");
   px.resizeToLongEdge(s.resize
                           ? s.longEdge
@@ -288,16 +297,26 @@ exportPicture(const std::string &path, const ExportSettings &s,
   if (target.empty())
     return fail("no free file name in the folder");
   std::string err;
-  const bool wrote =
-      px.is16() ? encodePng16File(target, *px.img16, &err)
-      : s.jpeg  ? saveJpegFile(target, *px.img8, s.quality, s.keepMetadata,
-                               s.removeGps && s.keepMetadata, real, &err)
-                : encodePngFile(target, *px.img8, &err);
+  bool wrote = false;
+  if (s.jpeg)
+    wrote = saveJpegFile(target, *px.img8, s.quality, s.keepMetadata,
+                         s.removeGps && s.keepMetadata, real, &err);
+  else {
+    // 8 or 16 bits per channel: the buffer's format says which.
+    const std::optional<ImageBuffer> buf =
+        px.is16() ? toImageBuffer(*px.img16) : toImageBuffer(*px.img8);
+    if (!buf)
+      err = "nothing to write";
+    else
+      wrote = liteui_image::encodePng(target, *buf, &err, exportPngOptions());
+  }
   if (!wrote)
     return fail(err.empty() ? "couldn't write " + baseName(target) : err);
-  if (!s.jpeg) // a PNG carries its source's color tags (nothing is converted;
-               // see io/color_tag.hpp)
+  if (!s.jpeg) { // a PNG carries its source's color tags (nothing is converted;
+                 // see io/color_tag.hpp), and only those
+    color_tag::dropEncoderColor(target);
     color_tag::carryColorToPng(target, real);
+  }
   o.ok = true;
   o.outFile = target;
   o.width = px.width();

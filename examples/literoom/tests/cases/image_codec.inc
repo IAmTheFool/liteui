@@ -2,12 +2,15 @@
 // #define LITEUI_IMPLEMENTATION. Helpers and TEST_CASEs live in namespace image_codec_cases
 // so they cannot collide with other cases.
 //
-// image_codec_test.cpp - flattenRow (pure) and the platform encoders (libpng /
-// libjpeg on Linux, WIC on Windows), checked by decoding what they write with
-// liteui's own decoders. Links liteui like raster_ops_test does.
+// image_codec_test.cpp - how Literoom writes pictures through liteui's encoders (libpng / libjpeg on Linux,
+// WIC on Windows): the CanvasImage / Image16 -> ImageBuffer copy (toImageBuffer), the PNG options an export
+// uses (exportPngOptions) and the encoders' output, checked by decoding what they write with liteui's own
+// decoders. There is no image_codec.hpp any more (Literoom's own encoders were replaced by liteui's); the file
+// keeps its name so literoom_test.cpp's include line stays as it is. Links liteui like raster_ops_test does.
 
+#include "cases/encode_helpers.hpp"
+#include "core/image16_convert.hpp"
 #include "io/color_tag.hpp"
-#include "io/image_codec.hpp"
 #include "io/image_meta.hpp"
 
 #include <algorithm>
@@ -15,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -102,49 +106,69 @@ static bool isJpegStream(const Bytes &b)
   return b.size() > 4 && b[0] == 0xFF && b[1] == 0xD8 && b[b.size() - 2] == 0xFF && b[b.size() - 1] == 0xD9;
 }
 
-// ------------------------------------------------------------- flattenRow
-TEST_CASE("image_codec: flattenRow", "[image_codec]")
+// ------------------------------------------------------- toImageBuffer / options
+TEST_CASE("image_codec: toImageBuffer", "[image_codec]")
 {
-  CanvasImage img(5, 2);
-  put(img, 0, 0, 10, 20, 30);              // opaque
-  put(img, 1, 0, 11, 22, 33, 0);           // fully transparent -> white
-  put(img, 2, 0, 0, 100, 200, 128);        // half transparent
-  put(img, 3, 0, 255, 128, 0, 254);        // almost opaque
-  put(img, 4, 0, 1, 2, 3, 128);            // rounds up: (v*128 + 255*127 + 127) / 255
-  put(img, 0, 1, 1, 2, 3);                 // second row: only used when asked for
-  put(img, 1, 1, 0, 0, 0, 1);              // nearly invisible
-  put(img, 2, 1, 255, 255, 255, 1);
-  put(img, 3, 1, 200, 100, 50);
-  put(img, 4, 1, 0, 0, 0);
+  CanvasImage img(3, 2);
+  for (size_t i = 0; i < img.pixels.size(); ++i)
+    img.pixels[i] = static_cast<uint8_t>(i * 7 + 1);
+  const auto b8 = toImageBuffer(img);
+  REQUIRE(b8.has_value());
+  CHECK((b8->width == 3 && b8->height == 2 && b8->format == PixelFormat::RGBA8_UNORM && b8->valid()));
+  CHECK(b8->rowStride == 12); // tightly packed
+  CHECK(std::memcmp(b8->pixels.data(), img.pixels.data(), img.pixels.size()) == 0);
 
-  uint8_t rgb[5 * 3 + 4];
-  std::fill(std::begin(rgb), std::end(rgb), uint8_t{0xEE}); // sentinels past the row
-  flattenRow(img, 0, rgb, false);
-  const uint8_t want0[] = {10, 20, 30,   255, 255, 255,   127, 177, 227,   255, 128, 1,   128, 128, 129};
-  CHECK(std::equal(want0, want0 + 15, rgb));
-  CHECK((rgb[15] == 0xEE && rgb[18] == 0xEE)); // writes exactly 3 bytes per pixel
+  Image16 wide(2, 3);
+  for (size_t i = 0; i < wide.pixels.size(); ++i)
+    wide.pixels[i] = static_cast<uint16_t>(i * 2749 + 5);
+  const auto b16 = toImageBuffer(wide);
+  REQUIRE(b16.has_value());
+  CHECK((b16->width == 2 && b16->height == 3 && b16->format == PixelFormat::RGBA16_UNORM && b16->valid()));
+  CHECK(b16->rowStride == 16);
+  CHECK(std::memcmp(b16->pixels.data(), wide.pixels.data(), wide.pixels.size() * 2) == 0); // host-order samples
 
-  uint8_t bgr[5 * 3];
-  flattenRow(img, 0, bgr, true);
-  for (int x = 0; x < 5; ++x)
-  {
-    CHECK(bgr[x * 3 + 0] == rgb[x * 3 + 2]); // B and R swapped...
-    CHECK(bgr[x * 3 + 1] == rgb[x * 3 + 1]); // ...G stays
-    CHECK(bgr[x * 3 + 2] == rgb[x * 3 + 0]);
-  }
+  // Nothing to copy: empty, or a pixel vector shorter than the size says.
+  CHECK(!toImageBuffer(CanvasImage()));
+  CHECK(!toImageBuffer(Image16()));
+  CanvasImage shortImg(4, 4);
+  shortImg.pixels.resize(10);
+  CHECK(!toImageBuffer(shortImg));
+  Image16 shortWide(4, 4);
+  shortWide.pixels.resize(10);
+  CHECK(!toImageBuffer(shortWide));
+}
 
-  flattenRow(img, 1, rgb, false); // picks the requested row
-  const uint8_t want1[] = {1, 2, 3,   254, 254, 254,   255, 255, 255,   200, 100, 50,   0, 0, 0};
-  CHECK(std::equal(want1, want1 + 15, rgb));
+TEST_CASE("image_codec: exportPngOptions", "[image_codec]")
+{
+  const auto o = exportPngOptions();
+  CHECK(o.compression == 3);
+  CHECK(!o.dropOpaqueAlpha);
 
-  CHECK((jpegFullChroma(100) && jpegFullChroma(92) && jpegFullChroma(90)));
-  CHECK((!jpegFullChroma(89) && !jpegFullChroma(50) && !jpegFullChroma(1)));
-  CHECK((kJpegQualityDefault == 92 && kJpegMaxSide == 65500));
+  // A picture whose alpha is everywhere opaque: liteui's own default writes RGB (colour type 2), the
+  // options an export uses keep RGBA (colour type 6).
+  TempDir d("opts");
+  const auto buf = toImageBuffer(solid(4, 4, 1, 2, 3));
+  REQUIRE(buf.has_value());
+  std::string err;
+  CHECK(liteui_image::encodePng(d.file("default.png"), *buf, &err));
+  CHECK(liteui_image::encodePng(d.file("export.png"), *buf, &err, exportPngOptions()));
+  const Bytes a = slurp(d.file("default.png")), b = slurp(d.file("export.png"));
+  REQUIRE((a.size() > 26 && b.size() > 26));
+  CHECK(a[25] == 2);
+  CHECK(b[25] == 6);
+}
 
-  const int M = kJpegMaxSide;
+TEST_CASE("image_codec: jpegLimits", "[image_codec]")
+{
+  using liteui_image::jpegSizeOk;
+  const uint32_t M = liteui_image::kJpegMaxSide;
+  CHECK(M == 65500);
   CHECK((jpegSizeOk(1, 1) && jpegSizeOk(M, 1) && jpegSizeOk(1, M) && jpegSizeOk(M, M)));
   CHECK((!jpegSizeOk(M + 1, 1) && !jpegSizeOk(1, M + 1) && !jpegSizeOk(M + 1, M + 1)));
-  CHECK((!jpegSizeOk(0, 5) && !jpegSizeOk(5, 0) && !jpegSizeOk(-1, 5) && !jpegSizeOk(5, -1)));
+  CHECK((!jpegSizeOk(0, 5) && !jpegSizeOk(5, 0)));
+  // A negative int (a bad size) turns into a huge unsigned one, which is refused too: the callers cast
+  // an int size straight to uint32_t.
+  CHECK((!jpegSizeOk(static_cast<uint32_t>(-1), 5) && !jpegSizeOk(5, static_cast<uint32_t>(-1))));
 }
 
 // -------------------------------------------------------------------- PNG
@@ -165,7 +189,7 @@ TEST_CASE("image_codec: pngRoundTrip", "[image_codec]")
 
   const std::string p = d.file("out.png");
   std::string err;
-  CHECK(encodePngFile(p, img, &err));
+  CHECK(encode_helpers::writePng8(p, img, &err));
 
   const Bytes b = slurp(p);
   const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
@@ -190,9 +214,9 @@ TEST_CASE("image_codec: pngFailure", "[image_codec]")
   TempDir d("pngfail");
   const CanvasImage img = solid(4, 4, 1, 2, 3);
   std::string err;
-  CHECK(!encodePngFile(d.file("no_such_dir/out.png"), img, &err));
+  CHECK(!encode_helpers::writePng8(d.file("no_such_dir/out.png"), img, &err));
   CHECK(!err.empty());
-  CHECK(!encodePngFile(d.file("no_such_dir/out.png"), img, nullptr)); // null errorOut is fine
+  CHECK(!encode_helpers::writePng8(d.file("no_such_dir/out.png"), img, nullptr)); // null errorOut is fine
 }
 
 // ------------------------------------------------------------------- JPEG
@@ -201,7 +225,7 @@ TEST_CASE("image_codec: jpegRoundTrip", "[image_codec]")
   const CanvasImage img = gradient(64, 48);
   Bytes jpeg;
   std::string err;
-  CHECK(encodeJpegMemory(img, 95, &jpeg, &err));
+  CHECK(encode_helpers::jpegBytes(img, 95, &jpeg, &err));
   CHECK(isJpegStream(jpeg));
 
   const auto back = liteui_image::decodeMemory(jpeg.data(), jpeg.size(), &err);
@@ -229,13 +253,13 @@ TEST_CASE("image_codec: jpegRoundTrip", "[image_codec]")
 TEST_CASE("image_codec: jpegChannelOrder", "[image_codec]")
 {
   Bytes jpeg;
-  CHECK(encodeJpegMemory(solid(16, 16, 200, 40, 60), 95, &jpeg, nullptr));
+  CHECK(encode_helpers::jpegBytes(solid(16, 16, 200, 40, 60), 95, &jpeg, nullptr));
   const auto back = liteui_image::decodeMemory(jpeg.data(), jpeg.size());
   CHECK(back.has_value());
   if (!back)
     return;
   const uint8_t *p = at(*back, 8, 8);
-  CHECK(p[0] == within(200, 10)); // a red/blue swap (the WIC path flattens to BGR) would show here
+  CHECK(p[0] == within(200, 10)); // a red/blue swap (WIC packs BGR) would show here
   CHECK(p[1] == within(40, 10));
   CHECK(p[2] == within(60, 10));
 }
@@ -247,7 +271,7 @@ TEST_CASE("image_codec: jpegFlattensAlphaOnWhite", "[image_codec]")
     for (int x = 8; x < 16; ++x)
       put(img, x, y, 0, 0, 0, 0); // the right half is transparent
   Bytes jpeg;
-  CHECK(encodeJpegMemory(img, 100, &jpeg, nullptr));
+  CHECK(encode_helpers::jpegBytes(img, 100, &jpeg, nullptr));
   const auto back = liteui_image::decodeMemory(jpeg.data(), jpeg.size());
   CHECK(back.has_value());
   if (!back)
@@ -258,7 +282,7 @@ TEST_CASE("image_codec: jpegFlattensAlphaOnWhite", "[image_codec]")
   CHECK((r[0] >= 245 && r[1] >= 245 && r[2] >= 245)); // white, not black
 
   Bytes half;
-  CHECK(encodeJpegMemory(solid(16, 16, 255, 0, 0, 128), 100, &half, nullptr));
+  CHECK(encode_helpers::jpegBytes(solid(16, 16, 255, 0, 0, 128), 100, &half, nullptr));
   const auto hb = liteui_image::decodeMemory(half.data(), half.size());
   CHECK(hb.has_value());
   if (hb)
@@ -276,10 +300,10 @@ TEST_CASE("image_codec: jpegQualityAndChroma", "[image_codec]")
   // The quality argument is really used. Each pair is on one side of the 4:4:4
   // threshold (90), so chroma handling can't be what makes the difference.
   Bytes q100, q95, q80, q30;
-  CHECK(encodeJpegMemory(img, 100, &q100, nullptr));
-  CHECK(encodeJpegMemory(img, 95, &q95, nullptr));
-  CHECK(encodeJpegMemory(img, 80, &q80, nullptr));
-  CHECK(encodeJpegMemory(img, 30, &q30, nullptr));
+  CHECK(encode_helpers::jpegBytes(img, 100, &q100, nullptr));
+  CHECK(encode_helpers::jpegBytes(img, 95, &q95, nullptr));
+  CHECK(encode_helpers::jpegBytes(img, 80, &q80, nullptr));
+  CHECK(encode_helpers::jpegBytes(img, 30, &q30, nullptr));
   CHECK((isJpegStream(q100) && isJpegStream(q95) && isJpegStream(q80) && isJpegStream(q30)));
   CHECK(q100.size() > q95.size() * 23 / 20); // measured about 1.7x
   CHECK(q80.size() > q30.size() * 13 / 10);  // measured about 1.9x
@@ -291,7 +315,7 @@ TEST_CASE("image_codec: jpegQualityAndChroma", "[image_codec]")
     for (int x = 0; x < 32; ++x)
       x % 2 == 0 ? put(stripes, x, y, 255, 0, 0) : put(stripes, x, y, 0, 0, 255);
   Bytes sj;
-  CHECK(encodeJpegMemory(stripes, 95, &sj, nullptr));
+  CHECK(encode_helpers::jpegBytes(stripes, 95, &sj, nullptr));
   const auto back = liteui_image::decodeMemory(sj.data(), sj.size());
   CHECK(back.has_value());
   if (back)
@@ -302,16 +326,16 @@ TEST_CASE("image_codec: jpegQualityAndChroma", "[image_codec]")
   }
 }
 
-// The size limit is enforced by the encoder itself, so no caller can skip it.
+// The size limit is enforced by liteui's encoder itself, so no caller can skip it.
 TEST_CASE("image_codec: jpegSizeLimit", "[image_codec]")
 {
-  const int M = kJpegMaxSide;
+  const int M = static_cast<int>(liteui_image::kJpegMaxSide);
   // Exactly at the limit still encodes (1 pixel thick, so the buffers stay small).
   for (const CanvasImage &img : {solid(M, 1, 10, 20, 30), solid(1, M, 10, 20, 30)})
   {
     Bytes jpeg;
     std::string err;
-    CHECK(encodeJpegMemory(img, 90, &jpeg, &err));
+    CHECK(encode_helpers::jpegBytes(img, 90, &jpeg, &err));
     CHECK(isJpegStream(jpeg));
   }
 
@@ -320,10 +344,10 @@ TEST_CASE("image_codec: jpegSizeLimit", "[image_codec]")
   {
     Bytes jpeg;
     std::string err;
-    CHECK(!encodeJpegMemory(img, 90, &jpeg, &err));
+    CHECK(!encode_helpers::jpegBytes(img, 90, &jpeg, &err));
     CHECK(!err.empty());
     CHECK(jpeg.empty());
-    CHECK(!encodeJpegMemory(img, 90, &jpeg, nullptr)); // null errorOut is fine
+    CHECK(!encode_helpers::jpegBytes(img, 90, &jpeg, nullptr)); // null errorOut is fine
   }
 
   // Empty or negative sizes: the guard runs before any pixel is read, so the
@@ -335,9 +359,9 @@ TEST_CASE("image_codec: jpegSizeLimit", "[image_codec]")
     h.height = bad;
     Bytes jpeg;
     std::string err;
-    CHECK((!encodeJpegMemory(w, 90, &jpeg, &err) && !err.empty() && jpeg.empty()));
+    CHECK((!encode_helpers::jpegBytes(w, 90, &jpeg, &err) && !err.empty() && jpeg.empty()));
     err.clear();
-    CHECK((!encodeJpegMemory(h, 90, &jpeg, &err) && !err.empty() && jpeg.empty()));
+    CHECK((!encode_helpers::jpegBytes(h, 90, &jpeg, &err) && !err.empty() && jpeg.empty()));
   }
 }
 
@@ -363,7 +387,7 @@ TEST_CASE("image_codec: embedIntoRealEncoderOutput", "[image_codec]")
   CHECK((exifOrientationOf(srcPath).rot == 1 && !exifOrientationOf(srcPath).flip)); // reads as "turn 90 cw"
 
   Bytes jpeg;
-  CHECK(encodeJpegMemory(gradient(40, 30), 92, &jpeg, nullptr));
+  CHECK(encode_helpers::jpegBytes(gradient(40, 30), 92, &jpeg, nullptr));
   const Bytes plain = jpeg;
   CHECK(embedSourceMetadata(&jpeg, srcPath, 40, 30));
   CHECK(jpeg.size() > plain.size());
@@ -389,7 +413,7 @@ TEST_CASE("image_codec: colorTagsSurviveTheEncoder", "[image_codec]")
 
   // A JPEG carrying an ICC profile (the bytes are made up: only that it is tagged matters here).
   Bytes jpeg;
-  CHECK(encodeJpegMemory(gradient(40, 30), 92, &jpeg, nullptr));
+  CHECK(encode_helpers::jpegBytes(gradient(40, 30), 92, &jpeg, nullptr));
   exif::JpegMeta meta;
   Bytes payload{'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0, 1, 1};
   payload.insert(payload.end(), 200, 0x37);
@@ -404,7 +428,7 @@ TEST_CASE("image_codec: colorTagsSurviveTheEncoder", "[image_codec]")
 
   // JPEG source -> PNG export.
   const std::string out = d.file("out.png");
-  CHECK(encodePngFile(out, img, &err));
+  CHECK(encode_helpers::writePng8(out, img, &err));
   CHECK(color_tag::colorTagOf(out).text == "untagged (assumed sRGB)");
   CHECK(color_tag::carryColorToPng(out, srcJpg) == "ICC profile (embedded profile, not sRGB)");
   CHECK(color_tag::colorTagOf(out).text == "ICC profile (embedded profile, not sRGB)");
@@ -415,14 +439,14 @@ TEST_CASE("image_codec: colorTagsSurviveTheEncoder", "[image_codec]")
 
   // PNG source -> PNG export: its chunks are copied.
   const std::string out2 = d.file("out2.png");
-  CHECK(encodePngFile(out2, img, &err));
+  CHECK(encode_helpers::writePng8(out2, img, &err));
   CHECK(color_tag::carryColorToPng(out2, out) == "ICC profile (embedded profile, not sRGB)");
   const auto back2 = liteui_image::decodeFile(out2, &err);
   CHECK((back2.has_value() && back2->pixels == img.pixels));
 
   // An untagged source writes nothing: the export stays byte for byte what the encoder wrote.
   const std::string plain = d.file("plain.png"), out3 = d.file("out3.png");
-  CHECK((encodePngFile(plain, img, &err) && encodePngFile(out3, img, &err)));
+  CHECK((encode_helpers::writePng8(plain, img, &err) && encode_helpers::writePng8(out3, img, &err)));
   const Bytes before = slurp(out3);
   CHECK(color_tag::carryColorToPng(out3, plain).empty());
   CHECK(slurp(out3) == before);

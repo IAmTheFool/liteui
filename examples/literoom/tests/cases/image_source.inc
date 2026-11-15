@@ -3,12 +3,12 @@
 // so they cannot collide with other cases.
 //
 // image_source_test.cpp - how a picture file is opened (io/image_source.hpp): wide or narrow by the
-// file's header, upright by the orientation it is given, the 8-bit fallback for a wide file whose
-// full-precision read fails, and the errors. Real files in the temp folder; links LiteUI like
+// file's header, upright by the orientation it is given, one decode per open, the header-only size,
+// the same refusal of a damaged PNG on every platform, and the errors. Real files in the temp folder; links LiteUI like
 // image_codec16_test.
 
-#include "io/image_codec.hpp"
 #include "io/image_codec16.hpp"
+#include "cases/encode_helpers.hpp"
 #include "io/image_source.hpp"
 
 #include <cstdint>
@@ -65,8 +65,8 @@ TEST_CASE("image_source: depthFollowsTheHeader", "[image_source]")
 {
   TempFile wide("depth16.png"), narrow("depth8.png"), junk("depth_junk.png");
   std::string err;
-  CHECK(encodePng16File(wide.path, widePicture(7, 5), &err));
-  CHECK(encodePngFile(narrow.path, narrowPicture(7, 5), &err));
+  CHECK(encode_helpers::writePng16(wide.path, widePicture(7, 5), &err));
+  CHECK(encode_helpers::writePng8(narrow.path, narrowPicture(7, 5), &err));
   {
     std::ofstream f(junk.path, std::ios::binary);
     f << "this is not a picture";
@@ -82,7 +82,7 @@ TEST_CASE("image_source: wideFileKeepsItsPrecision", "[image_source]")
   TempFile f("wide.png");
   const Image16 src = widePicture(7, 5);
   std::string err;
-  CHECK(encodePng16File(f.path, src, &err));
+  CHECK(encode_helpers::writePng16(f.path, src, &err));
   const auto o = image_source::openUpright(f.path, Orient{}, /*want8=*/true, &err);
   CHECK(o.has_value());
   if (!o)
@@ -105,7 +105,7 @@ TEST_CASE("image_source: narrowFileHasNoTwin", "[image_source]")
   TempFile f("narrow.png");
   const CanvasImage src = narrowPicture(7, 5);
   std::string err;
-  CHECK(encodePngFile(f.path, src, &err));
+  CHECK(encode_helpers::writePng8(f.path, src, &err));
   for (const bool want8 : {true, false})
   {
     const auto o = image_source::openUpright(f.path, Orient{}, want8, &err);
@@ -119,8 +119,8 @@ TEST_CASE("image_source: orientationIsApplied", "[image_source]")
 {
   TempFile w("orient16.png"), n("orient8.png");
   std::string err;
-  CHECK(encodePng16File(w.path, widePicture(7, 5), &err));
-  CHECK(encodePngFile(n.path, narrowPicture(7, 5), &err));
+  CHECK(encode_helpers::writePng16(w.path, widePicture(7, 5), &err));
+  CHECK(encode_helpers::writePng8(n.path, narrowPicture(7, 5), &err));
   const Orient turn{1, false}; // a quarter turn: 7 x 5 becomes 5 x 7
   const auto ow = image_source::openUpright(w.path, turn, true, &err);
   CHECK((ow && ow->wide && ow->image));
@@ -148,10 +148,10 @@ TEST_CASE("image_source: failures", "[image_source]")
   err.clear();
   CHECK(!image_source::openUpright(junk.path, Orient{}, true, &err));
   CHECK(!err.empty());
-  // A 16-bit PNG cut off after its header: both readers fail, no crash, a message (and a null error
-  // pointer is allowed).
+  // A 16-bit PNG cut off after its header: refused, no crash, a message (and a null error pointer is
+  // allowed).
   TempFile whole("whole16.png"), cut("cut16.png");
-  CHECK(encodePng16File(whole.path, widePicture(16, 16), &err));
+  CHECK(encode_helpers::writePng16(whole.path, widePicture(16, 16), &err));
   {
     std::ifstream in(whole.path, std::ios::binary);
     std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -183,7 +183,7 @@ TEST_CASE("image_source: truncatedPngIsRefusedOnEveryPlatform", "[image_source]"
   // checked for its IEND chunk first, so both platforms give the same answer.
   TempFile whole("trunc_whole.png"), cut("trunc_cut.png");
   std::string err;
-  CHECK(encodePng16File(whole.path, widePicture(16, 16), &err));
+  CHECK(encode_helpers::writePng16(whole.path, widePicture(16, 16), &err));
   const std::vector<char> bytes = slurp(whole.path);
   CHECK(bytes.size() > 100);
   CHECK(!image_source::pngIsTruncated(whole.path));
@@ -222,7 +222,7 @@ TEST_CASE("image_source: uprightSize", "[image_source]")
 {
   TempFile f("size.png");
   std::string err;
-  CHECK(encodePngFile(f.path, narrowPicture(7, 5), &err));
+  CHECK(encode_helpers::writePng8(f.path, narrowPicture(7, 5), &err));
   int w = 0, h = 0;
   CHECK((image_source::uprightSize(f.path, Orient{}, &w, &h, &err) && w == 7 && h == 5));
   CHECK((image_source::uprightSize(f.path, Orient{1, false}, &w, &h, &err) && w == 5 && h == 7));
@@ -237,10 +237,105 @@ TEST_CASE("image_source: decodeForThumb", "[image_source]")
 {
   TempFile w("thumb16.png");
   std::string err;
-  CHECK(encodePng16File(w.path, widePicture(7, 5), &err));
+  CHECK(encode_helpers::writePng16(w.path, widePicture(7, 5), &err));
   // A wide file's thumbnail source is its plain 8-bit decode, not turned.
   const auto t = image_source::decodeForThumb(w.path, &err);
   CHECK((t && t->width == 7 && t->height == 5));
   CHECK(!image_source::decodeForThumb(tmp("does_not_exist.png"), &err));
+}
+
+TEST_CASE("image_source: damagedPngIsRefusedButItsSizeIsStillReadFromTheHeader", "[image_source]")
+{
+  // A flipped byte inside the pixel data: the chunk CRC no longer matches. Opening and thumbnailing refuse
+  // it (liteui checks every chunk CRC on both platforms); uprightSize reads only the header and still gives
+  // the size, which is what the sidecar sync needs.
+  TempFile whole("crc_whole.png"), bad("crc_bad.png");
+  std::string err;
+  CHECK(encode_helpers::writePng16(whole.path, widePicture(16, 16), &err));
+  std::vector<char> bytes = slurp(whole.path);
+  bytes[bytes.size() / 2] = static_cast<char>(bytes[bytes.size() / 2] ^ 0x5A);
+  spit(bad.path, bytes, bytes.size());
+  CHECK(!image_source::pngIsTruncated(bad.path));
+  err.clear();
+  CHECK(!image_source::openUpright(bad.path, Orient{}, true, &err));
+  CHECK(!err.empty());
+  CHECK(err != image_source::kTruncatedMessage);
+  err.clear();
+  CHECK(!image_source::decodeForThumb(bad.path, &err));
+  CHECK(!err.empty());
+  int w = 0, h = 0;
+  CHECK((image_source::uprightSize(bad.path, Orient{}, &w, &h, &err) && w == 16 && h == 16));
+}
+
+TEST_CASE("image_source: thumbOfAWideFileIsTheNarrowedWideRead", "[image_source]")
+{
+  // The filmstrip and the editor show the same 8-bit picture for a 16-bit file: the nearest byte.
+  TempFile f("thumb_eq.png");
+  std::string err;
+  CHECK(encode_helpers::writePng16(f.path, widePicture(23, 11), &err));
+  const auto t = image_source::decodeForThumb(f.path, &err);
+  const auto o = image_source::openUpright(f.path, Orient{}, true, &err);
+  CHECK((t && o && o->image));
+  if (t && o && o->image)
+    CHECK((t->width == o->image->width && t->height == o->image->height && t->pixels == o->image->pixels));
+}
+
+TEST_CASE("image_source: theFormatComesFromTheContentNotTheName", "[image_source]")
+{
+  // A PNG called .jpg (and the other way round) is read as what it is.
+  TempFile asJpg("really_png.jpg"), asPng("really_jpeg.png");
+  std::string err;
+  CHECK(encode_helpers::writePng8(asJpg.path, narrowPicture(9, 4), &err));
+  std::vector<uint8_t> jpeg;
+  CHECK(encode_helpers::jpegBytes(narrowPicture(9, 4), 90, &jpeg, &err));
+  {
+    std::ofstream f(asPng.path, std::ios::binary);
+    f.write(reinterpret_cast<const char *>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+  }
+  const auto a = image_source::openUpright(asJpg.path, Orient{}, true, &err);
+  const auto b = image_source::openUpright(asPng.path, Orient{}, true, &err);
+  CHECK((a && a->image && a->image->width == 9 && a->image->height == 4));
+  CHECK((b && b->image && b->image->width == 9 && b->image->height == 4 && !b->wide));
+  CHECK(image_source::depthOf(asJpg.path) == image_source::Depth::Narrow);
+}
+
+TEST_CASE("image_source: uprightSizeOfAJpegIsItsHeader", "[image_source]")
+{
+  TempFile f("size.jpg");
+  std::string err;
+  std::vector<uint8_t> jpeg;
+  CHECK(encode_helpers::jpegBytes(narrowPicture(13, 6), 90, &jpeg, &err));
+  {
+    std::ofstream o(f.path, std::ios::binary);
+    o.write(reinterpret_cast<const char *>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
+  }
+  int w = 0, h = 0;
+  CHECK((image_source::uprightSize(f.path, Orient{}, &w, &h, &err) && w == 13 && h == 6));
+  CHECK((image_source::uprightSize(f.path, Orient{1, false}, &w, &h, &err) && w == 6 && h == 13));
+  // Same answer as an actual open.
+  const auto o = image_source::openUpright(f.path, Orient{1, false}, true, &err);
+  CHECK((o && o->image && o->image->width == 6 && o->image->height == 13));
+}
+
+TEST_CASE("image_source: aPngCutInsideItsHeaderIsTruncatedToo", "[image_source]")
+{
+  // Shorter than the IHDR (8..28 bytes): liteui's probe cannot read it, but it is a cut-off PNG, not a
+  // damaged one, and says so in Literoom's words. A file with garbage after the signature is NOT truncated.
+  TempFile whole("hdrcut_whole.png"), cut("hdrcut.png");
+  std::string err;
+  CHECK(encode_helpers::writePng8(whole.path, narrowPicture(5, 5), &err));
+  const std::vector<char> bytes = slurp(whole.path);
+  for (const size_t n : {size_t{8}, size_t{9}, size_t{20}, size_t{28}})
+  {
+    spit(cut.path, bytes, n);
+    CHECK(image_source::pngIsTruncated(cut.path));
+  }
+  std::vector<char> junk = bytes;
+  for (size_t i = 8; i < 40; ++i)
+    junk[i] = static_cast<char>(0x11 * (i % 7)); // no IHDR where it belongs
+  spit(cut.path, junk, junk.size());
+  CHECK(!image_source::pngIsTruncated(cut.path));
+  err.clear();
+  CHECK((!image_source::openUpright(cut.path, Orient{}, true, &err) && !err.empty() && err != image_source::kTruncatedMessage));
 }
 } // namespace image_source_cases
