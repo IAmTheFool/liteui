@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 7
+#define LITEUI_VERSION_MINOR 8
 
 #include <algorithm>
 #include <array>
@@ -12136,6 +12136,85 @@ private:
 
 } // namespace liteui_pointer
 
+// ---------------------------------------------------------------------------
+// liteui_wheel — turns raw scroll input into WheelEvent deltas, with no
+// window, platform or renderer dependency (like liteui_pointer, so the unit
+// tests can drive it directly, on every platform).
+//
+// Wayland describes one physical scroll as a group of events closed by
+// wl_pointer.frame: per-axis continuous pixels (axis), whole notches
+// (axis_discrete, v5-v7) or 1/120ths of a notch (axis_value120, v8), plus
+// the device kind (axis_source). The Wayland backend accumulates those into
+// two Axis records and calls normalize() once per frame. The result is what
+// Win32's WM_MOUSEWHEEL produces: 40px per wheel notch, precise == false for
+// whole notches, precise == true for touchpads and fractional-notch wheels.
+// ---------------------------------------------------------------------------
+namespace liteui_wheel {
+
+// Pixels scrolled per wheel notch. WM_MOUSEWHEEL uses the same 40px step, so
+// a mouse wheel scrolls (and zooms, in apps that treat !precise as a notch)
+// identically on both platforms.
+inline constexpr float kNotchPx = 40.0f;
+
+// What physically produced the scroll.
+enum class Source {
+  Unknown, // the compositor didn't say (Wayland < v5, or no axis_source sent)
+  Wheel,   // notched or hi-res mouse wheel, including tilt wheels
+  Finger,  // touchpad / touchscreen / continuous (pixel-accurate) scrolling
+};
+
+// Everything received for ONE axis (vertical or horizontal) in ONE frame.
+struct Axis {
+  double value = 0;     // continuous pixels from wl_pointer.axis (summed)
+  int32_t v120 = 0;     // 1/120ths of a notch, wl_pointer.axis_value120 (v8)
+  int32_t discrete = 0; // whole notches, wl_pointer.axis_discrete (v5-v7)
+  bool hasValue = false, hasV120 = false, hasDiscrete = false;
+};
+
+struct Result {
+  float dx = 0, dy = 0; // pixels; +dy = content scrolls down, +dx = right
+  bool precise = false;
+  // A frame can carry no movement at all (e.g. one that only holds
+  // axis_stop); such a frame must not produce a WheelEvent.
+  bool empty() const { return dx == 0.0f && dy == 0.0f; }
+};
+
+// Normalizes one accumulated frame.
+//  - Wheel: value120/120 notches (preferred, v8), else discrete notches
+//    (v5-v7), else the raw value; each notch is kNotchPx. `precise` is false
+//    unless the wheel reported a fractional notch (same rule as Win32).
+//  - Finger: the compositor's pixel value, precise = true.
+//  - Unknown source: a v120 / discrete count can only come from a wheel, so
+//    treat it as one; otherwise pass the raw value through, precise = false.
+// Wayland's sign (positive = down/right) already matches WheelEvent's.
+inline Result normalize(Source src, const Axis &vertical,
+                        const Axis &horizontal) {
+  Result r;
+  r.precise = src == Source::Finger;
+  const Axis *axes[2] = {&vertical, &horizontal};
+  float d[2] = {0.0f, 0.0f};
+  for (int i = 0; i < 2; ++i) {
+    const Axis &a = *axes[i];
+    const bool wheelLike =
+        src == Source::Wheel ||
+        (src == Source::Unknown && (a.hasV120 || a.hasDiscrete));
+    if (wheelLike && a.hasV120) {
+      d[i] = static_cast<float>(a.v120) / 120.0f * kNotchPx;
+      if (a.v120 % 120 != 0)
+        r.precise = true; // fractional notch
+    } else if (wheelLike && a.hasDiscrete) {
+      d[i] = static_cast<float>(a.discrete) * kNotchPx;
+    } else if (a.hasValue) {
+      d[i] = static_cast<float>(a.value);
+    }
+  }
+  r.dy = d[0];
+  r.dx = d[1];
+  return r;
+}
+
+} // namespace liteui_wheel
+
 #if !defined(_WIN32)
 inline Key xkbKeysymToKey(xkb_keysym_t sym) {
   if (sym >= XKB_KEY_a && sym <= XKB_KEY_z)
@@ -14947,6 +15026,16 @@ private:
   int32_t repeatRateHz_ = 0; // 0 = repeat disabled by compositor
   int32_t repeatDelayMs_ = 0;
 
+  // Wheel / touchpad scroll events accumulated between wl_pointer.frame
+  // events. One physical scroll can arrive as several events (vertical
+  // axis, horizontal axis, axis_source, axis_value120, ...); the compositor
+  // closes the group with frame(), and we dispatch ONE WheelEvent for it.
+  // The normalization itself lives in liteui_wheel (window-free, unit
+  // tested); this is only the per-frame accumulation state.
+  liteui_wheel::Axis axis_[2]; // [0] = vertical, [1] = horizontal
+  liteui_wheel::Source axisSource_ = liteui_wheel::Source::Unknown;
+  bool axisPending_ = false;
+
   wl_pointer *pointer_ =
       nullptr; // The pointer (mouse) device obtained from
                // the seat, once it announces pointer capability.
@@ -15902,6 +15991,13 @@ private:
     static_cast<LiteUIImpl *>(data)->flushPendingMotion();
     static_cast<LiteUIImpl *>(data)->currentCursorName_.clear();
     static_cast<LiteUIImpl *>(data)->pointerInside_ = false;
+    // Drop any half-accumulated scroll frame so it can't leak into the next
+    // window/gesture.
+    auto *self = static_cast<LiteUIImpl *>(data);
+    self->axis_[0] = {};
+    self->axis_[1] = {};
+    self->axisSource_ = liteui_wheel::Source::Unknown;
+    self->axisPending_ = false;
   }
   // Called on every pointer movement while over this surface.
   // Called on every pointer movement while over this surface.
@@ -15966,30 +16062,109 @@ private:
     // what's under the pointer) so the user sees it before they even click.
     refreshCursor();
   }
-  // Called on scroll/axis events — mouse wheel rotation or a touchpad's
-  // continuous scroll gesture. `value` is already a relative-movement
-  // amount in the same coordinate space as pointer motion (per the
-  // wl_pointer protocol), so it's usable directly as a pixel delta with no
-  // extra scaling, unlike Windows' notch-based WM_MOUSEWHEEL.
+  // ---- Scrolling ------------------------------------------------------
+  // Wayland describes one scroll as a group of events closed by
+  // wl_pointer.frame (v5+): per-axis `axis` (continuous pixels), optional
+  // `axis_source` (wheel / finger / continuous), `axis_discrete` (v5-v7) or
+  // `axis_value120` (v8) for notched wheels, and `axis_stop`. We accumulate
+  // them and dispatch ONE wheel event per frame in flushAxisFrame().
+  //
+  // Compositors older than v5 never send frame (or a source), so there each
+  // axis event is dispatched immediately.
+  //
+  // `value` is a relative-movement amount in surface-local coordinates, like
+  // pointer motion. Wayland's sign is already positive for scroll-down/right,
+  // which is WheelEvent's convention.
   static void pointerAxis(void *data, wl_pointer *, uint32_t, uint32_t axis,
                           wl_fixed_t value) {
     auto *self = static_cast<LiteUIImpl *>(data);
-    self->flushPendingMotion(); // hit-test against the up-to-date position
-    float delta = static_cast<float>(wl_fixed_to_double(value));
-    float dx = 0, dy = 0;
-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-      dy = delta;
-    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
-      dx = delta;
-    // Wayland's axis value is already positive for scroll-down/right, which
-    // is WheelEvent's sign convention. This listener has no axis_source
-    // event, so it can't tell a trackpad from a notched wheel: precise stays
-    // false.
-    bool changed =
-        self->dispatchWheel(static_cast<float>(self->pointer_x_),
-                            static_cast<float>(self->pointer_y_), dx, dy);
+    if (axis > 1)
+      return;
+    liteui_wheel::Axis &a = self->axis_[axis];
+    a.value += wl_fixed_to_double(value);
+    a.hasValue = true;
+    self->axisPending_ = true;
+#ifdef WL_POINTER_FRAME_SINCE_VERSION
+    if (self->pointer_ &&
+        wl_pointer_get_version(self->pointer_) >= WL_POINTER_FRAME_SINCE_VERSION)
+      return; // v5+: wait for frame()
+#endif
+    self->flushAxisFrame(); // v1-4: no frame event will ever arrive
+  }
+#ifdef WL_POINTER_FRAME_SINCE_VERSION
+  // End of one logical group of pointer events: dispatch what we collected.
+  static void pointerFrame(void *data, wl_pointer *) {
+    static_cast<LiteUIImpl *>(data)->flushAxisFrame();
+  }
+  // What physically produced this scroll (wheel / finger / continuous /
+  // wheel tilt). Sent before the axis events of the frame it belongs to.
+  static void pointerAxisSource(void *data, wl_pointer *, uint32_t source) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (source == WL_POINTER_AXIS_SOURCE_WHEEL ||
+        source == WL_POINTER_AXIS_SOURCE_WHEEL_TILT)
+      self->axisSource_ = liteui_wheel::Source::Wheel;
+    else if (source == WL_POINTER_AXIS_SOURCE_FINGER ||
+             source == WL_POINTER_AXIS_SOURCE_CONTINUOUS)
+      self->axisSource_ = liteui_wheel::Source::Finger;
+    else
+      self->axisSource_ = liteui_wheel::Source::Unknown;
+    self->axisPending_ = true;
+  }
+  // The user lifted their fingers (kinetic scrolling would begin here).
+  // We don't implement kinetic scrolling, so there's nothing to do; the
+  // zero-delta frame that follows is ignored by flushAxisFrame().
+  static void pointerAxisStop(void *, wl_pointer *, uint32_t, uint32_t) {}
+  // Whole wheel notches (v5-v7). Superseded by axis_value120 in v8.
+  static void pointerAxisDiscrete(void *data, wl_pointer *, uint32_t axis,
+                                  int32_t discrete) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (axis > 1)
+      return;
+    self->axis_[axis].discrete += discrete;
+    self->axis_[axis].hasDiscrete = true;
+    self->axisPending_ = true;
+  }
+#endif
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+  // High-resolution wheel steps: 120 == one full notch, smaller values are
+  // fractions of one (free-spinning / hi-res wheels).
+  static void pointerAxisValue120(void *data, wl_pointer *, uint32_t axis,
+                                  int32_t v120) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (axis > 1)
+      return;
+    self->axis_[axis].v120 += v120;
+    self->axis_[axis].hasV120 = true;
+    self->axisPending_ = true;
+  }
+#endif
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+  // v9 (we bind at most v8, so never sent): natural-scrolling hint.
+  static void pointerAxisRelDir(void *, wl_pointer *, uint32_t, uint32_t) {}
+#endif
+
+  // Turns the accumulated axis state into one WheelEvent and resets it. The
+  // math (wheel notches -> 40px, touchpad pixels pass through, `precise`)
+  // is liteui_wheel::normalize().
+  void flushAxisFrame() {
+    if (!axisPending_)
+      return;
+    axisPending_ = false;
+
+    const liteui_wheel::Result r =
+        liteui_wheel::normalize(axisSource_, axis_[0], axis_[1]);
+    axis_[0] = {};
+    axis_[1] = {};
+    axisSource_ = liteui_wheel::Source::Unknown;
+    if (r.empty())
+      return; // e.g. an axis_stop-only frame
+
+    flushPendingMotion(); // hit-test against the up-to-date position
+    bool changed = dispatchWheel(static_cast<float>(pointer_x_),
+                                 static_cast<float>(pointer_y_), r.dx, r.dy,
+                                 r.precise);
     if (changed)
-      self->redraw();
+      redraw();
   }
   // Called on every pointer button press/release.
   static void pointerButton(void *data, wl_pointer *, uint32_t serial, uint32_t,
@@ -16016,10 +16191,28 @@ private:
     else if (state == WL_POINTER_BUTTON_STATE_RELEASED)
       self->handleRelease(btn);
   }
-  // Listener struct binding all five pointer callbacks above to wl_pointer's
-  // events, in the order the interface expects.
+  // Listener struct binding the pointer callbacks above to wl_pointer's
+  // events. Designated initializers keep each slot explicit; the newer
+  // events exist only when the wayland headers we compile against do.
   static constexpr wl_pointer_listener pointerListener = {
-      pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis};
+      .enter = pointerEnter,
+      .leave = pointerLeave,
+      .motion = pointerMotion,
+      .button = pointerButton,
+      .axis = pointerAxis,
+#ifdef WL_POINTER_FRAME_SINCE_VERSION
+      .frame = pointerFrame,
+      .axis_source = pointerAxisSource,
+      .axis_stop = pointerAxisStop,
+      .axis_discrete = pointerAxisDiscrete,
+#endif
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+      .axis_value120 = pointerAxisValue120,
+#endif
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+      .axis_relative_direction = pointerAxisRelDir,
+#endif
+  };
 
   static void keyboardKeymap(void *data, wl_keyboard *, uint32_t format,
                              int32_t fd, uint32_t size) {
@@ -16187,9 +16380,22 @@ private:
     }
     // If instead this global is the seat (input devices) interface...
     else if (strcmp(interface, wl_seat_interface.name) == 0) {
-      // ...bind to it...
+      // ...bind to it. The version decides which input events the
+      // compositor may send us:
+      //   v4: wl_keyboard.repeat_info (without it key repeat never starts)
+      //   v5: wl_pointer.frame / axis_source / axis_stop / axis_discrete
+      //   v8: wl_pointer.axis_value120 (high-resolution wheel steps)
+      // Bind as high as the headers we compiled against understand, capped
+      // by what the compositor offers.
+#if defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+      const uint32_t seatVersion = std::min<uint32_t>(version, 8);
+#elif defined(WL_POINTER_FRAME_SINCE_VERSION)
+      const uint32_t seatVersion = std::min<uint32_t>(version, 5);
+#else
+      const uint32_t seatVersion = std::min<uint32_t>(version, 4);
+#endif
       self->seat_ = static_cast<wl_seat *>(
-          wl_registry_bind(registry, name, &wl_seat_interface, 1));
+          wl_registry_bind(registry, name, &wl_seat_interface, seatVersion));
       // ...and register the capabilities/name listener so we learn about the
       // pointer.
       wl_seat_add_listener(self->seat_, &seatListener, self);
@@ -16225,11 +16431,6 @@ private:
       self->decoration_manager_ =
           static_cast<zxdg_decoration_manager_v1 *>(wl_registry_bind(
               registry, name, &zxdg_decoration_manager_v1_interface, 1));
-    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-      self->seat_ = static_cast<wl_seat *>(
-          wl_registry_bind(registry, name, &wl_seat_interface,
-                           4)); // bump to 4 for keyboard repeat_info
-      wl_seat_add_listener(self->seat_, &seatListener, self);
     }
   }
   // Called when a global is removed; this minimal window doesn't need to react.
@@ -17775,8 +17976,16 @@ inline LiteUIImpl::~LiteUIImpl() {
   // Destroy the decoration-mode object if one was requested.
   if (toplevel_decoration_)
     zxdg_toplevel_decoration_v1_destroy(toplevel_decoration_);
-  if (keyboard_)
-    wl_keyboard_destroy(keyboard_);
+  if (keyboard_) {
+    // release (v3+) also frees the compositor-side object; destroy only
+    // frees our proxy.
+#ifdef WL_KEYBOARD_RELEASE_SINCE_VERSION
+    if (wl_keyboard_get_version(keyboard_) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+      wl_keyboard_release(keyboard_);
+    else
+#endif
+      wl_keyboard_destroy(keyboard_);
+  }
   if (xkbState_)
     xkb_state_unref(xkbState_);
   if (xkbKeymap_)
@@ -17788,11 +17997,23 @@ inline LiteUIImpl::~LiteUIImpl() {
   if (wakeFd_ >= 0)
     close(wakeFd_);
   // Release the pointer device if one was obtained.
-  if (pointer_)
-    wl_pointer_destroy(pointer_);
+  if (pointer_) {
+#ifdef WL_POINTER_RELEASE_SINCE_VERSION
+    if (wl_pointer_get_version(pointer_) >= WL_POINTER_RELEASE_SINCE_VERSION)
+      wl_pointer_release(pointer_);
+    else
+#endif
+      wl_pointer_destroy(pointer_);
+  }
   // Release the seat object if one was bound.
-  if (seat_)
-    wl_seat_destroy(seat_);
+  if (seat_) {
+#ifdef WL_SEAT_RELEASE_SINCE_VERSION
+    if (wl_seat_get_version(seat_) >= WL_SEAT_RELEASE_SINCE_VERSION)
+      wl_seat_release(seat_);
+    else
+#endif
+      wl_seat_destroy(seat_);
+  }
   // Destroy the toplevel object if one was created.
   if (toplevel_)
     xdg_toplevel_destroy(toplevel_);
