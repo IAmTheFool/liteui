@@ -40,6 +40,11 @@ endif()
 #   platform/wayland-protocols/xdg-decoration-client-protocol.h
 #   platform/wayland-protocols/tablet-protocol.c            (pen input)
 #   platform/wayland-protocols/tablet-client-protocol.h     (tablet-unstable-v2)
+#   platform/wayland-protocols/viewporter-protocol.c        (HiDPI: wp_viewporter)
+#   platform/wayland-protocols/viewporter-client-protocol.h
+#   platform/wayland-protocols/fractional-scale-protocol.c  (HiDPI: wp-fractional-scale-v1;
+#   platform/wayland-protocols/fractional-scale-client-protocol.h   needs wayland-protocols >= 1.31
+#                                                                   to regenerate)
 #
 # On a FRESH CHECKOUT those files don't exist yet. This file registers the
 # `regen-protocols` target BEFORE checking for the vendored files, and
@@ -117,6 +122,8 @@ else()
         set(_xdg_shell_xml      "${_liteui_wp_dir}/stable/xdg-shell/xdg-shell.xml")
         set(_xdg_decoration_xml "${_liteui_wp_dir}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml")
         set(_tablet_xml         "${_liteui_wp_dir}/unstable/tablet/tablet-unstable-v2.xml")
+        set(_viewporter_xml     "${_liteui_wp_dir}/stable/viewporter/viewporter.xml")
+        set(_fractional_xml     "${_liteui_wp_dir}/staging/fractional-scale/fractional-scale-v1.xml")
         add_custom_target(regen-protocols
             COMMAND ${CMAKE_COMMAND} -E make_directory ${LITEUI_PROTO_DIR}
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_xdg_shell_xml}      ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
@@ -125,13 +132,17 @@ else()
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_xdg_decoration_xml} ${LITEUI_PROTO_DIR}/xdg-decoration-client-protocol.h
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_tablet_xml}         ${LITEUI_PROTO_DIR}/tablet-protocol.c
             COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_tablet_xml}         ${LITEUI_PROTO_DIR}/tablet-client-protocol.h
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_viewporter_xml}     ${LITEUI_PROTO_DIR}/viewporter-protocol.c
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_viewporter_xml}     ${LITEUI_PROTO_DIR}/viewporter-client-protocol.h
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${_fractional_xml}     ${LITEUI_PROTO_DIR}/fractional-scale-protocol.c
+            COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${_fractional_xml}     ${LITEUI_PROTO_DIR}/fractional-scale-client-protocol.h
             COMMENT "liteui: regenerating platform/wayland-protocols/ — remember to commit the result"
             VERBATIM
         )
     endif()
 
-    # All six generated files must exist: the three .c files are compiled
-    # into liteui_wayland_protocols, and the three headers are what
+    # All ten generated files must exist: the five .c files are compiled
+    # into liteui_wayland_protocols, and the five headers are what
     # liteui.hpp includes. Checking only one would let a partial checkout
     # slip through and fail later with a confusing compile/link error.
     set(LITEUI_PROTO_FILES
@@ -141,6 +152,10 @@ else()
         xdg-decoration-client-protocol.h
         tablet-protocol.c
         tablet-client-protocol.h
+        viewporter-protocol.c
+        viewporter-client-protocol.h
+        fractional-scale-protocol.c
+        fractional-scale-client-protocol.h
     )
     set(LITEUI_PROTO_MISSING "")
     foreach(_f IN LISTS LITEUI_PROTO_FILES)
@@ -173,12 +188,14 @@ else()
         endif()
     endif()
 
-    # Only build (and link) the protocol bindings once all six files exist.
+    # Only build (and link) the protocol bindings once all ten files exist.
     if(NOT LITEUI_PROTO_MISSING)
         add_library(liteui_wayland_protocols STATIC
             ${LITEUI_PROTO_DIR}/xdg-shell-protocol.c
             ${LITEUI_PROTO_DIR}/xdg-decoration-protocol.c
             ${LITEUI_PROTO_DIR}/tablet-protocol.c
+            ${LITEUI_PROTO_DIR}/viewporter-protocol.c
+            ${LITEUI_PROTO_DIR}/fractional-scale-protocol.c
         )
         target_include_directories(liteui_wayland_protocols PUBLIC ${LITEUI_PROTO_DIR})
         target_compile_options(liteui_wayland_protocols PRIVATE -w)

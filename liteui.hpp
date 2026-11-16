@@ -1447,6 +1447,14 @@ public:
   };
   float width() const;
   float height() const;
+  // Device pixels per logical unit of the surface being drawn on (1 on a
+  // 96-dpi display, 2 on a 200% one, 1.25 ...). width()/height() and all
+  // drawing coordinates stay logical; the backing store is
+  // pixelWidth() x pixelHeight() device pixels. getImageData/putImageData
+  // address those raw device pixels, ignoring the transform.
+  float devicePixelRatio() const;
+  int pixelWidth() const;
+  int pixelHeight() const;
   void save();
   void restore();
   void translate(float x, float y);
@@ -2065,6 +2073,17 @@ public:
   // Handler run on the UI thread once per coalesced wake, before the repaint.
   void setWakeHandler(std::function<void()> fn);
 
+  // Device pixels per logical unit of this window: 1.0 on a 96-dpi display,
+  // 2.0 on a 200% one, fractional values (1.25, 1.5, ...) are common. Layout,
+  // events and all drawing coordinates are logical; use this to size things
+  // that are measured in real pixels (a "100%" zoom, 1:1 bitmaps, @2x assets).
+  float contentScale() const;
+  // Runs on the UI thread, before the relayout, whenever contentScale()
+  // changes (the window moved to a monitor with another scale, or the user
+  // changed the display scale). The window is laid out and repainted
+  // afterwards. Set it from the UI thread.
+  void setScaleChangedHandler(std::function<void()> fn);
+
 private:
   LiteUIImpl *p_;
 };
@@ -2109,6 +2128,9 @@ private:
 #include <shobjidl.h>
 #include <wincodec.h>
 #include <windows.h>
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
 #include <windowsx.h> // GET_X_LPARAM/GET_Y_LPARAM/GET_WHEEL_DELTA_WPARAM, used by the mouse-wheel handlers
 #pragma comment(lib, "user32")
 #pragma comment(lib, "gdi32")
@@ -2122,6 +2144,8 @@ private:
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
 #include "tablet-client-protocol.h" // Generated client bindings for tablet-unstable-v2 (pen pressure/tilt/eraser/barrel buttons).
+#include "viewporter-client-protocol.h" // Generated client bindings for wp_viewporter (decouples buffer size from surface size: HiDPI).
+#include "fractional-scale-client-protocol.h" // Generated client bindings for wp-fractional-scale-v1 (the compositor's preferred, possibly fractional, scale).
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h> // OpenGL ES 3.0 (superset of the ES 2.0 entry points used so far)
@@ -6387,6 +6411,19 @@ public:
 
   float width() const { return width_; }
   float height() const { return height_; }
+  float devicePixelRatio() const {
+    float dx = 96.0f, dy = 96.0f;
+    rt_->GetDpi(&dx, &dy);
+    return dx / 96.0f;
+  }
+  int pixelWidth() const {
+    return target_ ? static_cast<int>(target_->GetPixelSize().width)
+                   : static_cast<int>(std::ceil(width_));
+  }
+  int pixelHeight() const {
+    return target_ ? static_cast<int>(target_->GetPixelSize().height)
+                   : static_cast<int>(std::ceil(height_));
+  }
 
   // ---- state stack ----
   void save() {
@@ -6885,8 +6922,12 @@ public:
     if (!bmp)
       return;
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
-    D2D1_RECT_F dst = D2D1::RectF(dx, dy, dx + static_cast<float>(img.width),
-                                  dy + static_cast<float>(img.height));
+    // dx/dy and the image size are raw DEVICE pixels; the context works in
+    // DIPs, so divide by the pixel ratio for a 1:1 texel-to-pixel blit.
+    const float k = 1.0f / devicePixelRatio();
+    D2D1_RECT_F dst = D2D1::RectF(dx * k, dy * k,
+                                  (dx + static_cast<float>(img.width)) * k,
+                                  (dy + static_cast<float>(img.height)) * k);
     rt_->DrawBitmap(bmp, dst, 1.0f,
                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
     bmp->Release();
@@ -7197,8 +7238,10 @@ private:
         dst[i + 3] = a;
       }
     }
-    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(
-        DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                          D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f); // explicit: 0 would inherit the context's scaled dpi
     HRESULT hr = rt_->CreateBitmap(
         D2D1::SizeU(static_cast<UINT32>(img.width),
                     static_cast<UINT32>(img.height)),
@@ -8766,16 +8809,35 @@ public:
   // where drawImage() keeps the last uploaded texture. Null for a context
   // not backed by a node (images are then uploaded per call and
   // getImageData() returns nullopt).
+  // `width`/`height` are in LOGICAL units; `dpr` is device pixels per logical
+  // unit. The render target is ceil(width*dpr) x ceil(height*dpr) device
+  // pixels and the initial transform scales by dpr, so callers draw in
+  // logical units while every texel lands on a device pixel. resetTransform()
+  // and setTransform() are relative to that base. With dpr == 1 this is the
+  // plain pixel context it always was. getImageData/putImageData address raw
+  // device pixels, as in HTML canvas.
   GlCanvasContext(Gl &gl, float width, float height,
-                    const View::Computed *imageCacheOwner = nullptr)
-      : gl_(gl), width_(width), height_(height),
-        imageCacheOwner_(imageCacheOwner) {}
+                    const View::Computed *imageCacheOwner = nullptr,
+                    float dpr = 1.0f)
+      : gl_(gl),
+        width_(dpr == 1.0f ? width : std::ceil(width * dpr - 0.001f)),
+        height_(dpr == 1.0f ? height : std::ceil(height * dpr - 0.001f)),
+        imageCacheOwner_(imageCacheOwner) {
+    logicalW_ = width;
+    logicalH_ = height;
+    dpr_ = dpr;
+    base_ = Mat{dpr, 0, 0, dpr, 0, 0};
+    ctm_ = base_;
+  }
   ~GlCanvasContext() = default;
   GlCanvasContext(const GlCanvasContext &) = delete;
   GlCanvasContext &operator=(const GlCanvasContext &) = delete;
 
-  float width() const { return width_; }
-  float height() const { return height_; }
+  float width() const { return logicalW_; }
+  float height() const { return logicalH_; }
+  float devicePixelRatio() const { return dpr_; }
+  int pixelWidth() const { return static_cast<int>(std::ceil(width_)); }
+  int pixelHeight() const { return static_cast<int>(std::ceil(height_)); }
 
   // ---- state stack ----
   void save() {
@@ -8841,9 +8903,9 @@ public:
     ctm_ = ctm_.mul({a, b, c, d, e, f});
   }
   void setTransform(float a, float b, float c, float d, float e, float f) {
-    ctm_ = Mat{a, b, c, d, e, f};
+    ctm_ = base_.mul(Mat{a, b, c, d, e, f});
   }
-  void resetTransform() { ctm_ = Mat{}; }
+  void resetTransform() { ctm_ = base_; }
 
   // ---- paint/style ----
   void setFillColor(Color c) { fillPaint_ = Paint::solid(c); }
@@ -9963,6 +10025,9 @@ private:
   const View::Computed *imageCacheOwner_;
 
   Mat ctm_;
+  Mat base_;                           // device scale; identity at dpr == 1
+  float logicalW_ = 0, logicalH_ = 0; // width()/height(); width_/height_ are device px
+  float dpr_ = 1.0f;
   Paint fillPaint_ = Paint::solid(Color{0, 0, 0, 255});
   Paint strokePaint_ = Paint::solid(Color{0, 0, 0, 255});
   float lineWidth_ = 1.0f;
@@ -10011,6 +10076,21 @@ public:
 
   float width() const { return width_; }
   float height() const { return height_; }
+  // The canvas surface carries a device scale (see ensureCanvasSurface):
+  // drawing is in logical units, the pixels are device pixels.
+  float devicePixelRatio() const {
+    double sx = 1.0, sy = 1.0;
+    cairo_surface_get_device_scale(cairo_get_target(cr_), &sx, &sy);
+    return static_cast<float>(sx);
+  }
+  int pixelWidth() const {
+    int w = cairo_image_surface_get_width(cairo_get_target(cr_));
+    return w > 0 ? w : static_cast<int>(std::ceil(width_));
+  }
+  int pixelHeight() const {
+    int h = cairo_image_surface_get_height(cairo_get_target(cr_));
+    return h > 0 ? h : static_cast<int>(std::ceil(height_));
+  }
 
   // ---- state stack ----
   // Cairo's own save/restore already covers the CTM, clip, line width/
@@ -12314,6 +12394,7 @@ private:
   static inline LiteUIImpl *activeInstance_ = nullptr;
 
   std::function<void()> wakeHandler_; // see setWakeHandler
+  std::function<void()> scaleChanged_; // see setScaleChangedHandler
   std::function<void()> onCloseRequest_;
   void handleCloseRequested() {
     if (onCloseRequest_)
@@ -13230,6 +13311,10 @@ public:
   void setWakeHandler(std::function<void()> fn) {
     wakeHandler_ = std::move(fn);
   }
+  float contentScale() const { return scale_; }
+  void setScaleChangedHandler(std::function<void()> fn) {
+    scaleChanged_ = std::move(fn);
+  }
 
 private:
   // Called by both platform backends on every key press. Checks
@@ -13519,6 +13604,94 @@ private:
   bool moveRequested_ = false;
   std::unordered_map<UINT_PTR, std::function<void()>> timers_;
 
+  // ---- DPI scaling -----------------------------------------------------
+  // Device pixels per logical unit: 1.0 at 96 dpi, 1.5 at 144, 2.0 at 192.
+  // The library lays out, hit-tests and reports events in LOGICAL units
+  // (what width_/height_ hold). Everything physical -- the swap chain, the
+  // back-buffer bitmap, Canvas textures -- is that times scale_. Direct2D
+  // does the multiplication: both device contexts run at 96 * scale_ dpi,
+  // so painting code keeps drawing in logical units and lands on a
+  // physical-resolution target. Mouse/wheel/pen coordinates arrive in
+  // device pixels and are divided by scale_ on the way in.
+  float scale_ = 1.0f;
+  float dpi() const { return 96.0f * scale_; }
+  // Rounds a logical coordinate to the nearest whole device pixel.
+  float snapPx(float v) const { return std::round(v * scale_) / scale_; }
+  float toLogical(float px) const { return px / scale_; }
+  int toPhysical(float logical) const {
+    return static_cast<int>(std::lround(logical * scale_));
+  }
+  float mouseX(LPARAM lp) const {
+    return toLogical(static_cast<float>(static_cast<short>(LOWORD(lp))));
+  }
+  float mouseY(LPARAM lp) const {
+    return toLogical(static_cast<float>(static_cast<short>(HIWORD(lp))));
+  }
+
+  // user32 DPI entry points are looked up at run time so the header still
+  // builds against older SDKs / MinGW defaults (WINVER < Win10 1607/1703).
+  static UINT dpiForWindow(HWND h) {
+    using Fn = UINT(WINAPI *)(HWND);
+    static Fn fn = reinterpret_cast<Fn>(reinterpret_cast<void *>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")));
+    if (fn && h) {
+      UINT d = fn(h);
+      if (d)
+        return d;
+    }
+    HDC dc = GetDC(nullptr); // system DPI (primary monitor once DPI-aware)
+    int d = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc)
+      ReleaseDC(nullptr, dc);
+    return d > 0 ? static_cast<UINT>(d) : 96u;
+  }
+
+  // Opts the process into per-monitor-v2 awareness so Windows stops
+  // bitmap-stretching the window. Must run before the first window exists.
+  // A manifest or an earlier call that already fixed the awareness makes
+  // this fail harmlessly. Define LITEUI_NO_DPI_AWARENESS to manage it
+  // yourself (manifest, or SetProcessDpiAwarenessContext in main()).
+  static void enablePerMonitorDpiAwareness() {
+#if !defined(LITEUI_NO_DPI_AWARENESS)
+    using Fn = BOOL(WINAPI *)(HANDLE);
+    static Fn fn = reinterpret_cast<Fn>(reinterpret_cast<void *>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                       "SetProcessDpiAwarenessContext")));
+    if (fn) // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+      fn(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));
+#endif
+  }
+
+  // Re-derives everything physical after scale_ changed (WM_DPICHANGED).
+  // Canvas textures are sized in device pixels, so they are dropped here and
+  // rebuilt (and repainted) on demand by the next paint.
+  void applyScale() {
+    applyDpi();
+    if (hasRoot_)
+      root_.freeTextResources();
+    if (scaleChanged_)
+      scaleChanged_(); // the app re-derives its scale-dependent state
+    RECT rc;
+    if (hwnd_ && GetClientRect(hwnd_, &rc)) {
+      const int pw = std::max<LONG>(1, rc.right - rc.left);
+      const int ph = std::max<LONG>(1, rc.bottom - rc.top);
+      width_ = static_cast<int>(std::ceil(pw / scale_));
+      height_ = static_cast<int>(std::ceil(ph / scale_));
+      resizeBackBuffer(static_cast<UINT>(pw), static_cast<UINT>(ph));
+      if (deviceLost_)
+        releaseDeviceResources(); // rebuilt by the next WM_PAINT
+    }
+    relayout();
+    pollAndRelayout();
+  }
+
+  void applyDpi() {
+    if (renderTarget_)
+      renderTarget_->SetDpi(dpi(), dpi());
+    if (canvasDc_)
+      canvasDc_->SetDpi(dpi(), dpi());
+  }
+
   // wake(): a private window message posted from any thread. `wakePending_`
   // keeps at most one such message in the queue (see wake / WndProc).
   static constexpr UINT kWakeMsg = WM_APP + 1;
@@ -13568,17 +13741,20 @@ private:
     HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&surface));
     if (FAILED(hr))
       return hr;
-    // 96 dpi: the library lays everything out in client-area pixels, so
-    // one Direct2D unit is one pixel (as with the old HwndRenderTarget).
+    // The swap chain is in device pixels; the bitmap's dpi (96 * scale_)
+    // makes one Direct2D unit one LOGICAL unit, so layout coordinates are
+    // used as-is and land on the physical-resolution buffer.
     D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-        96.0f, 96.0f);
+        dpi(), dpi());
     hr = renderTarget_->CreateBitmapFromDxgiSurface(surface, &props,
                                                     &backBuffer_);
     surface->Release();
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
       renderTarget_->SetTarget(backBuffer_);
+      renderTarget_->SetDpi(dpi(), dpi()); // SetTarget may adopt the bitmap's
+    }
     return hr;
   }
 
@@ -13642,8 +13818,7 @@ private:
     releaseCom(dxgiDevice);
     if (FAILED(hr))
       return hr;
-    renderTarget_->SetDpi(96.0f, 96.0f);
-    canvasDc_->SetDpi(96.0f, 96.0f);
+    applyDpi();
     return createBackBufferTarget();
   }
 
@@ -13701,12 +13876,17 @@ private:
 
   // Draws a filled rectangle in one shot: create brush, fill, release.
   // Mirrors the old gdiFillRect's create-use-delete pattern 1:1.
-  static void d2dFillRect(ID2D1RenderTarget *rt, float x, float y, float w,
-                          float h, Color c) {
+  // Edges are snapped to whole device pixels (see snapPx), so fills stay
+  // crisp at fractional scales and neighbours sharing an edge never leave a
+  // seam.
+  void d2dFillRect(ID2D1RenderTarget *rt, float x, float y, float w, float h,
+                   Color c) {
     ID2D1SolidColorBrush *brush = nullptr;
     rt->CreateSolidColorBrush(toD2DColor(c), &brush);
     if (brush) {
-      rt->FillRectangle(D2D1::RectF(x, y, x + w, y + h), brush);
+      rt->FillRectangle(D2D1::RectF(snapPx(x), snapPx(y), snapPx(x + w),
+                                    snapPx(y + h)),
+                        brush);
       brush->Release();
     }
   }
@@ -13775,7 +13955,8 @@ private:
     GetClientRect(hwnd_, &rc);
     if (!captured && !PtInRect(&rc, pt))
       return; // over the titlebar/border: leave it to Windows
-    SetCursor(cursorHandleAt(static_cast<float>(pt.x), static_cast<float>(pt.y)));
+    SetCursor(cursorHandleAt(toLogical(static_cast<float>(pt.x)),
+                             toLogical(static_cast<float>(pt.y))));
   }
 
   // ---- Pen and touch (WM_POINTER*, Windows 8+) ---------------------------------
@@ -13794,8 +13975,8 @@ private:
     RECT rc;
     if (hwnd_ && GetCursorPos(&pt) && ScreenToClient(hwnd_, &pt) &&
         GetClientRect(hwnd_, &rc) && PtInRect(&rc, pt)) {
-      x = static_cast<float>(pt.x);
-      y = static_cast<float>(pt.y);
+      x = toLogical(static_cast<float>(pt.x));
+      y = toLogical(static_cast<float>(pt.y));
     }
     return updateHoverAt(x, y, needPoll);
   }
@@ -13812,8 +13993,8 @@ private:
     auto clientPos = [this](const POINTER_INFO &pi, float &x, float &y) {
       POINT p = pi.ptPixelLocation; // device pixels, screen space
       ScreenToClient(hwnd_, &p);
-      x = static_cast<float>(p.x);
-      y = static_cast<float>(p.y);
+      x = toLogical(static_cast<float>(p.x));
+      y = toLogical(static_cast<float>(p.y));
     };
     PointerFrame f;
     std::vector<PointerSample> samples;
@@ -14016,8 +14197,8 @@ private:
         self->hideTooltip();
         self->moveRequested_ =
             false; // only honor a request made during THIS press
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         if (!self->beginScrollPress(x, y))
           self->beginPress(x, y);
 
@@ -14068,8 +14249,9 @@ private:
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hwnd, &pt);
-        SetCursor(
-            self->cursorHandleAt(static_cast<float>(pt.x), static_cast<float>(pt.y)));
+        SetCursor(self->cursorHandleAt(
+            self->toLogical(static_cast<float>(pt.x)),
+            self->toLogical(static_cast<float>(pt.y))));
         return TRUE;
       }
       return DefWindowProcW(hwnd, msg, wp, lp);
@@ -14081,8 +14263,8 @@ private:
     case WM_MOUSEMOVE: {
       if (self) {
         LITEUI_PROF_START(profMove);
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         bool changed = self->updateScrollDrag(x, y);
         if (self->dispatchPointerMove(x, y))
           changed = true;
@@ -14108,8 +14290,8 @@ private:
     // moved, i.e. it was really just a click).
     case WM_LBUTTONUP: {
       if (self) {
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         if (self->endScrollPress(x, y) && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -14123,8 +14305,8 @@ private:
     case WM_MBUTTONDOWN: {
       if (self) {
         self->hideTooltip();
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         self->beginPress(x, y, MouseButton::Middle);
         SetCapture(hwnd);
         if (self->hwnd_)
@@ -14135,8 +14317,8 @@ private:
 
     case WM_MBUTTONUP: {
       if (self) {
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         if (self->endPress(x, y, MouseButton::Middle) && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -14147,8 +14329,8 @@ private:
     case WM_RBUTTONDOWN: {
       if (self) {
         self->hideTooltip();
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         self->beginPress(x, y, MouseButton::Right);
         SetCapture(hwnd);
         if (self->hwnd_)
@@ -14159,8 +14341,8 @@ private:
 
     case WM_RBUTTONUP: {
       if (self) {
-        float x = static_cast<float>(static_cast<short>(LOWORD(lp)));
-        float y = static_cast<float>(static_cast<short>(HIWORD(lp)));
+        float x = self->mouseX(lp);
+        float y = self->mouseY(lp);
         if (self->endPress(x, y, MouseButton::Right) && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
       }
@@ -14183,8 +14365,9 @@ private:
         // decrease scrollY — hence the negation. A delta that isn't a whole
         // number of notches comes from a precision touchpad/wheel.
         bool precise = std::fmod(std::abs(notches), 1.0f) != 0.0f;
-        bool changed = self->dispatchWheel(static_cast<float>(pt.x),
-                                           static_cast<float>(pt.y), 0.0f,
+        bool changed = self->dispatchWheel(
+            self->toLogical(static_cast<float>(pt.x)),
+            self->toLogical(static_cast<float>(pt.y)), 0.0f,
                                            -notches * 40.0f, precise);
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -14202,8 +14385,9 @@ private:
         float notches =
             static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
         bool precise = std::fmod(std::abs(notches), 1.0f) != 0.0f;
-        if (self->dispatchWheel(static_cast<float>(pt.x),
-                                static_cast<float>(pt.y), notches * 40.0f,
+        if (self->dispatchWheel(self->toLogical(static_cast<float>(pt.x)),
+                                self->toLogical(static_cast<float>(pt.y)),
+                                notches * 40.0f,
                                 0.0f, precise) &&
             self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
@@ -14304,12 +14488,14 @@ private:
       if (wp == SIZE_MINIMIZED)
         return 0;
       if (self) {
-        self->width_ = LOWORD(lp);
-        self->height_ = HIWORD(lp);
+        // lp is the client size in DEVICE pixels. width_/height_ are logical;
+        // round up so layout always covers the whole client area.
+        const int pw = LOWORD(lp), ph = HIWORD(lp);
+        self->width_ = static_cast<int>(std::ceil(pw / self->scale_));
+        self->height_ = static_cast<int>(std::ceil(ph / self->scale_));
         if (self->swapChain_) {
-          self->resizeBackBuffer(
-              static_cast<UINT>(std::max(1, self->width_)),
-              static_cast<UINT>(std::max(1, self->height_)));
+          self->resizeBackBuffer(static_cast<UINT>(std::max(1, pw)),
+                                 static_cast<UINT>(std::max(1, ph)));
           if (self->deviceLost_)
             self->releaseDeviceResources(); // rebuilt by the next WM_PAINT
         }
@@ -14338,6 +14524,22 @@ private:
           it->second();
           self->requestRepaint();
         }
+      }
+      return 0;
+    }
+    // The window moved to a monitor with a different DPI, or the user changed
+    // the display scale. HIWORD(wp) is the new DPI, lp the suggested window
+    // rect (same logical size, new physical size). scale_ is updated BEFORE
+    // SetWindowPos so the WM_SIZE it triggers already sees the new scale.
+    case WM_DPICHANGED: {
+      if (self) {
+        const RECT *r = reinterpret_cast<const RECT *>(lp);
+        self->scale_ = static_cast<float>(HIWORD(wp)) / 96.0f;
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
+                     r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        self->applyScale();
+        self->hideTooltip();
+        InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
     }
@@ -14521,14 +14723,23 @@ private:
       releaseCom(v.computed.canvasStaging); // sized for the old texture
       // cachedImageBitmap is deliberately kept: it is a device resource,
       // not tied to the old texture, so a resize can reuse it.
+      // The texture is allocated in DEVICE pixels (logical size * scale_) at
+      // 96 * scale_ dpi, so onPaint keeps drawing in logical units but every
+      // texel maps 1:1 onto a screen pixel. CanvasContext::devicePixelRatio()
+      // / pixelWidth() / pixelHeight() expose this; getImageData/putImageData
+      // work on the raw device pixels.
       D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
           D2D1_BITMAP_OPTIONS_TARGET,
           D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                             D2D1_ALPHA_MODE_PREMULTIPLIED),
-          96.0f, 96.0f);
+          dpi(), dpi());
       canvasDc_->CreateBitmap(
-          D2D1::SizeU(static_cast<UINT32>(innerW),
-                      static_cast<UINT32>(innerH)),
+          D2D1::SizeU(static_cast<UINT32>(std::max(
+                          1, static_cast<int>(
+                                 std::ceil(innerW * scale_ - 0.001f)))),
+                      static_cast<UINT32>(std::max(
+                          1, static_cast<int>(
+                                 std::ceil(innerH * scale_ - 0.001f))))),
           nullptr, 0, &props, &v.computed.canvasBitmap);
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
@@ -14539,6 +14750,7 @@ private:
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
       LITEUI_PROF_START(profCanvas);
       canvasDc_->SetTarget(v.computed.canvasBitmap);
+      canvasDc_->SetDpi(dpi(), dpi());
       canvasDc_->BeginDraw();
       canvasDc_->Clear(D2D1::ColorF(0, 0, 0, 0));
       {
@@ -14571,9 +14783,14 @@ private:
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float x = v.computed.x + pad.left;
     float y = v.computed.y + pad.top;
-    D2D1_SIZE_F sz = bmp->GetSize();
+    // Snap the destination to whole device pixels so the texture is blitted
+    // 1:1 (no bilinear blur) even at fractional scales like 125% / 150%.
+    D2D1_SIZE_U px = bmp->GetPixelSize();
+    const float l = std::round(x * scale_) / scale_;
+    const float t = std::round(y * scale_) / scale_;
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
-    rt->DrawBitmap(bmp, D2D1::RectF(x, y, x + sz.width, y + sz.height));
+    rt->DrawBitmap(bmp, D2D1::RectF(l, t, l + px.width / scale_,
+                                    t + px.height / scale_));
     LITEUI_PROF_ADD(blit, profBlit);
   }
 
@@ -14614,8 +14831,11 @@ private:
 
     float borderRadius =
         resolveDynamic(s.borderRadius, v.computed.resolvedBorderRadius);
-    D2D1_ROUNDED_RECT rr = {D2D1::RectF(x, y, x + w, y + h), borderRadius,
-                            borderRadius};
+    // Box edges on whole device pixels: no soft edges at 125%/150%, and two
+    // boxes sharing a logical edge share the same device edge.
+    D2D1_ROUNDED_RECT rr = {
+        D2D1::RectF(snapPx(x), snapPx(y), snapPx(x + w), snapPx(y + h)),
+        borderRadius, borderRadius};
     Color bg = (v.computed.isHovered && s.hoverColor)
                    ? *s.hoverColor
                    : resolveDynamic(s.backgroundColor,
@@ -14635,7 +14855,11 @@ private:
               resolveDynamic(s.borderColor, v.computed.resolvedBorderColor)),
           &borderBrush);
       if (borderBrush) {
-        rt->DrawRoundedRectangle(rr, borderBrush, borderWidth);
+        // Whole device pixels wide (at least one), so the stroke doesn't
+        // alternate between 1 and 2 pixels with position.
+        const float crispBorder =
+            std::max(1.0f, std::round(borderWidth * scale_)) / scale_;
+        rt->DrawRoundedRectangle(rr, borderBrush, crispBorder);
         borderBrush->Release();
       }
     }
@@ -14784,6 +15008,222 @@ private:
   bool maximized_ =
       false; // Tracks whether the window currently believes
              // itself to be maximized (for toggling and icon state).
+
+  // ---- HiDPI ------------------------------------------------------------
+  // Device pixels per logical unit. Layout, hit-testing, pointer coordinates
+  // and width_/height_ stay LOGICAL (Wayland surface-local units); only the
+  // EGL buffer, the GL viewport/scissor, glyph and Canvas textures and the
+  // cursor images are physical. Source of the scale, best first:
+  //   1. wp_fractional_scale_v1.preferred_scale (needs wp_viewporter): the
+  //      buffer is width_*scale_ pixels and wp_viewport maps it to width_.
+  //   2. wl_surface.preferred_buffer_scale (compositor v6), else the largest
+  //      wl_output.scale among the outputs the surface is on: integer scale
+  //      via wl_surface_set_buffer_scale.
+  // LITEUI_SCALE=<float> in the environment overrides this (testing, or
+  // compositors without either protocol; fractional values need wp_viewporter).
+  float scale_ = 1.0f;
+  int bufferScale_ = 1;           // integer scale set on the surface (non-fractional path)
+  bool fractionalActive_ = false; // buffer size is mapped through wp_viewport
+  int cursorScale_ = 1;           // integer scale of the loaded cursor theme
+  wp_viewporter *viewporter_ = nullptr;
+  wp_viewport *viewport_ = nullptr;
+  wp_fractional_scale_manager_v1 *fracMgr_ = nullptr;
+  wp_fractional_scale_v1 *fracScale_ = nullptr;
+  uint32_t fracPreferred_ = 0;     // preferred_scale, in 120ths; 0 = none yet
+  int surfacePreferredScale_ = 0;  // wl_surface.preferred_buffer_scale; 0 = none
+  struct OutputInfo {
+    wl_output *output;
+    int scale;
+    bool entered;
+  };
+  std::vector<OutputInfo> outputs_;
+
+  int bufferW() const {
+    return std::max(1, static_cast<int>(std::lround(width_ * scale_)));
+  }
+  int bufferH() const {
+    return std::max(1, static_cast<int>(std::lround(height_ * scale_)));
+  }
+  // Device-pixel size of a texture covering `logical` units, and a position
+  // snapped to a whole device pixel (so textures blit 1:1, not resampled).
+  int deviceDim(int logical) const {
+    return std::max(1, static_cast<int>(std::ceil(logical * scale_)));
+  }
+  float snapPx(float v) const { return std::round(v * scale_) / scale_; }
+  // Device-pixel size of a Canvas covering a fractional logical size. At
+  // scale 1 this is the historical truncation; above 1 it rounds up (with a
+  // little slack for float error) so a canvas sized as N device pixels /
+  // scale_ gets exactly N pixels back rather than N-1.
+  int deviceDimF(float logical) const {
+    if (scale_ == 1.0f)
+      return std::max(1, static_cast<int>(logical));
+    return std::max(1, static_cast<int>(std::ceil(logical * scale_ - 0.001f)));
+  }
+
+  OutputInfo *findOutput(wl_output *o) {
+    for (auto &i : outputs_)
+      if (i.output == o)
+        return &i;
+    return nullptr;
+  }
+
+  void chooseScale() {
+    float s = 1.0f;
+    bool frac = false;
+    const char *forced = std::getenv("LITEUI_SCALE");
+    const float forcedValue = forced ? static_cast<float>(std::atof(forced)) : 0.0f;
+    if (forcedValue >= 1.0f) {
+      if (viewport_) {
+        s = forcedValue;
+        frac = true;
+      } else {
+        s = std::round(forcedValue);
+      }
+    } else if (fracScale_ && viewport_ && fracPreferred_ > 0) {
+      s = static_cast<float>(fracPreferred_) / 120.0f;
+      frac = true;
+    } else if (surfacePreferredScale_ > 0) {
+      s = static_cast<float>(surfacePreferredScale_);
+    } else {
+      int entered = 0, any = 1;
+      for (const auto &o : outputs_) {
+        any = std::max(any, o.scale);
+        if (o.entered)
+          entered = std::max(entered, o.scale);
+      }
+      // Until the surface has entered an output, the largest output scale is
+      // the best guess (corrected by the enter event).
+      s = static_cast<float>(entered > 0 ? entered : any);
+    }
+    setScale(s, frac);
+  }
+
+  void setScale(float s, bool frac) {
+    if (s < 1.0f)
+      s = 1.0f;
+    if (s == scale_ && frac == fractionalActive_)
+      return;
+    const bool scaleChanged = s != scale_;
+    scale_ = s;
+    fractionalActive_ = frac;
+    bufferScale_ = frac ? 1 : std::max(1, static_cast<int>(std::lround(s)));
+    applyScaleGeometry();
+    if (scaleChanged) {
+      freeScaleDependentResources();
+      reloadCursorTheme();
+      if (scaleChanged_) {
+        scaleChanged_(); // the app re-derives its scale-dependent state
+        relayout();
+      }
+    }
+    if (eglReady_)
+      redraw();
+  }
+
+  // Tells the compositor how our buffer relates to the surface, and resizes
+  // the EGL buffer to match. Buffer-scale and viewport state is double
+  // buffered: it takes effect with the next frame's swap.
+  void applyScaleGeometry() {
+    if (surface_) {
+      if (fractionalActive_ && viewport_) {
+        wl_surface_set_buffer_scale(surface_, 1);
+        wp_viewport_set_destination(viewport_, std::max(1, width_),
+                                    std::max(1, height_));
+      } else {
+        wl_surface_set_buffer_scale(surface_, bufferScale_);
+        if (viewport_)
+          wp_viewport_set_destination(viewport_, -1, -1); // unset
+      }
+    }
+    if (eglWindow_)
+      wl_egl_window_resize(eglWindow_, bufferW(), bufferH(), 0, 0);
+  }
+
+  // Glyph and Canvas textures are rasterized at the current scale, so a
+  // scale change drops them; the next paint rebuilds them.
+  void freeScaleDependentResources() {
+    if (!eglReady_)
+      return;
+    makeContextCurrent();
+    if (hasRoot_)
+      root_.freeTextResources();
+    if (tooltipTextTexture_) {
+      glDeleteTextures(1, &tooltipTextTexture_);
+      tooltipTextTexture_ = 0;
+    }
+  }
+
+  // Cursor images come from an XCursor theme loaded at a pixel size; on a
+  // HiDPI output load it at base size * ceil(scale) and tag the cursor
+  // surfaces with that integer buffer scale.
+  void reloadCursorTheme() {
+    const int cs = std::max(1, static_cast<int>(std::ceil(scale_)));
+    if (cs == cursorScale_ || !shm_)
+      return;
+    cursorScale_ = cs;
+    if (cursorTheme_) {
+      wl_cursor_theme_destroy(cursorTheme_);
+      cursorTheme_ = nullptr;
+    }
+    cursorTheme_ = wl_cursor_theme_load(nullptr, 24 * cs, shm_);
+    currentCursorName_.clear(); // force the next refresh to re-attach
+    if (cursorTheme_)
+      refreshCursor();
+  }
+
+  static void fracPreferredScale(void *data, wp_fractional_scale_v1 *,
+                                 uint32_t scale120) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    self->fracPreferred_ = scale120;
+    self->chooseScale();
+  }
+  static constexpr wp_fractional_scale_v1_listener fracListener = {
+      fracPreferredScale};
+
+  static void surfaceEnter(void *data, wl_surface *, wl_output *o) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (auto *i = self->findOutput(o))
+      i->entered = true;
+    self->chooseScale();
+  }
+  static void surfaceLeave(void *data, wl_surface *, wl_output *o) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (auto *i = self->findOutput(o))
+      i->entered = false;
+    self->chooseScale();
+  }
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+  static void surfacePreferredBufferScale(void *data, wl_surface *,
+                                          int32_t factor) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    self->surfacePreferredScale_ = factor;
+    self->chooseScale();
+  }
+  static void surfacePreferredBufferTransform(void *, wl_surface *, uint32_t) {}
+#endif
+  static constexpr wl_surface_listener surfaceListener = {
+      surfaceEnter, surfaceLeave
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+      ,
+      surfacePreferredBufferScale, surfacePreferredBufferTransform
+#endif
+  };
+
+  static void outputGeometry(void *, wl_output *, int32_t, int32_t, int32_t,
+                             int32_t, int32_t, const char *, const char *,
+                             int32_t) {}
+  static void outputMode(void *, wl_output *, uint32_t, int32_t, int32_t,
+                         int32_t) {}
+  static void outputDone(void *data, wl_output *) {
+    static_cast<LiteUIImpl *>(data)->chooseScale();
+  }
+  static void outputScale(void *data, wl_output *o, int32_t factor) {
+    auto *self = static_cast<LiteUIImpl *>(data);
+    if (auto *i = self->findOutput(o))
+      i->scale = std::max(1, factor);
+  }
+  static constexpr wl_output_listener outputListener = {
+      outputGeometry, outputMode, outputDone, outputScale};
 
   // ---- EGL / GLES 3.0 ----
   // GPU-accelerated replacement for the old wl_shm double buffer. The
@@ -15282,12 +15722,14 @@ private:
     wl_buffer *buf = wl_cursor_image_get_buffer(image);
     if (!buf)
       return;
+    wl_surface_set_buffer_scale(toolCursorSurface_, cursorScale_);
     wl_surface_attach(toolCursorSurface_, buf, 0, 0);
     wl_surface_damage_buffer(toolCursorSurface_, 0, 0, image->width,
                              image->height);
     wl_surface_commit(toolCursorSurface_);
     zwp_tablet_tool_v2_set_cursor(t.tool, t.proxSerial, toolCursorSurface_,
-                                  image->hotspot_x, image->hotspot_y);
+                                  image->hotspot_x / cursorScale_,
+                                  image->hotspot_y / cursorScale_);
   }
 
   void processToolFrame(TabletTool &t, uint64_t ms) {
@@ -15714,14 +16156,20 @@ private:
 
   // Called once per global object the compositor advertises via the registry.
   static void registryGlobal(void *data, wl_registry *registry, uint32_t name,
-                             const char *interface, uint32_t) {
+                             const char *interface, uint32_t version) {
     // Recover the owning LiteUI.
     auto *self = static_cast<LiteUIImpl *>(data);
     // If this global is the compositor interface...
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
       // ...bind to it at version 4 and store the resulting proxy.
-      self->compositor_ = static_cast<wl_compositor *>(
-          wl_registry_bind(registry, name, &wl_compositor_interface, 4));
+      // Version 6 adds wl_surface.preferred_buffer_scale (integer HiDPI hint).
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+      const uint32_t compositorVersion = std::min<uint32_t>(version, 6);
+#else
+      const uint32_t compositorVersion = std::min<uint32_t>(version, 4);
+#endif
+      self->compositor_ = static_cast<wl_compositor *>(wl_registry_bind(
+          registry, name, &wl_compositor_interface, compositorVersion));
     }
     // If instead this global is the xdg_wm_base (window-shell) interface...
     else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
@@ -15752,6 +16200,22 @@ private:
       self->tabletManager_ = static_cast<zwp_tablet_manager_v2 *>(
           wl_registry_bind(registry, name, &zwp_tablet_manager_v2_interface, 1));
       self->maybeCreateTabletSeat();
+    }
+    // HiDPI: an output (its integer scale), the viewporter, and the
+    // fractional-scale manager.
+    else if (strcmp(interface, wl_output_interface.name) == 0) {
+      auto *o = static_cast<wl_output *>(wl_registry_bind(
+          registry, name, &wl_output_interface, std::min<uint32_t>(version, 2)));
+      self->outputs_.push_back({o, 1, false});
+      wl_output_add_listener(o, &outputListener, self);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+      self->viewporter_ = static_cast<wp_viewporter *>(
+          wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
+    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) ==
+               0) {
+      self->fracMgr_ = static_cast<wp_fractional_scale_manager_v1 *>(
+          wl_registry_bind(registry, name,
+                           &wp_fractional_scale_manager_v1_interface, 1));
     }
     // If instead this global is the decoration-manager interface...
     else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) ==
@@ -15925,11 +16389,15 @@ private:
     if (!cbuf)
       return;
     currentCursorName_ = name;
+    // The theme was loaded at 24 * cursorScale_ px: tag the surface with that
+    // integer scale and give the hotspot in surface-local (logical) units.
+    wl_surface_set_buffer_scale(cursorSurface_, cursorScale_);
     wl_surface_attach(cursorSurface_, cbuf, 0, 0);
     wl_surface_damage_buffer(cursorSurface_, 0, 0, image->width, image->height);
     wl_surface_commit(cursorSurface_);
     wl_pointer_set_cursor(pointer_, pointerEnterSerial_, cursorSurface_,
-                          image->hotspot_x, image->hotspot_y);
+                          image->hotspot_x / cursorScale_,
+                          image->hotspot_y / cursorScale_);
   }
 
   // Handles a compositor-driven resize: tears down the old shm buffers,
@@ -15940,8 +16408,7 @@ private:
   void resize(int newWidth, int newHeight) {
     width_ = newWidth;
     height_ = newHeight;
-    if (eglWindow_)
-      wl_egl_window_resize(eglWindow_, width_, height_, 0, 0);
+    applyScaleGeometry(); // buffer = logical size * scale_, mapped to width_ x height_
     relayout();
 
     pollAndRelayout();
@@ -16158,9 +16625,10 @@ private:
 
     createEglContext();
 
-    eglWindow_ = wl_egl_window_create(surface_, width_, height_);
+    eglWindow_ = wl_egl_window_create(surface_, bufferW(), bufferH());
     if (!eglWindow_)
       throw std::runtime_error("wl_egl_window_create failed");
+    applyScaleGeometry();
 
     eglSurface_ = eglCreateWindowSurface(
         eglDisplay_, eglConfig_,
@@ -16197,8 +16665,14 @@ private:
       x1 = x0;
     if (y1 < y0)
       y1 = y0;
-    glScissor(static_cast<int>(x0), static_cast<int>(height_ - y1),
-              static_cast<int>(x1 - x0), static_cast<int>(y1 - y0));
+    // Scissor is in device pixels: scale, expanding outwards to whole pixels
+    // so a fractional edge never clips a partially covered pixel away.
+    const int bw = bufferW(), bh = bufferH();
+    const int px0 = std::clamp(static_cast<int>(std::floor(x0 * scale_)), 0, bw);
+    const int px1 = std::clamp(static_cast<int>(std::ceil(x1 * scale_)), px0, bw);
+    const int py0 = std::clamp(static_cast<int>(std::floor(y0 * scale_)), 0, bh);
+    const int py1 = std::clamp(static_cast<int>(std::ceil(y1 * scale_)), py0, bh);
+    glScissor(px0, bh - py1, px1 - px0, py1 - py0);
   }
 
   // Draws one filled, optionally rounded-corner rectangle. radius <= 0
@@ -16207,6 +16681,17 @@ private:
                   const ClipRect &clip) {
     if (w <= 0 || h <= 0)
       return;
+    // Snap the edges (not the origin and size separately) to whole device
+    // pixels: crisp at fractional scales, and boxes that share a logical
+    // edge share the same device edge, so no seams. A rect that would
+    // collapse to nothing keeps at least one device pixel.
+    {
+      const float x1 = snapPx(x + w), y1 = snapPx(y + h);
+      x = snapPx(x);
+      y = snapPx(y);
+      w = std::max(x1 - x, 1.0f / scale_);
+      h = std::max(y1 - y, 1.0f / scale_);
+    }
     applyScissor(clip);
     glUseProgram(rectProgram_);
     glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
@@ -16276,7 +16761,8 @@ private:
   }
 
   GLuint tooltipTextTexture_ = 0;
-  int tooltipTexW_ = 0, tooltipTexH_ = 0;
+  int tooltipTexW_ = 0, tooltipTexH_ = 0; // logical size (layout)
+  int tooltipPxW_ = 0, tooltipPxH_ = 0;   // texture size in device pixels
   std::string tooltipTextureBuiltFor_;
 
   void ensureTooltipTexture(const std::string &text) {
@@ -16295,8 +16781,10 @@ private:
         resolveStatic(ts.fontStyle), -1);
     int w = std::max(1, (int)std::ceil(m.width)),
         h = std::max(1, (int)std::ceil(m.height));
+    const int pw = deviceDim(w), ph = deviceDim(h);
     cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+    cairo_surface_set_device_scale(surf, scale_, scale_);
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -16311,10 +16799,10 @@ private:
     cairo_surface_flush(surf);
     unsigned char *data = cairo_image_surface_get_data(surf);
     int stride = cairo_image_surface_get_stride(surf);
-    std::vector<unsigned char> alpha((size_t)w * h);
-    for (int row = 0; row < h; ++row)
-      for (int col = 0; col < w; ++col)
-        alpha[row * w + col] = data[row * stride + col * 4 + 3];
+    std::vector<unsigned char> alpha((size_t)pw * ph);
+    for (int row = 0; row < ph; ++row)
+      for (int col = 0; col < pw; ++col)
+        alpha[row * pw + col] = data[row * stride + col * 4 + 3];
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -16323,7 +16811,7 @@ private:
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, pw, ph, 0, GL_ALPHA,
                  GL_UNSIGNED_BYTE, alpha.data());
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     cairo_destroy(cr);
@@ -16331,6 +16819,8 @@ private:
     tooltipTextTexture_ = tex;
     tooltipTexW_ = w;
     tooltipTexH_ = h;
+    tooltipPxW_ = pw;
+    tooltipPxH_ = ph;
     tooltipTextureBuiltFor_ = text;
   }
 
@@ -16354,8 +16844,8 @@ private:
     glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
     glEnableVertexAttribArray(texAPos_);
     glVertexAttribPointer(texAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glUniform2f(texUPos_, bx + pad, by + pad);
-    glUniform2f(texUSize_, (float)tooltipTexW_, (float)tooltipTexH_);
+    glUniform2f(texUPos_, snapPx(bx + pad), snapPx(by + pad));
+    glUniform2f(texUSize_, tooltipPxW_ / scale_, tooltipPxH_ / scale_);
     glUniform2f(texUScreen_, (float)width_, (float)height_);
     Color c = tooltipStyle_.textColor;
     glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
@@ -16373,7 +16863,7 @@ private:
   // cairo's native ARGB32 buffer — GL_ALPHA is core GLES2, unlike the
   // BGRA extension and non-tightly-packed row uploads that ARGB32 would
   // otherwise require.
-  static void ensureTextTexture(const View &v) {
+  void ensureTextTexture(const View &v) {
     const std::string &text = resolveDynamic(v.text, v.computed.resolvedText);
     float fontSize =
         resolveDynamic(v.textStyle.fontSize, v.computed.resolvedFontSize);
@@ -16399,8 +16889,13 @@ private:
     int innerH =
         std::max(1, static_cast<int>(v.computed.h - pad.top - pad.bottom));
 
+    // Rasterize at device resolution: the surface is pw x ph pixels but
+    // carries a device scale, so the layout below still works in logical
+    // units (innerW wide) and Pango renders/hints for the real pixel grid.
+    const int pw = deviceDim(innerW), ph = deviceDim(innerH);
     cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, innerW, innerH);
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+    cairo_surface_set_device_scale(surf, scale_, scale_);
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -16430,11 +16925,11 @@ private:
     // Cairo's ARGB32 stores alpha in the high byte of each native-endian
     // 32-bit pixel, which on the little-endian platforms this file
     // targets is byte offset 3.
-    std::vector<unsigned char> alpha(static_cast<size_t>(innerW) * innerH);
-    for (int row = 0; row < innerH; ++row) {
+    std::vector<unsigned char> alpha(static_cast<size_t>(pw) * ph);
+    for (int row = 0; row < ph; ++row) {
       const unsigned char *src = data + row * stride;
-      unsigned char *dst = alpha.data() + row * innerW;
-      for (int col = 0; col < innerW; ++col)
+      unsigned char *dst = alpha.data() + row * pw;
+      for (int col = 0; col < pw; ++col)
         dst[col] = src[col * 4 + 3];
     }
 
@@ -16452,7 +16947,7 @@ private:
     // into diagonal noise whenever innerW isn't a multiple of 4 (which
     // is almost always, for arbitrary text widths).
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, innerW, innerH, 0, GL_ALPHA,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, pw, ph, 0, GL_ALPHA,
                  GL_UNSIGNED_BYTE, alpha.data());
     glPixelStorei(GL_UNPACK_ALIGNMENT,
                   4); // restore GL's default for other uploads
@@ -16461,8 +16956,8 @@ private:
     cairo_surface_destroy(surf);
 
     v.computed.textTexture = tex;
-    v.computed.textTexW = innerW;
-    v.computed.textTexH = innerH;
+    v.computed.textTexW = pw; // device pixels
+    v.computed.textTexH = ph;
     v.computed.textTextureBuiltForWidth = v.computed.w;
     v.computed.textTextureBuiltForText = text;
     v.computed.textTextureBuiltForFontSize = fontSize;
@@ -16484,11 +16979,12 @@ private:
     glVertexAttribPointer(texAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
-    float x = v.computed.x + pad.left;
-    float y = v.computed.y + pad.top;
+    float x = snapPx(v.computed.x + pad.left);
+    float y = snapPx(v.computed.y + pad.top);
     glUniform2f(texUPos_, x, y);
-    glUniform2f(texUSize_, static_cast<float>(v.computed.textTexW),
-                static_cast<float>(v.computed.textTexH));
+    // The texture is in device pixels; draw it at its logical size.
+    glUniform2f(texUSize_, static_cast<float>(v.computed.textTexW) / scale_,
+                static_cast<float>(v.computed.textTexH) / scale_);
     glUniform2f(texUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
     const Color &c =
@@ -16515,6 +17011,7 @@ private:
     float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
     int iw = std::max(1, static_cast<int>(innerW));
     int ih = std::max(1, static_cast<int>(innerH));
+    const int pw = deviceDimF(innerW), ph = deviceDimF(innerH); // device px
     bool resized = !v.computed.canvasSurface ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
@@ -16524,7 +17021,9 @@ private:
         v.computed.canvasSurface = nullptr;
       }
       v.computed.canvasSurface =
-          cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
+          cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
+      // Device scale: onPaint draws in logical units onto pw x ph pixels.
+      cairo_surface_set_device_scale(v.computed.canvasSurface, scale_, scale_);
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
@@ -16539,7 +17038,8 @@ private:
       cairo_set_source_rgba(cr, 0, 0, 0, 0);
       cairo_paint(cr);
       cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-      CanvasContextImpl ctx(cr, static_cast<float>(iw), static_cast<float>(ih),
+      CanvasContextImpl ctx(cr, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
+                            scale_ == 1.0f ? static_cast<float>(ih) : innerH,
                             &v.computed);
       v.onPaint(ctx);
       cairo_destroy(cr);
@@ -16558,12 +17058,12 @@ private:
     // uploaded directly. Fall back to a repack only if that ever changes.
     std::vector<unsigned char> repacked;
     const unsigned char *upload = data;
-    if (stride != iw * 4) {
-      repacked.resize(static_cast<size_t>(iw) * ih * 4);
-      for (int row = 0; row < ih; ++row)
-        std::memcpy(repacked.data() + static_cast<size_t>(row) * iw * 4,
+    if (stride != pw * 4) {
+      repacked.resize(static_cast<size_t>(pw) * ph * 4);
+      for (int row = 0; row < ph; ++row)
+        std::memcpy(repacked.data() + static_cast<size_t>(row) * pw * 4,
                     data + static_cast<size_t>(row) * stride,
-                    static_cast<size_t>(iw) * 4);
+                    static_cast<size_t>(pw) * 4);
       upload = repacked.data();
     }
 
@@ -16584,14 +17084,14 @@ private:
     }
 
     glPixelStorei(GL_UNPACK_ALIGNMENT,
-                  4); // rows are iw*4 bytes, always 4-aligned
+                  4); // rows are pw*4 bytes, always 4-aligned
     if (created || resized) {
       // (Re)specify storage: new texture, or the canvas changed size.
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, iw, ih, 0, GL_RGBA,
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0, GL_RGBA,
                    GL_UNSIGNED_BYTE, upload);
     } else {
       // Same size: overwrite in place, no reallocation on the driver side.
-      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iw, ih, GL_RGBA, GL_UNSIGNED_BYTE,
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE,
                       upload);
     }
   }
@@ -16614,13 +17114,14 @@ private:
     float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
     int iw = std::max(1, static_cast<int>(innerW));
     int ih = std::max(1, static_cast<int>(innerH));
+    const int pw = deviceDimF(innerW), ph = deviceDimF(innerH); // device px
     bool resized = !v.computed.canvasTexture ||
                    v.computed.canvasBuiltForWidth != innerW ||
                    v.computed.canvasBuiltForHeight != innerH;
     if (resized) {
-      if (!liteui_canvas_gl::Renderer::buildTarget(v.computed, iw, ih)) {
-        fprintf(stderr, "liteui: could not create a %dx%d canvas target\n", iw,
-                ih);
+      if (!liteui_canvas_gl::Renderer::buildTarget(v.computed, pw, ph)) {
+        fprintf(stderr, "liteui: could not create a %dx%d canvas target\n", pw,
+                ph);
         return; // texture stays 0: nothing is drawn for this node
       }
       v.computed.canvasBuiltForWidth = innerW;
@@ -16630,10 +17131,13 @@ private:
     if (!v.computed.canvasTexture)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      canvasGl_.begin(v.computed, iw, ih);
+      canvasGl_.begin(v.computed, pw, ph);
       {
-        CanvasContextImpl ctx(canvasGl_, static_cast<float>(iw),
-                              static_cast<float>(ih), &v.computed);
+        // The target is pw x ph device pixels; the context draws in logical
+        // units (iw x ih) with a base transform of scale_.
+        CanvasContextImpl ctx(canvasGl_, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
+                              scale_ == 1.0f ? static_cast<float>(ih) : innerH,
+                              &v.computed, scale_);
         v.onPaint(ctx);
       }
       canvasGl_.end(v.computed);
@@ -16660,11 +17164,12 @@ private:
     glVertexAttribPointer(canvasAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
-    float x = v.computed.x + pad.left;
-    float y = v.computed.y + pad.top;
+    // Blit 1:1: device-pixel-aligned position, size = texture pixels / scale_.
+    float x = snapPx(v.computed.x + pad.left);
+    float y = snapPx(v.computed.y + pad.top);
     glUniform2f(canvasUPos_, x, y);
-    glUniform2f(canvasUSize_, v.computed.canvasBuiltForWidth,
-                v.computed.canvasBuiltForHeight);
+    glUniform2f(canvasUSize_, deviceDimF(v.computed.canvasBuiltForWidth) / scale_,
+                deviceDimF(v.computed.canvasBuiltForHeight) / scale_);
     glUniform2f(canvasUScreen_, static_cast<float>(width_),
                 static_cast<float>(height_));
 
@@ -16884,7 +17389,9 @@ private:
   void redraw() {
     if (!eglReady_)
       return;
-    glViewport(0, 0, width_, height_);
+    // Viewport in device pixels; every shader's u_screen stays in logical
+    // units, so all drawing code keeps using logical coordinates.
+    glViewport(0, 0, bufferW(), bufferH());
     applyScissor(ClipRect{});
     glClearColor(windowBg_.r / 255.0f, windowBg_.g / 255.0f,
                  windowBg_.b / 255.0f, 1.0f);
@@ -17039,6 +17546,14 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   // Register the class with the OS so CreateWindowExW can use it.
   RegisterClassW(&wc);
 
+  // Per-monitor DPI awareness must be in place before the first window is
+  // created. Until the window exists, the system DPI is the best guess for
+  // its scale; it is corrected right after creation if the window landed on
+  // a monitor with a different one.
+  enablePerMonitorDpiAwareness();
+  scale_ = static_cast<float>(dpiForWindow(nullptr)) / 96.0f;
+  const int requestedW = width_, requestedH = height_; // logical
+
   // Convert the UTF-8 title into the wide string Win32 expects.
   std::wstring wtitle = toWide(title);
 
@@ -17052,15 +17567,28 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
     // so center the window in the work area ourselves.
     RECT wa{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    posX = wa.left + ((wa.right - wa.left) - width_) / 2;
-    posY = wa.top + ((wa.bottom - wa.top) - height_) / 2;
+    posX = wa.left + ((wa.right - wa.left) - toPhysical(requestedW)) / 2;
+    posY = wa.top + ((wa.bottom - wa.top) - toPhysical(requestedH)) / 2;
   }
   hwnd_ = CreateWindowExW(0, className, wtitle.c_str(), style, posX, posY,
-                          width_, height_, nullptr, nullptr, hInst, this);
+                          toPhysical(requestedW), toPhysical(requestedH),
+                          nullptr, nullptr, hInst, this);
   // If creation failed, surface it as an exception rather than continuing with
   // a null handle.
   if (!hwnd_) {
     throw std::runtime_error("CreateWindowExW failed");
+  }
+  {
+    // The window may have opened on a monitor whose DPI differs from the
+    // system DPI used above: adopt its real scale and resize to match.
+    const float actual = static_cast<float>(dpiForWindow(hwnd_)) / 96.0f;
+    if (actual != scale_) {
+      scale_ = actual;
+      RECT wr{};
+      GetWindowRect(hwnd_, &wr);
+      SetWindowPos(hwnd_, nullptr, wr.left, wr.top, toPhysical(requestedW),
+                   toPhysical(requestedH), SWP_NOZORDER | SWP_NOACTIVATE);
+    }
   }
 
   // One factory per LiteUI instance is simplest here; a real app with many
@@ -17098,6 +17626,11 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   // Block until the compositor has processed everything so far, guaranteeing
   // all globals are bound by now.
   wl_display_roundtrip(display_);
+  // wl_output scale events arrive only after the output has been bound, i.e.
+  // one roundtrip later: take it now so the very first buffer already has the
+  // right HiDPI scale.
+  if (!outputs_.empty())
+    wl_display_roundtrip(display_);
 
   // Make sure the globals this window absolutely needs were actually
   // advertised.
@@ -17109,12 +17642,26 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   // decorations would. nullptr picks the user's configured/default theme;
   // 24 is a conventional base cursor size in pixels. Non-fatal if it fails:
   // we just silently keep whatever cursor the compositor already set.
-  cursorTheme_ = wl_cursor_theme_load(nullptr, 24, shm_);
+  // (An output's scale event may already have loaded it at the HiDPI size.)
+  if (!cursorTheme_)
+    cursorTheme_ = wl_cursor_theme_load(nullptr, 24 * cursorScale_, shm_);
   if (cursorTheme_)
     cursorSurface_ = wl_compositor_create_surface(compositor_);
 
   // Create the raw drawable surface from the compositor.
   surface_ = wl_compositor_create_surface(compositor_);
+  // HiDPI: learn which outputs the surface is on (and, on compositor v6,
+  // its preferred integer scale), and attach a viewport + fractional-scale
+  // object when the compositor offers them. All of it is optional.
+  wl_surface_add_listener(surface_, &surfaceListener, this);
+  if (viewporter_)
+    viewport_ = wp_viewporter_get_viewport(viewporter_, surface_);
+  if (viewport_ && fracMgr_) {
+    fracScale_ =
+        wp_fractional_scale_manager_v1_get_fractional_scale(fracMgr_, surface_);
+    wp_fractional_scale_v1_add_listener(fracScale_, &fracListener, this);
+  }
+  chooseScale(); // best guess now; refined by the events above
   // Wrap that surface as an xdg_surface so it can become a desktop window.
   xdg_surf_ = xdg_wm_base_get_xdg_surface(wm_base_, surface_);
   // Register the configure/ack handler on the xdg_surface.
@@ -17195,6 +17742,18 @@ inline LiteUIImpl::~LiteUIImpl() {
   }
   if (eglWindow_)
     wl_egl_window_destroy(eglWindow_);
+  // HiDPI objects (the viewport must go before the surface it extends).
+  if (fracScale_)
+    wp_fractional_scale_v1_destroy(fracScale_);
+  if (fracMgr_)
+    wp_fractional_scale_manager_v1_destroy(fracMgr_);
+  if (viewport_)
+    wp_viewport_destroy(viewport_);
+  if (viewporter_)
+    wp_viewporter_destroy(viewporter_);
+  for (auto &o : outputs_)
+    wl_output_destroy(o.output);
+  outputs_.clear();
   // Pens and touch.
   for (auto &t : tabletTools_)
     if (t->tool)
@@ -17965,6 +18524,15 @@ float CanvasContext::width() const {
 float CanvasContext::height() const {
   return static_cast<const CanvasContextImpl *>(this)->height();
 }
+float CanvasContext::devicePixelRatio() const {
+  return static_cast<const CanvasContextImpl *>(this)->devicePixelRatio();
+}
+int CanvasContext::pixelWidth() const {
+  return static_cast<const CanvasContextImpl *>(this)->pixelWidth();
+}
+int CanvasContext::pixelHeight() const {
+  return static_cast<const CanvasContextImpl *>(this)->pixelHeight();
+}
 void CanvasContext::save() { static_cast<CanvasContextImpl *>(this)->save(); }
 void CanvasContext::restore() {
   static_cast<CanvasContextImpl *>(this)->restore();
@@ -18174,6 +18742,10 @@ void LiteUI::addShortcut(KeyModifiers mods, Key key, std::function<void()> fn) {
 void LiteUI::requestRepaint() { p_->requestRepaint(); }
 LiteUI *LiteUI::current() { return liteui_currentFacade_; }
 void LiteUI::wake() { p_->wake(); }
+float LiteUI::contentScale() const { return p_->contentScale(); }
+void LiteUI::setScaleChangedHandler(std::function<void()> fn) {
+  p_->setScaleChangedHandler(std::move(fn));
+}
 void LiteUI::setWakeHandler(std::function<void()> fn) {
   p_->setWakeHandler(std::move(fn));
 }

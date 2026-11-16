@@ -77,10 +77,10 @@ jobs:
           cp liteui.hpp scratch/
 
           # On Linux liteui.hpp #include's the generated protocol headers
-          # (xdg-shell, xdg-decoration, tablet) by relative name, and linking
-          # needs the matching generated .c files: the six vendored files
-          # under platform/wayland-protocols/ are the only extras a drop-in
-          # user needs.
+          # (xdg-shell, xdg-decoration, tablet, viewporter, fractional-scale)
+          # by relative name, and linking needs the matching generated .c
+          # files: the ten vendored files under platform/wayland-protocols/
+          # are the only extras a drop-in user needs.
           if [ "$RUNNER_OS" = "Linux" ]; then
             cp platform/wayland-protocols/* scratch/
           fi

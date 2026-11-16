@@ -95,7 +95,8 @@ constexpr float kMaskTrackW = 240.0f;  // slider track length in that panel
                                        // (kMinMaskPanelW - 2 * pad - scrollbar
                                        // must stay >= this)
 
-// Zoom range/step.
+// Zoom range/step. Zoom is measured in DEVICE pixels (see EditorState::zoomDev):
+// 1.0 = one image pixel per physical screen pixel, on any display scale.
 constexpr float kZoomMin = 0.1f;
 constexpr float kZoomMax = 8.0f;
 constexpr float kZoomStep = 1.25f;
@@ -491,7 +492,27 @@ struct EditorState {
   bool colorNoticePending =
       false; // the open's color notice may still be wiped by a geometry job;
              // show it again when that lands
+  // Zoom. Everything on screen (the canvas size, overlays, hit-testing) is in
+  // LOGICAL units, so `zoom` is logical units per image pixel, and every use of
+  // it (lx / state.zoom, ctx.scale(state.zoom), ...) stays correct on a HiDPI
+  // display. What the user sees ("100%") is device-based: zoomDev is device
+  // pixels per image pixel, so 100% really is one image pixel per physical pixel
+  // (pixel-exact), and zoom = zoomDev / dpr. Change them only through
+  // applyZoomDev() / setZoom() / setDpr().
   float zoom = 1.0f;
+  float zoomDev = 1.0f;
+  float dpr = 1.0f; // device pixels per logical unit (LiteUI::contentScale())
+  // The canvas is as big as the area it fills (not as big as the zoomed
+  // picture), so its texture stays window-sized at any zoom. The picture is
+  // drawn into it at an offset that we compute: centered when it fits, scrolled
+  // by scrollX/scrollY (logical units, in the padded picture) when it doesn't.
+  struct View2D {
+    float w = 0, h = 0;           // canvas size, from onLayout
+    float scrollX = 0, scrollY = 0;
+    enum class Drag { None, Pan, VThumb, HThumb } drag = Drag::None;
+    float dragX = 0, dragY = 0;             // pointer at press
+    float dragScrollX = 0, dragScrollY = 0; // scroll at press
+  } view;
   AdjustmentSet adjust;      // current slider values + their undo/redo history
   uint64_t sidecarSaved = 0; // adjust.version() at the last sidecar save / load
   PhotoMeta meta;            // the open picture's rating / flag / color label
@@ -668,9 +689,217 @@ static void clearStatus() {
   state.statusIsError = false;
 }
 
-static void setZoom(float z) {
-  state.zoom = std::clamp(z, kZoomMin, kZoomMax);
+// Sets the zoom from a device-pixel zoom (1.0 = 100%, pixel-exact) and derives
+// the logical scale everything else uses. Does not mark dirty.
+static void applyZoomDev(float zoomDev) {
+  state.zoomDev = std::clamp(zoomDev, kZoomMin, kZoomMax);
+  state.zoom = state.zoomDev / state.dpr;
+}
+
+// ---- The canvas view: where the picture sits inside the canvas ----
+// The picture is state.docWidth() x docHeight() image pixels shown at
+// state.zoom logical units per pixel, with kViewPad of margin all round. If it
+// fits an axis it is centered there; otherwise that axis scrolls.
+using ViewDrag = decltype(EditorState::view)::Drag;
+constexpr float kViewPad = 24.0f;
+constexpr float kViewBar = kScrollbarThickness;
+constexpr float kViewMinThumb = 24.0f;
+
+struct ViewGeo {
+  float W = 0, H = 0;           // picture size on screen
+  float cw = 0, ch = 0;         // padded content size
+  bool hbar = false, vbar = false;
+  float baseX = 0, baseY = 0;   // picture origin in the canvas at scroll 0
+  float maxX = 0, maxY = 0;     // largest scroll offset
+};
+
+// Geometry of the view; also keeps the scroll offsets inside their range
+// (the picture can change size under us: crop, rotate, a new zoom).
+static ViewGeo viewGeo(bool clampScroll = true) {
+  auto &v = state.view;
+  ViewGeo g;
+  g.W = state.docWidth() * state.zoom;
+  g.H = state.docHeight() * state.zoom;
+  g.cw = g.W + 2.0f * kViewPad;
+  g.ch = g.H + 2.0f * kViewPad;
+  g.hbar = g.cw > v.w + 0.5f;
+  g.vbar = g.ch > v.h + 0.5f;
+  g.maxX = std::max(0.0f, g.cw - v.w);
+  g.maxY = std::max(0.0f, g.ch - v.h);
+  g.baseX = g.hbar ? kViewPad : (v.w - g.W) / 2.0f;
+  g.baseY = g.vbar ? kViewPad : (v.h - g.H) / 2.0f;
+  if (clampScroll) {
+    v.scrollX = std::clamp(v.scrollX, 0.0f, g.maxX);
+    v.scrollY = std::clamp(v.scrollY, 0.0f, g.maxY);
+  }
+  return g;
+}
+
+// The picture's top-left corner in canvas coordinates, on a whole device pixel
+// so a 100% picture is drawn pixel-exact at any display scale.
+static void viewOrigin(const ViewGeo &g, float &ox, float &oy) {
+  const float d = state.dpr;
+  ox = std::round((g.baseX - state.view.scrollX) * d) / d;
+  oy = std::round((g.baseY - state.view.scrollY) * d) / d;
+}
+// Canvas coordinates -> picture-local coordinates (what the crop, mask, picker
+// and readout code take: divide by state.zoom to get image pixels).
+static void viewLocal(float x, float y, float &lx, float &ly) {
+  float ox, oy;
+  viewOrigin(viewGeo(), ox, oy);
+  lx = x - ox;
+  ly = y - oy;
+}
+
+// Changes the display scale and/or the device-pixel zoom, keeping the image
+// point under canvas position (ax, ay) where it is.
+static void changeView(float newDpr, float newZoomDev, float ax, float ay) {
+  auto &v = state.view;
+  const bool have = state.image && state.zoom > 0.0f;
+  float ix = 0, iy = 0; // image-pixel point under the anchor
+  if (have) {
+    const ViewGeo g = viewGeo();
+    ix = (ax - (g.baseX - v.scrollX)) / state.zoom;
+    iy = (ay - (g.baseY - v.scrollY)) / state.zoom;
+  }
+  state.dpr = std::max(1.0f, newDpr);
+  applyZoomDev(newZoomDev);
+  if (have) {
+    const ViewGeo g = viewGeo(false);
+    v.scrollX = g.baseX + ix * state.zoom - ax;
+    v.scrollY = g.baseY + iy * state.zoom - ay;
+  }
+  viewGeo(); // clamp
   state.markDirty();
+}
+static void zoomAbout(float zoomDev, float ax, float ay) {
+  changeView(state.dpr, zoomDev, ax, ay);
+}
+// Zooms about the middle of the canvas (menus, buttons, shortcuts).
+static void setZoom(float zoomDev) {
+  zoomAbout(zoomDev, state.view.w / 2.0f, state.view.h / 2.0f);
+}
+// The display scale changed (first known at startup, or the window moved to
+// another monitor): keep the same device zoom, so 100% stays 100%.
+static void setDpr(float dpr) {
+  changeView(dpr, state.zoomDev, state.view.w / 2.0f, state.view.h / 2.0f);
+}
+
+// Scrollbar thumb along a track of length `track`.
+struct ViewThumb {
+  float pos, len;
+};
+static ViewThumb viewThumb(float track, float content, float scroll,
+                           float maxScroll) {
+  const float len =
+      std::clamp(track * track / std::max(1.0f, content), kViewMinThumb, track);
+  const float pos = maxScroll > 0 ? scroll / maxScroll * (track - len) : 0.0f;
+  return {pos, len};
+}
+
+// A press at canvas position (x, y): starts a scrollbar drag, or pages the
+// view when it lands on a track. Returns true if it landed on a bar.
+static bool viewBarPress(float x, float y) {
+  if (!state.image)
+    return false;
+  auto &v = state.view;
+  const ViewGeo g = viewGeo();
+  const float availW = v.w - (g.vbar ? kViewBar : 0.0f);
+  const float availH = v.h - (g.hbar ? kViewBar : 0.0f);
+  if (g.vbar && x >= v.w - kViewBar && y < availH) {
+    const ViewThumb t = viewThumb(availH, g.ch, v.scrollY, g.maxY);
+    if (y >= t.pos && y <= t.pos + t.len) {
+      v.drag = ViewDrag::VThumb;
+      v.dragY = y;
+      v.dragScrollY = v.scrollY;
+    } else {
+      v.scrollY += (y < t.pos ? -availH : availH);
+      viewGeo();
+      state.markDirty();
+    }
+    return true;
+  }
+  if (g.hbar && y >= v.h - kViewBar && x < availW) {
+    const ViewThumb t = viewThumb(availW, g.cw, v.scrollX, g.maxX);
+    if (x >= t.pos && x <= t.pos + t.len) {
+      v.drag = ViewDrag::HThumb;
+      v.dragX = x;
+      v.dragScrollX = v.scrollX;
+    } else {
+      v.scrollX += (x < t.pos ? -availW : availW);
+      viewGeo();
+      state.markDirty();
+    }
+    return true;
+  }
+  return false;
+}
+static void viewPanBegin(float x, float y) {
+  auto &v = state.view;
+  v.drag = ViewDrag::Pan;
+  v.dragX = x;
+  v.dragY = y;
+  v.dragScrollX = v.scrollX;
+  v.dragScrollY = v.scrollY;
+}
+static void viewDragTo(float x, float y) {
+  auto &v = state.view;
+  if (!state.image || v.drag == ViewDrag::None)
+    return;
+  const ViewGeo g = viewGeo();
+  const float availW = v.w - (g.vbar ? kViewBar : 0.0f);
+  const float availH = v.h - (g.hbar ? kViewBar : 0.0f);
+  switch (v.drag) {
+  case ViewDrag::Pan:
+    v.scrollX = v.dragScrollX - (x - v.dragX);
+    v.scrollY = v.dragScrollY - (y - v.dragY);
+    break;
+  case ViewDrag::VThumb: {
+    const ViewThumb t = viewThumb(availH, g.ch, v.scrollY, g.maxY);
+    const float range = availH - t.len;
+    if (range > 0)
+      v.scrollY = v.dragScrollY + (y - v.dragY) / range * g.maxY;
+    break;
+  }
+  case ViewDrag::HThumb: {
+    const ViewThumb t = viewThumb(availW, g.cw, v.scrollX, g.maxX);
+    const float range = availW - t.len;
+    if (range > 0)
+      v.scrollX = v.dragScrollX + (x - v.dragX) / range * g.maxX;
+    break;
+  }
+  default:
+    break;
+  }
+  viewGeo(); // clamp
+  state.markDirty();
+}
+static void paintViewBars(CanvasContext &ctx, const ViewGeo &g) {
+  auto &v = state.view;
+  const float availW = v.w - (g.vbar ? kViewBar : 0.0f);
+  const float availH = v.h - (g.hbar ? kViewBar : 0.0f);
+  if (g.vbar) {
+    const ViewThumb t = viewThumb(availH, g.ch, v.scrollY, g.maxY);
+    ctx.setFillColor(kColorTrack);
+    ctx.fillRect(v.w - kViewBar, 0, kViewBar, availH);
+    ctx.setFillColor(kColorScrollThumb);
+    ctx.beginPath();
+    ctx.roundRect(v.w - kViewBar + 2, t.pos + 1, kViewBar - 4, t.len - 2, 3);
+    ctx.fill();
+  }
+  if (g.hbar) {
+    const ViewThumb t = viewThumb(availW, g.cw, v.scrollX, g.maxX);
+    ctx.setFillColor(kColorTrack);
+    ctx.fillRect(0, v.h - kViewBar, availW, kViewBar);
+    ctx.setFillColor(kColorScrollThumb);
+    ctx.beginPath();
+    ctx.roundRect(t.pos + 1, v.h - kViewBar + 2, t.len - 2, kViewBar - 4, 3);
+    ctx.fill();
+  }
+  if (g.vbar && g.hbar) {
+    ctx.setFillColor(kColorTrack);
+    ctx.fillRect(v.w - kViewBar, v.h - kViewBar, kViewBar, kViewBar);
+  }
 }
 
 static void syncSource(bool force);
@@ -3303,7 +3532,8 @@ static void adoptDecoded(DecodeWorker::Result &&r) {
       std::move(r.wide); // null for an 8-bit file; syncSource(true) below
                          // rebuilds the twin chain
   state.imagePath = std::move(r.path);
-  state.zoom = 1.0f;    // start fresh at 100% on every newly opened image
+  applyZoomDev(1.0f);   // start fresh at 100% on every newly opened image
+  state.view.scrollX = state.view.scrollY = 0.0f; // centered
   state.adjust.reset(); // and with no adjustment, crop or rotation applied yet
   state.adjust.setOriginalSize(state.original->width, state.original->height);
   state.maskSel = -1;
@@ -4144,8 +4374,13 @@ static View buildGradeWheel(int range, int diameter, float pad) {
     const float R = diameter / 2.0f;
 
     ctx.setGlobalAlpha(w.visible ? 1.0f : 0.3f);
-    ctx.drawImage(gradeWheelImage(diameter, kGradeWheelBrightness[range]),
-                  cx - R, cy - R);
+    // The disc is a bitmap: build it at device resolution and draw it at its
+    // logical size, so it is as sharp as the vector drawing around it.
+    const int devDiameter = std::max(
+        1, static_cast<int>(std::lround(diameter * ctx.devicePixelRatio())));
+    ctx.drawImage(gradeWheelImage(devDiameter, kGradeWheelBrightness[range]),
+                  cx - R, cy - R, static_cast<float>(diameter),
+                  static_cast<float>(diameter));
     ctx.setGlobalAlpha(1.0f);
 
     const float ang = -w.hue * kGradePi / 180.0f;
@@ -7296,22 +7531,34 @@ static void paintClipOverlay(CanvasContext &ctx, float docW, float docH) {
 
 static void paintCanvas(CanvasContext &ctx) {
   LITEUI_PROF_START(profAppPaint);
-  ctx.setFillColor(state.image ? kColorWhite : kColorCanvasPlaceholderBg);
-  ctx.fillRect(0, 0, ctx.width(), ctx.height());
-
-  if (!state.image || state.image->width <= 0 || state.image->height <= 0)
+  if (!state.image || state.image->width <= 0 || state.image->height <= 0) {
+    ctx.setFillColor(kColorCanvasPlaceholderBg);
+    ctx.fillRect(0, 0, ctx.width(), ctx.height());
     return;
-
-  // Drawn at the document's natural pixel size; the canvas itself is
-  // already sized to docWidth*zoom / docHeight*zoom (see canvas.style
-  // below), so a plain ctx.scale(zoom, zoom) here is all that's needed.
+  }
+  // The canvas is the whole viewport; the picture is a W x H rectangle inside
+  // it at (ox, oy), on a whole device pixel. Everything picture-related below
+  // is drawn into that rectangle (clipped to it, as the canvas used to do by
+  // being exactly that size), in the same coordinates as before.
+  ctx.setFillColor(kColorViewportBg);
+  ctx.fillRect(0, 0, ctx.width(), ctx.height());
+  const ViewGeo vg = viewGeo();
+  float ox, oy;
+  viewOrigin(vg, ox, oy);
+  ctx.setFillColor(kColorWhite);
+  ctx.fillRect(ox, oy, vg.W, vg.H);
   // A straightened image with "Keep full canvas" has transparent corners;
   // a neutral backdrop keeps them from reading as part of a white picture.
   if (state.adjust.expand() && state.adjust.angle() != 0.0f) {
     ctx.setFillColor(kColorEmptyCorner);
-    ctx.fillRect(0, 0, ctx.width(), ctx.height());
+    ctx.fillRect(ox, oy, vg.W, vg.H);
   }
 
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(ox, oy, vg.W, vg.H);
+  ctx.clip();
+  ctx.translate(ox, oy);
   ctx.save();
   ctx.scale(state.zoom, state.zoom);
   const float docW = state.docWidth(), docH = state.docHeight();
@@ -7360,6 +7607,15 @@ static void paintCanvas(CanvasContext &ctx) {
   ctx.restore();
   if (state.compare != CompareMode::Off)
     paintCompareOverlay(ctx); // labels and the split line (screen space)
+  ctx.restore(); // the picture clip and offset
+  // A hairline (one device pixel) just outside the picture.
+  const float hair = 1.0f / state.dpr;
+  ctx.setStrokeColor(kColorCanvasBorder);
+  ctx.setLineWidth(hair);
+  ctx.beginPath();
+  ctx.rect(ox - hair / 2, oy - hair / 2, vg.W + hair, vg.H + hair);
+  ctx.stroke();
+  paintViewBars(ctx, vg);
   LITEUI_PROF_ADD(appPaint, profAppPaint);
 }
 
@@ -8496,6 +8752,11 @@ static void verifyAdjustmentSpecs() {
 int main() {
   verifyAdjustmentSpecs();
   LiteUI ui("Literoom", -1, -1, /*hideTitlebar=*/true);
+  // Zoom is in device pixels (100% = one image pixel per physical pixel), so the
+  // display scale must be known before the first layout and follow the window
+  // between monitors. The handler runs before LiteUI relayouts and repaints.
+  setDpr(ui.contentScale());
+  ui.setScaleChangedHandler([&ui] { setDpr(ui.contentScale()); });
   // A finished background render wakes the (otherwise sleeping) event loop.
   renderWorker.setNotify([&ui] { ui.wake(); });
   geometryWorker.setNotify([&ui] { ui.wake(); });
@@ -8547,8 +8808,8 @@ int main() {
           fn();
       };
     };
-    auto zoomIn = [] { setZoom(state.zoom * kZoomStep); };
-    auto zoomOut = [] { setZoom(state.zoom / kZoomStep); };
+    auto zoomIn = [] { setZoom(state.zoomDev * kZoomStep); };
+    auto zoomOut = [] { setZoom(state.zoomDev / kZoomStep); };
 
     ui.addShortcut(ctrlShift, Key::C, notTyping(copySettings));
     ui.addShortcut(ctrlShift, Key::V, notTyping(idle(pasteSettings)));
@@ -8687,8 +8948,8 @@ int main() {
   titlebar.addChild(menuButton(
       "View", 1,
       {
-          {"Zoom In", [] { setZoom(state.zoom * kZoomStep); }, "Ctrl+="},
-          {"Zoom Out", [] { setZoom(state.zoom / kZoomStep); }, "Ctrl+-"},
+          {"Zoom In", [] { setZoom(state.zoomDev * kZoomStep); }, "Ctrl+="},
+          {"Zoom Out", [] { setZoom(state.zoomDev / kZoomStep); }, "Ctrl+-"},
           {"Actual Size (100%)", [] { setZoom(1.0f); }, "Ctrl+0"},
           {"Toggle Sidebar", toggleSidebar, "Ctrl+B"},
           {"Toggle Filmstrip", toggleFilmstrip, "F6"},
@@ -8937,7 +9198,7 @@ int main() {
   Text infoZoom;
   infoZoom.label = std::function<std::string()>([] {
     return "Zoom: " +
-           std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
+           std::to_string(static_cast<int>(state.zoomDev * 100.0f + 0.5f)) + "%";
   });
   infoZoom.fontSize = 13.0f;
   infoZoom.color = kColorTextMid;
@@ -10831,35 +11092,23 @@ int main() {
   centerColumn.style.height = Size::full();
   centerColumn.style.flexGrow = 1;
 
-  // ---- Scrollable canvas viewport ----
-  View viewport;
-  viewport.style.width = Size::full();
-  viewport.style.flexGrow = 1;
-  viewport.style.backgroundColor = kColorViewportBg;
-  viewport.style.overflowX = Overflow::Auto;
-  viewport.style.overflowY = Overflow::Auto;
-  viewport.style.justifyContent = Justify::Center;
-  viewport.style.alignItems = Align::Center;
-  viewport.style.padding = EdgeInsets::all(24);
-  viewport.style.wheelScrollEnabled = false;
-  viewport.style.scrollThumbColor = kColorScrollThumb;
-  viewport.style.scrollTrackColor = kColorTrack;
-  viewport.style.scrollbarAutoHide = true;
-  // Only occupies the slot in `workspace` while an image is open; the
-  // "no image" placeholder below is workspace's other child for that
-  // same slot and shows exactly when this one doesn't.
-  viewport.style.display = std::function<Display()>(
-      [] { return state.image ? Display::Flex : Display::None; });
-
+  // ---- Canvas: fills the whole area under the toolbar ----
+  // The canvas is as big as that area, whatever the zoom; paintCanvas draws the
+  // picture into it, centered or scrolled (see ViewGeo). Only occupies the slot
+  // while an image is open; the "no image" placeholder below is the other child
+  // for that same slot.
   View canvas;
   canvas.isCanvas = true;
-  canvas.style.width = std::function<Size()>(
-      [] { return Size::pixel(state.docWidth() * state.zoom); });
-  canvas.style.height = std::function<Size()>(
-      [] { return Size::pixel(state.docHeight() * state.zoom); });
-  canvas.style.borderWidth = 1.0f;
-  canvas.style.borderColor = kColorCanvasBorder;
-  canvas.style.backgroundColor = kColorWhite;
+  canvas.style.width = Size::full();
+  canvas.style.flexGrow = 1;
+  canvas.style.display = std::function<Display()>(
+      [] { return state.image ? Display::Flex : Display::None; });
+  // The final size, on every relayout (window resize included).
+  canvas.onLayout = [](float, float, float w, float h) {
+    state.view.w = w;
+    state.view.h = h;
+    viewGeo(); // keep the scroll offsets in range
+  };
 
   canvas.onPaint = [](CanvasContext &ctx) { paintCanvas(ctx); };
   canvas.canvasDirtySource = [] {
@@ -10885,11 +11134,29 @@ int main() {
   // the release of some other gesture crossing it are not taken for a drag.
   // (one pointer owns the gesture, as in bindDrag: a second finger is ignored)
   auto pressed = std::make_shared<std::optional<uint32_t>>();
-  canvas.onPointerDown = [pressed](PointerEvent &e) {
+  // The pointer that owns a view drag (scrollbar thumb, or panning with the
+  // middle button / the left one while no tool is active).
+  auto viewPointer = std::make_shared<std::optional<uint32_t>>();
+  canvas.onPointerDown = [pressed, viewPointer](PointerEvent &e) {
     e.stopPropagation();
     if (e.button == MouseButton::Left)
       closeMenus(); // this press never reaches the workspace's handler
-    const float lx = e.x, ly = e.y;
+    if (*viewPointer)
+      return; // another pointer is already moving the view
+    if (e.button == MouseButton::Left && viewBarPress(e.x, e.y)) {
+      if (state.view.drag != ViewDrag::None)
+        *viewPointer = e.pointerId;
+      return;
+    }
+    if (e.button == MouseButton::Middle) {
+      viewPanBegin(e.x, e.y);
+      *viewPointer = e.pointerId;
+      return;
+    }
+    // The tools work in picture-local coordinates (divide by the zoom for
+    // image pixels): the canvas coordinates minus the picture's corner.
+    float lx, ly;
+    viewLocal(e.x, e.y, lx, ly);
     if (e.button == MouseButton::Right) {
       if (state.compare == CompareMode::Off) {
         objectPress(lx, ly, true);
@@ -10907,6 +11174,13 @@ int main() {
         splitFromX(lx);
       return;
     }
+    if (!wbPickerActive() && !cropToolActive() && !maskToolActive()) {
+      // No tool wants the drag: it pans the view.
+      pressed->reset();
+      viewPanBegin(e.x, e.y);
+      *viewPointer = e.pointerId;
+      return;
+    }
     if (wbPress(lx, ly)) {
       state.openMenu = -1; // same as cropPress: a canvas press closes any menu
       return;
@@ -10914,18 +11188,24 @@ int main() {
     cropPress(lx, ly);
     maskPress(lx, ly);
   };
-  canvas.onPointerMove = [pressed](PointerEvent &e) {
-    if (hoverSample(e.x, e.y))
+  canvas.onPointerMove = [pressed, viewPointer](PointerEvent &e) {
+    if (*viewPointer == e.pointerId) {
+      viewDragTo(e.x, e.y);
+      return;
+    }
+    float lx, ly;
+    viewLocal(e.x, e.y, lx, ly);
+    if (hoverSample(lx, ly))
       state.dirty = true;
     if (*pressed != e.pointerId || !e.held(MouseButton::Left))
       return;
     if (state.compare != CompareMode::Off) {
       if (state.compare == CompareMode::Split)
-        splitFromX(e.x);
+        splitFromX(lx);
       return;
     }
-    cropDrag(e.x, e.y);
-    maskDrag(e.x, e.y);
+    cropDrag(lx, ly);
+    maskDrag(lx, ly);
   };
   auto endCanvasDrag = [pressed](const PointerEvent &e) {
     if (*pressed != e.pointerId)
@@ -10935,11 +11215,19 @@ int main() {
     if (state.mask.drag != MaskUi::Drag::None)
       maskEndDrag();
   };
-  canvas.onPointerUp = [endCanvasDrag](PointerEvent &e) {
+  auto endViewDrag = [viewPointer](const PointerEvent &e) {
+    if (*viewPointer != e.pointerId)
+      return;
+    viewPointer->reset();
+    state.view.drag = ViewDrag::None;
+  };
+  canvas.onPointerUp = [endCanvasDrag, endViewDrag](PointerEvent &e) {
+    endViewDrag(e);
     if (e.button == MouseButton::Left)
       endCanvasDrag(e);
   };
-  canvas.onPointerCancel = [endCanvasDrag](PointerEvent &e) {
+  canvas.onPointerCancel = [endCanvasDrag, endViewDrag](PointerEvent &e) {
+    endViewDrag(e);
     endCanvasDrag(e);
   };
   // Cursor: the split line drags sideways; the tools and the picker aim.
@@ -10959,13 +11247,11 @@ int main() {
       return;
     const float f = e.precise ? std::pow(kZoomStep, -e.dy / 40.0f)
                               : (e.dy < 0.0f ? kZoomStep : 1.0f / kZoomStep);
-    setZoom(state.zoom * f);
+    zoomAbout(state.zoomDev * f, e.x, e.y); // the point under the pointer stays
     e.stopPropagation();
   };
 
-  viewport.addChild(std::move(canvas));
-
-  centerColumn.addChild(std::move(viewport));
+  centerColumn.addChild(std::move(canvas));
 
   View noImagePlaceholder;
   noImagePlaceholder.style.width = Size::full();
@@ -11186,11 +11472,11 @@ int main() {
   zoomControls.addChild(std::move(rgbReadout));
 
   zoomControls.addChild(
-      statusGlyphBtn("-", [] { setZoom(state.zoom / kZoomStep); }));
+      statusGlyphBtn("-", [] { setZoom(state.zoomDev / kZoomStep); }));
 
   Text zoomLabel;
   zoomLabel.label = [] {
-    return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
+    return std::to_string(static_cast<int>(state.zoomDev * 100.0f + 0.5f)) + "%";
   };
   zoomLabel.fontSize = 12.0f;
   zoomLabel.color = kColorWhite;
@@ -11198,7 +11484,7 @@ int main() {
   zoomControls.addChild(std::move(zoomLabel));
 
   zoomControls.addChild(
-      statusGlyphBtn("+", [] { setZoom(state.zoom * kZoomStep); }));
+      statusGlyphBtn("+", [] { setZoom(state.zoomDev * kZoomStep); }));
 
   View zoomResetSpacer;
   zoomResetSpacer.style.width = Size::pixel(6);

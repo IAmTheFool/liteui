@@ -74,10 +74,11 @@ jobs:
             ':(exclude)examples/literoom/models'
 
           # The tarball must be able to configure on its own, so these have to
-          # be inside it. Fail the release if any went missing. All six
-          # vendored Wayland protocol files (xdg-shell, xdg-decoration, tablet:
-          # a .c and a .h each) are listed, because CMakeLists.txt refuses to
-          # build the protocol library unless every one of them exists.
+          # be inside it. Fail the release if any went missing. All ten
+          # vendored Wayland protocol files (xdg-shell, xdg-decoration, tablet,
+          # viewporter, fractional-scale: a .c and a .h each) are listed,
+          # because CMakeLists.txt refuses to build the protocol library unless
+          # every one of them exists.
           tar -tzf "dist/liteui-${VERSION}.tar.gz" > dist/contents.txt
           for f in LICENSE README.md liteui.hpp CMakeLists.txt CMakePresets.json \
                    cmake/LiteuiTests.cmake tests/CMakeLists.txt \
@@ -86,7 +87,11 @@ jobs:
                    platform/wayland-protocols/xdg-decoration-protocol.c \
                    platform/wayland-protocols/xdg-decoration-client-protocol.h \
                    platform/wayland-protocols/tablet-protocol.c \
-                   platform/wayland-protocols/tablet-client-protocol.h; do
+                   platform/wayland-protocols/tablet-client-protocol.h \
+                   platform/wayland-protocols/viewporter-protocol.c \
+                   platform/wayland-protocols/viewporter-client-protocol.h \
+                   platform/wayland-protocols/fractional-scale-protocol.c \
+                   platform/wayland-protocols/fractional-scale-client-protocol.h; do
             grep -qx "liteui-${VERSION}/${f}" dist/contents.txt \
               || { echo "::error::${f} is missing from the release tarball"; exit 1; }
           done

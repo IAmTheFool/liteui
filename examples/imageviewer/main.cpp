@@ -68,8 +68,16 @@ namespace
 
     std::string title;
     std::string status = "No image loaded";
-    float zoom = 1.0f; // 1.0 = one image pixel per screen pixel
-    // Top-left of the visible part, in zoomed-image pixels. Only meaningful
+    // Zoom is measured in DEVICE pixels: 1.0 = one image pixel per physical
+    // screen pixel (pixel-exact), whatever the display scale. Geometry,
+    // scrolling and all drawing coordinates below are in logical units, so one
+    // image pixel is zoom / dpr logical units wide (see pxScale()).
+    float zoom = 1.0f;
+    // Device pixels per logical unit, learned from the Canvas on every paint
+    // (CanvasContext::devicePixelRatio()): 1 on a 96-dpi display, 2 on 200%...
+    float dpr = 1.0f;
+    bool dprKnown = false; // false until the first paint has reported it
+    // Top-left of the visible part, in zoomed-image logical units. Only meaningful
     // on an axis where the zoomed image is larger than the view.
     float scrollX = 0, scrollY = 0;
     float viewW = 0, viewH = 0; // canvas size, updated from onLayout
@@ -86,6 +94,9 @@ namespace
     float dragX = 0, dragY = 0;             // pointer at press
     float dragScrollX = 0, dragScrollY = 0; // scroll at press
   };
+
+  // Logical units covered by one image pixel at the current zoom.
+  float pxScale(const ViewerState &s) { return s.zoom / s.dpr; }
 
   // Sizes derived from the state: where the image sits and how far it scrolls.
   struct Geometry
@@ -104,8 +115,8 @@ namespace
     g.availH = s.viewH;
     if (!s.image)
       return g;
-    g.cw = static_cast<float>(s.image->width) * s.zoom;
-    g.ch = static_cast<float>(s.image->height) * s.zoom;
+    g.cw = static_cast<float>(s.image->width) * pxScale(s);
+    g.ch = static_cast<float>(s.image->height) * pxScale(s);
     // A bar eats space on the other axis, which can make that bar necessary
     // too, so settle it in two passes. 0.5 px of slack avoids a bar
     // appearing from float rounding when the image exactly fits.
@@ -147,14 +158,14 @@ namespace
     // Image-space point under the anchor. offX is 0 on an overflowing axis
     // and scrollX is 0 on a fitting one, so one formula covers both. It may
     // lie outside the image when the pointer is over the margin.
-    float ix = (s.scrollX + ax - a.offX) / s.zoom;
-    float iy = (s.scrollY + ay - a.offY) / s.zoom;
+    float ix = (s.scrollX + ax - a.offX) / pxScale(s);
+    float iy = (s.scrollY + ay - a.offY) / pxScale(s);
 
     s.zoom = std::clamp(newZoom, kMinZoom, kMaxZoom);
 
     Geometry b = geometry(s);
-    s.scrollX = ix * s.zoom - (ax - b.offX);
-    s.scrollY = iy * s.zoom - (ay - b.offY);
+    s.scrollX = ix * pxScale(s) - (ax - b.offX);
+    s.scrollY = iy * pxScale(s) - (ay - b.offY);
     clampScroll(s);
     s.dirty = true;
   }
@@ -184,8 +195,11 @@ namespace
   {
     if (!s.image || s.viewW <= 0 || s.viewH <= 0)
       return;
-    float fit = std::min({1.0f, s.viewW / static_cast<float>(s.image->width),
-                          s.viewH / static_cast<float>(s.image->height)});
+    // The view is viewW x viewH logical units = viewW*dpr x viewH*dpr device
+    // pixels, and zoom is in device pixels.
+    float fit = std::min({1.0f,
+                          s.viewW * s.dpr / static_cast<float>(s.image->width),
+                          s.viewH * s.dpr / static_cast<float>(s.image->height)});
     s.zoom = std::max(kMinZoom, fit);
     s.scrollX = s.scrollY = 0;
     s.needFit = false;
@@ -465,6 +479,23 @@ namespace
 
   void paintViewer(ViewerState &s, CanvasContext &ctx)
   {
+    // Learn the display scale. It is only known here (not in onLayout), so on
+    // the first paint, or after the window moves to a monitor with another
+    // scale, adapt: keep the same image point scrolled into view, and redo a
+    // pending fit now that the view's size in device pixels is known.
+    const float dpr = ctx.devicePixelRatio();
+    if (!s.dprKnown || dpr != s.dpr)
+    {
+      const float r = s.dpr / dpr; // logical size of the image scales by this
+      s.scrollX *= r;
+      s.scrollY *= r;
+      s.dpr = dpr;
+      s.dprKnown = true;
+      if (s.needFit)
+        fitToView(s);
+      clampScroll(s);
+    }
+
     float w = ctx.width(), h = ctx.height();
     ctx.setFillColor(Color{30, 30, 30});
     ctx.fillRect(0, 0, w, h);
@@ -483,13 +514,17 @@ namespace
 
     // Draw the whole image, scaled and shifted, clipped to the visible
     // area (the drawImage source-rect form doesn't clip to its destination).
-    // Offsets are rounded so a 100% image stays pixel-exact.
+    // The offset is rounded in DEVICE pixels (not logical units) so a 100%
+    // image lands exactly on the pixel grid at any display scale, including
+    // fractional ones like 125% / 150%.
+    const float d = s.dpr;
+    const float px = std::floor(g.offX * d) - std::round(s.scrollX * d);
+    const float py = std::floor(g.offY * d) - std::round(s.scrollY * d);
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, 0, g.availW, g.availH);
     ctx.clip();
-    ctx.drawImage(*s.image, std::floor(g.offX) - std::round(s.scrollX),
-                  std::floor(g.offY) - std::round(s.scrollY), g.cw, g.ch);
+    ctx.drawImage(*s.image, px / d, py / d, g.cw, g.ch);
     ctx.restore();
     s.retired.clear(); // the backend's bitmap cache now refers to *s.image
 
