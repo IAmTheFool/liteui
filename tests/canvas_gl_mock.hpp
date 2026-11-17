@@ -25,8 +25,10 @@
 #if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +68,10 @@ struct MockGl {
   liteui_canvas_sampling::ImageFilter lastFilter =
       liteui_canvas_sampling::ImageFilter::Linear;
   std::vector<GLuint> mipmapped;
+  // App-owned Textures (drawTexture): GPU copies created, rectangles patched
+  // in place (in order), and the patches' rectangles {x, y, w, h}.
+  int textureCreates = 0, texturePatches = 0;
+  std::vector<std::array<int, 4>> patchRects;
 
   // Counters for the faked glyph rasterizer (shared by all instances).
   static inline int rasterCalls = 0;
@@ -134,6 +140,40 @@ struct MockGl {
     return static_cast<GLuint>(texPx_.size());
   }
   void deferDelete(GLuint t) { deleted.push_back(t); }
+
+  // Mirrors liteui_canvas_gl::Renderer::textureFor: the CanvasTexture's GPU copy is
+  // created on first use, then only the changed rectangles are patched in;
+  // the mip chain is rebuilt lazily, only for a minified draw after a change.
+  GLuint textureFor(const std::shared_ptr<CanvasTexture> &t, bool wantMips) {
+    textures_.sweep([this](TexHandle &h) { deleted.push_back(h.tex); });
+    auto *e = textures_.sync(
+        t,
+        [this](const CanvasTexture &tx, const CanvasTexture::Patch &full, TexHandle &out) {
+          ++textureCreates;
+          texPx_.push_back(full.px);
+          texSize_.push_back({tx.width(), tx.height()});
+          out.tex = static_cast<GLuint>(texPx_.size());
+          return true;
+        },
+        [this](TexHandle &h, const CanvasTexture::Patch &p) {
+          ++texturePatches;
+          patchRects.push_back({p.x, p.y, p.w, p.h});
+          auto &dst = texPx_[h.tex - 1];
+          const int tw = texSize_[h.tex - 1].first;
+          for (int r = 0; r < p.h; ++r)
+            std::copy_n(&p.px[static_cast<size_t>(r) * p.w * 4],
+                        static_cast<size_t>(p.w) * 4,
+                        &dst[(static_cast<size_t>(p.y + r) * tw + p.x) * 4]);
+          h.mips = false;
+        });
+    if (!e)
+      return 0;
+    if (wantMips && !e->handle.mips) {
+      mipmapped.push_back(e->handle.tex);
+      e->handle.mips = true;
+    }
+    return e->handle.tex;
+  }
   void readback(const View::Computed &, int x, int y, int w, int h,
                 uint8_t *dst) {
     for (int r = 0; r < h; ++r)
@@ -480,6 +520,11 @@ private:
   CanvasGradient grad_;
   float inv_[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   std::vector<uint8_t> ramp_;
+  struct TexHandle {
+    GLuint tex = 0;
+    bool mips = false;
+  };
+  liteui_texture::TextureTable<TexHandle> textures_;
   std::vector<std::vector<uint8_t>> texPx_;
   std::vector<std::pair<int, int>> texSize_;
   std::unordered_map<std::string, cgl::RasterText> rasters_;

@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -36,10 +37,12 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -671,6 +674,7 @@ struct Text {
 //  - fillText/strokeText's maxWidth parameter is accepted for API
 //    familiarity but currently unused (no horizontal squeeze-to-fit).
 class CanvasContext;
+class CanvasTexture;
 
 // A simple RGBA8, straight- (non-premultiplied) alpha bitmap. The app is
 // responsible for populating `pixels` (e.g. from a decoded image file or
@@ -684,6 +688,119 @@ struct CanvasImage {
   CanvasImage(int w, int h)
       : width(w), height(h),
         pixels(static_cast<size_t>(std::max(0, w)) * std::max(0, h) * 4, 0) {}
+};
+
+// ---- Canvas damage (partial redraw) ---------------------------------------
+// An axis-aligned rectangle in a canvas's LOGICAL units: the same space
+// onPaint draws in, origin at the top-left of the canvas content box.
+struct DirtyRect {
+  float x = 0, y = 0, w = 0, h = 0;
+  bool empty() const { return !(w > 0.0f) || !(h > 0.0f); }
+  float right() const { return x + w; }
+  float bottom() const { return y + h; }
+  // Smallest rectangle containing both; an empty operand is ignored.
+  DirtyRect united(const DirtyRect &o) const {
+    if (empty())
+      return o;
+    if (o.empty())
+      return *this;
+    const float x0 = std::min(x, o.x), y0 = std::min(y, o.y);
+    const float x1 = std::max(right(), o.right());
+    const float y1 = std::max(bottom(), o.bottom());
+    return {x0, y0, x1 - x0, y1 - y0};
+  }
+};
+
+// The damage an app reports for a retained Canvas (Canvas::retained). THREAD
+// SAFE: invalidate()/invalidateAll() may be called from any thread, e.g. a
+// worker that has just finished a tile. The UI thread drains the accumulated
+// damage on its next poll and repaints only that region.
+//
+//   auto damage = std::make_shared<CanvasDamage>();
+//   damage->setNotify([&ui] { ui.wake(); });   // optional; see below
+//   Canvas c; c.retained = true; c.damage = damage;
+//   ...
+//   // worker thread, tile at (x, y, w, h) in canvas logical units finished:
+//   damage->invalidate(x, y, w, h);            // also wakes the UI loop
+//
+// setNotify's callback runs on the invalidating thread, after the lock is
+// released; LiteUI::wake() is the intended callback (it is the one call that
+// is safe off the UI thread). Without a notify callback the damage is picked
+// up at the next poll/repaint for any reason, so the app must wake the loop
+// itself. Damage from several calls between two polls is merged into ONE
+// bounding rectangle, so scattered tiles repaint the box around them.
+class CanvasDamage {
+public:
+  // Marks (x, y, w, h) stale. A rectangle with no area is ignored; one with a
+  // non-finite coordinate is treated as invalidateAll() (a missed repaint is
+  // worse than an extra one). Negative sizes are normalised.
+  void invalidate(float x, float y, float w, float h) {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) ||
+        !std::isfinite(h)) {
+      invalidateAll();
+      return;
+    }
+    if (w < 0) {
+      x += w;
+      w = -w;
+    }
+    if (h < 0) {
+      y += h;
+      h = -h;
+    }
+    const DirtyRect r{x, y, w, h};
+    if (r.empty())
+      return;
+    std::function<void()> n;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      rect_ = rect_.united(r);
+      any_ = true;
+      n = notify_;
+    }
+    if (n)
+      n();
+  }
+  void invalidate(const DirtyRect &r) { invalidate(r.x, r.y, r.w, r.h); }
+  // The whole canvas is stale (same effect as View::requestCanvasRedraw()).
+  void invalidateAll() {
+    std::function<void()> n;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      full_ = true;
+      any_ = true;
+      n = notify_;
+    }
+    if (n)
+      n();
+  }
+  // Called after every invalidation, on the invalidating thread. Set it before
+  // starting the threads that invalidate (it is locked, but a callback that
+  // captures a LiteUI must not outlive it: join the workers first).
+  void setNotify(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(m_);
+    notify_ = std::move(fn);
+  }
+
+  struct Pending {
+    bool any = false;  // something was reported since the last take()
+    bool full = false; // the whole canvas is stale (rect is then unused)
+    DirtyRect rect;    // bounding box of the reported rectangles
+  };
+  // Library-internal: returns and clears the accumulated damage.
+  Pending take() {
+    std::lock_guard<std::mutex> lk(m_);
+    Pending p{any_, full_, rect_};
+    any_ = full_ = false;
+    rect_ = DirtyRect{};
+    return p;
+  }
+
+private:
+  std::mutex m_;
+  bool any_ = false, full_ = false;
+  DirtyRect rect_;
+  std::function<void()> notify_;
 };
 
 // ---- Pixel formats (storage description only) ---------------------------
@@ -1510,6 +1627,508 @@ inline ImageFilter pickFilter(ImageSampling mode, float a, float b, float c,
 }
 } // namespace liteui_canvas_sampling
 
+// Pure helpers behind retained-canvas partial redraw: no GPU, no platform
+// headers, so the rounding rules can be unit-tested on their own.
+namespace liteui_canvas_damage {
+// Half-open pixel rectangle [x0,x1) x [y0,y1) in DEVICE pixels of the canvas
+// backing store (y grows downward, row 0 = top of the canvas).
+struct DeviceRect {
+  int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  int width() const { return x1 - x0; }
+  int height() const { return y1 - y0; }
+  bool empty() const { return x1 <= x0 || y1 <= y0; }
+  bool operator==(const DeviceRect &) const = default;
+};
+
+// Rounds a logical rectangle OUTWARD to whole device pixels (so a fractionally
+// covered pixel is repainted, never left stale) and clamps it to the
+// pw x ph backing store. A tiny epsilon absorbs float noise so an exact pixel
+// boundary doesn't grow by a whole pixel.
+inline DeviceRect toDevice(const DirtyRect &r, float scale, int pw,
+                           int ph) noexcept {
+  constexpr float kEps = 1e-3f;
+  DeviceRect d;
+  if (r.empty() || !(scale > 0.0f) || pw <= 0 || ph <= 0)
+    return d;
+  auto clampI = [](double v, int lo, int hi) {
+    return static_cast<int>(std::min<double>(std::max<double>(v, lo), hi));
+  };
+  d.x0 = clampI(std::floor(static_cast<double>(r.x) * scale + kEps), 0, pw);
+  d.y0 = clampI(std::floor(static_cast<double>(r.y) * scale + kEps), 0, ph);
+  d.x1 = clampI(std::ceil(static_cast<double>(r.right()) * scale - kEps), 0, pw);
+  d.y1 = clampI(std::ceil(static_cast<double>(r.bottom()) * scale - kEps), 0, ph);
+  return d;
+}
+
+// What one canvas redraw has to do.
+struct Plan {
+  bool nothing = false;  // damage lies entirely off-canvas: skip onPaint
+  bool full = true;      // repaint the whole surface (clear everything)
+  DeviceRect dev;        // region to clear + repaint when !full
+  DirtyRect logical;     // `dev` back in logical units (what ctx.damage() says)
+};
+
+// Decides between a full and a partial redraw. A non-retained canvas, a full
+// request (first build, resize, device loss, requestCanvasRedraw(),
+// canvasDirtySource, invalidateAll()), or damage that covers the whole
+// surface all give a full redraw.
+inline Plan plan(bool retained, bool fullRequested, const DirtyRect &pending,
+                 float scale, int pw, int ph) noexcept {
+  Plan p;
+  if (!retained || fullRequested || pending.empty())
+    return p; // full
+  p.dev = toDevice(pending, scale, pw, ph);
+  if (p.dev.empty()) {
+    p.nothing = true;
+    p.full = false;
+    return p;
+  }
+  if (p.dev.x0 == 0 && p.dev.y0 == 0 && p.dev.x1 == pw && p.dev.y1 == ph)
+    return p; // covers everything
+  p.full = false;
+  p.logical = {p.dev.x0 / scale, p.dev.y0 / scale, p.dev.width() / scale,
+               p.dev.height() / scale};
+  return p;
+}
+} // namespace liteui_canvas_damage
+
+// ---- App-owned textures ---------------------------------------------------
+// How the bytes handed to CanvasTexture::update() encode transparency.
+enum class TextureAlpha : uint8_t {
+  Straight,     // colour is NOT multiplied by alpha (what CanvasImage holds)
+  Premultiplied // colour already multiplied by alpha: copied as-is, fastest
+};
+
+// A picture the APP owns and updates one rectangle at a time, then draws with
+// CanvasContext::drawTexture(). Built for tile-based progressive renderers:
+// a tile arrives, update() it, redraw; nothing else is re-sent or re-converted
+// (compare drawImage(), whose one-slot cache is keyed on the pixel buffer's
+// address and cannot see in-place edits).
+//
+// THREAD SAFE. A CanvasTexture is a plain CPU object: it can be created, updated
+// and destroyed on ANY thread, before a window exists, and one CanvasTexture can be
+// drawn in several canvases or windows. It keeps a premultiplied RGBA8 copy of
+// its pixels (4 bytes per pixel of CPU memory, on top of the GPU copy), which
+// is what makes it safe off the UI thread and lets a lost GPU device or
+// context be recovered without any help from the app. The GPU copy is created
+// lazily the first time the texture is drawn, and brought up to date with
+// ONLY the rectangles changed since then (glTexSubImage2D / CopyFromMemory).
+//
+//   auto tex = std::make_shared<CanvasTexture>(4096, 4096);
+//   tex->setNotify([&ui] { ui.wake(); });            // optional
+//   // worker thread: a tile finished
+//   tex->update(tx, ty, 256, 256, tilePixels, 256 * 4);
+//   damage->invalidate(tx * zoom, ty * zoom, 256 * zoom, 256 * zoom);
+//   // Canvas::onPaint
+//   ctx.drawTexture(tex, sx, sy, sw, sh, dx, dy, dw, dh);
+//
+// update() does NOT redraw anything by itself: a canvas only repaints when it
+// is told to (Canvas::damage / canvasDirtySource), exactly as with any other
+// drawing.
+//
+// Format: only PixelFormat::RGBA8_UNORM is supported for now (valid() is false
+// for the others, so a float format fails loudly, not silently).
+//
+// CanvasTexture::wrap(image) is the variant for a picture that is already
+// built and never edited afterwards (a decoded photo, a finished render): it
+// SHARES the CanvasImage's pixels instead of copying them, so it costs no CPU
+// memory beyond the image itself. It is immutable (update()/clear() return
+// false / do nothing), takes the image's straight alpha as is, and
+// premultiplies when the pixels are first uploaded, on the thread that draws.
+// The caller promises not to modify the image while the texture exists;
+// replace the image (and wrap the new one) to change the picture.
+class CanvasTexture {
+public:
+  // One changed rectangle of the premultiplied RGBA8 pixels, rows contiguous.
+  struct Patch {
+    int x = 0, y = 0, w = 0, h = 0;
+    std::vector<uint8_t> px;
+  };
+  // What a consumer (a window's GPU cache) must apply to catch up.
+  struct Delta {
+    bool full = false;      // patches holds one patch covering the whole texture
+    uint64_t version = 0;   // pass back as `since` on the next collect()
+    std::vector<Patch> patches;
+  };
+
+  // Largest pixel buffer a CanvasTexture will allocate (the CPU copy).
+  static constexpr size_t kMaxBytes = size_t(1) << 31;
+
+  CanvasTexture(int width, int height, PixelFormat format = PixelFormat::RGBA8_UNORM,
+          TextureAlpha alpha = TextureAlpha::Straight)
+      : id_(nextId_.fetch_add(1, std::memory_order_relaxed) + 1), format_(format),
+        alpha_(alpha) {
+    if (width > 0 && height > 0 && format == PixelFormat::RGBA8_UNORM &&
+        static_cast<size_t>(width) <= kMaxBytes / 4 / static_cast<size_t>(height)) {
+      w_ = width;
+      h_ = height;
+      px_.assign(static_cast<size_t>(w_) * h_ * 4, 0); // transparent black
+    }
+  }
+  // See "wrap" above. Invalid (valid() is false) for a null or empty image,
+  // one whose pixel buffer is shorter than width * height * 4, or an oversized
+  // one.
+  explicit CanvasTexture(std::shared_ptr<const CanvasImage> image)
+      : id_(nextId_.fetch_add(1, std::memory_order_relaxed) + 1),
+        format_(PixelFormat::RGBA8_UNORM), alpha_(TextureAlpha::Straight),
+        src_(std::move(image)) {
+    if (src_ && src_->width > 0 && src_->height > 0 &&
+        static_cast<size_t>(src_->width) <=
+            kMaxBytes / 4 / static_cast<size_t>(src_->height) &&
+        src_->pixels.size() >=
+            static_cast<size_t>(src_->width) * src_->height * 4) {
+      w_ = src_->width;
+      h_ = src_->height;
+    } else {
+      src_.reset();
+    }
+  }
+  static std::shared_ptr<CanvasTexture>
+  wrap(std::shared_ptr<const CanvasImage> image) {
+    return std::make_shared<CanvasTexture>(std::move(image));
+  }
+  // True for a texture made by wrap(): it shows another image's pixels and
+  // cannot be updated.
+  bool wrapped() const { return src_ != nullptr; }
+  ~CanvasTexture() { deaths_.fetch_add(1, std::memory_order_relaxed); }
+  CanvasTexture(const CanvasTexture &) = delete;
+  CanvasTexture &operator=(const CanvasTexture &) = delete;
+
+  // False for non-positive or oversized dimensions and unsupported formats;
+  // update() then returns false and drawTexture() draws nothing.
+  bool valid() const { return w_ > 0; }
+  int width() const { return w_; }
+  int height() const { return h_; }
+  PixelFormat format() const { return format_; }
+  TextureAlpha alphaMode() const { return alpha_; }
+  uint64_t id() const { return id_; } // unique per CanvasTexture, never reused
+  // Bumped by every update()/clear(); lets an app see that something changed.
+  uint64_t version() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return version_;
+  }
+
+  // Copies the w x h rectangle at (x, y) from `data` (row pitch `strideBytes`,
+  // at least w * 4) into the texture, converting straight alpha to
+  // premultiplied if the texture was made with TextureAlpha::Straight (done on
+  // the CALLING thread, outside the lock). The part outside the texture is
+  // clipped away, so edge tiles may overhang it. Returns false only for
+  // invalid arguments (invalid texture, null data, negative size, short
+  // stride); a rectangle entirely outside the texture returns true and
+  // changes nothing. Safe to call from any thread, concurrently.
+  bool update(int x, int y, int w, int h, const void *data, size_t strideBytes) {
+    if (src_ || !valid() || !data || w < 0 || h < 0)
+      return false; // a wrapped texture is immutable
+    if (w == 0 || h == 0)
+      return true;
+    const auto minRow = minimumRowBytes(static_cast<uint32_t>(w), format_);
+    if (!minRow || strideBytes < *minRow)
+      return false;
+    const long long x0 = x, y0 = y;
+    const long long cx0 = std::max<long long>(x0, 0);
+    const long long cy0 = std::max<long long>(y0, 0);
+    const long long cx1 = std::min<long long>(x0 + w, w_);
+    const long long cy1 = std::min<long long>(y0 + h, h_);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      return true;
+    const size_t rw = static_cast<size_t>(cx1 - cx0);
+    const size_t rh = static_cast<size_t>(cy1 - cy0);
+    const uint8_t *src = static_cast<const uint8_t *>(data) +
+                         static_cast<size_t>(cy0 - y0) * strideBytes +
+                         static_cast<size_t>(cx0 - x0) * 4;
+    size_t srcStride = strideBytes;
+    thread_local std::vector<uint8_t> scratch;
+    if (alpha_ == TextureAlpha::Straight) {
+      scratch.resize(rw * rh * 4);
+      for (size_t r = 0; r < rh; ++r)
+        premultiplyRow(src + r * strideBytes, scratch.data() + r * rw * 4, rw);
+      src = scratch.data();
+      srcStride = rw * 4;
+    }
+    std::function<void()> n;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      for (size_t r = 0; r < rh; ++r)
+        std::memcpy(&px_[((static_cast<size_t>(cy0) + r) * w_ +
+                          static_cast<size_t>(cx0)) *
+                         4],
+                    src + r * srcStride, rw * 4);
+      recordLocked({static_cast<int>(cx0), static_cast<int>(cy0),
+                    static_cast<int>(cx1), static_cast<int>(cy1)});
+      n = notify_;
+    }
+    if (n)
+      n();
+    return true;
+  }
+  // Places a whole CanvasImage (straight alpha) with its top-left at (x, y).
+  // Only valid on a Straight-alpha texture; returns false otherwise.
+  bool update(int x, int y, const CanvasImage &img) {
+    if (alpha_ != TextureAlpha::Straight || img.width <= 0 || img.height <= 0 ||
+        img.pixels.size() < static_cast<size_t>(img.width) * img.height * 4)
+      return false;
+    return update(x, y, img.width, img.height, img.pixels.data(),
+                  static_cast<size_t>(img.width) * 4);
+  }
+  // Resets every pixel to transparent black.
+  void clear() {
+    if (src_ || !valid())
+      return;
+    std::function<void()> n;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      std::fill(px_.begin(), px_.end(), uint8_t(0));
+      recordLocked({0, 0, w_, h_});
+      n = notify_;
+    }
+    if (n)
+      n();
+  }
+  // Called after every update()/clear(), on the calling thread, with no lock
+  // held (so it may call back into the CanvasTexture). LiteUI::wake() is the
+  // intended callback. Set it before starting the threads that update.
+  void setNotify(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(m_);
+    notify_ = std::move(fn);
+  }
+  // Copies the in-bounds w x h rectangle at (x, y) of the CPU copy out as
+  // premultiplied RGBA8, rows contiguous. False if it isn't fully inside.
+  bool readPixels(int x, int y, int w, int h, std::vector<uint8_t> &out) const {
+    if (!valid() || x < 0 || y < 0 || w <= 0 || h <= 0 || x > w_ - w ||
+        y > h_ - h)
+      return false;
+    out.resize(static_cast<size_t>(w) * h * 4);
+    if (src_) { // wrapped: premultiplied on the way out, like an upload
+      for (int r = 0; r < h; ++r)
+        premultiplyRow(&src_->pixels[(static_cast<size_t>(y + r) * w_ + x) * 4],
+                       &out[static_cast<size_t>(r) * w * 4],
+                       static_cast<size_t>(w));
+      return true;
+    }
+    std::lock_guard<std::mutex> lk(m_);
+    for (int r = 0; r < h; ++r)
+      std::memcpy(&out[static_cast<size_t>(r) * w * 4],
+                  &px_[(static_cast<size_t>(y + r) * w_ + x) * 4],
+                  static_cast<size_t>(w) * 4);
+    return true;
+  }
+
+  // ---- library-internal: how a GPU cache catches up ----
+  // Everything that changed since the consumer last saw version `since`
+  // (0 = never seen anything: one full patch). Several rectangles that overlap
+  // or sit inside each other are sent once; many scattered ones collapse into
+  // their bounding box; mostly-changed becomes a full patch. Pixels are copied
+  // under the lock, so the consumer never reads memory a worker is writing.
+  void collect(uint64_t since, Delta &out) const {
+    out.full = false;
+    out.patches.clear();
+    std::lock_guard<std::mutex> lk(m_);
+    out.version = version_;
+    if (!valid())
+      return;
+    if (since == 0) {
+      copyPatchLocked({0, 0, w_, h_}, out);
+      out.full = true;
+      return;
+    }
+    if (since >= version_)
+      return;
+    std::vector<Rect> rs;
+    for (const Change &c : log_)
+      if (c.version > since)
+        rs.push_back(c.r);
+    std::vector<Rect> keep;
+    for (size_t i = 0; i < rs.size(); ++i) {
+      bool inside = false;
+      for (size_t j = 0; j < rs.size() && !inside; ++j)
+        if (j != i && contains(rs[j], rs[i]) && (!(rs[i] == rs[j]) || j < i))
+          inside = true;
+      if (!inside)
+        keep.push_back(rs[i]);
+    }
+    long long area = 0;
+    for (const Rect &r : keep)
+      area += static_cast<long long>(r.width()) * r.height();
+    const long long total = static_cast<long long>(w_) * h_;
+    if (keep.empty())
+      return;
+    if (area * 5 >= total * 3) {
+      copyPatchLocked({0, 0, w_, h_}, out);
+      out.full = true;
+    } else if (keep.size() > 16) {
+      Rect u = keep[0];
+      for (const Rect &r : keep)
+        u = {std::min(u.x0, r.x0), std::min(u.y0, r.y0), std::max(u.x1, r.x1),
+             std::max(u.y1, r.y1)};
+      copyPatchLocked(u, out);
+    } else {
+      for (const Rect &r : keep)
+        copyPatchLocked(r, out);
+    }
+  }
+  // Total number of Textures destroyed so far (all threads). A GPU cache
+  // compares it with its last value to know when to look for dead entries.
+  static uint64_t deathCount() { return deaths_.load(std::memory_order_relaxed); }
+
+private:
+  using Rect = liteui_canvas_damage::DeviceRect;
+  struct Change {
+    uint64_t version;
+    Rect r;
+  };
+  static constexpr size_t kMaxLog = 64;
+  static bool contains(const Rect &a, const Rect &b) {
+    return a.x0 <= b.x0 && a.y0 <= b.y0 && a.x1 >= b.x1 && a.y1 >= b.y1;
+  }
+  void recordLocked(const Rect &r) {
+    ++version_;
+    log_.push_back({version_, r});
+    if (log_.size() > kMaxLog) { // collapse: a superset is always safe
+      Rect u = log_[0].r;
+      for (const Change &c : log_)
+        u = {std::min(u.x0, c.r.x0), std::min(u.y0, c.r.y0),
+             std::max(u.x1, c.r.x1), std::max(u.y1, c.r.y1)};
+      log_.assign(1, Change{version_, u});
+    }
+  }
+  // Straight -> premultiplied RGBA8 for `n` pixels (same rounding as the
+  // canvas's image upload); opaque pixels are copied as is.
+  static void premultiplyRow(const uint8_t *s, uint8_t *d, size_t n) {
+    for (size_t i = 0; i < n; ++i, s += 4, d += 4) {
+      const unsigned a = s[3];
+      if (a == 255) {
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+      } else {
+        d[0] = static_cast<uint8_t>((s[0] * a + 127) / 255);
+        d[1] = static_cast<uint8_t>((s[1] * a + 127) / 255);
+        d[2] = static_cast<uint8_t>((s[2] * a + 127) / 255);
+      }
+      d[3] = static_cast<uint8_t>(a);
+    }
+  }
+  void copyPatchLocked(const Rect &r, Delta &out) const {
+    Patch p;
+    p.x = r.x0;
+    p.y = r.y0;
+    p.w = r.width();
+    p.h = r.height();
+    p.px.resize(static_cast<size_t>(p.w) * p.h * 4);
+    if (src_) { // wrapped: read the shared image, premultiplying as we go
+      for (int row = 0; row < p.h; ++row)
+        premultiplyRow(
+            &src_->pixels[(static_cast<size_t>(r.y0 + row) * w_ + r.x0) * 4],
+            &p.px[static_cast<size_t>(row) * p.w * 4],
+            static_cast<size_t>(p.w));
+      out.patches.push_back(std::move(p));
+      return;
+    }
+    for (int row = 0; row < p.h; ++row)
+      std::memcpy(&p.px[static_cast<size_t>(row) * p.w * 4],
+                  &px_[(static_cast<size_t>(r.y0 + row) * w_ + r.x0) * 4],
+                  static_cast<size_t>(p.w) * 4);
+    out.patches.push_back(std::move(p));
+  }
+
+  static inline std::atomic<uint64_t> nextId_{0};
+  static inline std::atomic<uint64_t> deaths_{0};
+  const uint64_t id_;
+  int w_ = 0, h_ = 0;
+  const PixelFormat format_;
+  const TextureAlpha alpha_;
+  std::shared_ptr<const CanvasImage> src_; // set by wrap(): the shared pixels
+  mutable std::mutex m_;
+  std::vector<uint8_t> px_; // premultiplied RGBA8, w_ * h_ * 4 (empty if wrapped)
+  uint64_t version_ = 1;    // 0 is reserved for "consumer has seen nothing"
+  std::vector<Change> log_;
+  std::function<void()> notify_;
+};
+
+namespace liteui_texture {
+// One window's GPU-side mirror of the Textures it has drawn: a GPU handle per
+// CanvasTexture plus the version it holds. The backends (GL, Direct2D, the GL test
+// mock) supply only "create from the full pixels" and "apply one patch"; the
+// bookkeeping lives here, where it can be tested without a GPU. NOT thread
+// safe: use it from the UI thread only.
+template <class Handle> class TextureTable {
+public:
+  struct Entry {
+    std::weak_ptr<CanvasTexture> weak;
+    Handle handle{};
+    uint64_t seen = 0; // CanvasTexture::version() the GPU copy reflects
+  };
+  // Returns the entry for `t`, created or brought up to date first; nullptr
+  // when `t` is invalid or create() fails (nothing is stored, so the next
+  // call retries). create(const CanvasTexture&, const CanvasTexture::Patch& full, Handle&)
+  // -> bool; apply(Handle&, const CanvasTexture::Patch&). *changed is set when
+  // anything was uploaded.
+  template <class Create, class Apply>
+  Entry *sync(const std::shared_ptr<CanvasTexture> &t, Create &&create, Apply &&apply,
+              bool *changed = nullptr) {
+    if (changed)
+      *changed = false;
+    if (!t || !t->valid())
+      return nullptr;
+    auto it = map_.find(t->id());
+    if (it == map_.end()) {
+      CanvasTexture::Delta d;
+      t->collect(0, d);
+      Handle h{};
+      if (d.patches.empty() || !create(*t, d.patches.front(), h))
+        return nullptr;
+      Entry e;
+      e.weak = t;
+      e.handle = std::move(h);
+      e.seen = d.version;
+      it = map_.emplace(t->id(), std::move(e)).first;
+      if (changed)
+        *changed = true;
+      return &it->second;
+    }
+    Entry &e = it->second;
+    CanvasTexture::Delta d;
+    t->collect(e.seen, d);
+    for (const CanvasTexture::Patch &p : d.patches)
+      apply(e.handle, p);
+    if (changed && !d.patches.empty())
+      *changed = true;
+    e.seen = d.version;
+    return &e;
+  }
+  // Drops the entries whose CanvasTexture has been destroyed, calling
+  // destroy(Handle&) on each. Does nothing unless some CanvasTexture died since the
+  // last call, so it is cheap to call on every draw.
+  template <class Destroy> void sweep(Destroy &&destroy) {
+    const uint64_t deaths = CanvasTexture::deathCount();
+    if (deaths == lastDeaths_)
+      return;
+    lastDeaths_ = deaths;
+    for (auto it = map_.begin(); it != map_.end();) {
+      if (it->second.weak.expired()) {
+        destroy(it->second.handle);
+        it = map_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // Drops every entry (device or context loss; or shutdown, with a destroy
+  // that really frees). On loss pass a destroy that does nothing: the GPU
+  // objects are already gone, and the next draw rebuilds them from the CPU copy.
+  template <class Destroy> void clear(Destroy &&destroy) {
+    for (auto &kv : map_)
+      destroy(kv.second.handle);
+    map_.clear();
+  }
+  size_t size() const { return map_.size(); }
+
+private:
+  std::unordered_map<uint64_t, Entry> map_;
+  uint64_t lastDeaths_ = 0;
+};
+} // namespace liteui_texture
+
 // Drawing surface handed to a Canvas's onPaint. Modeled after the HTML5 2D
 // context. Only declared here; the implementation lives in the
 // LITEUI_IMPLEMENTATION section (one translation unit per program).
@@ -1588,12 +2207,51 @@ public:
   std::optional<CanvasImage> getImageData(float x, float y, float w, float h);
   void putImageData(const CanvasImage &img, float dx, float dy);
 
+  // ---- App-owned textures (see CanvasTexture) ----
+  // Like drawImage(), but the source is a CanvasTexture the app updates in place:
+  // only the rectangles changed since the last draw are uploaded, and the
+  // current pixels are always what is drawn. The source rectangle
+  // (sx, sy, sw, sh) is in texture pixels and crops, the destination in
+  // logical units; transform, clip, globalAlpha, the composite operation and
+  // setImageSampling() all apply. A null, invalid or too-large texture draws
+  // nothing.
+  void drawTexture(const std::shared_ptr<CanvasTexture> &tex, float dx, float dy);
+  void drawTexture(const std::shared_ptr<CanvasTexture> &tex, float dx, float dy,
+                   float dw, float dh);
+  void drawTexture(const std::shared_ptr<CanvasTexture> &tex, float sx, float sy,
+                   float sw, float sh, float dx, float dy, float dw, float dh);
+
+  // ---- Retained-canvas partial redraw (see Canvas::retained) ----
+  // True when this onPaint call must repaint the WHOLE canvas: the first
+  // paint, a resize, a device/context loss, requestCanvasRedraw(), a
+  // canvasDirtySource hit, CanvasDamage::invalidateAll(), or any canvas that
+  // is not retained. The surface has been cleared to transparent.
+  bool isFullRepaint() const { return fullRepaint_; }
+  // The region this call must repaint, in logical units. For a partial
+  // repaint it is already cleared to transparent, drawing is clipped to it,
+  // and pixels outside it keep their previous contents (so repaint everything
+  // that intersects it, nothing else is required). It is the invalidated box
+  // rounded outward to whole device pixels. For a full repaint it is
+  // (0, 0, width(), height()).
+  DirtyRect damage() const {
+    return fullRepaint_ ? DirtyRect{0, 0, width(), height()} : damage_;
+  }
+
 protected:
   // Only the library creates these (as the base of its platform backend).
   CanvasContext() = default;
   ~CanvasContext() = default;
   CanvasContext(const CanvasContext &) = delete;
   CanvasContext &operator=(const CanvasContext &) = delete;
+
+private:
+  friend class LiteUIImpl; // sets the damage state before calling onPaint
+  void setDamageState(const DirtyRect &r, bool full) {
+    damage_ = r;
+    fullRepaint_ = full;
+  }
+  DirtyRect damage_;
+  bool fullRepaint_ = true;
 };
 
 // Author-facing leaf node, addChild(Canvas)'d the same way Text is —
@@ -1625,6 +2283,21 @@ struct Canvas {
   PointerHandler onPointerLeave;
   WheelHandler onWheel;
   std::function<bool()> canvasDirtySource;
+  // Retained mode (partial redraw). Off by default: every redraw clears the
+  // whole canvas and onPaint repaints all of it, exactly as before.
+  // With `retained` on, the canvas keeps its pixels between onPaint calls.
+  // Report what changed through `damage` (CanvasDamage::invalidate, callable
+  // from any thread): the next onPaint then runs with ctx.damage() set to that
+  // region, only that region is cleared and drawn into (everything else is
+  // clipped away and untouched), and on the GPU backends only that region is
+  // resolved/uploaded. Anything that destroys the pixels (first paint, resize,
+  // device loss, requestCanvasRedraw(), canvasDirtySource, invalidateAll())
+  // turns the next onPaint into a full repaint with ctx.isFullRepaint() true;
+  // an onPaint that honours damage() must therefore also handle that case.
+  // `damage` without `retained` just acts as another dirty source (always a
+  // full redraw).
+  bool retained = false;
+  std::shared_ptr<CanvasDamage> damage;
   bool focusable = false;
   std::function<void()> onFocus;
   std::function<void()> onBlur;
@@ -1886,6 +2559,9 @@ public:
   // set true wherever a stroke/shape is added, and
   // `canvasDirtySource = [&]{ bool d = dirty; dirty = false; return d; };`
   std::function<bool()> canvasDirtySource;
+  // See Canvas::retained / Canvas::damage. isCanvas nodes only.
+  bool canvasRetained = false;
+  std::shared_ptr<CanvasDamage> canvasDamage;
 
   Dynamic<bool> disabled = false;
 
@@ -1917,6 +2593,13 @@ public:
     // ensureCanvasSurface/ensureCanvasTarget) — plain repaints (e.g. from
     // an unrelated sibling's hover change) do NOT re-invoke onPaint.
     mutable bool canvasNeedsRedraw = true;
+    // Retained canvases: what the pending redraw has to repaint. `Full`
+    // starts true and is set again by anything that destroys the pixels;
+    // otherwise canvasDamageRect is the bounding box of the invalidated
+    // rectangles drained since the last repaint (logical units). Both are
+    // reset by the backend after onPaint ran. UI thread only.
+    mutable bool canvasFullRepaint = true;
+    mutable DirtyRect canvasDamageRect;
 
     // Last polled result when text/disabled/value hold a callback; unused
     // (and untouched) when they hold a plain value — see resolveDynamic.
@@ -2063,7 +2746,10 @@ public:
   // View it's still holding a mutable reference to (e.g. right after
   // addChild, or via onLayout capturing a pointer/index) — there's no way
   // to reach into an already-submitted tree from outside.
-  void requestCanvasRedraw() { computed.canvasNeedsRedraw = true; }
+  void requestCanvasRedraw() {
+    computed.canvasNeedsRedraw = true;
+    computed.canvasFullRepaint = true; // whole canvas, even if retained
+  }
 
   // Whether this view clips/scrolls on the given axis.
   bool scrollsX() const { return style.overflowX != Overflow::Visible; }
@@ -6141,6 +6827,8 @@ View View::toView(Canvas c) {
   v.onPointerLeave = std::move(c.onPointerLeave);
   v.onWheel = std::move(c.onWheel);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
+  v.canvasRetained = c.retained;
+  v.canvasDamage = std::move(c.damage);
   v.focusable = c.focusable;
   v.onFocus = std::move(c.onFocus);
   v.onBlur = std::move(c.onBlur);
@@ -6446,6 +7134,89 @@ size_t caretIndexForX(const std::string &text, const TextStyle &style,
 // in the Canvas struct's own comment above. App code that only calls the
 // public API compiles unchanged on either platform.
 #if defined(_WIN32)
+
+// The window's GPU copies of the app's Textures (see CanvasTexture): one
+// ID2D1Bitmap1 each, on the window's device context, kept current by
+// CopyFromMemory of just the changed rectangles. Dropped (not rebuilt) when
+// the device goes away; the next draw recreates each from the CanvasTexture's CPU
+// copy. UI thread only.
+class D2DTextureCache {
+public:
+  struct Bmp {
+    ID2D1Bitmap1 *bmp = nullptr;
+    bool bgra = false; // created as BGRA because RGBA bitmaps were refused
+  };
+  ID2D1Bitmap1 *get(ID2D1DeviceContext *dc,
+                    const std::shared_ptr<CanvasTexture> &t) {
+    table_.sweep([](Bmp &b) {
+      if (b.bmp)
+        b.bmp->Release();
+    });
+    auto *e = table_.sync(
+        t,
+        [dc](const CanvasTexture &tx, const CanvasTexture::Patch &full, Bmp &out) {
+          // RGBA premultiplied is what the CanvasTexture stores, so try it first
+          // (no per-pixel work); fall back to BGRA with a swizzle.
+          for (int attempt = 0; attempt < 2; ++attempt) {
+            const bool bgra = attempt == 1;
+            std::vector<uint8_t> sw;
+            const uint8_t *data = full.px.data();
+            if (bgra) {
+              sw = swizzled(full.px);
+              data = sw.data();
+            }
+            D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(bgra ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                       : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                  D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f); // explicit: 0 would inherit the context's dpi
+            ID2D1Bitmap1 *b = nullptr;
+            if (SUCCEEDED(dc->CreateBitmap(
+                    D2D1::SizeU(static_cast<UINT32>(tx.width()),
+                                static_cast<UINT32>(tx.height())),
+                    data, static_cast<UINT32>(tx.width()) * 4, &props, &b)) &&
+                b) {
+              out.bmp = b;
+              out.bgra = bgra;
+              return true;
+            }
+          }
+          return false;
+        },
+        [](Bmp &b, const CanvasTexture::Patch &p) {
+          if (!b.bmp)
+            return;
+          std::vector<uint8_t> sw;
+          const uint8_t *data = p.px.data();
+          if (b.bgra) {
+            sw = swizzled(p.px);
+            data = sw.data();
+          }
+          const D2D1_RECT_U r =
+              D2D1::RectU(static_cast<UINT32>(p.x), static_cast<UINT32>(p.y),
+                          static_cast<UINT32>(p.x + p.w),
+                          static_cast<UINT32>(p.y + p.h));
+          b.bmp->CopyFromMemory(&r, data, static_cast<UINT32>(p.w) * 4);
+        });
+    return e ? e->handle.bmp : nullptr;
+  }
+  void clear() {
+    table_.clear([](Bmp &b) {
+      if (b.bmp)
+        b.bmp->Release();
+    });
+  }
+
+private:
+  static std::vector<uint8_t> swizzled(const std::vector<uint8_t> &rgba) {
+    std::vector<uint8_t> out(rgba);
+    for (size_t i = 0; i + 3 < out.size(); i += 4)
+      std::swap(out[i], out[i + 2]);
+    return out;
+  }
+  liteui_texture::TextureTable<Bmp> table_;
+};
 
 class CanvasContextImpl : public CanvasContext {
 public:
@@ -6922,6 +7693,61 @@ public:
     if (!imageCacheOwner_)
       bmp->Release();
   }
+
+  // ---- app-owned textures ----
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy,
+                  static_cast<float>(t->width()),
+                  static_cast<float>(t->height()));
+  }
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy,
+                   float dw, float dh) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy, dw, dh);
+  }
+  // Set by the window before onPaint; without it drawTexture draws nothing.
+  void setTextureCache(D2DTextureCache *c) { textures_ = c; }
+  // Same geometry, cropping and filtering as drawImage(); the bitmap is the
+  // CanvasTexture's own (see D2DTextureCache), updated by rectangle.
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float sx, float sy,
+                   float sw, float sh, float dx, float dy, float dw, float dh) {
+    if (!textures_ || !t || !t->valid() || sw <= 0 || sh <= 0 || dw == 0 ||
+        dh == 0)
+      return;
+    const float iw = static_cast<float>(t->width()),
+                ih = static_cast<float>(t->height());
+    const float cx0 = std::max(sx, 0.0f), cy0 = std::max(sy, 0.0f);
+    const float cx1 = std::min(sx + sw, iw), cy1 = std::min(sy + sh, ih);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      return;
+    const float rx = dw / sw, ry = dh / sh;
+    ID2D1Bitmap1 *bmp = textures_->get(dc_, t);
+    if (!bmp)
+      return;
+    rt_->SetTransform(transform_);
+    const float ox = dx + (cx0 - sx) * rx, oy = dy + (cy0 - sy) * ry;
+    D2D1_RECT_F dst =
+        D2D1::RectF(ox, oy, ox + (cx1 - cx0) * rx, oy + (cy1 - cy0) * ry);
+    D2D1_RECT_F src = D2D1::RectF(cx0, cy0, cx1, cy1);
+    const auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, transform_._11, transform_._12, transform_._21,
+        transform_._22, rx, ry, devicePixelRatio());
+    if (filter == liteui_canvas_sampling::ImageFilter::Mipmap) {
+      dc_->DrawBitmap(bmp, &dst, globalAlpha_,
+                      D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, &src,
+                      nullptr);
+    } else {
+      rt_->DrawBitmap(bmp, dst, globalAlpha_,
+                      filter == liteui_canvas_sampling::ImageFilter::Nearest
+                          ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                          : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                      src);
+    }
+  }
+  D2DTextureCache *textures_ = nullptr;
 
   // ---- pixel data ----
   // Fully supported (see the Canvas limitations note). The canvas lives in
@@ -8187,6 +9013,10 @@ public:
     samplers_[0] = samplers_[1] = samplers_[2] = 0;
     if (prog_)
       glDeleteProgram(prog_);
+    textures_.clear([](GlTex &g) {
+      if (g.tex)
+        glDeleteTextures(1, &g.tex);
+    });
     vbo_ = vao_ = prog_ = ramp_ = atlas_ = colorAtlas_ = backdrop_ = 0;
     backdropW_ = backdropH_ = 0;
     texts_.clear();
@@ -8209,6 +9039,9 @@ public:
     texts_.clear();
     packer_.reset();
     cpacker_.reset();
+    // The context is gone with every texture in it: forget them without
+    // touching GL; the next draw rebuilds each from the CanvasTexture's CPU copy.
+    textures_.clear([](GlTex &) {});
   }
 
   bool ready() const { return prog_ != 0; }
@@ -8340,11 +9173,15 @@ public:
   // ---- one canvas redraw -------------------------------------------
   // Saves the window renderer's GL state, binds `c`'s draw FBO, clears it to
   // transparent and prepares for batched drawing. Pair with end().
-  void begin(const View::Computed &c, int w, int h) {
+  // With `damage` non-null (and non-empty) only that device-pixel box is
+  // cleared and drawn into; the rest of the target keeps its contents.
+  void begin(const View::Computed &c, int w, int h,
+             const liteui_canvas_damage::DeviceRect *damage = nullptr) {
     saved_.scissor = glIsEnabled(GL_SCISSOR_TEST);
     saved_.blend = glIsEnabled(GL_BLEND);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_.fbo);
     glGetIntegerv(GL_VIEWPORT, saved_.viewport);
+    glGetIntegerv(GL_SCISSOR_BOX, saved_.scissorBox);
     glGetIntegerv(GL_CURRENT_PROGRAM, &saved_.program);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &saved_.vao);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_.arrayBuf);
@@ -8373,10 +9210,21 @@ public:
     w_ = w;
     h_ = h;
     batch_.clear();
+    textures_.sweep([this](GlTex &g) { // Textures destroyed since last pass
+      if (g.tex)
+        deferDelete(g.tex);
+    });
     glBindFramebuffer(GL_FRAMEBUFFER,
                       c.canvasMsaaFbo ? c.canvasMsaaFbo : c.canvasFbo);
     glViewport(0, 0, w, h);
-    glDisable(GL_SCISSOR_TEST);
+    partial_ = damage && !damage->empty();
+    if (partial_) {
+      damage_ = *damage;
+      glEnable(GL_SCISSOR_TEST);
+      glScissor(damage_.x0, damage_.y0, damage_.width(), damage_.height());
+    } else {
+      glDisable(GL_SCISSOR_TEST);
+    }
     glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glStencilMask(0xFF); // so the clear below also wipes the stencil
@@ -8406,11 +9254,19 @@ public:
       trash_.clear();
     }
     if (c.canvasMsaaFbo) {
+      // Resolve only what was repainted (same box on both sides, as
+      // multisample resolves require); the rest of the resolved texture is
+      // still what the previous pass produced.
+      const int bx0 = partial_ ? damage_.x0 : 0;
+      const int by0 = partial_ ? damage_.y0 : 0;
+      const int bx1 = partial_ ? damage_.x1 : w_;
+      const int by1 = partial_ ? damage_.y1 : h_;
       glBindFramebuffer(GL_READ_FRAMEBUFFER, c.canvasMsaaFbo);
       glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c.canvasFbo);
-      glBlitFramebuffer(0, 0, w_, h_, 0, 0, w_, h_, GL_COLOR_BUFFER_BIT,
-                        GL_NEAREST);
+      glBlitFramebuffer(bx0, by0, bx1, by1, bx0, by0, bx1, by1,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
+    partial_ = false;
     // The window renderer never uses stencil or colour masks; leave them in
     // their defaults.
     glDisable(GL_STENCIL_TEST);
@@ -8447,6 +9303,8 @@ public:
       glEnable(GL_BLEND);
     else
       glDisable(GL_BLEND);
+    glScissor(saved_.scissorBox[0], saved_.scissorBox[1], saved_.scissorBox[2],
+              saved_.scissorBox[3]);
     if (saved_.scissor)
       glEnable(GL_SCISSOR_TEST);
     else
@@ -8619,6 +9477,66 @@ public:
     glUniformMatrix3fv(uInv_, 1, GL_FALSE, inv);
     glUniform4f(uG_, g.x0, g.y0, g.x1, g.y1);
     glUniform2f(uR_, g.r0, g.r1);
+  }
+
+  // ---- app-owned textures ----------------------------------------------
+  // The GPU texture for `t`, created on first use and then kept current by
+  // uploading only the rectangles that changed since the last call (the
+  // CanvasTexture's CPU copy is premultiplied RGBA8, uploaded as is). With
+  // `wantMips` the mip chain is (re)built if it is stale, i.e. lazily, only
+  // for a minified draw, and again only after the pixels changed. 0 if the
+  // texture is invalid or larger than the GPU supports. Dead textures are
+  // released as a side effect.
+  GLuint textureFor(const std::shared_ptr<CanvasTexture> &t, bool wantMips) {
+    if (!t)
+      return 0;
+    textures_.sweep([this](GlTex &g) {
+      if (g.tex)
+        deferDelete(g.tex);
+    });
+    if (t->width() > maxTex_ || t->height() > maxTex_)
+      return 0;
+    bool changed = false;
+    auto *e = textures_.sync(
+        t,
+        [this](const CanvasTexture &tx, const CanvasTexture::Patch &full, GlTex &out) {
+          flush(); // binding a texture below must not affect queued draws
+          GLuint g = 0;
+          glGenTextures(1, &g);
+          if (!g)
+            return false;
+          glActiveTexture(GL_TEXTURE0);
+          glBindTexture(GL_TEXTURE_2D, g);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+          glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tx.width(), tx.height(), 0,
+                       GL_RGBA, GL_UNSIGNED_BYTE, full.px.data());
+          paintKind_ = PaintKind::None; // unit 0's binding changed under us
+          out.tex = g;
+          out.mips = false;
+          return true;
+        },
+        [this](GlTex &g, const CanvasTexture::Patch &p) {
+          flush();
+          glActiveTexture(GL_TEXTURE0);
+          glBindTexture(GL_TEXTURE_2D, g.tex);
+          glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+          glTexSubImage2D(GL_TEXTURE_2D, 0, p.x, p.y, p.w, p.h, GL_RGBA,
+                          GL_UNSIGNED_BYTE, p.px.data());
+          paintKind_ = PaintKind::None;
+          g.mips = false; // level 0 changed: the chain is stale
+        },
+        &changed);
+    if (!e)
+      return 0;
+    if (wantMips && !e->handle.mips) {
+      generateMipmaps(e->handle.tex);
+      e->handle.mips = true;
+    }
+    return e->handle.tex;
   }
 
   // ---- images --------------------------------------------------------
@@ -8889,8 +9807,21 @@ private:
           tex4 = 0;
     GLint sampler0 = 0; // sampler object bound to unit 0 (0 = none)
     GLint viewport[4] = {0, 0, 0, 0};
+    GLint scissorBox[4] = {0, 0, 0, 0};
     GLfloat clear[4] = {0, 0, 0, 0};
   } saved_;
+  // Retained-canvas partial redraw: set by begin() when only `damage_` (device
+  // pixels, y = canvas row = framebuffer row) is being repainted. The scissor
+  // test stays enabled over that box for the whole pass, which confines the
+  // clear, every draw and the MSAA resolve to it.
+  bool partial_ = false;
+  liteui_canvas_damage::DeviceRect damage_;
+  // GPU copies of the app's Textures (see textureFor).
+  struct GlTex {
+    GLuint tex = 0;
+    bool mips = false; // the mip chain reflects the current pixels
+  };
+  liteui_texture::TextureTable<GlTex> textures_;
 
   enum class PaintKind { None, Solid, Texture, Gradient };
   bool sameGradient(const CanvasGradient &g, const float inv[9]) const {
@@ -9340,6 +10271,53 @@ public:
     if (filter == liteui_canvas_sampling::ImageFilter::Mipmap &&
         !ensureImageMips(tex))
       filter = liteui_canvas_sampling::ImageFilter::Linear;
+    gl_.setPaintTexture(tex, filter);
+    emitTexQuad(ctm_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
+                (cx1 - cx0) * rx, (cy1 - cy0) * ry, cx0 / iw, cy0 / ih,
+                cx1 / iw, cy1 / ih, {globalAlpha_, globalAlpha_, globalAlpha_,
+                                     globalAlpha_});
+  }
+
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy,
+                  static_cast<float>(t->width()),
+                  static_cast<float>(t->height()));
+  }
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy,
+                   float dw, float dh) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy, dw, dh);
+  }
+  // Draws the (sx,sy,sw,sh) part of an app-owned CanvasTexture into (dx,dy,dw,dh):
+  // the same geometry, cropping, filtering, clip, alpha and compositing as
+  // drawImage(), but the GPU texture is the CanvasTexture's own, updated in place by
+  // rectangle (see Renderer::textureFor) instead of cached by pixel address.
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float sx, float sy,
+                   float sw, float sh, float dx, float dy, float dw, float dh) {
+    if (!t || !t->valid() || sw <= 0 || sh <= 0 || dw == 0 || dh == 0)
+      return;
+    const float iw = static_cast<float>(t->width()),
+                ih = static_cast<float>(t->height());
+    float cx0 = std::max(sx, 0.0f), cy0 = std::max(sy, 0.0f);
+    float cx1 = std::min(sx + sw, iw), cy1 = std::min(sy + sh, ih);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      return;
+    float rx = dw / sw, ry = dh / sh;
+    auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, ctm_.a, ctm_.b, ctm_.c, ctm_.d, rx, ry);
+    // Upload first (it flushes and rebinds), then set up the draw.
+    GLuint tex = gl_.textureFor(
+        t, filter == liteui_canvas_sampling::ImageFilter::Mipmap);
+    if (!tex) {
+      warnOnce("drawTexture(): the texture is invalid or larger than the GPU "
+               "supports; nothing drawn");
+      return;
+    }
+    prepareNormal();
+    gl_.setBlend(composite_);
     gl_.setPaintTexture(tex, filter);
     emitTexQuad(ctm_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
                 (cx1 - cx0) * rx, (cy1 - cy0) * ry, cx0 / iw, cy0 / ih,
@@ -10641,6 +11619,94 @@ public:
     // matching comment.
     if (!imageCacheOwner_)
       cairo_surface_destroy(surf);
+  }
+
+  // ---- app-owned textures ----
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy,
+                  static_cast<float>(t->width()),
+                  static_cast<float>(t->height()));
+  }
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy,
+                   float dw, float dh) {
+    if (t)
+      drawTexture(t, 0, 0, static_cast<float>(t->width()),
+                  static_cast<float>(t->height()), dx, dy, dw, dh);
+  }
+  // The Cairo backend has no GPU copy to keep: each draw converts just the
+  // part of the CanvasTexture it needs (premultiplied RGBA -> Cairo's ARGB32) into
+  // a temporary surface. Simple rather than fast; this is the fallback
+  // backend (the default Linux backend is OpenGL ES). Geometry, cropping,
+  // filtering, clip, alpha and compositing match drawImage().
+  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float sx, float sy,
+                   float sw, float sh, float dx, float dy, float dw, float dh) {
+    if (!t || !t->valid() || sw <= 0 || sh <= 0 || dw == 0 || dh == 0)
+      return;
+    const float tw = static_cast<float>(t->width()),
+                th = static_cast<float>(t->height());
+    const float cx0 = std::max(sx, 0.0f), cy0 = std::max(sy, 0.0f);
+    const float cx1 = std::min(sx + sw, tw), cy1 = std::min(sy + sh, th);
+    if (cx1 <= cx0 || cy1 <= cy0)
+      return;
+    const float rx = dw / sw, ry = dh / sh;
+    // Whole source pixels covering the cropped rectangle.
+    const int ix0 = static_cast<int>(std::floor(cx0));
+    const int iy0 = static_cast<int>(std::floor(cy0));
+    const int iw = static_cast<int>(std::ceil(cx1)) - ix0;
+    const int ih = static_cast<int>(std::ceil(cy1)) - iy0;
+    std::vector<uint8_t> px;
+    if (!t->readPixels(ix0, iy0, iw, ih, px))
+      return;
+    cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+      cairo_surface_destroy(surf);
+      return;
+    }
+    cairo_surface_flush(surf);
+    unsigned char *dstPx = cairo_image_surface_get_data(surf);
+    const int stride = cairo_image_surface_get_stride(surf);
+    for (int row = 0; row < ih; ++row)
+      for (int col = 0; col < iw; ++col) {
+        const uint8_t *s = &px[(static_cast<size_t>(row) * iw + col) * 4];
+        unsigned char *d = dstPx + static_cast<size_t>(row) * stride + col * 4;
+        d[0] = s[2]; // ARGB32 is BGRA in memory, premultiplied
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = s[3];
+      }
+    cairo_surface_mark_dirty(surf);
+    // Keep the app's current path intact, like fillRect() does.
+    cairo_path_t *orig = cairo_copy_path(cr_);
+    cairo_new_path(cr_);
+    cairo_save(cr_);
+    cairo_rectangle(cr_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
+                    (cx1 - cx0) * rx, (cy1 - cy0) * ry);
+    cairo_clip(cr_); // exact (possibly fractional) destination of the crop
+    cairo_translate(cr_, dx + (ix0 - sx) * rx, dy + (iy0 - sy) * ry);
+    cairo_scale(cr_, rx, ry);
+    cairo_set_source_surface(cr_, surf, 0, 0);
+    cairo_matrix_t m;
+    cairo_get_matrix(cr_, &m);
+    const auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, static_cast<float>(m.xx), static_cast<float>(m.yx),
+        static_cast<float>(m.xy), static_cast<float>(m.yy), 1.0f, 1.0f,
+        devicePixelRatio());
+    cairo_pattern_set_filter(
+        cairo_get_source(cr_),
+        filter == liteui_canvas_sampling::ImageFilter::Nearest
+            ? CAIRO_FILTER_NEAREST
+            : filter == liteui_canvas_sampling::ImageFilter::Mipmap
+                  ? CAIRO_FILTER_GOOD
+                  : CAIRO_FILTER_BILINEAR);
+    cairo_paint_with_alpha(cr_, globalAlpha_);
+    cairo_restore(cr_);
+    cairo_new_path(cr_);
+    cairo_append_path(cr_, orig);
+    cairo_path_destroy(orig);
+    cairo_surface_destroy(surf);
   }
 
   // ---- pixel data ----
@@ -13333,8 +14399,25 @@ private:
     }
     if (v.canvasDirtySource && v.canvasDirtySource()) {
       v.computed.canvasNeedsRedraw = true;
+      v.computed.canvasFullRepaint = true; // a bool source can't say where
       v.computed.dirty = true;
       changed = true;
+    }
+    if (v.canvasDamage) {
+      // Drain what worker threads reported since the last poll. Merged into
+      // the node (not the handle) so it survives until a repaint actually
+      // runs, e.g. when the frame is skipped because the buffer is busy.
+      const CanvasDamage::Pending p = v.canvasDamage->take();
+      if (p.any) {
+        if (p.full || !v.canvasRetained)
+          v.computed.canvasFullRepaint = true;
+        else
+          v.computed.canvasDamageRect =
+              v.computed.canvasDamageRect.united(p.rect);
+        v.computed.canvasNeedsRedraw = true;
+        v.computed.dirty = true;
+        changed = true;
+      }
     }
     if (v.wantsFocus && v.wantsFocus()) {
       pendingFocusRequest_ = &v;
@@ -14007,6 +15090,7 @@ private:
   ID2D1DeviceContext *renderTarget_ = nullptr;
   ID2D1Bitmap1 *backBuffer_ = nullptr;
   ID2D1DeviceContext *canvasDc_ = nullptr;
+  D2DTextureCache d2dTextures_; // GPU copies of the app's Textures
   // Set when something reports the device is gone (D2DERR_RECREATE_TARGET,
   // DXGI_ERROR_DEVICE_REMOVED/RESET); WM_PAINT/WM_SIZE then tear every
   // device object down and the next paint rebuilds them.
@@ -14111,6 +15195,7 @@ private:
   // repaint themselves on demand because their texture pointer is null).
   // Also the destructor's teardown path. Safe to call repeatedly.
   void releaseDeviceResources() {
+    d2dTextures_.clear(); // bitmaps die with the device; rebuilt on demand
     if (hasRoot_)
       root_.freeTextResources();
     if (renderTarget_)
@@ -15028,27 +16113,68 @@ private:
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
+      v.computed.canvasFullRepaint = true; // new storage: nothing to keep
     }
     if (!v.computed.canvasBitmap)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
       LITEUI_PROF_START(profCanvas);
-      canvasDc_->SetTarget(v.computed.canvasBitmap);
-      canvasDc_->SetDpi(dpi(), dpi());
-      canvasDc_->BeginDraw();
-      canvasDc_->Clear(D2D1::ColorF(0, 0, 0, 0));
-      {
-        // Scoped so ~CanvasContextImpl (which pops any clip layers onPaint
-        // left open) runs BEFORE EndDraw().
-        CanvasContextImpl ctx(canvasDc_, v.computed.canvasBitmap, innerW,
-                              innerH, &v.computed);
-        v.onPaint(ctx);
+      // Retained canvas with damage: repaint only that box (see
+      // liteui_canvas_damage::plan); anything else repaints everything.
+      const D2D1_SIZE_U bmpPx = v.computed.canvasBitmap->GetPixelSize();
+      const auto plan = liteui_canvas_damage::plan(
+          v.canvasRetained, v.computed.canvasFullRepaint,
+          v.computed.canvasDamageRect, scale_, static_cast<int>(bmpPx.width),
+          static_cast<int>(bmpPx.height));
+      if (!plan.nothing) {
+        canvasDc_->SetTarget(v.computed.canvasBitmap);
+        canvasDc_->SetDpi(dpi(), dpi());
+        canvasDc_->BeginDraw();
+        canvasDc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        bool pushedClip = false;
+        if (plan.full) {
+          canvasDc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+        } else {
+          // The box is in whole device pixels; DIPs are device / scale_. An
+          // aliased clip keeps every later draw (and a stray putImageData)
+          // inside it, and a COPY-blend fill of transparent black clears just
+          // that box (the same primitive clearRect uses).
+          const float k = 1.0f / scale_;
+          const D2D1_RECT_F box =
+              D2D1::RectF(plan.dev.x0 * k, plan.dev.y0 * k, plan.dev.x1 * k,
+                          plan.dev.y1 * k);
+          canvasDc_->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_ALIASED);
+          pushedClip = true;
+          ID2D1SolidColorBrush *clearBrush = nullptr;
+          canvasDc_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0),
+                                           &clearBrush);
+          if (clearBrush) {
+            canvasDc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            canvasDc_->FillRectangle(box, clearBrush);
+            canvasDc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            clearBrush->Release();
+          }
+        }
+        {
+          // Scoped so ~CanvasContextImpl (which pops any clip layers onPaint
+          // left open) runs BEFORE the clip pop and EndDraw().
+          CanvasContextImpl ctx(canvasDc_, v.computed.canvasBitmap, innerW,
+                                innerH, &v.computed);
+          static_cast<CanvasContext &>(ctx).setDamageState(plan.logical,
+                                                           plan.full);
+          ctx.setTextureCache(&d2dTextures_);
+          v.onPaint(ctx);
+        }
+        if (pushedClip)
+          canvasDc_->PopAxisAlignedClip();
+        HRESULT hr = canvasDc_->EndDraw();
+        canvasDc_->SetTarget(nullptr);
+        if (hr == D2DERR_RECREATE_TARGET)
+          deviceLost_ = true; // WM_PAINT tears the device down after this frame
       }
-      HRESULT hr = canvasDc_->EndDraw();
-      canvasDc_->SetTarget(nullptr);
-      if (hr == D2DERR_RECREATE_TARGET)
-        deviceLost_ = true; // WM_PAINT tears the device down after this frame
       v.computed.canvasNeedsRedraw = false;
+      v.computed.canvasFullRepaint = false;
+      v.computed.canvasDamageRect = DirtyRect{};
       LITEUI_PROF_ADD(canvas, profCanvas);
     }
   }
@@ -16931,6 +18057,7 @@ private:
     c.cachedImageMips = false;
     c.cachedImagePixels = nullptr; // the cached upload is gone
     c.canvasNeedsRedraw = true;    // contents were GPU-only: repaint them
+    c.canvasFullRepaint = true;    // ... all of them, even when retained
     c.canvasBuiltForWidth = c.canvasBuiltForHeight = -1.0f;
   }
 
@@ -17434,24 +18561,52 @@ private:
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
+      v.computed.canvasFullRepaint = true; // new storage: nothing to keep
     }
     if (!v.computed.canvasSurface)
       return;
 
     bool needUpload = resized;
+    // Set when a retained canvas repainted only a box: just that box is then
+    // re-uploaded instead of the whole surface.
+    bool partialUpload = false;
+    liteui_canvas_damage::DeviceRect partialRect;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      cairo_t *cr = cairo_create(v.computed.canvasSurface);
-      cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-      cairo_set_source_rgba(cr, 0, 0, 0, 0);
-      cairo_paint(cr);
-      cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-      CanvasContextImpl ctx(cr, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
-                            scale_ == 1.0f ? static_cast<float>(ih) : innerH,
-                            &v.computed);
-      v.onPaint(ctx);
-      cairo_destroy(cr);
+      const auto plan = liteui_canvas_damage::plan(
+          v.canvasRetained, v.computed.canvasFullRepaint,
+          v.computed.canvasDamageRect, scale_, pw, ph);
+      if (!plan.nothing) {
+        cairo_t *cr = cairo_create(v.computed.canvasSurface);
+        if (!plan.full) {
+          // Clip to the box (logical units; the surface carries the device
+          // scale). Aliased, so an edge on a whole device pixel never leaves
+          // a faint partial-coverage row behind.
+          cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+          cairo_rectangle(cr, plan.logical.x, plan.logical.y, plan.logical.w,
+                          plan.logical.h);
+          cairo_clip(cr);
+          cairo_set_antialias(cr, CAIRO_ANTIALIAS_DEFAULT);
+        }
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0, 0, 0, 0);
+        cairo_paint(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+        CanvasContextImpl ctx(cr, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
+                              scale_ == 1.0f ? static_cast<float>(ih) : innerH,
+                              &v.computed);
+        static_cast<CanvasContext &>(ctx).setDamageState(plan.logical,
+                                                         plan.full);
+        v.onPaint(ctx);
+        cairo_destroy(cr);
+        needUpload = true;
+        if (!plan.full && !resized && v.computed.canvasTexture) {
+          partialUpload = true;
+          partialRect = plan.dev;
+        }
+      }
       v.computed.canvasNeedsRedraw = false;
-      needUpload = true;
+      v.computed.canvasFullRepaint = false;
+      v.computed.canvasDamageRect = DirtyRect{};
     }
     if (!needUpload && v.computed.canvasTexture)
       return;
@@ -17460,6 +18615,24 @@ private:
     unsigned char *data =
         cairo_image_surface_get_data(v.computed.canvasSurface);
     int stride = cairo_image_surface_get_stride(v.computed.canvasSurface);
+
+    if (partialUpload) {
+      // Repack just the repainted box into a contiguous buffer (no reliance
+      // on GL_UNPACK_ROW_LENGTH) and overwrite that region of the texture.
+      const int rw = partialRect.width(), rh = partialRect.height();
+      std::vector<unsigned char> sub(static_cast<size_t>(rw) * rh * 4);
+      for (int row = 0; row < rh; ++row)
+        std::memcpy(sub.data() + static_cast<size_t>(row) * rw * 4,
+                    data + static_cast<size_t>(partialRect.y0 + row) * stride +
+                        static_cast<size_t>(partialRect.x0) * 4,
+                    static_cast<size_t>(rw) * 4);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, v.computed.canvasTexture);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, partialRect.x0, partialRect.y0, rw, rh,
+                      GL_RGBA, GL_UNSIGNED_BYTE, sub.data());
+      return;
+    }
 
     // Cairo's ARGB32 stride is always width*4, so the surface can be
     // uploaded directly. Fall back to a repack only if that ever changes.
@@ -17534,21 +18707,33 @@ private:
       v.computed.canvasBuiltForWidth = innerW;
       v.computed.canvasBuiltForHeight = innerH;
       v.computed.canvasNeedsRedraw = true;
+      v.computed.canvasFullRepaint = true; // new storage: nothing to keep
     }
     if (!v.computed.canvasTexture)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      canvasGl_.begin(v.computed, pw, ph);
-      {
-        // The target is pw x ph device pixels; the context draws in logical
-        // units (iw x ih) with a base transform of scale_.
-        CanvasContextImpl ctx(canvasGl_, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
-                              scale_ == 1.0f ? static_cast<float>(ih) : innerH,
-                              &v.computed, scale_);
-        v.onPaint(ctx);
+      // Retained canvas with damage: repaint only that box (see
+      // liteui_canvas_damage::plan); anything else repaints everything.
+      const auto plan = liteui_canvas_damage::plan(
+          v.canvasRetained, v.computed.canvasFullRepaint,
+          v.computed.canvasDamageRect, scale_, pw, ph);
+      if (!plan.nothing) {
+        canvasGl_.begin(v.computed, pw, ph, plan.full ? nullptr : &plan.dev);
+        {
+          // The target is pw x ph device pixels; the context draws in
+          // logical units (iw x ih) with a base transform of scale_.
+          CanvasContextImpl ctx(canvasGl_, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
+                                scale_ == 1.0f ? static_cast<float>(ih) : innerH,
+                                &v.computed, scale_);
+          static_cast<CanvasContext &>(ctx).setDamageState(plan.logical,
+                                                           plan.full);
+          v.onPaint(ctx);
+        }
+        canvasGl_.end(v.computed);
       }
-      canvasGl_.end(v.computed);
       v.computed.canvasNeedsRedraw = false;
+      v.computed.canvasFullRepaint = false;
+      v.computed.canvasDamageRect = DirtyRect{};
     }
   }
 #endif // LITEUI_CANVAS_GL
@@ -19134,6 +20319,20 @@ std::optional<CanvasImage> CanvasContext::getImageData(float x, float y,
 }
 void CanvasContext::putImageData(const CanvasImage &img, float dx, float dy) {
   static_cast<CanvasContextImpl *>(this)->putImageData(img, dx, dy);
+}
+void CanvasContext::drawTexture(const std::shared_ptr<CanvasTexture> &tex, float dx,
+                                float dy) {
+  static_cast<CanvasContextImpl *>(this)->drawTexture(tex, dx, dy);
+}
+void CanvasContext::drawTexture(const std::shared_ptr<CanvasTexture> &tex, float dx,
+                                float dy, float dw, float dh) {
+  static_cast<CanvasContextImpl *>(this)->drawTexture(tex, dx, dy, dw, dh);
+}
+void CanvasContext::drawTexture(const std::shared_ptr<CanvasTexture> &tex, float sx,
+                                float sy, float sw, float sh, float dx,
+                                float dy, float dw, float dh) {
+  static_cast<CanvasContextImpl *>(this)->drawTexture(tex, sx, sy, sw, sh, dx,
+                                                      dy, dw, dh);
 }
 
 // ---- public LiteUI handle -> platform implementation ----

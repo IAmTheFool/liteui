@@ -34,4 +34,6 @@
 #include "cases/canvas_sampling.inc"
 #include "cases/canvas_gl_helpers.inc"
 #include "cases/canvas_gl_context.inc"
+#include "cases/canvas_texture.inc"
+#include "cases/canvas_damage.inc"
 #include "cases/canvas_hardware.inc"

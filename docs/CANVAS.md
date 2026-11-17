@@ -24,7 +24,7 @@ This guide covers the mental model, how and when your drawing code runs, handlin
 
 A canvas is a **retained bitmap**. LiteUI keeps an offscreen surface for each canvas node and draws it into the window like any other box. Your `onPaint` callback is **not** a per-frame draw loop. It is called when the picture needs rebuilding, and the result is cached until the next time it does.
 
-Treat `onPaint` as: *"rebuild my picture from the app state I close over."* Keep your data (strokes, values, an image) in your own variables, mutate those from event handlers, and tell LiteUI the picture is stale with a dirty flag. Do not draw from event handlers, because there is no context to draw into outside `onPaint`.
+Treat `onPaint` as: *"rebuild my picture from the app state I close over."* (By default every rebuild repaints the whole canvas. If only a small region changes at a time, a [retained canvas](#retained-canvases-and-partial-redraw) repaints just that region.) Keep your data (strokes, values, an image) in your own variables, mutate those from event handlers, and tell LiteUI the picture is stale with a dirty flag. Do not draw from event handlers, because there is no context to draw into outside `onPaint`.
 
 ## Quick start
 
@@ -63,10 +63,10 @@ A `Canvas` has a `Style` like any other node, so it lays out with the normal [la
 
 - **The surface is the canvas's content box**: the node's size minus its padding, in whole pixels (at least 1 × 1). `g.width()` and `g.height()` give you that size, so lay your drawing out from them and it follows resizes automatically.
 - **A `Canvas` has no intrinsic size.** It has no children to fit around, so a `Fit` width or height resolves to **0** and nothing is drawn. Give it a `Fixed`, `Percentage` or `Full` size, or let `flexGrow` size it. (`Image` and `Svg` are different: they default to their natural size.)
-- **Every `onPaint` starts from a fully transparent surface and a fresh context.** Nothing carries over from the previous call, neither pixels nor state such as the fill color or transform. Redraw everything each time.
+- **Every `onPaint` starts from a fully transparent surface and a fresh context.** Nothing carries over from the previous call, neither pixels nor state such as the fill color or transform. Redraw everything each time. (The one exception is a [retained canvas](#retained-canvases-and-partial-redraw): its pixels outside the damaged region are kept, but the context state is still fresh.)
 - **A resize rebuilds the surface and triggers a redraw.** You do not need to detect it. A lost GPU device or EGL context is also recovered automatically: the surfaces are rebuilt for you.
 - **Some failures print one line to `stderr`** instead of throwing, for example an image larger than the GPU supports, text too large for the glyph atlas, or a canvas target that could not be created on Linux/GL (messages start with `liteui [LITEUI_CANVAS_GL]:`). Nothing is drawn for that call, and each distinct message prints once per process.
-- **Coordinates are 1:1 with window pixels.** The header performs no DPI scaling.
+- **Coordinates are logical units; the backing store is in device pixels.** `width()`, `height()` and every drawing coordinate are logical, so the same code looks the same on a 100% and a 200% display. The surface itself is `pixelWidth()` x `pixelHeight()` device pixels, and `devicePixelRatio()` is the ratio between them (1 on a 96-dpi display, 2 at 200%, fractional values such as 1.25 are common; `LiteUI::contentScale()` is the same number for the window). `getImageData` and `putImageData` address those raw device pixels and ignore the transform.
 - **Do not keep the `CanvasContext` after `onPaint` returns.** It is a stack object owned by the library. Unbalanced `save()`/`clip()` calls are cleaned up for you when the callback returns.
 - **A huge canvas costs memory**, because the surface is a texture the size of the box (GPU memory on Windows and Linux/GL; a CPU bitmap on the Cairo fallback). For something like a zoomable image, keep the canvas the size of the viewport and draw with a source rectangle (see [the viewer recipe](#recipes)).
 
@@ -75,8 +75,9 @@ A `Canvas` has a `Style` like any other node, so it lays out with the normal [la
 LiteUI calls `onPaint` when:
 
 1. the canvas is first laid out,
-2. the surface is resized, or
-3. `canvasDirtySource` returns `true`.
+2. the surface is resized,
+3. `canvasDirtySource` returns `true`, or
+4. (retained canvases only) something was reported to the canvas's [`CanvasDamage`](#retained-canvases-and-partial-redraw).
 
 It does **not** re-run for unrelated repaints, such as a sibling's hover change, a scroll, or a timer tick elsewhere. This is what keeps idle UIs cheap.
 
@@ -93,7 +94,7 @@ state.value = 0.7f;
 dirty = true;
 ```
 
-Event handlers on the canvas (and on other views, timers, and worker threads that call `LiteUI::wake()`) have no handle back into the tree, so a flag in your own state is the intended channel. Do not return `true` permanently: you would redraw on every poll.
+Event handlers on the canvas (and on other views, timers, and worker threads that call `LiteUI::wake()`) have no handle back into the tree, so a flag in your own state is the intended channel. Do not return `true` permanently: you would redraw on every poll. A bool says "everything is stale"; to say *which region* changed, and to do it safely from a worker thread, use a [`CanvasDamage`](#retained-canvases-and-partial-redraw) handle instead.
 
 ### Animation
 
@@ -110,6 +111,43 @@ c.onPaint = [&](CanvasContext &g) { /* draw using t */ };
 ```
 
 Every tick repaints the window, not just the canvas, so animate only while something is actually moving. `removeInterval` stops it.
+
+### Retained canvases and partial redraw
+
+By default a redraw clears the whole canvas and `onPaint` repaints all of it. That is the right model for most canvases. It is wasteful when a small region changes at a time (a tile-based renderer, a paint surface): every change repaints, clears and re-resolves the full-size surface. A **retained** canvas keeps its pixels between paints and repaints only the region you report.
+
+```cpp
+auto damage = std::make_shared<CanvasDamage>();
+damage->setNotify([&ui] { ui.wake(); });          // optional: wake the UI loop after each report
+
+Canvas c;
+c.retained = true;
+c.damage = damage;
+c.onPaint = [&](CanvasContext &g) {
+    if (g.isFullRepaint()) { /* draw everything */ }
+    else                   { /* draw what intersects g.damage() */ }
+};
+
+damage->invalidate(x, y, w, h);                   // any thread; canvas logical units
+```
+
+**What happens on a redraw**
+
+- Only the damaged box is **cleared to transparent and repainted**. Drawing outside it is clipped away, so pixels outside it keep exactly what they had. Repaint everything that intersects the box; you do not need to repaint anything else.
+- `g.damage()` returns the box in logical units. It is the reported rectangle rounded **outward to whole device pixels**, so a fractionally covered pixel is repainted, never left stale. `g.isFullRepaint()` is true when the whole surface was cleared, and then `g.damage()` is `(0, 0, width(), height())`.
+- Damage reported between two repaints is **merged into one bounding box**, so scattered updates repaint the box around them. A rectangle with no area is ignored; one with a non-finite coordinate counts as `invalidateAll()`. Damage that lies entirely off the canvas skips `onPaint`.
+- On Windows the box is applied with an axis-aligned clip and a copy-blend clear, on Linux/GL with a scissor over the box (only that box is resolved from the multisample target), and on the Cairo fallback with a clip (only that box is re-uploaded).
+
+**What forces a full repaint** (`isFullRepaint()` is `true`, the whole surface is cleared first): the first paint, a resize, a lost GPU device or EGL context, a `canvasDirtySource` that returns `true`, `damage->invalidateAll()`, and any canvas that is not retained. An `onPaint` that honors `damage()` must therefore handle the full case too.
+
+**Threads.** `CanvasDamage::invalidate()` and `invalidateAll()` are safe to call from any thread. The notify callback runs on the invalidating thread after the lock is released; `LiteUI::wake()` is the intended callback, because it is the one call that is safe off the UI thread. Without a callback the damage is picked up at the next repaint for any reason, so wake the loop yourself. Join your worker threads before the `LiteUI` they notify goes away.
+
+**Notes**
+
+- `damage` without `retained` is just another dirty source: it triggers a full redraw.
+- Context state is never retained, only pixels. Every `onPaint` still starts with a fresh context.
+- `putImageData` is clipped to the damaged box on Windows and Linux/GL. The Cairo fallback writes pixels directly and does **not** clip it, so keep it inside the box.
+- Retained mode helps most together with [textures](#textures), which let the tiles themselves be updated in place.
 
 ## Input and focus
 
@@ -276,9 +314,60 @@ g.drawImage(img, dx, dy, dw, dh);                      // scaled
 g.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);      // source rect -> destination rect
 ```
 
-Images are drawn with bilinear filtering, the current transform, clip and global alpha (and, on Linux/GL, the composite operation). The nine-argument form is how you crop, zoom and pan. On Windows and Linux/GL the source rectangle really **crops**: the part outside the image is dropped and the destination shrinks in proportion. The Cairo fallback treats an out-of-bounds source rectangle differently, so keep it inside the image if you may run there.
+Images honor the current transform, clip and global alpha (and, on Linux/GL, the composite operation). The nine-argument form is how you crop, zoom and pan.
 
-> **In-place edits are not detected.** To avoid re-converting and re-uploading the same bitmap every redraw, each canvas caches the last image it drew, keyed on the pixel buffer's **address, size and dimensions**. A new image (a fresh allocation) or a resized one is picked up. If you change pixels **in place**, with the same buffer at the same address, the cache still holds the old picture and the canvas keeps drawing it. After in-place edits, give the image a fresh `pixels` vector (assign a new one, or copy the image) before the next draw.
+**Filtering.** `setImageSampling(mode)` chooses how `drawImage` (and `drawTexture`) filter the source. It is saved and restored by `save()` / `restore()`, and `putImageData` is unaffected (it always blits 1:1).
+
+| Mode | Behavior |
+|---|---|
+| `Smooth` (default) | Bilinear. Drawn smaller than the source (zoomed out), a downscale filter is used so detail does not shimmer: mipmaps on Linux/GL, high-quality filtering on Windows. |
+| `Nearest` | Nearest neighbor: crisp pixels. |
+| `Auto` | `Nearest` while the image is drawn at one device pixel per source pixel or larger (zoomed in), `Smooth` below that. Decided per call from the transform, the rectangle ratio and `devicePixelRatio()`, using the smaller axis scale. |
+
+If you downscale an image yourself (for a slider preview, say), set `Smooth` explicitly: `Auto` would see the already-reduced image drawn magnified and pick `Nearest`. On Windows and Linux/GL the source rectangle really **crops**: the part outside the image is dropped and the destination shrinks in proportion. The Cairo fallback treats an out-of-bounds source rectangle differently, so keep it inside the image if you may run there.
+
+> **In-place edits are not detected, and the cache has one slot.** To avoid re-converting and re-uploading the same bitmap every redraw, each canvas caches the **last** image it drew, keyed on the pixel buffer's **address, size and dimensions**. A new image (a fresh allocation) or a resized one is picked up. If you change pixels **in place**, with the same buffer at the same address, the cache still holds the old picture and the canvas keeps drawing it. After in-place edits, give the image a fresh `pixels` vector (assign a new one, or copy the image) before the next draw.
+>
+> Because there is only one slot, a canvas that draws **several different images in one `onPaint`** (a row of thumbnails, a before/after pair) evicts and re-uploads them on every redraw. Use a [`CanvasTexture`](#textures) for each picture instead: every texture keeps its own GPU copy, and one you update in place is always current.
+
+### Textures
+
+A `CanvasTexture` is a picture **you own** that lives on the GPU between paints and is drawn with `drawTexture`. It fixes the two weak spots of `drawImage` described above: pictures never evict each other, and a texture can be updated **one rectangle at a time**, so a tile that finished does not re-send the rest. There are two kinds.
+
+**An updatable texture** for pixels that arrive in pieces:
+
+```cpp
+auto tex = std::make_shared<CanvasTexture>(4096, 4096);   // RGBA8, starts transparent
+tex->update(tx, ty, 256, 256, pixels, 256 * 4);           // any thread: x, y, w, h, data, row bytes
+g.drawTexture(tex, sx, sy, sw, sh, dx, dy, dw, dh);       // inside onPaint
+```
+
+**A wrapped texture** for a picture that is built once and never edited (a decoded photo, a finished render):
+
+```cpp
+auto tex = CanvasTexture::wrap(image);                    // std::shared_ptr<const CanvasImage>
+g.drawTexture(tex, 0, 0);
+```
+
+`wrap` **shares** the image's pixels instead of copying them, so it costs no memory beyond the image itself. It is immutable (`update` returns `false`), and you promise not to modify the image while the texture exists: to change the picture, wrap the new image. The texture keeps the image alive, and dropping the texture releases both.
+
+`drawTexture` takes the same arguments as `drawImage` (natural size, scaled, or source rectangle to destination rectangle; the source is in **texture pixels**, the destination in logical units) and honors the transform, clip, global alpha, the composite operation and `setImageSampling`. A source rectangle outside the texture is cropped. A null, invalid or too-large texture draws nothing.
+
+**Updating**
+
+- `update(x, y, w, h, data, strideBytes)` copies a rectangle in and returns `false` only for invalid arguments (null data, a negative size, a stride shorter than a row, or an invalid texture). The part outside the texture is clipped, so an edge tile may overhang it; a rectangle wholly outside succeeds and changes nothing. `update(x, y, image)` places a whole `CanvasImage`.
+- A texture made with the default `TextureAlpha::Straight` takes straight-alpha input (what `CanvasImage` holds) and premultiplies it **on the calling thread**. `TextureAlpha::Premultiplied` copies as is.
+- `clear()` resets every pixel to transparent. `version()` increases on every change. `setNotify(fn)` runs after every `update` / `clear` on the calling thread with no lock held; `LiteUI::wake()` is the intended callback.
+- `update()` does **not** redraw anything: a canvas repaints only when told to. Also report the affected region to the canvas's [`CanvasDamage`](#retained-canvases-and-partial-redraw), or set a dirty flag.
+
+**Threads and memory**
+
+- A texture is a plain CPU object, safe to create, update and destroy on **any thread**, even before a window exists, and one texture can be drawn by several canvases or windows. It keeps a premultiplied CPU copy of its pixels (4 bytes per pixel; a wrapped texture keeps none) and creates the GPU copy the first time it is drawn.
+- Each window uploads **only the rectangles changed since it last drew** the texture. Overlapping or nested updates are sent once, many scattered ones collapse to their bounding box, and a mostly-changed texture is sent whole.
+- The CPU copy is what makes a lost GPU device or EGL context recover with no help from you: the next draw rebuilds the GPU copy from it.
+- When a texture is destroyed, its GPU copy is released at the next canvas pass.
+
+**Limits.** Only `PixelFormat::RGBA8_UNORM` is supported for now (any other format makes `valid()` false). `valid()` is also false for non-positive or oversized dimensions (the CPU copy is capped at 2 GB), and a texture larger than the GPU's maximum texture size draws nothing and prints one line to `stderr`. The Cairo fallback has no GPU copy: each `drawTexture` converts just the part it needs into a temporary surface, which is simple but slower.
 
 ### Reading and writing pixels
 
@@ -312,9 +401,13 @@ Both work in **raw surface pixels**, ignoring the current transform.
 | `Alphabetic` baseline | Approximated (80% of line height) | Font's real baseline | Font's real baseline |
 | `width()` / `height()` | Content box size, possibly fractional | Whole pixels | Whole pixels |
 | `drawImage` source rectangle | Crops | Crops | Differs for out-of-bounds rectangles |
+| `drawTexture` source rectangle | Crops | Crops | Crops |
+| `CanvasTexture` GPU copy | One `ID2D1Bitmap1` each, changed rectangles written with `CopyFromMemory` | One GL texture each, changed rectangles written with `glTexSubImage2D`; mipmaps rebuilt lazily after a change | None: each draw converts the part it needs into a temporary surface |
+| Retained canvas: partial redraw | Axis-aligned clip + copy-blend clear of the damage box | Scissor over the damage box; only that box is resolved from the multisample target | Clip over the damage box; only that box is re-uploaded |
+| Retained canvas: `putImageData` | Clipped to the damage box | Clipped to the damage box | **Not** clipped (writes pixels directly) |
 | Shadow blur | Not supported | Not supported | Not supported |
 
-The same on all three: `maxWidth` is unused, shadows are flat and unblurred, `drawImage` and `putImageData` draw no shadow, and there is no DPI scaling.
+The same on all three: `maxWidth` is unused, shadows are flat and unblurred, and `drawImage`, `drawTexture` and `putImageData` draw no shadow.
 
 For `putImageData`, the differences only show for pixels that are not fully opaque, or when a clip is active. For opaque pixels with no clip, which is the usual case for photos and for round-tripping `getImageData` on an opaque drawing, all backends give identical results.
 
@@ -475,12 +568,85 @@ c.onPaint = [&](CanvasContext &g) {
 };
 ```
 
+**A progressive tile renderer (worker threads)**
+
+Tiles are rendered off the UI thread. Each finished tile is written into a texture and only its region is repainted. The canvas is retained, so nothing else is cleared or redrawn.
+
+```cpp
+constexpr int   kTile = 256;
+constexpr float kZoom = 0.25f;                       // canvas units per texture pixel
+auto tex    = std::make_shared<CanvasTexture>(4096, 4096);
+auto damage = std::make_shared<CanvasDamage>();
+
+LiteUI ui("Tiles", 1024, 768);
+damage->setNotify([&ui] { ui.wake(); });            // every invalidate() wakes the UI loop
+
+Canvas c;
+c.style.width = Size::full();
+c.style.height = Size::full();
+c.retained = true;                                   // keep pixels between paints
+c.damage = damage;
+c.onPaint = [tex](CanvasContext &g) {
+    const DirtyRect d = g.damage();                  // the whole canvas on a full repaint
+    g.setImageSampling(ImageSampling::Smooth);
+    g.drawTexture(tex, d.x / kZoom, d.y / kZoom, d.w / kZoom, d.h / kZoom,   // texture pixels
+                  d.x, d.y, d.w, d.h);               // canvas units
+};
+
+std::thread worker([&] {
+    std::vector<uint8_t> px(kTile * kTile * 4);
+    for (int ty = 0; ty < 16; ++ty)
+        for (int tx = 0; tx < 16; ++tx) {
+            // ... render the tile into px (straight-alpha RGBA8) ...
+            tex->update(tx * kTile, ty * kTile, kTile, kTile, px.data(), kTile * 4);  // any thread
+            damage->invalidate(tx * kTile * kZoom, ty * kTile * kZoom,
+                               kTile * kZoom, kTile * kZoom);                         // any thread
+        }
+});
+// ... ui.run(...); then worker.join() before `ui` goes away.
+```
+
+If the view can zoom or pan, call `damage->invalidateAll()` when it changes: the tiles already in the texture are still right, but the region they map to is not.
+
+**A before / after split with two textures**
+
+Both pictures stay on the GPU, so dragging the split does not re-upload either one. (With `drawImage`, drawing the two alternately would re-upload both on every redraw.)
+
+```cpp
+std::shared_ptr<CanvasImage> before, after;          // finished pictures, never edited in place
+auto beforeTex = CanvasTexture::wrap(before);        // shares the pixels: no copy
+auto afterTex  = CanvasTexture::wrap(after);
+float split = 0.5f;
+bool dirty = false;
+
+Canvas c;
+c.style.width = Size::full();
+c.style.height = Size::full();
+c.canvasDirtySource = [&] { bool d = dirty; dirty = false; return d; };
+c.onPaint = [&](CanvasContext &g) {
+    const float W = g.width(), H = g.height(), x = W * split;
+    g.save();
+    g.beginPath();  g.rect(0, 0, x, H);  g.clip();
+    g.drawTexture(beforeTex, 0, 0, W, H);
+    g.restore();
+    g.save();
+    g.beginPath();  g.rect(x, 0, W - x, H);  g.clip();
+    g.drawTexture(afterTex, 0, 0, W, H);
+    g.restore();
+};
+
+// the split moved:        split = 0.7f;  dirty = true;
+// a new edit finished:    afterTex = CanvasTexture::wrap(newAfter);  dirty = true;
+```
+
 ## Performance notes
 
 - **Cache your inputs, not your output.** A redraw rasterizes everything you issue, so avoid rebuilding large data structures inside `onPaint`. Precompute them and let `onPaint` only draw.
 - **Redraw only when something changed.** Prefer event-driven dirty flags over a permanent timer. An always-on interval repaints the whole window every tick.
 - **The finished canvas stays on the GPU** (Windows and Linux/GL), so a window repaint that does not redraw the canvas only draws its texture. The costs to watch instead are `getImageData` (a GPU readback that flushes pending work), `globalCompositeOperation = Multiply` on Linux/GL (one canvas copy per shape), and very large canvases, which take GPU memory proportional to their pixel size. Keep canvases no bigger than they need to be.
 - **Large images:** draw with a source rectangle (see the viewer recipe) rather than scaling a huge image into a tiny box, and decode once, outside `onPaint`.
+- **Several images in one canvas, or pixels that change in pieces:** use [`CanvasTexture`](#textures). `drawImage` has one cache slot per canvas, so alternating images re-upload every redraw. Use `CanvasTexture::wrap` for finished pictures (no extra memory) and an updatable texture for tiles.
+- **Small changes to a big canvas:** make it [retained](#retained-canvases-and-partial-redraw) and report the damaged rectangle. The cost of a redraw then follows the size of the change, not the size of the canvas. Nothing here reduces the window-level cost: the window still repaints as before.
 - **Save/restore around clips and transforms** rather than undoing them by hand.
 
 ## Not available
@@ -488,7 +654,7 @@ c.onPaint = [&](CanvasContext &g) {
 These HTML canvas features do not exist on `CanvasContext` today:
 
 - patterns (`createPattern`), `Path2D`, `isPointInPath` / `isPointInStroke`, `getTransform`
-- shadow blur (the parameter is ignored), filters, `imageSmoothingEnabled` (images are always bilinear; `putImageData` on Windows is nearest-neighbor)
+- shadow blur (the parameter is ignored), filters, a per-call `imageSmoothingEnabled` flag (use `setImageSampling`; `putImageData` on Windows is nearest-neighbor)
 - text metrics beyond width, wrapped or multi-line text, `letterSpacing`, `direction`, and (on Windows and the Cairo fallback) true stroked glyph outlines; Linux/GL does trace real outlines
 - `createImageData` (use `CanvasImage(w, h)` instead)
-- DPI-aware surfaces
+- texture formats other than RGBA8 (`CanvasTexture` rejects them), and rectangle updates to a wrapped texture (wrap a new image instead)

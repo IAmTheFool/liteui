@@ -416,6 +416,10 @@ struct FilmEntry {
   std::string path;                         // full path (UTF-8)
   std::string name;                         // file name only
   std::shared_ptr<const CanvasImage> thumb; // null until made
+  // The GPU-side copy of `thumb` that paintFilmstrip draws (see
+  // filmThumbTexture). Made lazily while painting, hence mutable.
+  mutable std::shared_ptr<CanvasTexture> thumbTex;
+  mutable std::shared_ptr<const CanvasImage> thumbTexOf; // what thumbTex shows
   bool failed = false;                      // couldn't be decoded: plain box
   bool edited = false;                      // has saved edits (a sidecar file)
   bool selected = false; // in the multi-selection (Sync Settings)
@@ -3208,6 +3212,27 @@ static std::string starsText(int n) {
   return s;
 }
 
+// The texture paintFilmstrip draws for `e`: built from e.thumb the first time
+// and again whenever e.thumb is replaced (the worker delivers a thumbnail, or
+// the open picture's own is refreshed with its edits). Every thumbnail keeps
+// its own GPU copy across repaints. drawImage has ONE cache slot per canvas,
+// so drawing a row of thumbnails with it re-uploaded every visible one on
+// every repaint (scroll, hover, selection). thumbTexOf holds the source image
+// so its address cannot be reused while it is compared. Null if there is no
+// thumbnail or the texture could not be made.
+static const std::shared_ptr<CanvasTexture> &filmThumbTexture(const FilmEntry &e) {
+  if (e.thumbTexOf != e.thumb) {
+    e.thumbTex.reset();
+    e.thumbTexOf = e.thumb;
+    if (e.thumb && e.thumb->width > 0 && e.thumb->height > 0) {
+      auto t = std::make_shared<CanvasTexture>(e.thumb->width, e.thumb->height);
+      if (t->update(0, 0, *e.thumb))
+        e.thumbTex = std::move(t);
+    }
+  }
+  return e.thumbTex;
+}
+
 static void paintFilmstrip(CanvasContext &ctx) {
   FilmStrip &f = state.film;
   const float W = ctx.width();
@@ -3327,7 +3352,10 @@ static void paintFilmstrip(CanvasContext &ctx) {
     if (e.thumb) {
       const float x = bx + (kFilmThumbW - e.thumb->width) / 2.0f;
       const float y = by + (kFilmThumbH - e.thumb->height) / 2.0f;
-      ctx.drawImage(*e.thumb, std::floor(x), std::floor(y));
+      if (const auto &tex = filmThumbTexture(e))
+        ctx.drawTexture(tex, std::floor(x), std::floor(y));
+      else
+        ctx.drawImage(*e.thumb, std::floor(x), std::floor(y)); // fallback
     } else {
       ctx.setFillColor(kColorTrack);
       ctx.fillRect(bx, by, kFilmThumbW, kFilmThumbH);
@@ -7529,9 +7557,63 @@ static void paintClipOverlay(CanvasContext &ctx, float docW, float docH) {
     ctx.drawImage(*state.clipOverlay, 0, 0, docW, docH);
 }
 
+// ---- The picture's GPU copies ----
+// The main canvas draws up to three pictures: the edited image, the original
+// ("source", for Before and Split) and the mid-drag preview. drawImage keeps
+// ONE cached GPU texture per canvas, so alternating between them (Split
+// compare, or a drag ending and starting again) re-uploaded the whole picture
+// each time. Each one now has a CanvasTexture of its own, made lazily here the
+// first time it is painted and replaced when the picture is.
+struct PictureTex {
+  std::shared_ptr<const CanvasImage> of; // the picture `tex` shows (held, so
+                                         // its address cannot be reused)
+  std::shared_ptr<CanvasTexture> tex;
+};
+static PictureTex gImageTex, gSourceTex, gPreviewTex;
+
+// The image and the source are built once and replaced, never edited in place
+// (the editor's rule, see architecture.md), so the texture can SHARE their
+// pixels: wrap() costs no extra memory. Null if there is no picture or it can't
+// be wrapped; the caller then falls back to drawImage.
+static const std::shared_ptr<CanvasTexture> &
+pictureTexture(PictureTex &slot, const std::shared_ptr<CanvasImage> &img) {
+  if (slot.of != img) {
+    slot.of = img;
+    slot.tex = img ? CanvasTexture::wrap(img) : nullptr;
+    if (slot.tex && !slot.tex->valid())
+      slot.tex.reset();
+  }
+  return slot.tex;
+}
+
+// The drag preview is a NEW small image every frame (about 1 MP), so wrapping
+// each would still create and delete a GPU texture per frame. One texture of
+// the preview's size is kept instead and each new preview is copied into it
+// (a few MB), which uploads as a sub-image into the same GPU texture.
+static const std::shared_ptr<CanvasTexture> &
+previewTexture(const std::shared_ptr<CanvasImage> &img) {
+  PictureTex &slot = gPreviewTex;
+  if (slot.of != img) {
+    slot.of = img;
+    if (!img || img->width <= 0 || img->height <= 0) {
+      slot.tex.reset();
+    } else {
+      if (!slot.tex || slot.tex->width() != img->width ||
+          slot.tex->height() != img->height)
+        slot.tex = std::make_shared<CanvasTexture>(img->width, img->height);
+      if (!slot.tex->update(0, 0, *img))
+        slot.tex.reset();
+    }
+  }
+  return slot.tex;
+}
+
 static void paintCanvas(CanvasContext &ctx) {
   LITEUI_PROF_START(profAppPaint);
   if (!state.image || state.image->width <= 0 || state.image->height <= 0) {
+    gImageTex = PictureTex{}; // no picture: let go of the GPU copies
+    gSourceTex = PictureTex{};
+    gPreviewTex = PictureTex{};
     ctx.setFillColor(kColorCanvasPlaceholderBg);
     ctx.fillRect(0, 0, ctx.width(), ctx.height());
     return;
@@ -7568,17 +7650,27 @@ static void paintCanvas(CanvasContext &ctx) {
       // Mid-drag (or awaiting the background full-res render) preview: smaller
       // image stretched to the full document size
       // (bilinear), so layout/zoom are unaffected by its lower resolution.
-      ctx.drawImage(*state.previewImage, 0, 0, docW, docH);
+      if (const auto &t = previewTexture(state.previewImage))
+        ctx.drawTexture(t, 0, 0, docW, docH);
+      else
+        ctx.drawImage(*state.previewImage, 0, 0, docW, docH);
     } else {
-      ctx.drawImage(*state.image, 0, 0);
+      if (const auto &t = pictureTexture(gImageTex, state.image))
+        ctx.drawTexture(t, 0, 0);
+      else
+        ctx.drawImage(*state.image, 0, 0);
     }
   };
   // The same picture with every edit off (crop and rotation kept).
   const auto drawBefore = [&]() {
-    if (state.source)
-      ctx.drawImage(*state.source, 0, 0, docW, docH);
-    else
+    if (state.source) {
+      if (const auto &t = pictureTexture(gSourceTex, state.source))
+        ctx.drawTexture(t, 0, 0, docW, docH);
+      else
+        ctx.drawImage(*state.source, 0, 0, docW, docH);
+    } else {
       drawAfter();
+    }
   };
   if (state.compare == CompareMode::Before) {
     drawBefore();
