@@ -19,6 +19,15 @@
 //           (simple clip) or "Keep hue" (scale r,g,b together).
 //   HDR test  generates a scene-linear FP32 gradient reaching 8x white, so
 //           exposure and clamp are easy to see (try EV -3 .. -1).
+//   Sampling  cycles how the Canvas filters the picture when it is scaled
+//           (CanvasContext::setImageSampling): Auto = crisp pixel blocks at
+//           100% zoom and above, smooth below (the default); Smooth =
+//           bilinear / mipmapped; Nearest = always crisp. The percentage in
+//           the first toolbar also shows the filter actually in use.
+//   Pixel test  (first toolbar) generates a small image of colour blocks and a
+//           1-pixel checkerboard: zoom in to see block edges stay sharp (or
+//           blur under Smooth), zoom out to see the checkerboard average to
+//           grey under Smooth/Auto but alias under Nearest.
 
 #define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
@@ -83,6 +92,8 @@ namespace
     float viewW = 0, viewH = 0; // canvas size, updated from onLayout
     bool needFit = false;       // fit the new image once the view size is known
     bool dirty = false;         // the Canvas must repaint
+    // How the Canvas filters the image when it is scaled; see ImageSampling.
+    ImageSampling sampling = ImageSampling::Auto;
 
     enum class Drag
     {
@@ -97,6 +108,50 @@ namespace
 
   // Logical units covered by one image pixel at the current zoom.
   float pxScale(const ViewerState &s) { return s.zoom / s.dpr; }
+
+  const char *samplingName(ImageSampling m)
+  {
+    switch (m)
+    {
+    case ImageSampling::Smooth:
+      return "smooth";
+    case ImageSampling::Nearest:
+      return "nearest";
+    default:
+      return "auto";
+    }
+  }
+
+  ImageSampling nextSampling(ImageSampling m)
+  {
+    switch (m)
+    {
+    case ImageSampling::Auto:
+      return ImageSampling::Smooth;
+    case ImageSampling::Smooth:
+      return ImageSampling::Nearest;
+    default:
+      return ImageSampling::Auto;
+    }
+  }
+
+  // The filter the backend ends up applying at the current zoom: the same
+  // decision drawImage makes (zoom is device pixels per image pixel, so the
+  // scale is pxScale() logical units times dpr device pixels per unit).
+  const char *filterInUse(const ViewerState &s)
+  {
+    using liteui_canvas_sampling::ImageFilter;
+    const float k = pxScale(s);
+    switch (liteui_canvas_sampling::pickFilter(s.sampling, 1, 0, 0, 1, k, k, s.dpr))
+    {
+    case ImageFilter::Nearest:
+      return "nearest";
+    case ImageFilter::Mipmap:
+      return "downscaled";
+    default:
+      return "bilinear";
+    }
+  }
 
   // Sizes derived from the state: where the image sits and how far it scrolls.
   struct Geometry
@@ -360,6 +415,35 @@ namespace
     setMaster(s, std::make_shared<const ImageBuffer>(std::move(*buf)), "HDR test gradient");
   }
 
+  // A 128x128 8-bit sampling test pattern. Top half: 8x8-pixel cells in four
+  // pure colours, so a magnified edge is either a hard step (nearest) or a
+  // blended ramp (bilinear). Bottom half: a 1-pixel black/white checkerboard,
+  // which should average to mid grey when shrunk but aliases under nearest.
+  void loadSamplingTest(ViewerState &s)
+  {
+    constexpr uint32_t N = 128;
+    auto buf = ImageBuffer::create(N, N, PixelFormat::RGBA8_UNORM);
+    if (!buf)
+      return;
+    const float palette[4][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {1, 1, 1, 1}};
+    for (uint32_t y = 0; y < N; ++y)
+      for (uint32_t x = 0; x < N; ++x)
+      {
+        if (y < N / 2)
+          buf->setPixel(x, y, palette[((x / 8) + (y / 8)) % 4]);
+        else
+        {
+          const float v = ((x + y) & 1) ? 1.0f : 0.0f;
+          const float px[4] = {v, v, v, 1.0f};
+          buf->setPixel(x, y, px);
+        }
+      }
+    // Keep it 8-bit end to end so every pixel stays exactly 0 or 255.
+    s.format = PixelFormat::RGBA8_UNORM;
+    s.display = DisplaySettings{};
+    setMaster(s, std::make_shared<const ImageBuffer>(std::move(*buf)), "Sampling test pattern");
+  }
+
   // One line describing the image and the pipeline, for the second toolbar.
   std::string infoLine(const ViewerState &s)
   {
@@ -524,6 +608,7 @@ namespace
     ctx.beginPath();
     ctx.rect(0, 0, g.availW, g.availH);
     ctx.clip();
+    ctx.setImageSampling(s.sampling); // restored with the clip below
     ctx.drawImage(*s.image, px / d, py / d, g.cw, g.ch);
     ctx.restore();
     s.retired.clear(); // the backend's bitmap cache now refers to *s.image
@@ -618,6 +703,10 @@ int main(int argc, char **argv)
                               { return std::string("100%"); },
                               grey, greyHover, [&state]
                               { zoomAboutCenter(state, 1.0f); }));
+  toolbar.addChild(makeButton([]
+                              { return std::string("Pixel test"); },
+                              grey, greyHover, [&state]
+                              { loadSamplingTest(state); }));
 
   Text statusText;
   statusText.label = std::function<std::string()>(
@@ -625,7 +714,8 @@ int main(int argc, char **argv)
       {
         if (!state.image)
           return state.status;
-        return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%";
+        return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%  (" +
+               filterInUse(state) + ")";
       });
   statusText.fontSize = 14;
   statusText.color = Color{200, 200, 200};
@@ -693,6 +783,13 @@ int main(int argc, char **argv)
                                   ? ClampMode::PreserveHue
                                   : ClampMode::PerChannel;
         settingsChanged(state); }));
+  toolbar2.addChild(makeButton(
+      [&state]
+      { return std::string("Sampling: ") + samplingName(state.sampling); },
+      grey, greyHover, [&state]
+      {
+        state.sampling = nextSampling(state.sampling);
+        state.dirty = true; })); // the pixels are unchanged: only repaint
 
   // ---- Info row: the long pipeline description gets a row of its own, so
   // it can't squeeze the controls above it. ------------------------------

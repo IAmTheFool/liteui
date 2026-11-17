@@ -111,6 +111,34 @@ const Color kRed{255, 0, 0, 255}, kGreen{0, 255, 0, 255},
     kBlue{0, 0, 255, 255}, kWhite{255, 255, 255, 255},
     kBlack{0, 0, 0, 255};
 
+// ---- image sampling helpers ----------------------------------------------
+// Red, green / blue, white: four pure colours, so any blended pixel is
+// recognisable at a glance.
+inline CanvasImage quad2x2() {
+  CanvasImage img(2, 2);
+  const uint8_t px[16] = {255, 0, 0, 255, 0, 255, 0, 255,
+                          0, 0, 255, 255, 255, 255, 255, 255};
+  std::copy(px, px + 16, img.pixels.begin());
+  return img;
+}
+// 1-pixel black/white checkerboard.
+inline CanvasImage checker8x8() {
+  CanvasImage img(8, 8);
+  for (int y = 0; y < 8; ++y)
+    for (int x = 0; x < 8; ++x) {
+      const uint8_t v = ((x + y) & 1) ? 255 : 0;
+      uint8_t *p = &img.pixels[(static_cast<size_t>(y) * 8 + x) * 4];
+      p[0] = p[1] = p[2] = v;
+      p[3] = 255;
+    }
+  return img;
+}
+// Every colour channel is (almost) 0 or 255: not a blend of two source pixels.
+inline bool isPure(const Px &p) {
+  auto ch = [](int v) { return v <= 3 || v >= 252; };
+  return p.a >= 252 && ch(p.r) && ch(p.g) && ch(p.b);
+}
+
 inline void runAll(CanvasContext &g) {
   info(std::string("backend: ") + kBackend);
   {
@@ -331,6 +359,127 @@ inline void runAll(CanvasContext &g) {
                     pxNear(at(im, 30, 80), 255, 255, 255, 255, 6) &&
                     at(im, 55, 20).a == 0,
                 str(at(im, 30, 20)));
+       });
+
+  // ---- image sampling (setImageSampling) --------------------------------
+  // The 2x2 image drawn 32x magnified at (x0, 10) has its texel boundaries at
+  // x0 + 32 and y = 42. Bilinear filtering blends the two texels around a
+  // boundary; nearest does not.
+  test(g, "drawImage: Nearest keeps texel edges crisp",
+       [](CanvasContext &c) {
+         const CanvasImage img = quad2x2();
+         c.setImageSampling(ImageSampling::Nearest);
+         c.drawImage(img, 10, 10, 64, 64);
+       },
+       [](const CanvasImage &im) {
+         bool ok = pxNear(at(im, 41, 26), 255, 0, 0, 255) &&
+                   pxNear(at(im, 42, 26), 0, 255, 0, 255) &&
+                   pxNear(at(im, 26, 41), 255, 0, 0, 255) &&
+                   pxNear(at(im, 26, 42), 0, 0, 255, 255) &&
+                   pxNear(at(im, 41, 41), 255, 0, 0, 255) &&
+                   pxNear(at(im, 42, 42), 255, 255, 255, 255);
+         report("drawImage: Nearest keeps texel edges crisp", ok,
+                str(at(im, 41, 26)) + " / " + str(at(im, 42, 26)));
+       });
+
+  test(g, "drawImage: Smooth (the default) blends across a texel edge",
+       [](CanvasContext &c) {
+         const CanvasImage img = quad2x2();
+         c.drawImage(img, 10, 10, 64, 64); // no setImageSampling call
+       },
+       [](const CanvasImage &im) {
+         bool ok = !isPure(at(im, 41, 26)) && !isPure(at(im, 42, 26)) &&
+                   at(im, 41, 26).a >= 252;
+         report("drawImage: Smooth (the default) blends across a texel edge", ok,
+                str(at(im, 41, 26)) + " / " + str(at(im, 42, 26)));
+       });
+
+  test(g, "drawImage: Auto is crisp when magnified, smooth when minified",
+       [](CanvasContext &c) {
+         c.setImageSampling(ImageSampling::Auto);
+         const CanvasImage big = quad2x2();
+         c.drawImage(big, 10, 10, 64, 64); // 32 device px per source pixel
+         // Each output pixel of this 8 -> 4 reduction is centred on the corner
+         // of four texels, so bilinear gives mid grey and nearest would give
+         // pure black or white.
+         const CanvasImage reduced = checker8x8();
+         c.drawImage(reduced, 100, 10, 4, 4);
+       },
+       [](const CanvasImage &im) {
+         const Px grey = at(im, 101, 11);
+         bool crisp = pxNear(at(im, 41, 26), 255, 0, 0, 255) &&
+                      pxNear(at(im, 42, 26), 0, 255, 0, 255);
+         bool smooth = grey.r > 60 && grey.r < 195 && grey.g > 60 &&
+                       grey.g < 195 && grey.b > 60 && grey.b < 195;
+         report("drawImage: Auto is crisp when magnified, smooth when minified",
+                crisp && smooth,
+                std::string("magnified ") + str(at(im, 41, 26)) +
+                    ", minified " + str(grey));
+       });
+
+  // The same image (one cached texture) drawn with different filters in ONE
+  // frame. A renderer that batches draws without ending the batch when the
+  // filter changes applies a single filter to all three.
+  test(g, "drawImage: the filter can change between draws of one image",
+       [](CanvasContext &c) {
+         const CanvasImage img = quad2x2();
+         c.setImageSampling(ImageSampling::Smooth);
+         c.drawImage(img, 10, 10, 64, 64);
+         c.setImageSampling(ImageSampling::Nearest);
+         c.drawImage(img, 84, 10, 64, 64);
+         c.setImageSampling(ImageSampling::Smooth);
+         c.drawImage(img, 10, 84, 64, 64);
+       },
+       [](const CanvasImage &im) {
+         bool first = !isPure(at(im, 41, 26));
+         bool second = pxNear(at(im, 115, 26), 255, 0, 0, 255) &&
+                       pxNear(at(im, 116, 26), 0, 255, 0, 255);
+         bool third = !isPure(at(im, 41, 100));
+         report("drawImage: the filter can change between draws of one image",
+                first && second && third,
+                std::string(first ? "" : "1st not smooth; ") +
+                    (second ? "" : "2nd not crisp; ") +
+                    (third ? "" : "3rd not smooth; "));
+       });
+
+  test(g, "drawImage: restore() brings back the previous sampling mode",
+       [](CanvasContext &c) {
+         const CanvasImage img = quad2x2();
+         c.save();
+         c.setImageSampling(ImageSampling::Nearest);
+         c.restore();
+         c.drawImage(img, 10, 10, 64, 64); // back to the default: Smooth
+       },
+       [](const CanvasImage &im) {
+         report("drawImage: restore() brings back the previous sampling mode",
+                !isPure(at(im, 41, 26)), str(at(im, 41, 26)));
+       });
+
+  // Heavy reduction of a 1-pixel checkerboard. With only bilinear sampling the
+  // result aliases: an output pixel looks at 2x2 texels of a 64x64 image, so
+  // it is black, white or noisy. A proper downscale averages to mid grey.
+  test(g, "drawImage: Smooth minified averages instead of aliasing",
+       [](CanvasContext &c) {
+         CanvasImage img(64, 64);
+         for (int y = 0; y < 64; ++y)
+           for (int x = 0; x < 64; ++x) {
+             const uint8_t v = ((x + y) & 1) ? 255 : 0;
+             uint8_t *p = &img.pixels[(static_cast<size_t>(y) * 64 + x) * 4];
+             p[0] = p[1] = p[2] = v;
+             p[3] = 255;
+           }
+         c.drawImage(img, 100, 100, 5, 5); // 12.8 source px per output px
+       },
+       [](const CanvasImage &im) {
+         int worst = 0;
+         for (int y = 100; y < 105; ++y)
+           for (int x = 100; x < 105; ++x) {
+             const Px p = at(im, x, y);
+             worst = std::max({worst, std::abs(p.r - 127), std::abs(p.g - 127),
+                               std::abs(p.b - 127)});
+           }
+         report("drawImage: Smooth minified averages instead of aliasing",
+                worst <= 24, "worst deviation from mid grey: " + std::to_string(worst));
        });
 
   test(g, "putImageData then getImageData round trip",

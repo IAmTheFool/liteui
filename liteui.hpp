@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 8
+#define LITEUI_VERSION_MINOR 9
 
 #include <algorithm>
 #include <array>
@@ -1437,6 +1437,78 @@ enum class CompositeOp {
   Screen
 };
 
+// How drawImage() samples the source image.
+//   Smooth  - smooth filtering (the historical behaviour, and the default):
+//             bilinear, and where the image is drawn SMALLER than 1 device
+//             pixel per source pixel a better downscale filter (mipmaps on GL,
+//             high-quality cubic on Direct2D, Cairo's GOOD filter) so heavy
+//             reductions average instead of aliasing.
+//   Nearest - nearest neighbour: every output pixel is exactly one source
+//             pixel, so magnified pixels stay crisp blocks.
+//   Auto    - Nearest while the image is drawn at >= 1 device pixel per source
+//             pixel (zoomed in), Smooth below that (zoomed out). Decided per
+//             drawImage() call from the current transform, the destination/
+//             source rectangle ratio and the device pixel ratio.
+// Apps that pre-downscale an image themselves (e.g. downscaleImage() for a
+// slider preview) should set Smooth explicitly, otherwise Auto sees the
+// already-reduced image drawn magnified and picks Nearest.
+// Saved and restored by save()/restore(). putImageData() is unaffected: it
+// always blits 1:1.
+enum class ImageSampling { Smooth, Nearest, Auto };
+
+namespace liteui_canvas_sampling {
+// Auto picks Nearest from this many device pixels per source pixel upwards;
+// below it, smooth draws are "minified" and use the downscale filter.
+inline constexpr float kAutoNearestMinScale = 1.0f;
+
+// The concrete filter a backend applies to one drawImage().
+//   Linear  - plain bilinear (magnified or ~1:1 smooth draws)
+//   Nearest - nearest neighbour
+//   Mipmap  - minified smooth draw: use the backend's downscale filter
+enum class ImageFilter { Linear, Nearest, Mipmap };
+
+// True when the image should be sampled nearest-neighbour.
+//   a,b,c,d : linear part of the transform that maps user space to device
+//             space (x' = a*x + c*y, y' = b*x + d*y). Column (a,b) is where
+//             the user x axis goes, (c,d) where the y axis goes.
+//   rx,ry   : destination size / source size of the drawImage rectangle.
+//   dpr     : device pixels per unit that is NOT already inside a..d. The GL
+//             backend's matrix already contains the device scale, so it
+//             passes 1; the Direct2D and Cairo transforms exclude it, so they
+//             pass devicePixelRatio().
+// Auto uses the SMALLER axis scale: an image squeezed on one axis aliases
+// even if it is stretched on the other. Degenerate or non-finite scales fall
+// back to Smooth.
+inline bool useNearest(ImageSampling mode, float a, float b, float c, float d,
+                       float rx, float ry, float dpr = 1.0f) {
+  if (mode == ImageSampling::Nearest)
+    return true;
+  if (mode == ImageSampling::Smooth)
+    return false;
+  const float sx = std::hypot(a, b) * std::fabs(rx) * dpr;
+  const float sy = std::hypot(c, d) * std::fabs(ry) * dpr;
+  if (!std::isfinite(sx) || !std::isfinite(sy) || !(sx > 0.0f) || !(sy > 0.0f))
+    return false;
+  // The tolerance absorbs float noise: 0.8 * 1.25 must count as 1.
+  return std::min(sx, sy) >= kAutoNearestMinScale - 1e-3f;
+}
+
+// useNearest() plus the minified case. Same inputs and conventions; Smooth and
+// Auto draws whose smaller axis scale is below kAutoNearestMinScale are
+// Mipmap, everything else smooth is Linear. Degenerate scales are Linear.
+inline ImageFilter pickFilter(ImageSampling mode, float a, float b, float c,
+                              float d, float rx, float ry, float dpr = 1.0f) {
+  if (useNearest(mode, a, b, c, d, rx, ry, dpr))
+    return ImageFilter::Nearest;
+  const float sx = std::hypot(a, b) * std::fabs(rx) * dpr;
+  const float sy = std::hypot(c, d) * std::fabs(ry) * dpr;
+  if (!std::isfinite(sx) || !std::isfinite(sy) || !(sx > 0.0f) || !(sy > 0.0f))
+    return ImageFilter::Linear;
+  return std::min(sx, sy) < kAutoNearestMinScale - 1e-3f ? ImageFilter::Mipmap
+                                                         : ImageFilter::Linear;
+}
+} // namespace liteui_canvas_sampling
+
 // Drawing surface handed to a Canvas's onPaint. Modeled after the HTML5 2D
 // context. Only declared here; the implementation lives in the
 // LITEUI_IMPLEMENTATION section (one translation unit per program).
@@ -1475,6 +1547,8 @@ public:
   void setLineDashOffset(float offset);
   void setGlobalAlpha(float a);
   void setGlobalCompositeOperation(CompositeOp op);
+  // How drawImage() filters the source (see ImageSampling). Default Smooth.
+  void setImageSampling(ImageSampling mode);
   void setShadow(Color color, float blurPx, float offsetX, float offsetY);
   void setFont(const std::string &family, float sizePx,
                FontWeight weight = FontWeight::Regular,
@@ -1601,6 +1675,10 @@ struct Image {
   // itself with the new pixels; no addChild/setRoot needed.
   Dynamic<std::shared_ptr<CanvasImage>> source;
   ObjectFit fit = ObjectFit::Fill;
+  // How the picture is filtered when it is scaled (see ImageSampling): Smooth
+  // by default; Nearest for crisp pixel blocks; Auto for crisp when zoomed in
+  // and smooth when zoomed out. Fixed for the life of the node.
+  ImageSampling sampling = ImageSampling::Smooth;
   // Painted behind the image before it's drawn — visible in the
   // letterboxed margins Contain/ScaleDown/None can leave. Alpha 0
   // (default) means "leave transparent".
@@ -1963,6 +2041,7 @@ public:
     // the premultiplied RGBA8 texture of the image drawn last (the fields
     // below key it, exactly as for the Cairo surface). Zero otherwise.
     mutable unsigned int cachedImageTexture = 0;
+    mutable bool cachedImageMips = false; // texture above has its mip chain
     mutable const void *cachedImagePixels = nullptr;
     mutable size_t cachedImagePixelsSize = 0;
     mutable int cachedImageW = -1, cachedImageH = -1;
@@ -6439,6 +6518,7 @@ public:
     s.dashOffset = dashOffset_;
     s.globalAlpha = globalAlpha_;
     s.composite = composite_;
+    s.imageSampling = imageSampling_;
     s.shadowColor = shadowColor_;
     s.shadowOffsetX = shadowOffsetX_;
     s.shadowOffsetY = shadowOffsetY_;
@@ -6469,6 +6549,7 @@ public:
     dashOffset_ = s.dashOffset;
     globalAlpha_ = s.globalAlpha;
     composite_ = s.composite;
+    imageSampling_ = s.imageSampling;
     applyBlend();
     shadowColor_ = s.shadowColor;
     shadowOffsetX_ = s.shadowOffsetX;
@@ -6519,6 +6600,7 @@ public:
     composite_ = op;
     applyBlend();
   }
+  void setImageSampling(ImageSampling mode) { imageSampling_ = mode; }
   void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
                  float offsetX, float offsetY) {
     shadowColor_ = color;
@@ -6811,8 +6893,27 @@ public:
     D2D1_RECT_F dst = D2D1::RectF(dx, dy, dx + dw, dy + dh);
     D2D1_RECT_F src = D2D1::RectF(sx, sy, sx + sw, sy + sh);
 
-    rt_->DrawBitmap(bmp, dst, globalAlpha_,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
+    // transform_ excludes the DPI scale (the device context applies that),
+    // so the pixel ratio is passed separately.
+    const auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, transform_._11, transform_._12, transform_._21,
+        transform_._22, sw != 0.0f ? dw / sw : 1.0f,
+        sh != 0.0f ? dh / sh : 1.0f, devicePixelRatio());
+    if (filter == liteui_canvas_sampling::ImageFilter::Mipmap) {
+      // Minified: plain LINEAR only looks at 2x2 texels and aliases badly on
+      // heavy reductions. The device context's high-quality cubic mode
+      // adapts to the scale (it pre-filters when shrinking). Needs the
+      // ID2D1DeviceContext overload, which takes pointers.
+      dc_->DrawBitmap(bmp, &dst, globalAlpha_,
+                      D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, &src,
+                      nullptr);
+    } else {
+      rt_->DrawBitmap(bmp, dst, globalAlpha_,
+                      filter == liteui_canvas_sampling::ImageFilter::Nearest
+                          ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                          : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                      src);
+    }
     // Only release when NOT cache-owned: an uncached draw (imageCacheOwner_
     // null) still owns bmp itself and must free it here, exactly as
     // before; a cached one is now owned by imageCacheOwner_ and lives on
@@ -6976,6 +7077,7 @@ private:
     float dashOffset;
     float globalAlpha;
     CompositeOp composite;
+    ImageSampling imageSampling;
     Color shadowColor;
     float shadowOffsetX, shadowOffsetY;
     TextStyle font;
@@ -7370,6 +7472,7 @@ private:
   float dashOffset_ = 0.0f;
   float globalAlpha_ = 1.0f;
   CompositeOp composite_ = CompositeOp::SourceOver;
+  ImageSampling imageSampling_ = ImageSampling::Smooth;
   Color shadowColor_{0, 0, 0, 0};
   float shadowOffsetX_ = 0.0f, shadowOffsetY_ = 0.0f;
   TextStyle font_;
@@ -7806,7 +7909,7 @@ inline bool outlineText(const std::string &text, const TextStyle &ts,
 // stroke (caps, joins, miter limit, dashes), clip, flat shadows,
 // measureText.
 // gradients (linear, and radial with the full two-circle model),
-// drawImage (cropped, bilinear, cached per node), putImageData,
+// drawImage (cropped, bilinear or nearest, cached per node), putImageData,
 // getImageData (GPU readback on request), fillText (Pango-shaped glyph
 // bitmaps in a shared GPU atlas, tinted by any paint), strokeText (true
 // glyph outlines through the GPU stroker).
@@ -8025,6 +8128,21 @@ public:
       glUseProgram(static_cast<GLuint>(prevProg));
     }
 
+    // Image filters, indexed by ImageFilter: [0] bilinear, [1] nearest,
+    // [2] trilinear (minified draws; needs mips). All clamp to the edge. They
+    // only take effect while bound to unit 0 (see setPaintTexture), and
+    // creating/configuring them touches no binding, so nothing to save here.
+    glGenSamplers(3, samplers_);
+    for (int i = 0; i < 3; ++i) {
+      const GLint minF = i == 0 ? GL_LINEAR
+                         : i == 1 ? GL_NEAREST
+                                  : GL_LINEAR_MIPMAP_LINEAR;
+      const GLint magF = i == 1 ? GL_NEAREST : GL_LINEAR;
+      glSamplerParameteri(samplers_[i], GL_TEXTURE_MIN_FILTER, minF);
+      glSamplerParameteri(samplers_[i], GL_TEXTURE_MAG_FILTER, magF);
+      glSamplerParameteri(samplers_[i], GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glSamplerParameteri(samplers_[i], GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     glGenVertexArrays(1, &vao_);
     glGenBuffers(1, &vbo_);
     GLint prevVao = 0, prevBuf = 0;
@@ -8063,6 +8181,9 @@ public:
       glDeleteTextures(1, &colorAtlas_);
     if (backdrop_)
       glDeleteTextures(1, &backdrop_);
+    if (samplers_[0])
+      glDeleteSamplers(3, samplers_);
+    samplers_[0] = samplers_[1] = samplers_[2] = 0;
     if (prog_)
       glDeleteProgram(prog_);
     vbo_ = vao_ = prog_ = ramp_ = atlas_ = colorAtlas_ = backdrop_ = 0;
@@ -8075,6 +8196,7 @@ public:
   // context), then init() can run again on the new context.
   void abandon() {
     prog_ = vao_ = vbo_ = ramp_ = atlas_ = colorAtlas_ = backdrop_ = 0;
+    samplers_[0] = samplers_[1] = samplers_[2] = 0;
     backdropW_ = backdropH_ = 0;
     uSize_ = uMode_ = uInv_ = uG_ = uR_ = uMask_ = uBlend_ = -1;
     paintKind_ = PaintKind::None;
@@ -8244,6 +8366,7 @@ public:
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex4);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &saved_.tex0);
+    glGetIntegerv(GL_SAMPLER_BINDING, &saved_.sampler0); // unit 0 is active
     cur_ = &c;
 
     w_ = w;
@@ -8303,6 +8426,9 @@ public:
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex1));
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(saved_.tex0));
+    // Our image sampler must not leak into the window renderer's draws: a
+    // bound sampler overrides the texture's own filter on that unit.
+    glBindSampler(0, static_cast<GLuint>(saved_.sampler0));
     glActiveTexture(static_cast<GLenum>(saved_.activeTex));
     glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(saved_.fbo));
     glViewport(saved_.viewport[0], saved_.viewport[1], saved_.viewport[2],
@@ -8441,15 +8567,38 @@ public:
     paintKind_ = PaintKind::Solid;
     glUniform1i(uMode_, 0);
   }
-  void setPaintTexture(GLuint tex) {
-    if (paintKind_ == PaintKind::Texture && tex_ == tex)
+  // The image filter lives in a sampler object bound to unit 0 (shared by all
+  // images), not in the texture's own parameters: one cached texture can be
+  // drawn smooth and nearest in the same frame. The filter is part of the
+  // paint key, so changing it ends the current batch (draws are queued until
+  // flush(), and a queued quad must keep the filter it was issued with).
+  // Mipmap requires the texture to have a complete mip chain
+  // (generateMipmaps()), otherwise the texture is incomplete and samples black.
+  void setPaintTexture(GLuint tex,
+                       liteui_canvas_sampling::ImageFilter filter =
+                           liteui_canvas_sampling::ImageFilter::Linear) {
+    if (paintKind_ == PaintKind::Texture && tex_ == tex && filter_ == filter)
       return;
     flush();
     paintKind_ = PaintKind::Texture;
     tex_ = tex;
+    filter_ = filter;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
+    glBindSampler(0, samplers_[static_cast<int>(filter)]);
     glUniform1i(uMode_, 1);
+  }
+  // Builds the mip chain of an image texture (RGBA8, premultiplied, so the
+  // averaging is alpha-correct; mutable storage, so any size works in ES 3.0).
+  // Called lazily, the first time a minified draw needs it. Flushes first:
+  // binding the texture on unit 0 would otherwise change what queued draws
+  // sample.
+  void generateMipmaps(GLuint tex) {
+    flush();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    paintKind_ = PaintKind::None; // unit 0's binding changed under us
   }
   // `inv` = column-major device->user matrix (see invert2x3).
   void setPaintGradient(const CanvasGradient &g, const float inv[9]) {
@@ -8737,6 +8886,7 @@ private:
     GLint srcRgb = GL_ONE, dstRgb = GL_ZERO, srcA = GL_ONE, dstA = GL_ZERO;
     GLint activeTex = GL_TEXTURE0, tex0 = 0, tex1 = 0, tex2 = 0, tex3 = 0,
           tex4 = 0;
+    GLint sampler0 = 0; // sampler object bound to unit 0 (0 = none)
     GLint viewport[4] = {0, 0, 0, 0};
     GLfloat clear[4] = {0, 0, 0, 0};
   } saved_;
@@ -8765,6 +8915,9 @@ private:
   GLint maxTex_ = 2048;
   PaintKind paintKind_ = PaintKind::None;
   GLuint tex_ = 0;
+  liteui_canvas_sampling::ImageFilter filter_ =
+      liteui_canvas_sampling::ImageFilter::Linear; // of the current Texture paint
+  GLuint samplers_[3] = {0, 0, 0}; // indexed by ImageFilter
   CanvasGradient grad_;
   float inv_[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   std::vector<uint8_t> rampBuf_, upBuf_;
@@ -8853,6 +9006,7 @@ public:
     s.dashOffset = dashOffset_;
     s.globalAlpha = globalAlpha_;
     s.composite = composite_;
+    s.imageSampling = imageSampling_;
     s.shadowColor = shadowColor_;
     s.shadowOffsetX = shadowOffsetX_;
     s.shadowOffsetY = shadowOffsetY_;
@@ -8878,6 +9032,7 @@ public:
     dashOffset_ = s.dashOffset;
     globalAlpha_ = s.globalAlpha;
     composite_ = s.composite;
+    imageSampling_ = s.imageSampling;
     shadowColor_ = s.shadowColor;
     shadowOffsetX_ = s.shadowOffsetX;
     shadowOffsetY_ = s.shadowOffsetY;
@@ -8922,6 +9077,7 @@ public:
   void setLineDashOffset(float offset) { dashOffset_ = offset; }
   void setGlobalAlpha(float a) { globalAlpha_ = std::clamp(a, 0.0f, 1.0f); }
   void setGlobalCompositeOperation(CompositeOp op) { composite_ = op; }
+  void setImageSampling(ImageSampling mode) { imageSampling_ = mode; }
   void setShadow(Color color, float /*blurPx: unblurred, as on Windows*/,
                  float offsetX, float offsetY) {
     shadowColor_ = color;
@@ -9152,8 +9308,8 @@ public:
     drawImage(img, 0, 0, static_cast<float>(img.width),
               static_cast<float>(img.height), dx, dy, dw, dh);
   }
-  // Draws the (sx,sy,sw,sh) part of `img` into (dx,dy,dw,dh), bilinearly
-  // filtered, through the CTM, clip, globalAlpha and composite operation.
+  // Draws the (sx,sy,sw,sh) part of `img` into (dx,dy,dw,dh), filtered as
+  // setImageSampling() says (bilinear by default), through the CTM, clip, globalAlpha and composite operation.
   // Like the HTML spec and the Windows backend (and unlike the Cairo one),
   // the source rectangle really crops: it is first clipped to the image and
   // the destination shrinks in proportion. The image lives in a GPU texture
@@ -9177,7 +9333,13 @@ public:
       return;
     prepareNormal();
     gl_.setBlend(composite_);
-    gl_.setPaintTexture(tex);
+    // ctm_ already contains the device scale (base_), so dpr is 1 here.
+    auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, ctm_.a, ctm_.b, ctm_.c, ctm_.d, rx, ry);
+    if (filter == liteui_canvas_sampling::ImageFilter::Mipmap &&
+        !ensureImageMips(tex))
+      filter = liteui_canvas_sampling::ImageFilter::Linear;
+    gl_.setPaintTexture(tex, filter);
     emitTexQuad(ctm_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
                 (cx1 - cx0) * rx, (cy1 - cy0) * ry, cx0 / iw, cy0 / ih,
                 cx1 / iw, cy1 / ih, {globalAlpha_, globalAlpha_, globalAlpha_,
@@ -9239,7 +9401,7 @@ public:
     gl_.deferDelete(tex);
     gl_.setMode(Mode::Off, 0); // ignore the clip
     gl_.setBlend(CompositeOp::Copy);
-    gl_.setPaintTexture(tex);
+    gl_.setPaintTexture(tex, liteui_canvas_sampling::ImageFilter::Nearest); // 1:1 blit
     emitTexQuad(Mat{}, std::round(dx), std::round(dy),
                 static_cast<float>(img.width), static_cast<float>(img.height),
                 0, 0, 1, 1, {1, 1, 1, 1});
@@ -9302,6 +9464,7 @@ private:
     float dashOffset;
     float globalAlpha;
     CompositeOp composite;
+    ImageSampling imageSampling;
     Color shadowColor;
     float shadowOffsetX, shadowOffsetY;
     TextStyle font;
@@ -9360,6 +9523,7 @@ private:
       if (o->cachedImageTexture)
         gl_.deferDelete(o->cachedImageTexture);
       o->cachedImageTexture = t;
+      o->cachedImageMips = false;
       o->cachedImagePixels = img.pixels.data();
       o->cachedImagePixelsSize = img.pixels.size();
       o->cachedImageW = img.width;
@@ -9368,6 +9532,23 @@ private:
       gl_.deferDelete(t);
     }
     return t;
+  }
+
+  // Makes sure `tex` (this draw's image texture) has its mip chain, building
+  // it the first time a minified draw asks. The "has mips" flag lives next to
+  // the cached texture in the owner, so it is dropped whenever that texture is
+  // replaced or deleted. An image drawn without an owner has no stable home
+  // for the flag (its texture is deleted after this pass), so it stays on
+  // plain bilinear: returns false.
+  bool ensureImageMips(GLuint tex) {
+    const View::Computed *o = imageCacheOwner_;
+    if (!o || o->cachedImageTexture != tex)
+      return false;
+    if (!o->cachedImageMips) {
+      gl_.generateMipmaps(tex);
+      o->cachedImageMips = true;
+    }
+    return true;
   }
 
   // Textured version of emitQuad: (u0,v0)-(u1,v1) is the part of the image
@@ -10038,6 +10219,7 @@ private:
   float dashOffset_ = 0.0f;
   float globalAlpha_ = 1.0f;
   CompositeOp composite_ = CompositeOp::SourceOver;
+  ImageSampling imageSampling_ = ImageSampling::Smooth;
   Color shadowColor_{0, 0, 0, 0};
   float shadowOffsetX_ = 0.0f, shadowOffsetY_ = 0.0f;
   TextStyle font_;
@@ -10103,6 +10285,7 @@ public:
     s.fill = fillPaint_;
     s.stroke = strokePaint_;
     s.globalAlpha = globalAlpha_;
+    s.imageSampling = imageSampling_;
     s.font = font_;
     s.textAlign = textAlign_;
     s.textBaseline = textBaseline_;
@@ -10120,6 +10303,7 @@ public:
     fillPaint_ = s.fill;
     strokePaint_ = s.stroke;
     globalAlpha_ = s.globalAlpha;
+    imageSampling_ = s.imageSampling;
     font_ = s.font;
     textAlign_ = s.textAlign;
     textBaseline_ = s.textBaseline;
@@ -10190,6 +10374,7 @@ public:
   void setGlobalCompositeOperation(CompositeOp op) {
     cairo_set_operator(cr_, toCairoOp(op));
   }
+  void setImageSampling(ImageSampling mode) { imageSampling_ = mode; }
   void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
                  float offsetX, float offsetY) {
     shadowColor_ = color;
@@ -10432,7 +10617,23 @@ public:
     cairo_scale(cr_, dw / std::max(1.0f, sw), dh / std::max(1.0f, sh));
     cairo_translate(cr_, -sx, -sy);
     cairo_set_source_surface(cr_, surf, 0, 0);
-    cairo_pattern_set_filter(cairo_get_source(cr_), CAIRO_FILTER_BILINEAR);
+    // The CTM here already includes the dw/sw, dh/sh scale applied above, but
+    // not the surface's device scale, so only the latter is passed as dpr.
+    cairo_matrix_t m;
+    cairo_get_matrix(cr_, &m);
+    const auto filter = liteui_canvas_sampling::pickFilter(
+        imageSampling_, static_cast<float>(m.xx), static_cast<float>(m.yx),
+        static_cast<float>(m.xy), static_cast<float>(m.yy), 1.0f, 1.0f,
+        devicePixelRatio());
+    // BILINEAR only samples 2x2 texels; GOOD is Cairo's quality filter, which
+    // convolves over the whole footprint when the image is shrunk.
+    cairo_pattern_set_filter(
+        cairo_get_source(cr_),
+        filter == liteui_canvas_sampling::ImageFilter::Nearest
+            ? CAIRO_FILTER_NEAREST
+            : filter == liteui_canvas_sampling::ImageFilter::Mipmap
+                  ? CAIRO_FILTER_GOOD
+                  : CAIRO_FILTER_BILINEAR);
     cairo_paint_with_alpha(cr_, globalAlpha_);
     cairo_restore(cr_);
     // Only destroy when NOT cache-owned — see the Windows drawImage's
@@ -10533,6 +10734,7 @@ private:
   struct ExtraState {
     Paint fill, stroke;
     float globalAlpha;
+    ImageSampling imageSampling;
     TextStyle font;
     TextAlign textAlign;
     TextBaseline textBaseline;
@@ -10742,6 +10944,7 @@ private:
   Paint strokePaint_ = Paint::solid(Color{0, 0, 0, 255});
   float dashOffset_ = 0.0f;
   float globalAlpha_ = 1.0f;
+  ImageSampling imageSampling_ = ImageSampling::Smooth;
   Color shadowColor_{0, 0, 0, 0};
   float shadowOffsetX_ = 0.0f, shadowOffsetY_ = 0.0f;
   TextStyle font_;
@@ -12321,6 +12524,7 @@ void View::freeTextResources() {
   if (computed.cachedImageTexture) {
     glDeleteTextures(1, &computed.cachedImageTexture);
     computed.cachedImageTexture = 0;
+    computed.cachedImageMips = false;
     computed.cachedImagePixels = nullptr;
   }
   if (computed.canvasFbo) {
@@ -16723,6 +16927,7 @@ private:
     c.canvasMsaaColorRb = 0;
     c.canvasDsRb = 0;
     c.cachedImageTexture = 0;
+    c.cachedImageMips = false;
     c.cachedImagePixels = nullptr; // the cached upload is gone
     c.canvasNeedsRedraw = true;    // contents were GPU-only: repaint them
     c.canvasBuiltForWidth = c.canvasBuiltForHeight = -1.0f;
@@ -18330,6 +18535,7 @@ View View::toView(Image img) {
   }
 
   ObjectFit fit = img.fit;
+  const ImageSampling sampling = img.sampling;
   Color bg = img.backgroundColor;
 
   // Polled every dispatch cycle exactly like TextInput's blink timer
@@ -18380,7 +18586,7 @@ View View::toView(Image img) {
     return d;
   };
 
-  v.onPaint = [state, fit, bg](CanvasContext &ctx) {
+  v.onPaint = [state, fit, bg, sampling](CanvasContext &ctx) {
     if (bg.a > 0) {
       ctx.setFillColor(bg);
       ctx.fillRect(0, 0, ctx.width(), ctx.height());
@@ -18422,7 +18628,10 @@ View View::toView(Image img) {
       break;
     }
     }
+    ctx.save();
+    ctx.setImageSampling(sampling);
     ctx.drawImage(im, dx, dy, dw, dh);
+    ctx.restore();
     state->retired.clear(); // the backend cache now refers to `im`
   };
 
@@ -18813,6 +19022,9 @@ void CanvasContext::setGlobalAlpha(float a) {
 }
 void CanvasContext::setGlobalCompositeOperation(CompositeOp op) {
   static_cast<CanvasContextImpl *>(this)->setGlobalCompositeOperation(op);
+}
+void CanvasContext::setImageSampling(ImageSampling mode) {
+  static_cast<CanvasContextImpl *>(this)->setImageSampling(mode);
 }
 void CanvasContext::setShadow(Color color, float blurPx, float offsetX,
                               float offsetY) {

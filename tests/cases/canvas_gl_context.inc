@@ -824,6 +824,7 @@ TEST_CASE("GL canvas: drawImage", "[canvas][gl][image]") {
 
   SECTION("scaling picks the right texel for each destination pixel") {
     Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
     f.c.drawImage(quadImage(), 10, 10, 4, 4);
     CHECK(f.ch(10, 10, 0) == within(255, 1)); // red
     CHECK(f.ch(12, 10, 1) == within(255, 1)); // green
@@ -834,6 +835,7 @@ TEST_CASE("GL canvas: drawImage", "[canvas][gl][image]") {
 
   SECTION("the source rectangle crops the image") {
     Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
     f.c.drawImage(quadImage(), 1, 0, 1, 2, 0, 0, 8, 16); // right column only
     CHECK(f.count() == 128);
     CHECK(f.ch(3, 3, 1) == within(255, 1));   // green (top right texel)
@@ -843,6 +845,7 @@ TEST_CASE("GL canvas: drawImage", "[canvas][gl][image]") {
 
   SECTION("a source rectangle past the image edge is clipped, shrinking the destination") {
     Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
     f.c.drawImage(quadImage(), -1, -1, 2, 2, 0, 0, 20, 20);
     CHECK(f.count() == 100); // only the 1x1 corner texel, at 10x10 pixels
     CHECK(f.ch(15, 15, 0) == within(255, 1));
@@ -885,6 +888,7 @@ TEST_CASE("GL canvas: drawImage", "[canvas][gl][image]") {
 
   SECTION("straight alpha is premultiplied; globalAlpha and clip apply") {
     Fx f(32, 32);
+    f.c.setImageSampling(ImageSampling::Nearest); // exact alpha checks below
     CanvasImage half(1, 1);
     half.pixels = {255, 0, 0, 128};
     f.c.drawImage(half, 0, 0);
@@ -906,6 +910,7 @@ TEST_CASE("GL canvas: drawImage", "[canvas][gl][image]") {
 
   SECTION("the transform applies to the destination rectangle") {
     Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
     f.c.translate(20, 20);
     f.c.scale(2, 2);
     f.c.drawImage(quadImage(), 0, 0, 4, 4); // 8x8 on screen at (20,20)
@@ -1406,6 +1411,227 @@ TEST_CASE("GL canvas: a path with thousands of segments fills correctly",
   CHECK(f.count() > ideal * 0.97);
   CHECK(f.count() < ideal * 1.02);
   CHECK(f.a(16, 16) == 1.0f);
+}
+
+TEST_CASE("GL canvas: image sampling", "[canvas][gl][image][sampling]") {
+  using namespace canvas_gl_context_test;
+
+  // 2x2 source drawn into w x h at the origin; returns the filter the context
+  // asked the renderer for (true = nearest).
+  auto pick = [](Fx &f, float w, float h) {
+    f.gl.samplingLog.clear();
+    f.c.drawImage(quadImage(), 0, 0, w, h);
+    REQUIRE(f.gl.samplingLog.size() == 1);
+    return f.gl.lastNearest;
+  };
+
+  SECTION("the default is Smooth: bilinear, and unchanged from before") {
+    Fx f;
+    CHECK_FALSE(pick(f, 8, 8));
+    // x = 3 sits 37.5% of the way from the red texel centre to the green one.
+    CHECK(f.ch(3, 0, 0) == within(159, 2));
+    CHECK(f.ch(3, 0, 1) == within(96, 2));
+  }
+
+  SECTION("Nearest gives only source colours, whatever the scale") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
+    CHECK(pick(f, 8, 8));
+    CHECK(f.count() == 64);
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) {
+        const float r = f.ch(x, y, 0), g = f.ch(x, y, 1), b = f.ch(x, y, 2);
+        const bool pure = (r == 255 || r == 0) && (g == 255 || g == 0) &&
+                          (b == 255 || b == 0);
+        INFO("pixel " << x << "," << y);
+        CHECK(pure);
+      }
+    CHECK(f.ch(3, 0, 0) == 255.0f); // left of the red/green boundary
+    CHECK(f.ch(4, 0, 1) == 255.0f); // right of it
+    f.gl.samplingLog.clear();
+    f.c.drawImage(quadImage(), 20, 20, 1, 1); // minified: still nearest
+    CHECK(f.gl.lastNearest);
+  }
+
+  SECTION("explicit Smooth ignores the scale") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Smooth);
+    CHECK_FALSE(pick(f, 64, 64)); // magnified 32x, still bilinear
+  }
+
+  SECTION("Auto: nearest when magnified or 1:1, smooth when minified") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Auto);
+    CHECK(pick(f, 8, 8));       // 4 device px per source pixel
+    CHECK(pick(f, 2, 2));       // exactly 1
+    CHECK_FALSE(pick(f, 1, 1)); // 0.5
+    CHECK_FALSE(pick(f, 1.9f, 1.9f));
+  }
+
+  SECTION("Auto looks at the smaller axis") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Auto);
+    CHECK_FALSE(pick(f, 8, 1)); // stretched in x, squeezed in y
+    CHECK_FALSE(pick(f, 1, 8));
+    CHECK(pick(f, 8, 2));
+  }
+
+  SECTION("Auto uses the source-rect ratio, not the image size") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Auto);
+    f.gl.samplingLog.clear();
+    f.c.drawImage(quadImage(), 0, 0, 1, 1, 0, 0, 4, 4); // 1 texel -> 4 px
+    CHECK(f.gl.lastNearest);
+    f.gl.samplingLog.clear();
+    f.c.drawImage(quadImage(), 0, 0, 2, 2, 0, 0, 1, 1); // 2 texels -> 1 px
+    CHECK_FALSE(f.gl.lastNearest);
+  }
+
+  SECTION("Auto follows the transform, including rotation") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Auto);
+    f.c.save();
+    f.c.scale(0.25f, 0.25f);
+    CHECK(pick(f, 8, 8)); // 8 * 0.25 / 2 = 1 device pixel per source pixel
+    f.c.restore();
+    f.c.save();
+    f.c.scale(0.2f, 0.2f);
+    CHECK_FALSE(pick(f, 8, 8)); // 0.8
+    f.c.restore();
+    f.c.save();
+    f.c.translate(30, 30);
+    f.c.rotate(kPi / 2);
+    CHECK(pick(f, 8, 8)); // rotation does not change the scale
+    f.c.restore();
+  }
+
+  SECTION("Auto counts the device pixel ratio exactly once") {
+    // 16x16 logical at dpr 2 = a 32x32 pixel target. The GL matrix already
+    // contains the dpr, so a context that multiplied it in again would call a
+    // half-size draw 1:1 and pick nearest.
+    Mock gl(32, 32);
+    View::Computed owner;
+    owner.canvasFbo = 1;
+    Ctx c(gl, 16, 16, &owner, 2.0f);
+    c.setImageSampling(ImageSampling::Auto);
+    c.drawImage(quadImage(), 0, 0, 1, 1); // 2 source px -> 2 device px: 1:1
+    CHECK(gl.lastNearest);
+    c.drawImage(quadImage(), 4, 4, 0.5f, 0.5f); // 2 source px -> 1 device px
+    CHECK_FALSE(gl.lastNearest);
+  }
+
+  SECTION("the mode is part of the saved state") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
+    f.c.save();
+    f.c.setImageSampling(ImageSampling::Smooth);
+    CHECK_FALSE(pick(f, 8, 8));
+    f.c.restore();
+    CHECK(pick(f, 8, 8));
+    f.c.restore(); // unbalanced restore is a no-op, as for the other state
+    CHECK(pick(f, 8, 8));
+  }
+
+  SECTION("a fresh context starts at Smooth, not at a leaked mode") {
+    {
+      Fx a;
+      a.c.setImageSampling(ImageSampling::Nearest);
+    }
+    Fx b;
+    CHECK_FALSE(pick(b, 8, 8));
+  }
+
+  SECTION("changing the mode does not re-upload the texture") {
+    Fx f;
+    const CanvasImage img = quadImage();
+    f.c.setImageSampling(ImageSampling::Smooth);
+    f.c.drawImage(img, 0, 0, 8, 8);
+    f.c.setImageSampling(ImageSampling::Nearest);
+    f.c.drawImage(img, 10, 0, 8, 8);
+    CHECK(f.gl.uploads == 1);
+    REQUIRE(f.gl.samplingLog.size() == 2);
+    CHECK_FALSE(f.gl.samplingLog[0]); // same texture, two filters, in order
+    CHECK(f.gl.samplingLog[1]);
+  }
+
+  SECTION("putImageData always blits nearest, whatever the mode") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Smooth);
+    f.c.putImageData(quadImage(), 4, 4);
+    CHECK(f.gl.lastNearest);
+    CHECK(f.ch(4, 4, 0) == 255.0f); // exact source pixels
+    CHECK(f.ch(5, 4, 1) == 255.0f);
+  }
+}
+
+TEST_CASE("GL canvas: minified images use mipmaps, built lazily", "[canvas][gl][image][sampling]") {
+  using namespace canvas_gl_context_test;
+  using liteui_canvas_sampling::ImageFilter;
+
+  // 4x4 image so a 2x reduction is easy to ask for.
+  auto big = [] {
+    CanvasImage im(4, 4);
+    for (size_t i = 0; i < im.pixels.size(); ++i)
+      im.pixels[i] = static_cast<uint8_t>(i * 7);
+    return im;
+  };
+
+  SECTION("a minified Smooth draw asks for Mipmap, builds the chain once") {
+    Fx f;
+    const CanvasImage img = big();
+    f.c.drawImage(img, 0, 0, 2, 2); // 0.5 device px per source pixel
+    CHECK(f.gl.lastFilter == ImageFilter::Mipmap);
+    CHECK(f.gl.mipmapped.size() == 1);
+    f.c.drawImage(img, 4, 0, 2, 2); // same cached texture
+    CHECK(f.gl.lastFilter == ImageFilter::Mipmap);
+    CHECK(f.gl.mipmapped.size() == 1); // not rebuilt
+  }
+
+  SECTION("magnified and 1:1 smooth draws stay Linear and build nothing") {
+    Fx f;
+    const CanvasImage img = big();
+    f.c.drawImage(img, 0, 0, 8, 8);
+    CHECK(f.gl.lastFilter == ImageFilter::Linear);
+    f.c.drawImage(img, 10, 0, 4, 4); // exactly 1:1
+    CHECK(f.gl.lastFilter == ImageFilter::Linear);
+    CHECK(f.gl.mipmapped.empty());
+  }
+
+  SECTION("Auto: minified -> Mipmap, magnified -> Nearest") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Auto);
+    const CanvasImage img = big();
+    f.c.drawImage(img, 0, 0, 2, 2);
+    CHECK(f.gl.lastFilter == ImageFilter::Mipmap);
+    f.c.drawImage(img, 0, 8, 8, 8);
+    CHECK(f.gl.lastFilter == ImageFilter::Nearest);
+  }
+
+  SECTION("Nearest never builds mips, even when minified") {
+    Fx f;
+    f.c.setImageSampling(ImageSampling::Nearest);
+    f.c.drawImage(big(), 0, 0, 2, 2);
+    CHECK(f.gl.lastFilter == ImageFilter::Nearest);
+    CHECK(f.gl.mipmapped.empty());
+  }
+
+  SECTION("a replaced image gets its own mip chain") {
+    Fx f;
+    const CanvasImage a = big(), b = big(); // different pixel buffers
+    f.c.drawImage(a, 0, 0, 2, 2);
+    f.c.drawImage(b, 0, 0, 2, 2); // owner's texture is replaced
+    CHECK(f.gl.mipmapped.size() == 2);
+    CHECK(f.gl.mipmapped[0] != f.gl.mipmapped[1]);
+    f.c.drawImage(b, 4, 0, 2, 2);
+    CHECK(f.gl.mipmapped.size() == 2);
+  }
+
+  SECTION("putImageData is always Nearest and builds nothing") {
+    Fx f;
+    f.c.putImageData(big(), 0, 0);
+    CHECK(f.gl.lastFilter == ImageFilter::Nearest);
+    CHECK(f.gl.mipmapped.empty());
+  }
 }
 
 #endif // LITEUI_CANVAS_GL && !_WIN32

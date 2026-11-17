@@ -8,7 +8,9 @@
 //   * the stencil modes of Renderer::setMode (clip level in bits 7..4,
 //     scratch/winding count in bits 3..0) on a per-pixel stencil array;
 //   * the fragment shader's paint maths (solid, image, linear/radial
-//     gradient, glyph masks) evaluated per pixel;
+//     gradient, glyph masks) evaluated per pixel; images are sampled
+//     bilinearly (premultiplied, clamp-to-edge) or nearest, as requested by
+//     setPaintTexture();
 //   * blending through the real blendFactorsFor(), plus the Multiply shader
 //     formula, on premultiplied float colour;
 //   * triangle rasterization by pixel-centre sampling (no antialiasing).
@@ -54,6 +56,16 @@ struct MockGl {
   int uploads = 0;          // textures uploaded (cache tests)
   std::vector<cgl::Vertex> lastDraw; // vertices of the most recent draw call
   std::vector<GLuint> deleted;
+  // The filter requested by each setPaintTexture() call, in order, and the
+  // most recent one (true = nearest, false = bilinear).
+  std::vector<bool> samplingLog;
+  bool lastNearest = false;
+  // The same requests as ImageFilter values, and every texture whose mip
+  // chain was built (in order).
+  std::vector<liteui_canvas_sampling::ImageFilter> filterLog;
+  liteui_canvas_sampling::ImageFilter lastFilter =
+      liteui_canvas_sampling::ImageFilter::Linear;
+  std::vector<GLuint> mipmapped;
 
   // Counters for the faked glyph rasterizer (shared by all instances).
   static inline int rasterCalls = 0;
@@ -75,10 +87,22 @@ struct MockGl {
   void setBlend(CompositeOp o) { op_ = o; }
   void setMask(int m) { mask_ = m; }
   void setPaintSolid() { paint_ = PaintKind::Solid; }
-  void setPaintTexture(GLuint t) {
+  // Mipmap is sampled as plain bilinear here: the mock has no mip chains, it
+  // only records that a minified filter was requested (and, via mipmapped,
+  // that the context built the chain first).
+  void setPaintTexture(GLuint t,
+                       liteui_canvas_sampling::ImageFilter f =
+                           liteui_canvas_sampling::ImageFilter::Linear) {
     paint_ = PaintKind::Texture;
     tex_ = t;
+    const bool nearest = f == liteui_canvas_sampling::ImageFilter::Nearest;
+    nearest_ = nearest;
+    lastNearest = nearest;
+    lastFilter = f;
+    samplingLog.push_back(nearest);
+    filterLog.push_back(f);
   }
+  void generateMipmaps(GLuint t) { mipmapped.push_back(t); }
   void setPaintGradient(const CanvasGradient &g, const float inv[9]) {
     paint_ = PaintKind::Gradient;
     grad_ = g;
@@ -257,10 +281,29 @@ private:
     if (paint_ == PaintKind::Texture) {
       const auto [tw, th] = texSize_[tex_ - 1];
       const auto &p = texPx_[tex_ - 1];
-      const int ix = std::clamp(static_cast<int>(std::floor(u * tw)), 0, tw - 1);
-      const int iy = std::clamp(static_cast<int>(std::floor(v * th)), 0, th - 1);
-      for (int k = 0; k < 4; ++k)
-        s[k] = p[(static_cast<size_t>(iy) * tw + ix) * 4 + k] / 255.0f;
+      auto texel = [&](int x, int y, int k) {
+        x = std::clamp(x, 0, tw - 1); // GL_CLAMP_TO_EDGE
+        y = std::clamp(y, 0, th - 1);
+        return p[(static_cast<size_t>(y) * tw + x) * 4 + k] / 255.0f;
+      };
+      if (nearest_) { // GL_NEAREST
+        const int ix = static_cast<int>(std::floor(u * tw));
+        const int iy = static_cast<int>(std::floor(v * th));
+        for (int k = 0; k < 4; ++k)
+          s[k] = texel(ix, iy, k);
+      } else { // GL_LINEAR on premultiplied texels, texel centres at +0.5
+        const float fx = u * tw - 0.5f, fy = v * th - 0.5f;
+        const int x0 = static_cast<int>(std::floor(fx));
+        const int y0 = static_cast<int>(std::floor(fy));
+        const float tx = fx - static_cast<float>(x0);
+        const float ty = fy - static_cast<float>(y0);
+        for (int k = 0; k < 4; ++k) {
+          const float top = texel(x0, y0, k) * (1 - tx) + texel(x0 + 1, y0, k) * tx;
+          const float bot =
+              texel(x0, y0 + 1, k) * (1 - tx) + texel(x0 + 1, y0 + 1, k) * tx;
+          s[k] = top * (1 - ty) + bot * ty;
+        }
+      }
     } else if (paint_ == PaintKind::Gradient) {
       const float px = inv_[0] * X + inv_[3] * Y + inv_[6];
       const float py = inv_[1] * X + inv_[4] * Y + inv_[7];
@@ -433,6 +476,7 @@ private:
   int mask_ = 0;
   PaintKind paint_ = PaintKind::Solid;
   GLuint tex_ = 0;
+  bool nearest_ = false;
   CanvasGradient grad_;
   float inv_[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   std::vector<uint8_t> ramp_;
