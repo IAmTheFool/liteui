@@ -2,7 +2,8 @@
 // drag-to-pan and scrollbars. The image is centered, and wheel zoom is
 // anchored at the pointer (the point under the cursor stays put).
 // Input uses the pointer / wheel / key events (PointerEvent, WheelEvent,
-// addShortcut); keyboard: Ctrl+= / Ctrl+- zoom, Ctrl+1 = 100%, Ctrl+0 = fit.
+// addShortcut); keyboard: Ctrl+= / Ctrl+- zoom, Ctrl+1 = 100%, Ctrl+0 = fit,
+// Ctrl+C / Ctrl+V copy / paste the image.
 // It also shows the high-precision image pipeline (ImageBuffer, RGBA16F /
 // RGBA32F working formats, exposure and clamp display settings).
 //
@@ -24,6 +25,12 @@
 //           100% zoom and above, smooth below (the default); Smooth =
 //           bilinear / mipmapped; Nearest = always crisp. The percentage in
 //           the first toolbar also shows the filter actually in use.
+//   Copy / Paste  (first toolbar, also Ctrl+C / Ctrl+V) use the image
+//           clipboard (liteui_clipboard::setImageWithFallback /
+//           getImageWithFallback). Copy puts the picture you are looking at
+//           (the RGBA8 display copy, so exposure and clamp are baked in) on
+//           the system clipboard; Paste shows whatever image is on it, e.g.
+//           a screenshot, and feeds it through the same pipeline as a file.
 //   Pixel test  (first toolbar) generates a small image of colour blocks and a
 //           1-pixel checkerboard: zoom in to see block edges stay sharp (or
 //           blur under Smooth), zoom out to see the checkerboard average to
@@ -77,6 +84,10 @@ namespace
 
     std::string title;
     std::string status = "No image loaded";
+    // A short-lived message (clipboard results) shown in place of the zoom
+    // readout, so feedback is visible even while an image is on screen.
+    std::string notice;
+    std::chrono::steady_clock::time_point noticeUntil{};
     // Zoom is measured in DEVICE pixels: 1.0 = one image pixel per physical
     // screen pixel (pixel-exact), whatever the display scale. Geometry,
     // scrolling and all drawing coordinates below are in logical units, so one
@@ -389,6 +400,63 @@ namespace
     setMaster(s, std::make_shared<const ImageBuffer>(std::move(*decoded)), baseName(path));
   }
 
+  // Shows `msg` in the toolbar for a few seconds.
+  void setNotice(ViewerState &s, std::string msg)
+  {
+    s.notice = std::move(msg);
+    s.noticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  }
+
+  // ---- Image clipboard -----------------------------------------------------
+  // Both functions must run on the UI thread (they do: clicks and shortcuts).
+  // The *WithFallback variants keep an in-process copy, so Copy then Paste
+  // still works inside this app even where the OS clipboard can't carry an
+  // image (headless session, no wl-clipboard/xclip, locked Windows clipboard).
+
+  // Copies the picture on screen (the RGBA8 display copy) to the clipboard.
+  void copyImage(ViewerState &s)
+  {
+    if (!s.image)
+    {
+      setNotice(s, "Nothing to copy: no image loaded");
+      return;
+    }
+    const bool osAccepted = liteui_clipboard::setImageWithFallback(*s.image);
+    setNotice(s, osAccepted
+                     ? "Copied " + std::to_string(s.image->width) + " x " +
+                           std::to_string(s.image->height) + " image to the clipboard"
+                     : "System clipboard unavailable: copy kept inside this app only");
+  }
+
+  // Replaces the current image with the one on the clipboard, if any.
+  void pasteImage(ViewerState &s)
+  {
+    auto clip = liteui_clipboard::getImageWithFallback();
+    if (!clip || clip->width <= 0 || clip->height <= 0)
+    {
+      setNotice(s, liteui_clipboard::imageSupported()
+                       ? "The clipboard has no image"
+                       : "This system's clipboard can't carry images");
+      return;
+    }
+    // CanvasImage is tightly packed RGBA8 (straight alpha), which is exactly
+    // what an RGBA8_UNORM ImageBuffer holds, so rows copy across unchanged.
+    const auto w = static_cast<uint32_t>(clip->width);
+    const auto h = static_cast<uint32_t>(clip->height);
+    auto buf = ImageBuffer::create(w, h, PixelFormat::RGBA8_UNORM);
+    if (!buf || clip->pixels.size() < static_cast<size_t>(w) * h * 4)
+    {
+      setNotice(s, "Could not use the clipboard image");
+      return;
+    }
+    const size_t rowBytes = static_cast<size_t>(w) * 4;
+    for (uint32_t y = 0; y < h; ++y)
+      std::memcpy(buf->pixels.data() + y * buf->rowStride,
+                  clip->pixels.data() + y * rowBytes, rowBytes);
+    setMaster(s, std::make_shared<const ImageBuffer>(std::move(*buf)), "Pasted image");
+    setNotice(s, "Pasted " + std::to_string(w) + " x " + std::to_string(h) + " image");
+  }
+
   // A scene-linear FP32 test image: intensity ramps 0 -> 8x white left to
   // right (so it needs negative exposure to see), while the colour shifts
   // from orange to magenta top to bottom, which makes the difference
@@ -696,6 +764,14 @@ int main(int argc, char **argv)
     if (path)
       loadImage(state, *path); }));
   toolbar.addChild(makeButton([]
+                              { return std::string("Paste"); },
+                              grey, greyHover, [&state]
+                              { pasteImage(state); }));
+  toolbar.addChild(makeButton([]
+                              { return std::string("Copy"); },
+                              grey, greyHover, [&state]
+                              { copyImage(state); }));
+  toolbar.addChild(makeButton([]
                               { return std::string("HDR test"); },
                               grey, greyHover, [&state]
                               { loadHdrTest(state); }));
@@ -712,6 +788,9 @@ int main(int argc, char **argv)
   statusText.label = std::function<std::string()>(
       [&state]
       {
+        if (!state.notice.empty() &&
+            std::chrono::steady_clock::now() < state.noticeUntil)
+          return state.notice;
         if (!state.image)
           return state.status;
         return std::to_string(static_cast<int>(state.zoom * 100.0f + 0.5f)) + "%  (" +
@@ -883,6 +962,10 @@ int main(int argc, char **argv)
                    { zoomAboutCenter(state, state.zoom * kZoomStep); });
     ui.addShortcut(ctrl, Key::Minus, [&state]
                    { zoomAboutCenter(state, state.zoom / kZoomStep); });
+    ui.addShortcut(ctrl, Key::C, [&state]
+                   { copyImage(state); });
+    ui.addShortcut(ctrl, Key::V, [&state]
+                   { pasteImage(state); });
     ui.addShortcut(ctrl, Key::N1, [&state]
                    { zoomAboutCenter(state, 1.0f); });
     ui.addShortcut(ctrl, Key::N0, [&state]

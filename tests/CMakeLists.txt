@@ -27,7 +27,25 @@
 file(GLOB LITEUI_TEST_CASES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cases/*.inc)
 
 liteui_add_test(core
-    SOURCES  liteui_tests.cpp test_helpers.hpp canvas_gl_mock.hpp ${LITEUI_TEST_CASES}
+    SOURCES  liteui_tests.cpp test_helpers.hpp canvas_gl_mock.hpp
+             clipboard_helpers.hpp clipboard_tools_mock.hpp clipboard_wayland_mock.hpp
+             ${LITEUI_TEST_CASES}
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}     # test_helpers.hpp, cases/*.inc
     LITEUI
-    THREADS)                                 # canvas_damage / canvas_texture thread tests
+    THREADS)                                 # canvas_damage / canvas_texture / clipboard thread tests
+
+# cases/clipboard_wayland.inc tests the native Wayland clipboard against a small
+# fake compositor built on libwayland-server (shipped with libwayland-dev).
+# liteui_add_test has no hook for extra libraries or defines, so they are added
+# to the target it created. Without libwayland-server those cases are simply
+# compiled out (the file is empty) and everything else still builds and runs.
+if(NOT WIN32)
+    pkg_check_modules(WAYLAND_SERVER IMPORTED_TARGET wayland-server)
+    if(WAYLAND_SERVER_FOUND)
+        target_link_libraries(liteui_core_test PRIVATE PkgConfig::WAYLAND_SERVER)
+        target_compile_definitions(liteui_core_test PRIVATE LITEUI_TEST_WAYLAND_SERVER)
+    else()
+        message(STATUS "liteui tests: wayland-server not found; "
+                       "skipping the native Wayland clipboard cases")
+    endif()
+endif()

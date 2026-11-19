@@ -10,6 +10,7 @@
 #include "liteui.hpp"
 
 #include "test_helpers.hpp"
+#include "clipboard_helpers.hpp"
 
 #include "cases/core_types.inc"
 #include "cases/pixel_format.inc"
@@ -27,6 +28,17 @@
 #include "cases/pointer_events.inc"
 #include "cases/wheel_input.inc"
 #include "cases/platform.inc"
+
+// Clipboard (text and images): the DIB converters and the shared PNG layer run
+// everywhere; the tool-backed and native Wayland cases are Linux-only (the
+// Wayland ones also need libwayland-server, see CMakeLists.txt), and the
+// real-clipboard cases are Windows-only. Each file is empty where it does not
+// apply.
+#include "cases/clipboard_dib.inc"
+#include "cases/clipboard_image.inc"
+#include "cases/clipboard_tools.inc"
+#include "cases/clipboard_wayland.inc"
+#include "cases/clipboard_windows.inc"
 
 // Canvas: the GL backend cases compile only on Linux with LITEUI_CANVAS_GL (the
 // two canvas_gl_*.inc files are empty elsewhere). canvas_hardware.inc builds on
