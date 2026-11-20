@@ -24,7 +24,7 @@
 #define LITEUI_HPP_INCLUDED
 
 #define LITEUI_VERSION_MAJOR 0
-#define LITEUI_VERSION_MINOR 9
+#define LITEUI_VERSION_MINOR 10
 
 #include <algorithm>
 #include <array>
@@ -325,6 +325,41 @@ private:
 
 using PointerHandler = std::function<void(PointerEvent &)>;
 using WheelHandler = std::function<void(WheelEvent &)>;
+
+// ---- File / text drop ----------------------------------------------------
+// Something dragged in from another application (a file manager, a browser,
+// an editor) and dropped on the window. Views opt in with onDrop; onDragEnter /
+// onDragOver / onDragLeave let the same view show a highlight.
+//
+//  * The target is the DEEPEST enabled view under the pointer that has an
+//    onDrop handler (disabled views are transparent, like pointer events).
+//    Only that one view is told: nothing bubbles. When no view qualifies, the
+//    window-level LiteUI::setFileDropHandler gets the drop instead, if set.
+//  * onDragEnter fires when the drag first reaches the target (followed at
+//    once by an onDragOver with the entry position), onDragOver on every
+//    motion inside it, onDragLeave when it moves to another target,
+//    leaves the window, or is dropped (onDragLeave runs right BEFORE onDrop,
+//    so a highlight is always cleared). None of them bubble.
+//  * A drag is only accepted (drop cursor/effect "copy") over a target or
+//    when a window-level handler exists; elsewhere the OS shows "not allowed".
+//  * `paths` and `text` are only filled in onDrop. Before the drop, only
+//    `hasFiles` / `hasText` say what is being dragged (Wayland cannot read
+//    the data before the drop).
+//  * `paths` are absolute UTF-8 file-system paths. `text` is dropped text, or
+//    the URL(s) one per line when a URI list holds no files.
+//  * Handlers run on the UI thread and should return quickly: on Windows the
+//    dragging application waits for them. Start long work elsewhere.
+//  * Nothing is moved, deleted or opened: the drop is always a "copy".
+struct DropEvent {
+  float x = 0, y = 0; // local to the view whose handler is running
+  float windowX = 0, windowY = 0;
+  bool hasFiles = false; // the drag carries files
+  bool hasText = false;  // the drag carries text or a URL
+  std::vector<std::string> paths; // onDrop only
+  std::string text;               // onDrop only
+  KeyModifiers mods;
+};
+using DropHandler = std::function<void(DropEvent &)>;
 
 // The type of View::onClick (and Canvas::onClick). Accepts either
 //   [&](PointerEvent &e) { ... }   // bubbles to ancestors unless the handler
@@ -2355,6 +2390,11 @@ struct Canvas {
   PointerHandler onPointerEnter;
   PointerHandler onPointerLeave;
   WheelHandler onWheel;
+  // File / text drop — same semantics as on View (see DropEvent).
+  DropHandler onDrop;
+  DropHandler onDragEnter;
+  DropHandler onDragOver;
+  DropHandler onDragLeave;
   std::function<bool()> canvasDirtySource;
   // Retained mode (partial redraw). Off by default: every redraw clears the
   // whole canvas and onPaint repaints all of it, exactly as before.
@@ -2577,6 +2617,14 @@ public:
   PointerHandler onContextMenu; // right-button click, fired on release
   WheelHandler onWheel;         // falls through to overflow scrolling unless
                                 // a handler calls e.stopPropagation()
+
+  // File / text dragged in from another application. See DropEvent for the
+  // full rules. A view with onDrop is a drop target; the others are optional
+  // and only ever fire on the view that has onDrop.
+  DropHandler onDrop;
+  DropHandler onDragEnter;
+  DropHandler onDragOver;
+  DropHandler onDragLeave;
 
   // Left-button click (press and release on the same view). Accepts
   // `[&](PointerEvent &e) {...}` (bubbles unless stopped) or the shorter
@@ -2922,6 +2970,10 @@ public:
   // changed the display scale). The window is laid out and repainted
   // afterwards. Set it from the UI thread.
   void setScaleChangedHandler(std::function<void()> fn);
+  // Window-level file / text drop. Called, on the UI thread, for a drop that
+  // lands where no view has an onDrop handler (see DropEvent); with one set,
+  // the whole window accepts drags. Set it from the UI thread.
+  void setFileDropHandler(std::function<void(DropEvent &)> fn);
 
 private:
   LiteUIImpl *p_;
@@ -2967,6 +3019,8 @@ private:
 #include <shobjidl.h>
 #include <wincodec.h>
 #include <windows.h>
+#include <ole2.h>     // OleInitialize, RegisterDragDrop, IDropTarget (file drop)
+#include <shellapi.h> // DragAcceptFiles / DragQueryFileW (the WM_DROPFILES fallback)
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -2979,6 +3033,7 @@ private:
 #pragma comment(lib, "dwrite")
 #pragma comment(lib, "windowscodecs")
 #pragma comment(lib, "ole32")
+#pragma comment(lib, "shell32")
 #else
 #include "xdg-decoration-client-protocol.h" // Generated client bindings for the xdg-decoration protocol (server-side vs client-side decorations).
 #include "xdg-shell-client-protocol.h" // Generated client bindings for the xdg-shell protocol (toplevel windows, configure events).
@@ -3566,6 +3621,322 @@ std::optional<std::string> saveFolderPicker(const std::string &title) {
   return liteui_filepicker::first(liteui_filepicker::pick(
       {liteui_filepicker::Mode::SaveFolder, title, {}, {}, {}}));
 }
+
+// ==================== File / text drop ====================
+namespace liteui_drop {
+
+// What a platform backend calls into. Coordinates are LOGICAL window
+// coordinates. enter/over return whether a drop here would be accepted;
+// drop returns whether something took it.
+struct Hooks {
+  std::function<bool(float x, float y, bool files, bool text)> enter;
+  std::function<bool(float x, float y)> over;
+  std::function<void()> leave;
+  std::function<bool(float x, float y, std::vector<std::string> paths,
+                     std::string text)>
+      drop;
+};
+
+inline int hexVal(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+// "%20" -> " ". A '%' not followed by two hex digits is kept as it is.
+inline std::string percentDecode(const std::string &s) {
+  std::string r;
+  r.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size() && hexVal(s[i + 1]) >= 0 &&
+        hexVal(s[i + 2]) >= 0) {
+      r.push_back(static_cast<char>(hexVal(s[i + 1]) * 16 + hexVal(s[i + 2])));
+      i += 2;
+    } else {
+      r.push_back(s[i]);
+    }
+  }
+  return r;
+}
+
+inline bool startsWithNoCase(const std::string &s, const char *prefix) {
+  for (size_t i = 0; prefix[i]; ++i) {
+    if (i >= s.size() ||
+        std::tolower(static_cast<unsigned char>(s[i])) != prefix[i])
+      return false;
+  }
+  return true;
+}
+
+// Parses a text/uri-list (RFC 2483): one URI per line, "#" lines are
+// comments. file: URIs (file:///p, file://localhost/p, file:/p) become
+// decoded absolute paths; a file: URI naming another host, a relative path or
+// one with an embedded NUL is dropped. Every other URI is appended to `other`
+// (when given), verbatim.
+inline std::vector<std::string>
+parseUriList(const std::string &data, std::vector<std::string> *other = nullptr) {
+  std::vector<std::string> paths;
+  size_t pos = 0;
+  while (pos <= data.size()) {
+    size_t end = data.find('\n', pos);
+    if (end == std::string::npos)
+      end = data.size();
+    std::string line = data.substr(pos, end - pos);
+    pos = end + 1;
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                             line.back() == '\t'))
+      line.pop_back();
+    if (line.empty() || line[0] == '#')
+      continue;
+    if (!startsWithNoCase(line, "file:")) {
+      if (other)
+        other->push_back(line);
+      continue;
+    }
+    std::string rest = line.substr(5);
+    std::string path;
+    if (rest.rfind("//", 0) == 0) {
+      const size_t slash = rest.find('/', 2);
+      const std::string host =
+          rest.substr(2, slash == std::string::npos ? std::string::npos : slash - 2);
+      if (slash == std::string::npos)
+        continue;
+      if (!host.empty() && host != "localhost")
+        continue; // a file on another machine
+      path = rest.substr(slash);
+    } else {
+      path = rest; // file:/path
+    }
+    // Drop a query/fragment (not part of a local path).
+    const size_t cut = path.find_first_of("?#");
+    if (cut != std::string::npos)
+      path.resize(cut);
+    path = percentDecode(path);
+    if (path.empty() || path[0] != '/' || path.find('\0') != std::string::npos)
+      continue;
+    paths.push_back(std::move(path));
+  }
+  return paths;
+}
+
+// UTF-16 (LE) code units -> UTF-8. A lone surrogate becomes U+FFFD.
+inline std::string utf16ToUtf8(const char16_t *u, size_t n) {
+  std::string r;
+  r.reserve(n);
+  auto put = [&r](uint32_t cp) {
+    if (cp < 0x80) {
+      r.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      r.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      r.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      r.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      r.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      r.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      r.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      r.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      r.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      r.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  };
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t c = u[i];
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && u[i + 1] >= 0xDC00 &&
+        u[i + 1] <= 0xDFFF) {
+      put(0x10000 + ((c - 0xD800) << 10) + (u[i + 1] - 0xDC00));
+      ++i;
+    } else if (c >= 0xD800 && c <= 0xDFFF) {
+      put(0xFFFD);
+    } else {
+      put(c);
+    }
+  }
+  return r;
+}
+
+// Latin-1 bytes -> UTF-8 (the legacy X11 "STRING" type).
+inline std::string latin1ToUtf8(const std::string &in) {
+  std::string r;
+  r.reserve(in.size());
+  for (const char ch : in) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (c < 0x80) {
+      r.push_back(static_cast<char>(c));
+    } else {
+      r.push_back(static_cast<char>(0xC0 | (c >> 6)));
+      r.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+  }
+  return r;
+}
+
+// Reads the paths out of a Windows CF_HDROP block (a DROPFILES header, then
+// NUL-separated names ended by an empty one). Bounds-checked; garbage yields
+// an empty list. A non-wide (ANSI) list is returned byte-for-byte, which is
+// exact for ASCII names; Windows has sent wide lists since NT.
+inline std::vector<std::string> parseDropFiles(const uint8_t *p, size_t n) {
+  std::vector<std::string> out;
+  if (!p || n < 20)
+    return out;
+  uint32_t off = 0, wide = 0;
+  std::memcpy(&off, p, 4);
+  std::memcpy(&wide, p + 16, 4);
+  if (off < 20 || off > n)
+    return out;
+  if (wide) {
+    const size_t units = (n - off) / 2;
+    std::vector<char16_t> u(units);
+    if (units)
+      std::memcpy(u.data(), p + off, units * 2);
+    size_t i = 0;
+    while (i < units && u[i] != 0) {
+      size_t j = i;
+      while (j < units && u[j] != 0)
+        ++j;
+      out.push_back(utf16ToUtf8(u.data() + i, j - i));
+      i = j + 1;
+    }
+  } else {
+    size_t i = off;
+    while (i < n && p[i] != 0) {
+      size_t j = i;
+      while (j < n && p[j] != 0)
+        ++j;
+      out.emplace_back(reinterpret_cast<const char *>(p + i), j - i);
+      i = j + 1;
+    }
+  }
+  return out;
+}
+
+#if defined(_WIN32)
+// The window's OLE drop target: enter/over/leave/drop from IDropTarget become
+// liteui_drop::Hooks calls. Used on the UI thread (OLE calls it there).
+// Reads CF_HDROP (files) and CF_UNICODETEXT (text); always answers "copy"
+// (or "link" when only that is allowed), never "move".
+class OleDropTarget final : public IDropTarget {
+public:
+  using Convert = std::function<void(POINTL screen, float &x, float &y)>;
+  OleDropTarget(Hooks h, Convert c) : hooks_(std::move(h)), convert_(std::move(c)) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+    if (!ppv)
+      return E_POINTER;
+    if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+      *ppv = static_cast<IDropTarget *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return static_cast<ULONG>(InterlockedIncrement(&ref_));
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const LONG r = InterlockedDecrement(&ref_);
+    if (r == 0)
+      delete this;
+    return static_cast<ULONG>(r);
+  }
+
+  HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *obj, DWORD, POINTL pt,
+                                      DWORD *effect) override {
+    files_ = has(obj, CF_HDROP);
+    text_ = has(obj, CF_UNICODETEXT);
+    float x = 0, y = 0;
+    convert_(pt, x, y);
+    accept_ = hooks_.enter && hooks_.enter(x, y, files_, text_);
+    *effect = pick(*effect);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD *effect) override {
+    float x = 0, y = 0;
+    convert_(pt, x, y);
+    accept_ = hooks_.over && hooks_.over(x, y);
+    *effect = pick(*effect);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE DragLeave() override {
+    if (hooks_.leave)
+      hooks_.leave();
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE Drop(IDataObject *obj, DWORD, POINTL pt,
+                                 DWORD *effect) override {
+    float x = 0, y = 0;
+    convert_(pt, x, y);
+    std::vector<std::string> paths;
+    std::string text;
+    std::vector<uint8_t> blob;
+    if (read(obj, CF_HDROP, blob))
+      paths = parseDropFiles(blob.data(), blob.size());
+    if (paths.empty() && read(obj, CF_UNICODETEXT, blob)) {
+      const auto *u = reinterpret_cast<const char16_t *>(blob.data());
+      size_t n = blob.size() / 2, len = 0;
+      while (len < n && u[len] != 0)
+        ++len;
+      text = utf16ToUtf8(u, len);
+    }
+    bool handled = false;
+    if (hooks_.drop && (!paths.empty() || !text.empty()))
+      handled = hooks_.drop(x, y, std::move(paths), std::move(text));
+    else if (hooks_.leave)
+      hooks_.leave(); // nothing usable: clear the highlight
+    accept_ = handled;
+    *effect = pick(*effect);
+    return S_OK;
+  }
+
+private:
+  static bool has(IDataObject *o, CLIPFORMAT cf) {
+    FORMATETC fe{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    return o && o->QueryGetData(&fe) == S_OK;
+  }
+  static bool read(IDataObject *o, CLIPFORMAT cf, std::vector<uint8_t> &out) {
+    out.clear();
+    if (!o)
+      return false;
+    FORMATETC fe{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM sm{};
+    if (FAILED(o->GetData(&fe, &sm)))
+      return false;
+    bool ok = false;
+    if (sm.tymed == TYMED_HGLOBAL && sm.hGlobal) {
+      const SIZE_T sz = GlobalSize(sm.hGlobal);
+      if (const void *p = GlobalLock(sm.hGlobal)) {
+        out.assign(static_cast<const uint8_t *>(p),
+                   static_cast<const uint8_t *>(p) + sz);
+        GlobalUnlock(sm.hGlobal);
+        ok = true;
+      }
+    }
+    ReleaseStgMedium(&sm);
+    return ok;
+  }
+  DWORD pick(DWORD allowed) const {
+    if (!accept_)
+      return DROPEFFECT_NONE;
+    if (allowed & DROPEFFECT_COPY)
+      return DROPEFFECT_COPY;
+    if (allowed & DROPEFFECT_LINK)
+      return DROPEFFECT_LINK;
+    return DROPEFFECT_NONE; // never "move": we do not delete the source
+  }
+
+  LONG ref_ = 1;
+  Hooks hooks_;
+  Convert convert_;
+  bool files_ = false, text_ = false, accept_ = false;
+};
+#endif // _WIN32
+
+} // namespace liteui_drop
 
 // ==================== Clipboard ====================
 namespace liteui_clipboard {
@@ -4347,6 +4718,12 @@ namespace detail {
 // the UI thread: as much as fits now, the rest from the window's poll() loop
 // (appendPollFds / servicePolled). No threads.
 //
+// Drag-and-drop IN (files / text dropped on the window) shares this device,
+// because a wl_data_device takes exactly one listener. enter/motion/leave/drop
+// are forwarded to liteui_drop::Hooks; on drop the offer is read through a
+// non-blocking pipe polled from the window's loop (never the UI thread), then
+// parsed (text/uri-list -> paths) and handed to hooks.drop.
+//
 // Limits worth knowing: the protocol gives no reply to set_selection, so a
 // compositor that rejects the serial does so silently. canWrite() therefore
 // requires a serial from an input event in the last few seconds, and
@@ -4377,8 +4754,35 @@ class WlClipboard final : public NativeClipboard {
   struct OfferInfo {
     wl_data_offer *offer = nullptr;
     std::vector<std::string> mimes;
-    bool dnd = false; // arrived via drag-and-drop enter, not as the selection
+    bool dnd = false;  // arrived via drag-and-drop enter, not as the selection
+    bool busy = false; // a drop read is in flight: keep the offer alive
   };
+  // The drag currently over the window (between enter and leave/drop).
+  struct DndSession {
+    bool active = false;
+    wl_data_offer *offer = nullptr;
+    uint32_t serial = 0;
+    uint32_t action = 0;     // last wl_data_offer.action (copy / none / ...)
+    bool files = false;      // offers text/uri-list
+    bool text = false;       // offers a text type we understand
+    bool latin1 = false;     // the text type is the legacy Latin-1 "STRING"
+    bool accepted = false;   // what we last told the compositor
+    bool sentOnce = false;
+    std::string mime;        // the type we'd read (offer's own spelling)
+    float lastX = 0, lastY = 0; // last pointer position (logical)
+  };
+  // A drop whose data is still arriving.
+  struct DropReader {
+    int fd = -1;
+    wl_data_offer *offer = nullptr;
+    bool files = false;
+    bool latin1 = false;
+    float x = 0, y = 0;
+    std::string buf;
+    Clock::time_point start{}, last{};
+  };
+  // Caps on dropped data (a misbehaving source must not eat memory).
+  static constexpr size_t kMaxDropBytes = 4u << 20;
   struct Writer {
     int fd = -1;
     std::shared_ptr<const std::vector<uint8_t>> data;
@@ -4414,6 +4818,10 @@ public:
   }
   void setFocused(bool focused) { focused_ = focused; }
 
+  // Where drag-and-drop events go (see liteui_drop::Hooks). Without hooks
+  // every drag is declined, as before.
+  void setDropHooks(liteui_drop::Hooks h) { hooks_ = std::move(h); }
+
   // Destroys every protocol object. Idempotent; must run before the display
   // is disconnected.
   void shutdown() {
@@ -4423,6 +4831,12 @@ public:
       if (w.fd >= 0)
         ::close(w.fd);
     writers_.clear();
+    for (DropReader &r : readers_)
+      if (r.fd >= 0)
+        ::close(r.fd);
+    readers_.clear();
+    dnd_ = {};
+    hooks_ = {};
     // A selection we still own dies with this process. Hand it to wl-copy /
     // xclip first so it survives, as tool-made copies always did.
     if (persistOnExit() && src_ && srcData_ && !srcData_->empty())
@@ -4456,21 +4870,46 @@ public:
     haveSerial_ = false;
   }
 
-  // ---- poll() integration: pending writes to clipboard readers ----
-  // Appends one POLLOUT entry per in-flight write and returns how many.
+  // ---- poll() integration ----
+  // Appends one POLLOUT entry per in-flight write (a clipboard reader's pipe
+  // was full) and one POLLIN entry per in-flight drop read; returns how many.
   size_t appendPollFds(std::vector<pollfd> &fds) const {
     for (const Writer &w : writers_)
       fds.push_back({w.fd, POLLOUT, 0});
-    return writers_.size();
+    for (const DropReader &r : readers_)
+      fds.push_back({r.fd, POLLIN, 0});
+    polledWriters_ = writers_.size();
+    polledReaders_ = readers_.size();
+    return polledWriters_ + polledReaders_;
+  }
+  // The poll() timeout to use: milliseconds until the earliest drop-read
+  // deadline, or -1 (wait forever) when no drop is being read.
+  int pollTimeoutMs() const {
+    if (readers_.empty())
+      return -1;
+    const auto now = Clock::now();
+    long best = -1;
+    for (const DropReader &r : readers_) {
+      const auto dl = std::min(r.last + std::chrono::milliseconds(kReadIdleMs),
+                               r.start + std::chrono::milliseconds(kReadTotalMs));
+      const long ms = static_cast<long>(
+          std::max<long long>(0, std::chrono::duration_cast<std::chrono::milliseconds>(dl - now).count()) + 1);
+      if (best < 0 || ms < best)
+        best = ms;
+    }
+    return static_cast<int>(best);
   }
   // `fds` points at the entries appendPollFds added (`n` of them). Writes that
   // started after that call (during this iteration's dispatch) are untouched
   // and join the next poll set.
   void servicePolled(const pollfd *fds, size_t n) {
+    const size_t nw = std::min(polledWriters_, n);
+    const size_t nr = std::min(polledReaders_, n - nw);
+    polledWriters_ = polledReaders_ = 0;
     size_t keep = 0;
     for (size_t i = 0; i < writers_.size(); ++i) {
       const bool finished =
-          (i < n && fds[i].revents != 0) ? pumpWriter(writers_[i]) : false;
+          (i < nw && fds[i].revents != 0) ? pumpWriter(writers_[i]) : false;
       if (!finished) {
         if (keep != i)
           writers_[keep] = std::move(writers_[i]);
@@ -4478,6 +4917,7 @@ public:
       }
     }
     writers_.resize(keep);
+    serviceReaders(fds + nw, nr);
   }
 
   // ---- NativeClipboard ----
@@ -4744,11 +5184,11 @@ private:
     if (selOffer_ == o)
       selOffer_ = nullptr;
   }
-  // We never accept drag-and-drop, but the protocol still hands us the offer
-  // object, which we must destroy.
+  // The protocol hands us an offer object per drag, which we must destroy
+  // (except one a drop read still uses: that goes when the read ends).
   void dropDndOffers() {
     for (size_t i = 0; i < offers_.size();) {
-      if (offers_[i].dnd) {
+      if (offers_[i].dnd && !offers_[i].busy) {
         wl_data_offer_destroy(offers_[i].offer);
         offers_.erase(offers_.begin() + static_cast<std::ptrdiff_t>(i));
       } else {
@@ -4779,6 +5219,164 @@ private:
     return true;
   }
 
+  // ---- drag-and-drop in ----
+  static bool hasMimeNoCase(const OfferInfo &i, const char *want,
+                            std::string *spelling = nullptr) {
+    for (const std::string &m : i.mimes)
+      if (normMime(m) == want) {
+        if (spelling)
+          *spelling = m;
+        return true;
+      }
+    return false;
+  }
+  // Tells the compositor whether we'd take a drop here (only on change).
+  // accept() names the type we want; set_actions (v3) offers "copy" only —
+  // we never move or delete the source.
+  void applyAccept(bool ok) {
+    DndSession &d = dnd_;
+    if (!d.active || !d.offer)
+      return;
+    const bool want = ok && (d.files || d.text);
+    if (d.sentOnce && want == d.accepted)
+      return;
+    d.sentOnce = true;
+    d.accepted = want;
+    wl_data_offer_accept(d.offer, d.serial, want ? d.mime.c_str() : nullptr);
+    if (wl_data_offer_get_version(d.offer) >= 3) {
+      const uint32_t a = want ? WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
+                              : WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+      wl_data_offer_set_actions(d.offer, a, a);
+    }
+    if (display_)
+      wl_display_flush(display_);
+  }
+  // Reads the dropped data from the poll() loop.
+  void startDropRead(float x, float y) {
+    DndSession d = dnd_;
+    dnd_ = {};
+    int fds[2];
+    if (::pipe2(fds, O_CLOEXEC) != 0) {
+      failDrop(d.offer);
+      return;
+    }
+    const int fl = fcntl(fds[0], F_GETFL);
+    if (fl >= 0)
+      fcntl(fds[0], F_SETFL, fl | O_NONBLOCK); // only OUR end
+    if (OfferInfo *i = findOffer(d.offer))
+      i->busy = true;
+    wl_data_offer_receive(d.offer, d.mime.c_str(), fds[1]);
+    ::close(fds[1]);
+    if (display_)
+      wl_display_flush(display_);
+    DropReader r;
+    r.fd = fds[0];
+    r.offer = d.offer;
+    r.files = d.files;
+    r.latin1 = d.latin1 && !d.files;
+    r.x = x;
+    r.y = y;
+    r.start = r.last = Clock::now();
+    readers_.push_back(std::move(r));
+  }
+  // A drop that cannot complete: release the offer, clear the highlight.
+  void failDrop(wl_data_offer *o) {
+    if (OfferInfo *i = findOffer(o))
+      i->busy = false;
+    dropOffer(o);
+    if (hooks_.leave)
+      hooks_.leave();
+  }
+  enum class ReadState { Pending, Done, Failed };
+  ReadState pumpReader(DropReader &r) {
+    char tmp[4096];
+    for (;;) {
+      const ssize_t k = ::read(r.fd, tmp, sizeof tmp);
+      if (k > 0) {
+        r.buf.append(tmp, static_cast<size_t>(k));
+        r.last = Clock::now();
+        if (r.buf.size() > kMaxDropBytes)
+          return ReadState::Failed;
+        continue;
+      }
+      if (k == 0)
+        return ReadState::Done;
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return ReadState::Pending;
+      return ReadState::Failed;
+    }
+  }
+  void serviceReaders(const pollfd *fds, size_t n) {
+    if (readers_.empty())
+      return;
+    const auto now = Clock::now();
+    std::vector<DropReader> done, failed;
+    size_t keep = 0;
+    for (size_t i = 0; i < readers_.size(); ++i) {
+      DropReader &r = readers_[i];
+      ReadState st = ReadState::Pending;
+      if (i < n && fds[i].revents != 0)
+        st = pumpReader(r);
+      if (st == ReadState::Pending &&
+          (now - r.last > std::chrono::milliseconds(kReadIdleMs) ||
+           now - r.start > std::chrono::milliseconds(kReadTotalMs)))
+        st = ReadState::Failed;
+      if (st == ReadState::Pending) {
+        if (keep != i)
+          readers_[keep] = std::move(readers_[i]);
+        ++keep;
+      } else if (st == ReadState::Done) {
+        done.push_back(std::move(r));
+      } else {
+        failed.push_back(std::move(r));
+      }
+    }
+    readers_.resize(keep);
+    // Callbacks run app code: only after readers_ is consistent again.
+    for (DropReader &r : failed) {
+      ::close(r.fd);
+      failDrop(r.offer);
+    }
+    for (DropReader &r : done)
+      completeDrop(r);
+  }
+  void completeDrop(DropReader &r) {
+    ::close(r.fd);
+    r.fd = -1;
+    std::vector<std::string> paths;
+    std::string text;
+    if (r.files) {
+      std::vector<std::string> other;
+      paths = liteui_drop::parseUriList(r.buf, &other);
+      if (paths.empty() && !other.empty()) {
+        for (size_t i = 0; i < other.size(); ++i)
+          text += (i ? "\n" : "") + other[i];
+      }
+    } else {
+      text = r.latin1 ? liteui_drop::latin1ToUtf8(r.buf) : std::move(r.buf);
+      while (!text.empty() && text.back() == '\0')
+        text.pop_back();
+    }
+    // Tell the source we are done (v3, and only valid after a negotiated
+    // action — guaranteed here: we only read after checking it), then free it.
+    if (OfferInfo *i = findOffer(r.offer))
+      i->busy = false;
+    if (wl_data_offer_get_version(r.offer) >= 3)
+      wl_data_offer_finish(r.offer);
+    dropOffer(r.offer);
+    if (display_)
+      wl_display_flush(display_);
+    if (paths.empty() && text.empty()) {
+      if (hooks_.leave)
+        hooks_.leave();
+      return;
+    }
+    if (hooks_.drop)
+      hooks_.drop(r.x, r.y, std::move(paths), std::move(text));
+  }
+
   // ---- wl_data_device events ----
   static void devDataOffer(void *d, wl_data_device *, wl_data_offer *o) {
     auto *self = static_cast<WlClipboard *>(d);
@@ -4787,20 +5385,86 @@ private:
     self->offers_.push_back(std::move(info));
     wl_data_offer_add_listener(o, &offerListener, self);
   }
-  static void devEnter(void *d, wl_data_device *, uint32_t, wl_surface *,
-                       wl_fixed_t, wl_fixed_t, wl_data_offer *o) {
+  static void devEnter(void *d, wl_data_device *, uint32_t serial,
+                       wl_surface *, wl_fixed_t fx, wl_fixed_t fy,
+                       wl_data_offer *o) {
     auto *self = static_cast<WlClipboard *>(d);
-    if (o)
-      if (OfferInfo *i = self->findOffer(o))
-        i->dnd = true;
+    if (!o)
+      return;
+    OfferInfo *i = self->findOffer(o);
+    if (!i)
+      return;
+    i->dnd = true;
+    // A drag we never saw end (a compositor that skipped `leave`).
+    if (self->dnd_.active && self->dnd_.offer != o) {
+      self->dnd_ = {};
+      self->dropDndOffers();
+      i = self->findOffer(o);
+      if (!i)
+        return;
+    }
+    DndSession &s = self->dnd_;
+    s = {};
+    s.active = true;
+    s.offer = o;
+    s.serial = serial;
+    s.files = hasMimeNoCase(*i, "text/uri-list", &s.mime);
+    if (!s.files) {
+      bool latin1 = false;
+      s.mime = self->pickTextMime(o, latin1);
+      s.latin1 = latin1;
+    }
+    s.text = !s.files && !s.mime.empty();
+    s.lastX = static_cast<float>(wl_fixed_to_double(fx));
+    s.lastY = static_cast<float>(wl_fixed_to_double(fy));
+    bool ok = false;
+    if (self->hooks_.enter)
+      ok = self->hooks_.enter(static_cast<float>(wl_fixed_to_double(fx)),
+                              static_cast<float>(wl_fixed_to_double(fy)),
+                              s.files, s.text);
+    self->applyAccept(ok);
   }
   static void devLeave(void *d, wl_data_device *) {
-    static_cast<WlClipboard *>(d)->dropDndOffers();
+    auto *self = static_cast<WlClipboard *>(d);
+    const bool wasActive = self->dnd_.active;
+    self->dnd_ = {};
+    if (wasActive && self->hooks_.leave)
+      self->hooks_.leave();
+    self->dropDndOffers(); // a read in flight keeps its offer (busy)
   }
-  static void devMotion(void *, wl_data_device *, uint32_t, wl_fixed_t,
-                        wl_fixed_t) {}
+  static void devMotion(void *d, wl_data_device *, uint32_t, wl_fixed_t fx,
+                        wl_fixed_t fy) {
+    auto *self = static_cast<WlClipboard *>(d);
+    if (!self->dnd_.active)
+      return;
+    bool ok = false;
+    if (self->hooks_.over)
+      ok = self->hooks_.over(static_cast<float>(wl_fixed_to_double(fx)),
+                             static_cast<float>(wl_fixed_to_double(fy)));
+    self->applyAccept(ok);
+    self->dnd_.lastX = static_cast<float>(wl_fixed_to_double(fx));
+    self->dnd_.lastY = static_cast<float>(wl_fixed_to_double(fy));
+  }
   static void devDrop(void *d, wl_data_device *) {
-    static_cast<WlClipboard *>(d)->dropDndOffers();
+    auto *self = static_cast<WlClipboard *>(d);
+    DndSession &s = self->dnd_;
+    if (!s.active || !s.offer) {
+      self->dropDndOffers();
+      return;
+    }
+    // finish() is a protocol ERROR unless an action was negotiated, so only
+    // go on when the compositor confirmed one (v3) and we accepted.
+    const bool v3 = wl_data_offer_get_version(s.offer) >= 3;
+    const bool actionOk =
+        !v3 || s.action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    if (!s.accepted || !actionOk || (!s.files && !s.text)) {
+      self->dnd_ = {};
+      if (self->hooks_.leave)
+        self->hooks_.leave();
+      self->dropDndOffers();
+      return;
+    }
+    self->startDropRead(s.lastX, s.lastY);
   }
   static void devSelection(void *d, wl_data_device *, wl_data_offer *o) {
     auto *self = static_cast<WlClipboard *>(d);
@@ -4819,7 +5483,11 @@ private:
       i->mimes.emplace_back(mime);
   }
   static void offerSourceActions(void *, wl_data_offer *, uint32_t) {}
-  static void offerAction(void *, wl_data_offer *, uint32_t) {}
+  static void offerAction(void *d, wl_data_offer *o, uint32_t action) {
+    auto *self = static_cast<WlClipboard *>(d);
+    if (self->dnd_.active && self->dnd_.offer == o)
+      self->dnd_.action = action;
+  }
   static constexpr wl_data_offer_listener offerListener = {
       offerMime, offerSourceActions, offerAction};
 
@@ -4870,6 +5538,10 @@ private:
   SrcKind srcKind_ = SrcKind::None;
   std::vector<std::string> srcMimes_; // types our source offers
   std::vector<Writer> writers_;
+  std::vector<DropReader> readers_;
+  DndSession dnd_;
+  liteui_drop::Hooks hooks_;
+  mutable size_t polledWriters_ = 0, polledReaders_ = 0;
   uint32_t serial_ = 0;
   bool haveSerial_ = false;
   bool focused_ = false;
@@ -8122,6 +8794,10 @@ View View::toView(Canvas c) {
   v.onPointerEnter = std::move(c.onPointerEnter);
   v.onPointerLeave = std::move(c.onPointerLeave);
   v.onWheel = std::move(c.onWheel);
+  v.onDrop = std::move(c.onDrop);
+  v.onDragEnter = std::move(c.onDragEnter);
+  v.onDragOver = std::move(c.onDragOver);
+  v.onDragLeave = std::move(c.onDragLeave);
   v.canvasDirtySource = std::move(c.canvasDirtySource);
   v.canvasRetained = c.retained;
   v.canvasDamage = std::move(c.damage);
@@ -14360,6 +15036,21 @@ public:
     return updateHover(*root, e, ClipRect{}, needPoll);
   }
 
+  // The deepest enabled view under window (x, y) that has an onDrop handler,
+  // or null. Dropping is not a pointer press, so this never touches pointer
+  // state.
+  View *dropTargetAt(float x, float y) {
+    if (!root)
+      return nullptr;
+    Scratch chain(*this);
+    chainAt(x, y,
+            [](const View &v) { return (bool)v.onDrop && !isDisabled(v); },
+            chain.v);
+    return chain.v.empty() ? nullptr : chain.v.front();
+  }
+  // Bumped by invalidate(): a raw View* saved before a bump may be dangling.
+  uint64_t generation() const { return generation_; }
+
 private:
   struct ClickRecord {
     View *target = nullptr;
@@ -14701,6 +15392,155 @@ private:
 };
 
 } // namespace liteui_pointer
+
+// ==================== File / text drop: dispatch ====================
+namespace liteui_drop {
+
+// Turns a platform's enter/over/leave/drop calls (Hooks) into the View
+// handlers of the tree behind `router`: picks the deepest enabled onDrop view,
+// fires onDragEnter / onDragOver / onDragLeave as the target changes, and
+// falls back to `windowHandler`. Kept apart from LiteUIImpl so it can be
+// driven without a window.
+class Dispatcher {
+public:
+  explicit Dispatcher(liteui_pointer::Router &r) : router_(r) {}
+
+  std::function<void(DropEvent &)> windowHandler;
+  std::function<KeyModifiers()> modifiers; // optional
+  // Runs after any app handler ran (apply Dynamic<> changes, repaint).
+  std::function<void()> afterHandlers;
+
+  Hooks hooks() {
+    Hooks h;
+    h.enter = [this](float x, float y, bool f, bool t) {
+      return enter(x, y, f, t);
+    };
+    h.over = [this](float x, float y) { return over(x, y); };
+    h.leave = [this] { leave(); };
+    h.drop = [this](float x, float y, std::vector<std::string> p,
+                    std::string t) { return drop(x, y, std::move(p), std::move(t)); };
+    return h;
+  }
+
+  // enter/over return whether a drop at (x, y) would be accepted.
+  bool enter(float x, float y, bool files, bool text) {
+    files_ = files;
+    text_ = text;
+    return move(x, y);
+  }
+  bool over(float x, float y) { return move(x, y); }
+  void leave() {
+    bool ran = false;
+    View *t = target_;
+    target_ = nullptr;
+    if (t && gen_ == router_.generation() && t->onDragLeave) {
+      fire(*t, t->onDragLeave, lastX_, lastY_);
+      ran = true;
+    }
+    if (ran)
+      after();
+  }
+  // The drop itself. False when nothing took it.
+  bool drop(float x, float y, std::vector<std::string> paths, std::string text) {
+    leave(); // clears any highlight first
+    View *t = router_.dropTargetAt(x, y);
+    DropEvent e;
+    e.windowX = e.x = x;
+    e.windowY = e.y = y;
+    e.hasFiles = !paths.empty();
+    e.hasText = !text.empty();
+    e.paths = std::move(paths);
+    e.text = std::move(text);
+    if (modifiers)
+      e.mods = modifiers();
+    bool handled = false;
+    if (t) {
+      e.x = x - t->computed.x;
+      e.y = y - t->computed.y;
+      t->onDrop(e);
+      handled = true;
+    } else if (windowHandler) {
+      windowHandler(e);
+      handled = true;
+    }
+    if (handled)
+      after();
+    return handled;
+  }
+  // The view tree was rebuilt: forget the target without calling it.
+  void forget() { target_ = nullptr; }
+  View *target() const { return target_; }
+
+private:
+  bool move(float x, float y) {
+    lastX_ = x;
+    lastY_ = y;
+    View *t = router_.dropTargetAt(x, y);
+    uint64_t gen = router_.generation();
+    bool ran = false;
+    if (gen_ != gen)
+      target_ = nullptr; // tree rebuilt: the old pointer may dangle
+    if (t != target_) {
+      View *old = target_;
+      target_ = nullptr;
+      if (old && old->onDragLeave) {
+        fire(*old, old->onDragLeave, x, y);
+        ran = true;
+        if (router_.generation() != gen) { // the handler rebuilt the tree
+          gen = router_.generation();
+          t = router_.dropTargetAt(x, y);
+        }
+      }
+      target_ = t;
+      gen_ = gen;
+      if (t && t->onDragEnter) {
+        fire(*t, t->onDragEnter, x, y);
+        ran = true;
+        if (router_.generation() != gen) {
+          gen = router_.generation();
+          t = router_.dropTargetAt(x, y);
+          target_ = t;
+          gen_ = gen;
+        }
+      }
+    }
+    if (t && t->onDragOver) {
+      fire(*t, t->onDragOver, x, y);
+      ran = true;
+      if (router_.generation() != gen) {
+        target_ = nullptr; // re-resolved by the next motion
+        t = router_.dropTargetAt(x, y);
+      }
+    }
+    if (ran)
+      after();
+    return t != nullptr || (bool)windowHandler;
+  }
+  void fire(View &v, const DropHandler &h, float x, float y) {
+    DropEvent e;
+    e.windowX = x;
+    e.windowY = y;
+    e.x = x - v.computed.x;
+    e.y = y - v.computed.y;
+    e.hasFiles = files_;
+    e.hasText = text_;
+    if (modifiers)
+      e.mods = modifiers();
+    h(e);
+  }
+  void after() {
+    if (afterHandlers)
+      afterHandlers();
+  }
+
+  liteui_pointer::Router &router_;
+  View *target_ = nullptr; // valid only while gen_ matches the router's
+  uint64_t gen_ = 0;
+  bool files_ = false, text_ = false;
+  float lastX_ = 0, lastY_ = 0;
+};
+
+} // namespace liteui_drop
 
 // ---------------------------------------------------------------------------
 // liteui_wheel — turns raw scroll input into WheelEvent deltas, with no
@@ -15782,6 +16622,7 @@ private:
   // silently for the same reason: no onPointerCancel here.
   void invalidateViewPointers() {
     ptrRouter_.invalidate(); // press and capture targets, silently
+    dropDisp_.forget();
     scrollDrag_ = {};
     focusedView_ = nullptr;
     hideTooltip(); // clears tooltipTarget_ and cancels its timer
@@ -15979,7 +16820,88 @@ public:
     scaleChanged_ = std::move(fn);
   }
 
+  // ---- File / text drop (see DropEvent) ----
+  void setFileDropHandler(std::function<void(DropEvent &)> fn) {
+    dropDisp_.windowHandler = std::move(fn);
+  }
+  // The bridge a platform backend calls into (logical coordinates).
+  liteui_drop::Hooks makeDropHooks() {
+    dropDisp_.modifiers = [this] { return modifiers(); };
+    dropDisp_.afterHandlers = [this] { finishDropDispatch(); };
+    return dropDisp_.hooks();
+  }
+
 private:
+  // A handler may have changed app state a Dynamic<> reads: apply it, repaint.
+  void finishDropDispatch() {
+    pollAndRelayout();
+#if defined(_WIN32)
+    if (hwnd_)
+      InvalidateRect(hwnd_, nullptr, FALSE);
+#else
+    redraw();
+#endif
+  }
+
+#if defined(_WIN32)
+  // Registers the window as a drop target. OLE gives enter/over/leave and the
+  // right drop effect; it needs OleInitialize (a single-threaded apartment)
+  // on this thread. If that is impossible — the host already initialised COM
+  // as a multithreaded apartment here — fall back to WM_DROPFILES.
+  void setupFileDrop() {
+    if (SUCCEEDED(OleInitialize(nullptr))) {
+      oleInited_ = true;
+      auto *t = new liteui_drop::OleDropTarget(
+          makeDropHooks(), [this](POINTL p, float &x, float &y) {
+            POINT pt{p.x, p.y};
+            ScreenToClient(hwnd_, &pt);
+            x = toLogical(static_cast<float>(pt.x));
+            y = toLogical(static_cast<float>(pt.y));
+          });
+      if (SUCCEEDED(RegisterDragDrop(hwnd_, t))) {
+        oleDrop_ = t; // RegisterDragDrop holds its own reference too
+        return;
+      }
+      t->Release();
+    }
+    DragAcceptFiles(hwnd_, TRUE);
+    legacyDrop_ = true;
+    // An elevated process only receives these messages from a lower-integrity
+    // sender (Explorer) once allowed. (This does not help the OLE path.)
+    using FilterFn = BOOL(WINAPI *)(HWND, UINT, DWORD, void *);
+    if (HMODULE u = GetModuleHandleW(L"user32.dll")) {
+      auto *fn = reinterpret_cast<FilterFn>(
+          reinterpret_cast<void *>(GetProcAddress(u, "ChangeWindowMessageFilterEx")));
+      if (fn)
+        for (const UINT m : {static_cast<UINT>(WM_DROPFILES),
+                             static_cast<UINT>(WM_COPYDATA), 0x0049u})
+          fn(hwnd_, m, 1 /* MSGFLT_ALLOW */, nullptr);
+    }
+  }
+  // Idempotent; runs on WM_DESTROY and again from the destructor.
+  void teardownFileDrop() {
+    if (hwnd_ && oleDrop_)
+      RevokeDragDrop(hwnd_);
+    if (oleDrop_) {
+      oleDrop_->Release();
+      oleDrop_ = nullptr;
+    }
+    if (hwnd_ && legacyDrop_)
+      DragAcceptFiles(hwnd_, FALSE);
+    legacyDrop_ = false;
+    if (oleInited_) {
+      OleUninitialize();
+      oleInited_ = false;
+    }
+  }
+  liteui_drop::OleDropTarget *oleDrop_ = nullptr;
+  bool oleInited_ = false;
+  bool legacyDrop_ = false;
+#endif
+
+  liteui_drop::Dispatcher dropDisp_{ptrRouter_};
+
+
   // Called by both platform backends on every key press. Checks
   // shortcuts_ first (global, focus-independent), then falls through to
   // focusedView_->onKeyDown if nothing claimed it. Polls dynamic sources
@@ -17212,8 +18134,37 @@ private:
       if (self)
         self->handleCloseRequested();
       return 0;
+    // Files dropped on the window — only arrives when the OLE drop target
+    // could not be registered (see setupFileDrop); DragAcceptFiles is the
+    // fallback, with no hover feedback.
+    case WM_DROPFILES: {
+      HDROP drop = reinterpret_cast<HDROP>(wp);
+      if (self) {
+        POINT pt{};
+        DragQueryPoint(drop, &pt); // client coordinates, physical pixels
+        std::vector<std::string> paths;
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
+        for (UINT i = 0; i < count; ++i) {
+          const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+          std::wstring w(len, L'\0');
+          if (len && DragQueryFileW(drop, i, w.data(), len + 1) == len)
+            paths.push_back(liteui_drop::utf16ToUtf8(
+                reinterpret_cast<const char16_t *>(w.data()), w.size()));
+        }
+        DragFinish(drop);
+        if (!paths.empty())
+          self->dropDisp_.drop(self->toLogical(static_cast<float>(pt.x)),
+                               self->toLogical(static_cast<float>(pt.y)),
+                               std::move(paths), {});
+      } else {
+        DragFinish(drop);
+      }
+      return 0;
+    }
     // When the window is being destroyed...
     case WM_DESTROY:
+      if (self)
+        self->teardownFileDrop();
       // ...tell Windows to post a WM_QUIT message, which ends the GetMessage
       // loop in run().
       PostQuitMessage(0);
@@ -18132,7 +19083,7 @@ private:
   // event.
   static constexpr xdg_wm_base_listener wmBaseListener = {wmBasePing};
 
-  // Called when the compositor wants us to (re)configure our xdg_surface.
+// Called when the compositor wants us to (re)configure our xdg_surface.
   static void surfaceConfigure(void *data, xdg_surface *xs, uint32_t serial) {
     // Recover the LiteUI instance this callback belongs to.
     auto *self = static_cast<LiteUIImpl *>(data);
@@ -18148,7 +19099,8 @@ private:
         (self->pendingWidth_ != self->width_ ||
          self->pendingHeight_ != self->height_)) {
       self->resize(self->pendingWidth_, self->pendingHeight_);
-    } else if (!self->eglReady_)
+    }
+    if (!self->eglReady_)
       self->initEgl();
   }
   // Listener struct binding surfaceConfigure to xdg_surface's single event.
@@ -20486,6 +21438,7 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   if (!hwnd_) {
     throw std::runtime_error("CreateWindowExW failed");
   }
+  setupFileDrop();
   {
     // The window may have opened on a monitor whose DPI differs from the
     // system DPI used above: adopt its real scale and resize to match.
@@ -20520,6 +21473,7 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   // Connect to the compositor via the default Wayland socket.
   display_ = wl_display_connect(nullptr);
   wlClip_.attach(display_);
+  wlClip_.setDropHooks(makeDropHooks());
   // Fail loudly if no compositor is reachable.
   if (!display_)
     throw std::runtime_error("Failed to connect to Wayland display");
@@ -20619,6 +21573,7 @@ inline LiteUIImpl::~LiteUIImpl() {
   releaseDeviceResources();
   if (d2dFactory_)
     d2dFactory_->Release();
+  teardownFileDrop();
   // Destroy the native window if it was successfully created.
   if (hwnd_)
     DestroyWindow(hwnd_);
@@ -21415,7 +22370,8 @@ inline void LiteUIImpl::run() {
     const size_t clipStart = fds.size();
     const size_t clipCount = wlClip_.appendPollFds(fds);
 
-    int n = poll(fds.data(), static_cast<nfds_t>(fds.size()), -1);
+    int n = poll(fds.data(), static_cast<nfds_t>(fds.size()),
+                 wlClip_.pollTimeoutMs());
     if (n < 0) {
       wl_display_cancel_read(display_);
       break;
@@ -21701,6 +22657,9 @@ void LiteUI::wake() { p_->wake(); }
 float LiteUI::contentScale() const { return p_->contentScale(); }
 void LiteUI::setScaleChangedHandler(std::function<void()> fn) {
   p_->setScaleChangedHandler(std::move(fn));
+}
+void LiteUI::setFileDropHandler(std::function<void(DropEvent &)> fn) {
+  p_->setFileDropHandler(std::move(fn));
 }
 void LiteUI::setWakeHandler(std::function<void()> fn) {
   p_->setWakeHandler(std::move(fn));

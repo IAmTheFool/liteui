@@ -27,17 +27,20 @@
 #include "cases/layout.inc"
 #include "cases/pointer_events.inc"
 #include "cases/wheel_input.inc"
+#include "cases/file_drop.inc"
 #include "cases/platform.inc"
 
 // Clipboard (text and images): the DIB converters and the shared PNG layer run
 // everywhere; the tool-backed and native Wayland cases are Linux-only (the
 // Wayland ones also need libwayland-server, see CMakeLists.txt), and the
 // real-clipboard cases are Windows-only. Each file is empty where it does not
-// apply.
+// apply. file_drop_wayland.inc (drag-and-drop in, native Wayland) is gated the
+// same way as clipboard_wayland.inc.
 #include "cases/clipboard_dib.inc"
 #include "cases/clipboard_image.inc"
 #include "cases/clipboard_tools.inc"
 #include "cases/clipboard_wayland.inc"
+#include "cases/file_drop_wayland.inc"
 #include "cases/clipboard_windows.inc"
 
 // Canvas: the GL backend cases compile only on Linux with LITEUI_CANVAS_GL (the

@@ -9,6 +9,11 @@
 //
 //   imageviewer [path/to/image.png|jpg]
 //
+// Drag and drop: drop an image file from a file manager onto the window to
+// open it (the canvas highlights while a file is dragged over it; a drop on
+// the toolbars works too, via LiteUI::setFileDropHandler). If several files
+// are dropped, the first one that decodes is shown.
+//
 // Second toolbar row (the third row is an info line):
 //   Format  cycles the in-memory working format of the image: 8-bit,
 //           FP16 (half the memory of FP32) or FP32. Files are decoded at
@@ -103,6 +108,7 @@ namespace
     float viewW = 0, viewH = 0; // canvas size, updated from onLayout
     bool needFit = false;       // fit the new image once the view size is known
     bool dirty = false;         // the Canvas must repaint
+    bool dropHover = false;     // a file is being dragged over the canvas
     // How the Canvas filters the image when it is scaled; see ImageSampling.
     ImageSampling sampling = ImageSampling::Auto;
 
@@ -388,16 +394,17 @@ namespace
 
   // Decodes `path` into the state. On failure the previous image (if any)
   // stays on screen and only the status line changes.
-  void loadImage(ViewerState &s, const std::string &path)
+  bool loadImage(ViewerState &s, const std::string &path)
   {
     std::string err;
     auto decoded = liteui_image::decodeFileBuffer(path, &err); // RGBA8, or RGBA16 for a 16-bit PNG
     if (!decoded)
     {
       s.status = "Could not open " + baseName(path) + ": " + err;
-      return;
+      return false;
     }
     setMaster(s, std::make_shared<const ImageBuffer>(std::move(*decoded)), baseName(path));
+    return true;
   }
 
   // Shows `msg` in the toolbar for a few seconds.
@@ -405,6 +412,48 @@ namespace
   {
     s.notice = std::move(msg);
     s.noticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  }
+
+  // ---- File drop -------------------------------------------------------------
+  // Runs on the UI thread, inside the OS drag-and-drop call, so it only does
+  // the (quick) decode. The drop is always a copy: the file is only read.
+
+  // A file is being dragged over the canvas: highlight it (files only; a
+  // dragged piece of text isn't something we can open).
+  void dragHover(ViewerState &s, bool on)
+  {
+    if (s.dropHover != on)
+    {
+      s.dropHover = on;
+      s.dirty = true;
+    }
+  }
+
+  void openDropped(ViewerState &s, const DropEvent &e)
+  {
+    dragHover(s, false);
+    if (e.paths.empty())
+    {
+      setNotice(s, "Drop an image file (PNG or JPEG), not text");
+      return;
+    }
+    // Several files: show the first one that decodes.
+    size_t tried = 0;
+    for (const std::string &p : e.paths)
+    {
+      ++tried;
+      if (loadImage(s, p))
+      {
+        setNotice(s, e.paths.size() > 1
+                         ? "Opened " + baseName(p) + " (" + std::to_string(e.paths.size()) +
+                               " files dropped: showing this one)"
+                         : "Opened " + baseName(p));
+        return;
+      }
+    }
+    // None worked; loadImage left the last reason in s.status.
+    setNotice(s, tried > 1 ? "None of the " + std::to_string(tried) + " dropped files could be opened"
+                           : s.status);
   }
 
   // ---- Image clipboard -----------------------------------------------------
@@ -629,6 +678,24 @@ namespace
     s.dirty = true;
   }
 
+  // Drawn over everything while a file is dragged over the canvas.
+  void drawDropOverlay(const ViewerState &s, CanvasContext &ctx)
+  {
+    if (!s.dropHover)
+      return;
+    const float w = ctx.width(), h = ctx.height();
+    ctx.setFillColor(Color{0, 110, 200, 60});
+    ctx.fillRect(0, 0, w, h);
+    ctx.setStrokeColor(Color{60, 160, 255});
+    ctx.setLineWidth(4);
+    ctx.strokeRect(2, 2, w - 4, h - 4);
+    ctx.setFillColor(Color{255, 255, 255});
+    ctx.setFont("", 18);
+    ctx.setTextAlign(TextAlign::Center);
+    ctx.setTextBaseline(TextBaseline::Middle);
+    ctx.fillText("Drop to open", w / 2, h / 2);
+  }
+
   void paintViewer(ViewerState &s, CanvasContext &ctx)
   {
     // Learn the display scale. It is only known here (not in onLayout), so on
@@ -658,7 +725,8 @@ namespace
       ctx.setFont("", 15);
       ctx.setTextAlign(TextAlign::Center);
       ctx.setTextBaseline(TextBaseline::Middle);
-      ctx.fillText("Click \"Open Image...\" to choose a PNG or JPEG, or \"HDR test\".", w / 2, h / 2);
+      ctx.fillText("Click \"Open Image...\" or drop a PNG / JPEG here, or try \"HDR test\".", w / 2, h / 2);
+      drawDropOverlay(s, ctx);
       return;
     }
 
@@ -707,6 +775,7 @@ namespace
       ctx.setFillColor(track);
       ctx.fillRect(w - kBar, h - kBar, kBar, kBar);
     }
+    drawDropOverlay(s, ctx);
   }
 
   // A toolbar button whose label is recomputed every frame.
@@ -937,6 +1006,15 @@ int main(int argc, char **argv)
   // Focus loss / the OS grabbing the mouse: the release will never arrive.
   canvas.onPointerCancel = [&state](PointerEvent &)
   { state.drag = ViewerState::Drag::None; };
+  // File drop onto the canvas: highlight while a file is over it, open on drop.
+  // (The handlers only fire on this view; see the window handler below for
+  // drops that land on the toolbars.)
+  canvas.onDragEnter = [&state](DropEvent &e)
+  { dragHover(state, e.hasFiles); };
+  canvas.onDragLeave = [&state](DropEvent &)
+  { dragHover(state, false); };
+  canvas.onDrop = [&state](DropEvent &e)
+  { openDropped(state, e); };
   // Double-click the canvas: back to fit-to-window.
   canvas.onDoubleClick = [&state](PointerEvent &)
   { state.needFit = true; fitToView(state); };
@@ -953,6 +1031,9 @@ int main(int argc, char **argv)
 
   LiteUI ui("Image Viewer", 1000, 700);
   ui.setRoot(root);
+  // Anywhere else in the window (toolbars): same result, no highlight.
+  ui.setFileDropHandler([&state](DropEvent &e)
+                        { openDropped(state, e); });
 
   // Keyboard: app-global shortcuts (no focusable view is needed).
   {

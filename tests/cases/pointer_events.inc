@@ -180,7 +180,7 @@ TEST_CASE("pointer: moves bubble from the capture target to its ancestors",
   g.root.children[0].onPointerMove = [&](PointerEvent &) { g.note("A.move"); };
   g.attach();
   ptr::press(g, ptr::centerOf(g.root.children[0]));
-  g.r.move(ptr::ev({290, 290}));
+  g.r.move(ptr::ev({290.f, 290.f}));
   CHECK(g.log == std::vector<std::string>{"A.move", "root.move"});
 }
 
@@ -968,7 +968,7 @@ TEST_CASE("pen: hovering fires enter/leave like a mouse", "[pointer][pen]") {
   g.attach();
   bool needPoll = false;
   g.r.hover(ptr::pen(ptr::centerOf(g.root.children[0])), &needPoll);
-  g.r.hover(ptr::pen({-100, -100}), &needPoll);
+  g.r.hover(ptr::pen({-100.f, -100.f}), &needPoll);
   CHECK(g.log == std::vector<std::string>{"A.in", "A.out"});
 }
 
@@ -1014,7 +1014,7 @@ TEST_CASE("coalesced: a move without a batch still has one sample (itself)",
     x = n ? e.coalesced[0].x : -1;
   };
   g.attach();
-  g.r.move(ptr::ev({30, 40}));
+  g.r.move(ptr::ev({30.f, 40.f}));
   CHECK(n == 1);
   CHECK(x == approx(30));
 }

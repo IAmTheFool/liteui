@@ -95,6 +95,7 @@ if(WIN32)
         dwrite
         windowscodecs
         ole32
+        shell32     # DragAcceptFiles / DragQueryFileW (file-drop fallback)
     )
 else()
     find_package(PkgConfig REQUIRED)

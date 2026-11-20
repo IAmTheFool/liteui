@@ -34,11 +34,12 @@ liteui_add_test(core
     LITEUI
     THREADS)                                 # canvas_damage / canvas_texture / clipboard thread tests
 
-# cases/clipboard_wayland.inc tests the native Wayland clipboard against a small
-# fake compositor built on libwayland-server (shipped with libwayland-dev).
+# cases/clipboard_wayland.inc (native Wayland clipboard) and
+# cases/file_drop_wayland.inc (native Wayland drag-and-drop in) test against a
+# small fake compositor built on libwayland-server (shipped with libwayland-dev).
 # liteui_add_test has no hook for extra libraries or defines, so they are added
 # to the target it created. Without libwayland-server those cases are simply
-# compiled out (the file is empty) and everything else still builds and runs.
+# compiled out (the files are empty) and everything else still builds and runs.
 if(NOT WIN32)
     pkg_check_modules(WAYLAND_SERVER IMPORTED_TARGET wayland-server)
     if(WAYLAND_SERVER_FOUND)
