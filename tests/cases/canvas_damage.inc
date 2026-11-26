@@ -1,4 +1,4 @@
-// Tests for retained-canvas partial redraw: the rounding/planning helpers
+// Tests for canvas partial redraw: the rounding/planning helpers
 // (liteui_canvas_damage) and the thread-safe CanvasDamage accumulator. No GPU
 // or window. The GL clear/scissor/resolve itself is covered by
 // canvas_gl_partial_check.cpp (hardware).
@@ -36,14 +36,14 @@ TEST_CASE("canvas damage: toDevice rounds outward and clamps",
 
 TEST_CASE("canvas damage: plan chooses full vs partial", "[canvas][damage]") {
   using namespace liteui_canvas_damage;
-  REQUIRE(plan(false, false, {1, 1, 2, 2}, 1, 100, 100).full); // not retained
-  REQUIRE(plan(true, true, {1, 1, 2, 2}, 1, 100, 100).full);   // full asked
-  REQUIRE(plan(true, false, {}, 1, 100, 100).full);            // no rect: safe
-  REQUIRE(plan(true, false, {0, 0, 100, 100}, 1, 100, 100).full);
-  REQUIRE(plan(true, false, {-5, -5, 200, 200}, 1, 100, 100).full);
-  auto off = plan(true, false, {150, 150, 5, 5}, 1, 100, 100);
+  REQUIRE(plan(true, {1, 1, 2, 2}, 1, 100, 100).full); // full asked
+  REQUIRE(plan(false, {}, 1, 100, 100).full); // no rect: safe
+  REQUIRE(plan(false, {0, 0, 100, 100}, 1, 100, 100).full);
+  REQUIRE(plan(false, DirtyRect::everything(), 1, 100, 100).full);
+  REQUIRE(plan(false, {-5, -5, 200, 200}, 1, 100, 100).full);
+  auto off = plan(false, {150, 150, 5, 5}, 1, 100, 100);
   REQUIRE((off.nothing && !off.full));
-  auto p = plan(true, false, {10.5f, 10.5f, 4, 4}, 2.0f, 200, 200);
+  auto p = plan(false, {10.5f, 10.5f, 4, 4}, 2.0f, 200, 200);
   REQUIRE(!p.full);
   REQUIRE((p.dev.x0 == 21 && p.dev.x1 == 29 && p.dev.y0 == 21 && p.dev.y1 == 29));
   REQUIRE((p.logical.x == 10.5f && p.logical.w == 4.0f));
@@ -65,18 +65,20 @@ TEST_CASE("canvas damage: CanvasDamage accumulates and drains",
   REQUIRE(!c.take().any);
   c.invalidate(10, 10, -5, -5); // negative size normalised
   auto p = c.take();
-  REQUIRE((p.any && !p.full && p.rect.x == 5 && p.rect.w == 5));
+  REQUIRE((p.any && p.rect.x == 5 && p.rect.w == 5));
   c.invalidate(0, 0, 2, 2);
   c.invalidate(8, 8, 2, 2);
   p = c.take();
   REQUIRE((p.rect.w == 10 && p.rect.h == 10)); // bounding box
   REQUIRE(!c.take().any);                       // take() clears
-  c.invalidate(NAN, 0, 1, 1);                   // non-finite => full
+  c.invalidate(NAN, 0, 1, 1);                   // non-finite => whole canvas
   p = c.take();
-  REQUIRE((p.any && p.full));
-  c.invalidateAll();
-  c.invalidate(1, 1, 1, 1);
-  REQUIRE(c.take().full);
+  REQUIRE((p.any && p.rect.x == 0 && p.rect.y == 0));
+  REQUIRE((p.rect.w >= 1e9f && p.rect.h >= 1e9f));
+  c.invalidate(DirtyRect::everything());
+  c.invalidate(1, 1, 1, 1); // absorbed by the whole-canvas box
+  p = c.take();
+  REQUIRE((p.rect.x == 0 && p.rect.w >= 1e9f));
 }
 
 TEST_CASE("canvas damage: notify and threads", "[canvas][damage][threads]") {
@@ -84,7 +86,7 @@ TEST_CASE("canvas damage: notify and threads", "[canvas][damage][threads]") {
   std::atomic<int> notes{0};
   c.setNotify([&] { ++notes; });
   c.invalidate(1, 1, 1, 1);
-  c.invalidateAll();
+  c.invalidate(DirtyRect::everything());
   c.invalidate(0, 0, 0, 0); // ignored: no notify
   REQUIRE(notes == 2);
   c.take();
@@ -98,7 +100,7 @@ TEST_CASE("canvas damage: notify and threads", "[canvas][damage][threads]") {
   for (auto &t : ts)
     t.join();
   auto p = c.take();
-  REQUIRE((p.any && !p.full));
+  REQUIRE(p.any);
   REQUIRE((p.rect.x == 0 && p.rect.w == 75 && p.rect.h == 54));
   REQUIRE(notes == 8000);
 }

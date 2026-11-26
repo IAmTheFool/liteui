@@ -424,7 +424,7 @@ inline const T &resolveDynamic(const Dynamic<T> &field, const T &cache) {
 }
 
 // For a Dynamic<> field built from a source that's inherently never a
-// callback (Canvas::setFont's plain params, a TextInput's/TooltipStyle's
+// callback (Canvas::setFont's plain params, a TextInput's
 // plain fields, ...) — no polled cache exists or is needed for these, so
 // there's nothing to fall back to. Throws (via std::get) if that
 // assumption is ever violated, rather than silently resolving to a wrong
@@ -730,6 +730,10 @@ struct DirtyRect {
   bool empty() const { return !(w > 0.0f) || !(h > 0.0f); }
   float right() const { return x + w; }
   float bottom() const { return y + h; }
+  // A rectangle larger than any canvas: invalidating it repaints the whole
+  // canvas (it is clamped to the surface, and a box that covers the surface
+  // is drawn as a full repaint).
+  static constexpr DirtyRect everything() { return {0.0f, 0.0f, 1e9f, 1e9f}; }
   // Smallest rectangle containing both; an empty operand is ignored.
   DirtyRect united(const DirtyRect &o) const {
     if (empty())
@@ -743,14 +747,14 @@ struct DirtyRect {
   }
 };
 
-// The damage an app reports for a retained Canvas (Canvas::retained). THREAD
-// SAFE: invalidate()/invalidateAll() may be called from any thread, e.g. a
+// The damage an app reports for a Canvas (Canvas::damage). THREAD
+// SAFE: invalidate() may be called from any thread, e.g. a
 // worker that has just finished a tile. The UI thread drains the accumulated
 // damage on its next poll and repaints only that region.
 //
 //   auto damage = std::make_shared<CanvasDamage>();
 //   damage->setNotify([&ui] { ui.wake(); });   // optional; see below
-//   Canvas c; c.retained = true; c.damage = damage;
+//   Canvas c; c.damage = damage;
 //   ...
 //   // worker thread, tile at (x, y, w, h) in canvas logical units finished:
 //   damage->invalidate(x, y, w, h);            // also wakes the UI loop
@@ -764,12 +768,13 @@ struct DirtyRect {
 class CanvasDamage {
 public:
   // Marks (x, y, w, h) stale. A rectangle with no area is ignored; one with a
-  // non-finite coordinate is treated as invalidateAll() (a missed repaint is
-  // worse than an extra one). Negative sizes are normalised.
+  // non-finite coordinate is treated as covering the whole canvas (a missed
+  // repaint is worse than an extra one). Negative sizes are normalised. To
+  // repaint everything, invalidate(DirtyRect::everything()).
   void invalidate(float x, float y, float w, float h) {
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) ||
         !std::isfinite(h)) {
-      invalidateAll();
+      invalidate(DirtyRect::everything());
       return;
     }
     if (w < 0) {
@@ -794,18 +799,6 @@ public:
       n();
   }
   void invalidate(const DirtyRect &r) { invalidate(r.x, r.y, r.w, r.h); }
-  // The whole canvas is stale (same effect as View::requestCanvasRedraw()).
-  void invalidateAll() {
-    std::function<void()> n;
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      full_ = true;
-      any_ = true;
-      n = notify_;
-    }
-    if (n)
-      n();
-  }
   // Called after every invalidation, on the invalidating thread. Set it before
   // starting the threads that invalidate (it is locked, but a callback that
   // captures a LiteUI must not outlive it: join the workers first).
@@ -815,22 +808,21 @@ public:
   }
 
   struct Pending {
-    bool any = false;  // something was reported since the last take()
-    bool full = false; // the whole canvas is stale (rect is then unused)
-    DirtyRect rect;    // bounding box of the reported rectangles
+    bool any = false; // something was reported since the last take()
+    DirtyRect rect;   // bounding box of the reported rectangles
   };
   // Library-internal: returns and clears the accumulated damage.
   Pending take() {
     std::lock_guard<std::mutex> lk(m_);
-    Pending p{any_, full_, rect_};
-    any_ = full_ = false;
+    Pending p{any_, rect_};
+    any_ = false;
     rect_ = DirtyRect{};
     return p;
   }
 
 private:
   std::mutex m_;
-  bool any_ = false, full_ = false;
+  bool any_ = false;
   DirtyRect rect_;
   std::function<void()> notify_;
 };
@@ -1773,14 +1765,13 @@ struct Plan {
   DirtyRect logical;     // `dev` back in logical units (what ctx.damage() says)
 };
 
-// Decides between a full and a partial redraw. A non-retained canvas, a full
-// request (first build, resize, device loss, requestCanvasRedraw(),
-// canvasDirtySource, invalidateAll()), or damage that covers the whole
-// surface all give a full redraw.
-inline Plan plan(bool retained, bool fullRequested, const DirtyRect &pending,
-                 float scale, int pw, int ph) noexcept {
+// Decides between a full and a partial redraw. A full request (first build,
+// resize, device or context loss) or damage that covers the whole surface
+// gives a full redraw; anything else repaints just the damaged box.
+inline Plan plan(bool fullRequested, const DirtyRect &pending, float scale,
+                 int pw, int ph) noexcept {
   Plan p;
-  if (!retained || fullRequested || pending.empty())
+  if (fullRequested || pending.empty())
     return p; // full
   p.dev = toDevice(pending, scale, pw, ph);
   if (p.dev.empty()) {
@@ -1828,7 +1819,7 @@ enum class TextureAlpha : uint8_t {
 //   ctx.drawTexture(tex, sx, sy, sw, sh, dx, dy, dw, dh);
 //
 // update() does NOT redraw anything by itself: a canvas only repaints when it
-// is told to (Canvas::damage / canvasDirtySource), exactly as with any other
+// is told to (Canvas::damage), exactly as with any other
 // drawing.
 //
 // Format: only PixelFormat::RGBA8_UNORM is supported for now (valid() is false
@@ -2326,11 +2317,10 @@ public:
   void drawTexture(const std::shared_ptr<CanvasTexture> &tex, float sx, float sy,
                    float sw, float sh, float dx, float dy, float dw, float dh);
 
-  // ---- Retained-canvas partial redraw (see Canvas::retained) ----
+  // ---- Partial redraw (see Canvas::damage) ----
   // True when this onPaint call must repaint the WHOLE canvas: the first
-  // paint, a resize, a device/context loss, requestCanvasRedraw(), a
-  // canvasDirtySource hit, CanvasDamage::invalidateAll(), or any canvas that
-  // is not retained. The surface has been cleared to transparent.
+  // paint, a resize, a device/context loss, or reported damage that covers
+  // the whole canvas. The surface has been cleared to transparent.
   bool isFullRepaint() const { return fullRepaint_; }
   // The region this call must repaint, in logical units. For a partial
   // repaint it is already cleared to transparent, drawing is clipped to it,
@@ -2363,14 +2353,15 @@ private:
 // flattened into a View with isCanvas=true (see View::toView(Canvas)).
 // `onPaint` is invoked (with a CanvasContext bound to this node's own
 // backing surface) whenever the canvas needs to be redrawn: once after
-// the first layout, and again any time `canvasDirtySource` reports true
-// (see its own comment on View — that's the mechanism an interactive
+// the first layout, a resize, and again any time damage is reported through
+// `damage` (CanvasDamage::invalidate — that's the mechanism an interactive
 // canvas, like a paint program responding to pen strokes via `onPointerMove`,
-// uses to request the next redraw, since those handlers have no direct
-// reference back into the tree) — plain drawing calls made once are
-// *not* re-issued on every frame the way a real-time game loop's draw
-// callback would be; treat onPaint as "rebuild my picture from whatever
-// app state it closes over" rather than "run every frame".
+// uses to request the next redraw; a handler just captures the shared_ptr)
+// — plain drawing calls made once are *not* re-issued on every frame the
+// way a real-time game loop's draw callback would be. The canvas keeps its
+// pixels between onPaint calls and each call repaints only the invalidated
+// region (CanvasContext::damage()); treat onPaint as "redraw this region
+// from whatever app state it closes over" rather than "run every frame".
 struct Canvas {
   Style style;
   std::function<void(CanvasContext &)> onPaint;
@@ -2392,21 +2383,16 @@ struct Canvas {
   DropHandler onDragEnter;
   DropHandler onDragOver;
   DropHandler onDragLeave;
-  std::function<bool()> canvasDirtySource;
-  // Retained mode (partial redraw). Off by default: every redraw clears the
-  // whole canvas and onPaint repaints all of it, exactly as before.
-  // With `retained` on, the canvas keeps its pixels between onPaint calls.
-  // Report what changed through `damage` (CanvasDamage::invalidate, callable
-  // from any thread): the next onPaint then runs with ctx.damage() set to that
-  // region, only that region is cleared and drawn into (everything else is
-  // clipped away and untouched), and on the GPU backends only that region is
-  // resolved/uploaded. Anything that destroys the pixels (first paint, resize,
-  // device loss, requestCanvasRedraw(), canvasDirtySource, invalidateAll())
-  // turns the next onPaint into a full repaint with ctx.isFullRepaint() true;
-  // an onPaint that honours damage() must therefore also handle that case.
-  // `damage` without `retained` just acts as another dirty source (always a
-  // full redraw).
-  bool retained = false;
+  // The canvas keeps its pixels between onPaint calls. Report what changed
+  // through `damage` (CanvasDamage::invalidate, callable from any thread): the
+  // next onPaint then runs with ctx.damage() set to that region, only that
+  // region is cleared and drawn into (everything else is clipped away and
+  // untouched), and on the GPU backends only that region is resolved/uploaded.
+  // A canvas without `damage` is painted once (and again after a resize).
+  // Anything that destroys the pixels (first paint, resize, device loss) turns
+  // the next onPaint into a full repaint with ctx.isFullRepaint() true, so an
+  // onPaint must handle that case too. To repaint everything, invalidate
+  // DirtyRect::everything().
   std::shared_ptr<CanvasDamage> damage;
   bool focusable = false;
   std::function<void()> onFocus;
@@ -2424,7 +2410,9 @@ struct Canvas {
 // never flips again after the first paint.
 struct ImageState {
   std::shared_ptr<CanvasImage> pixels;
-  bool dirty = true; // starts true so the very first paint always runs
+  // The canvas's damage handle (the very first paint is always a full one).
+  std::shared_ptr<CanvasDamage> damage = std::make_shared<CanvasDamage>();
+  void markDirty() { damage->invalidate(DirtyRect::everything()); }
   // High-precision source (Image::hdrSource): the buffer last seen, and the
   // RGBA8 display copy in `pixels` derived from it. Replaced display copies
   // stay in `retired` until the next paint has drawn the new one, so a new
@@ -2496,7 +2484,9 @@ struct TextInputState {
   size_t cursor = 0; // byte offset; ASCII-only, same limitation as before
   bool focused = false;
   bool blinkOn = true;
-  bool dirty = true;
+  // The canvas's damage handle (the very first paint is always a full one).
+  std::shared_ptr<CanvasDamage> damage = std::make_shared<CanvasDamage>();
+  void markDirty() { damage->invalidate(DirtyRect::everything()); }
   int blinkTimerHandle = -1;
   float scrollOffset = 0.0f;
   bool requestFocus = false;
@@ -2639,10 +2629,6 @@ public:
   // — a plain container/box should never steal focus from whatever the
   // user was actually typing into.
   bool focusable = false;
-  // Tooltip text shown after hovering this view for LiteUI's configured
-  // delay. Empty (default) = no tooltip. Plain field, not Dynamic<> —
-  // looked up once when the tooltip shows, not re-evaluated every frame.
-  std::string tooltip;
 
   // Fired when this view gains/loses keyboard focus. Typical use: a text
   // input shows/hides its caret here.
@@ -2665,20 +2651,11 @@ public:
   // dead keys in a way a raw Key never captures.
   std::function<void(uint32_t codepoint)> onTextInput;
 
-  // isCanvas nodes only. Polled the same way as the sources above; return
-  // true once to make the next paint/render pass re-invoke onPaint (see
-  // Canvas's own comment), then go back to returning false until there's
-  // something new to draw. This is the mechanism to use from inside a
-  // canvas's own onPointerDown/onPointerMove/onClick handlers — those are plain
-  // callbacks with no reference back into the tree, so they can't call
-  // View::requestCanvasRedraw() on themselves directly; stashing a dirty
-  // flag in app state and reporting+clearing it here is the workaround.
-  // A typical pattern: `bool dirty = false;` in the app's own state,
-  // set true wherever a stroke/shape is added, and
-  // `canvasDirtySource = [&]{ bool d = dirty; dirty = false; return d; };`
-  std::function<bool()> canvasDirtySource;
-  // See Canvas::retained / Canvas::damage. isCanvas nodes only.
-  bool canvasRetained = false;
+  // isCanvas nodes only. Library-internal hook for the built-in Image node:
+  // polled every dispatch cycle, before canvasDamage is drained, so it can
+  // pick up a new dynamic source and report it through canvasDamage.
+  std::function<void()> canvasPoll;
+  // See Canvas::damage. isCanvas nodes only.
   std::shared_ptr<CanvasDamage> canvasDamage;
 
   Dynamic<bool> disabled = false;
@@ -2707,11 +2684,11 @@ public:
     // Only meaningful for isCanvas nodes. Starts true so the very first
     // paint/render pass always invokes onPaint at least once; cleared by
     // whichever backend (re)builds the cached backing surface below, and
-    // set again only by View::requestCanvasRedraw() or a resize (see
+    // set again only by reported damage or a resize (see
     // ensureCanvasTargetGl/ensureCanvasTarget) — plain repaints (e.g. from
     // an unrelated sibling's hover change) do NOT re-invoke onPaint.
     mutable bool canvasNeedsRedraw = true;
-    // Retained canvases: what the pending redraw has to repaint. `Full`
+    // What the pending redraw has to repaint. `Full`
     // starts true and is set again by anything that destroys the pixels;
     // otherwise canvasDamageRect is the bounding box of the invalidated
     // rectangles drained since the last repaint (logical units). Both are
@@ -2841,18 +2818,6 @@ public:
   void addChild(Image img) { children.push_back(toView(std::move(img))); }
   void addChild(Svg s) { children.push_back(toView(std::move(s))); }
 
-  // Marks this canvas node's cached backing surface stale, so the next
-  // paint/render pass re-invokes onPaint instead of reusing whatever it
-  // last drew. A no-op (harmlessly) on a non-canvas node. Since the
-  // renderer walks a `const View&`, this is the app's own handle to a
-  // View it's still holding a mutable reference to (e.g. right after
-  // addChild, or via onLayout capturing a pointer/index) — there's no way
-  // to reach into an already-submitted tree from outside.
-  void requestCanvasRedraw() {
-    computed.canvasNeedsRedraw = true;
-    computed.canvasFullRepaint = true; // whole canvas, even if retained
-  }
-
   // Whether this view clips/scrolls on the given axis.
   bool scrollsX() const { return style.overflowX != Overflow::Visible; }
   bool scrollsY() const { return style.overflowY != Overflow::Visible; }
@@ -2881,15 +2846,6 @@ private:
   static View toView(TextInput ti);
   static View toView(Image img);
   static View toView(Svg s);
-};
-
-struct TooltipStyle {
-  int delayMs = 500;
-  Color background{50, 50, 50, 230};
-  Color textColor{255, 255, 255, 255};
-  float padding = 6.0f;
-  float fontSize = 13.0f;
-  std::string fontFamily; // empty = platform default
 };
 
 // The application window. Declared here as a thin handle; the platform
@@ -2925,7 +2881,6 @@ public:
   // returned handle. Each tick polls Dynamic<> sources and repaints.
   int addInterval(int ms, std::function<void()> fn);
   void removeInterval(int handle);
-  void setTooltipStyle(TooltipStyle s);
   void setWindowBackground(Color c);
   // Window-wide default scrollbar colors (a view's own Style colors override).
   void setScrollbarColors(Color track, Color thumb);
@@ -8712,8 +8667,6 @@ View View::toView(Canvas c) {
   v.onDragEnter = std::move(c.onDragEnter);
   v.onDragOver = std::move(c.onDragOver);
   v.onDragLeave = std::move(c.onDragLeave);
-  v.canvasDirtySource = std::move(c.canvasDirtySource);
-  v.canvasRetained = c.retained;
   v.canvasDamage = std::move(c.damage);
   v.focusable = c.focusable;
   v.onFocus = std::move(c.onFocus);
@@ -15365,43 +15318,6 @@ private:
     return liteui_pointer::containsPoint(v, px, py);
   }
 
-  static View *hitTestTooltipFlow(View &v, float x, float y, ClipRect clip) {
-    if (resolveDynamic(v.style.visibility, v.computed.resolvedVisibility) ==
-        Visibility::Hidden)
-      return nullptr;
-    if (!clip.contains(x, y) || !containsPoint(v, x, y))
-      return nullptr;
-    ClipRect childClip = (v.scrollsX() || v.scrollsY())
-                             ? clip.intersect(v.computed.x, v.computed.y,
-                                              v.computed.w, v.computed.h)
-                             : clip;
-    for (auto it = v.children.rbegin(); it != v.children.rend(); ++it) {
-      if (it->style.position == Position::Absolute ||
-          resolveDynamic(it->style.display, it->computed.resolvedDisplay) ==
-              Display::None)
-        continue;
-      if (View *hit = hitTestTooltipFlow(*it, x, y, childClip))
-        return hit;
-    }
-    if (!v.tooltip.empty() &&
-        !resolveDynamic(v.disabled, v.computed.resolvedDisabled))
-      return &v;
-    return nullptr;
-  }
-
-  View *hitTestTooltip(float x, float y) {
-    if (!hasRoot_)
-      return nullptr;
-    std::vector<AbsoluteEntry> absolutes;
-    collectAbsolutes(root_, absolutes);
-    sortAbsolutes(absolutes);
-    for (auto it = absolutes.rbegin(); it != absolutes.rend(); ++it)
-      if (View *hit =
-              hitTestTooltipFlow(const_cast<View &>(*it->view), x, y, it->clip))
-        return hit;
-    return hitTestTooltipFlow(root_, x, y, ClipRect{});
-  }
-
   // Polls every dynamic source in the subtree rooted at v, writing
   // changes back in place and marking the affected node dirty. Called
   // after a click is dispatched, since the handler may have mutated the
@@ -15632,23 +15548,16 @@ private:
         changed = true;
       }
     }
-    if (v.canvasDirtySource && v.canvasDirtySource()) {
-      v.computed.canvasNeedsRedraw = true;
-      v.computed.canvasFullRepaint = true; // a bool source can't say where
-      v.computed.dirty = true;
-      changed = true;
-    }
+    if (v.canvasPoll)
+      v.canvasPoll(); // may report damage; drained just below
     if (v.canvasDamage) {
       // Drain what worker threads reported since the last poll. Merged into
       // the node (not the handle) so it survives until a repaint actually
       // runs, e.g. when the frame is skipped because the buffer is busy.
       const CanvasDamage::Pending p = v.canvasDamage->take();
       if (p.any) {
-        if (p.full || !v.canvasRetained)
-          v.computed.canvasFullRepaint = true;
-        else
-          v.computed.canvasDamageRect =
-              v.computed.canvasDamageRect.united(p.rect);
+        v.computed.canvasDamageRect =
+            v.computed.canvasDamageRect.united(p.rect);
         v.computed.canvasNeedsRedraw = true;
         v.computed.dirty = true;
         changed = true;
@@ -15724,7 +15633,6 @@ private:
     dropDisp_.forget();
     scrollDrag_ = {};
     focusedView_ = nullptr;
-    hideTooltip(); // clears tooltipTarget_ and cancels its timer
   }
 
   // The one place that polls dynamic sources and applies the result.
@@ -15770,73 +15678,9 @@ private:
   View *focusedView_ = nullptr;
   View *pendingFocusRequest_ = nullptr;
 
-  TooltipStyle tooltipStyle_;
-  View *tooltipTarget_ = nullptr;
-  int tooltipTimerHandle_ = -1;
-  bool tooltipVisible_ = false;
-  float tooltipPointerX_ = 0, tooltipPointerY_ = 0;
-
   Color windowBg_{255, 255, 255, 255};
   Color scrollTrack_{0xE0, 0xE0, 0xE0, 255};
   Color scrollThumb_{0x90, 0x90, 0x90, 255};
-
-  void requestTooltipRepaint() {
-#if defined(_WIN32)
-    if (hwnd_)
-      InvalidateRect(hwnd_, nullptr, FALSE);
-#else
-    if (eglReady_)
-      redraw();
-#endif
-  }
-
-  void showTooltip() {
-    tooltipVisible_ = true;
-    requestTooltipRepaint();
-  }
-
-  void hideTooltip() {
-    if (tooltipTimerHandle_ >= 0) {
-      removeInterval(tooltipTimerHandle_);
-      tooltipTimerHandle_ = -1;
-    }
-    bool wasVisible = tooltipVisible_;
-    tooltipVisible_ = false;
-    tooltipTarget_ = nullptr;
-    if (wasVisible)
-      requestTooltipRepaint();
-  }
-
-  // Call on every pointer-motion event.
-  void updateTooltipHover(float x, float y) {
-    View *hit = hitTestTooltip(x, y);
-    tooltipPointerX_ = x;
-    tooltipPointerY_ = y;
-    if (hit == tooltipTarget_)
-      return; // same target (or same "nothing") — leave timer/visibility alone
-
-    if (tooltipTimerHandle_ >= 0) {
-      removeInterval(tooltipTimerHandle_);
-      tooltipTimerHandle_ = -1;
-    }
-    bool wasVisible = tooltipVisible_;
-    tooltipVisible_ = false;
-    tooltipTarget_ = hit;
-    if (wasVisible)
-      requestTooltipRepaint();
-
-    if (hit) {
-      tooltipTimerHandle_ = addInterval(tooltipStyle_.delayMs, [this] {
-        showTooltip();
-        // addInterval's timers repeat — cancel the underlying OS timer
-        // now that it's done its one job, or it'd keep firing.
-        int h = tooltipTimerHandle_;
-        tooltipTimerHandle_ = -1;
-        if (h >= 0)
-          removeInterval(h);
-      });
-    }
-  }
 
   // Modifier state, kept current by whichever platform backend is
   // handling raw key events (Win32's GetKeyState polling on each message,
@@ -15871,7 +15715,6 @@ public:
   // can freely flip plain bools/state and have it show up on screen.
   int addInterval(int ms, std::function<void()> fn);
   void removeInterval(int handle);
-  void setTooltipStyle(TooltipStyle s) { tooltipStyle_ = std::move(s); }
   void setWindowBackground(Color c) {
     windowBg_ = c;
     requestRepaint();
@@ -15909,7 +15752,7 @@ public:
   // Installs the handler wake() triggers; runs on the UI thread, once per
   // coalesced wake, before the repaint. Optional — with none installed a wake
   // still polls the Dynamic<> sources and repaints, which is all a worker
-  // needs when the UI reads its results from a canvasDirtySource. Set it from
+  // needs when the UI reads its results from a CanvasDamage. Set it from
   // the UI thread before the first wake().
   void setWakeHandler(std::function<void()> fn) {
     wakeHandler_ = std::move(fn);
@@ -16838,7 +16681,6 @@ private:
         self->renderTarget_->BeginDraw();
         self->renderTarget_->Clear(toD2DColor(self->windowBg_));
         self->paintRoot(self->renderTarget_);
-        self->paintTooltip(self->renderTarget_);
         HRESULT hr = self->renderTarget_->EndDraw();
         // Hand the finished frame to the display (vsync'd). Skipped when
         // drawing already failed or a canvas reported device loss.
@@ -16876,7 +16718,6 @@ private:
       // leaves the window before the button is released.
     case WM_LBUTTONDOWN: {
       if (self) {
-        self->hideTooltip();
         self->moveRequested_ =
             false; // only honor a request made during THIS press
         float x = self->mouseX(lp);
@@ -16952,7 +16793,6 @@ private:
         bool needPoll = false;
         if (self->hasRoot_ && self->updateHoverAt(x, y, &needPoll))
           changed = true;
-        self->updateTooltipHover(x, y);
         if (needPoll) {
           self->pollAndRelayout(); // a hover handler changed app state
           changed = true;
@@ -16984,7 +16824,6 @@ private:
     // press/click path.
     case WM_MBUTTONDOWN: {
       if (self) {
-        self->hideTooltip();
         float x = self->mouseX(lp);
         float y = self->mouseY(lp);
         self->beginPress(x, y, MouseButton::Middle);
@@ -17008,7 +16847,6 @@ private:
 
     case WM_RBUTTONDOWN: {
       if (self) {
-        self->hideTooltip();
         float x = self->mouseX(lp);
         float y = self->mouseY(lp);
         self->beginPress(x, y, MouseButton::Right);
@@ -17138,7 +16976,6 @@ private:
     case WM_KILLFOCUS:
       if (self) {
         self->setFocus(nullptr);
-        self->hideTooltip();
       }
       return 0;
 
@@ -17181,7 +17018,6 @@ private:
         }
         self->relayout();
         self->pollAndRelayout();
-        self->hideTooltip();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
@@ -17218,7 +17054,6 @@ private:
         SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
                      r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         self->applyScale();
-        self->hideTooltip();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
@@ -17281,38 +17116,6 @@ private:
       for (const auto &e : absolutes)
         paintView(rt, *e.view, e.clip);
     }
-  }
-
-  void paintTooltip(ID2D1RenderTarget *rt) {
-    if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
-      return;
-    TextStyle ts;
-    ts.fontSize = tooltipStyle_.fontSize;
-    ts.fontFamily = tooltipStyle_.fontFamily;
-    ts.wrap = TextWrap::NoWrap;
-    liteui_text::Measurement m = liteui_text::measure(
-        tooltipTarget_->tooltip, ts, resolveStatic(ts.fontSize),
-        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle), -1);
-    float pad = tooltipStyle_.padding;
-    float boxW = m.width + pad * 2, boxH = m.height + pad * 2;
-    float maxX = std::max(2.0f, width_ - boxW - 2.0f);
-    float maxY = std::max(2.0f, height_ - boxH - 2.0f);
-    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, maxX);
-    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f, maxY);
-
-    d2dFillRect(rt, bx, by, boxW, boxH, tooltipStyle_.background);
-    IDWriteTextLayout *layout = liteui_text::makeLayout(
-        tooltipTarget_->tooltip, ts, resolveStatic(ts.fontSize),
-        resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle), m.width + 4,
-        m.height + 4);
-    ID2D1SolidColorBrush *brush = nullptr;
-    rt->CreateSolidColorBrush(toD2DColor(tooltipStyle_.textColor), &brush);
-    if (brush) {
-      rt->SetTransform(D2D1::Matrix3x2F::Identity());
-      rt->DrawTextLayout(D2D1::Point2F(bx + pad, by + pad), layout, brush);
-      brush->Release();
-    }
-    layout->Release();
   }
 
   // Draws v's vertical/horizontal scrollbar (whichever are currently
@@ -17413,9 +17216,8 @@ private:
   // to v's inner (padding-excluded) content box, living on the same
   // Direct3D 11 device as the window — whenever that size has changed
   // since it was last built, then v.onPaint is (re)invoked into it
-  // whenever the size changed OR the app requested a redraw via
-  // View::requestCanvasRedraw() (canvasNeedsRedraw starts true, so this
-  // always happens at least once). A plain repaint with neither condition
+  // whenever the size changed OR damage was reported through Canvas::damage
+  // (canvasNeedsRedraw starts true, so this always happens at least once). A plain repaint with neither condition
   // true is a no-op: the previous frame's texture is simply reused.
   void ensureCanvasTarget(const View &v) {
     if (!canvasDc_)
@@ -17458,13 +17260,12 @@ private:
     if (!v.computed.canvasBitmap)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      // Retained canvas with damage: repaint only that box (see
-      // liteui_canvas_damage::plan); anything else repaints everything.
+      // Repaint only the damaged box (see liteui_canvas_damage::plan); a
+      // full request (first paint, resize, device loss) repaints everything.
       const D2D1_SIZE_U bmpPx = v.computed.canvasBitmap->GetPixelSize();
       const auto plan = liteui_canvas_damage::plan(
-          v.canvasRetained, v.computed.canvasFullRepaint,
-          v.computed.canvasDamageRect, scale_, static_cast<int>(bmpPx.width),
-          static_cast<int>(bmpPx.height));
+          v.computed.canvasFullRepaint, v.computed.canvasDamageRect, scale_,
+          static_cast<int>(bmpPx.width), static_cast<int>(bmpPx.height));
       if (!plan.nothing) {
         canvasDc_->SetTarget(v.computed.canvasBitmap);
         canvasDc_->SetDpi(dpi(), dpi());
@@ -17757,7 +17558,7 @@ private:
 
   // Set by pointerMotion; cleared by flushPendingMotion. Motion events only
   // record the newest position — the real work (drag handlers, hover,
-  // tooltip, cursor, redraw) runs once per event-loop iteration instead of
+  // cursor, redraw) runs once per event-loop iteration instead of
   // once per event. See flushPendingMotion for why.
   bool motionPending_ = false;
 
@@ -17903,10 +17704,6 @@ private:
     makeContextCurrent();
     if (hasRoot_)
       root_.freeTextResources();
-    if (tooltipTextTexture_) {
-      glDeleteTextures(1, &tooltipTextTexture_);
-      tooltipTextTexture_ = 0;
-    }
   }
 
   // Cursor images come from an XCursor theme loaded at a pixel size; on a
@@ -18674,7 +18471,7 @@ private:
 
   // Applies the most recent pointer position recorded by pointerMotion, if
   // any: advances scrollbar drags / content pans and onPointerMove handlers,
-  // refreshes hover and the tooltip timer, redraws once if anything
+  // refreshes hover, redraws once if anything
   // changed, and updates the cursor image. Called once per event-loop
   // iteration (see run()), and first thing in any handler that acts on the
   // pointer position (button, axis, leave) so a press/release never sees a
@@ -18701,10 +18498,6 @@ private:
     if (hasRoot_ && updateHoverAt(x, y, &needPoll))
       changed = true;
 
-    // arms/cancels/re-targets the tooltip timer. Handles its own
-    // repaint scheduling internally (via requestTooltipRepaint), so it
-    // doesn't need to participate in the `changed` flag above.
-    updateTooltipHover(x, y);
     if (needPoll) {
       pollAndRelayout(); // a hover handler changed app state
       changed = true;
@@ -18913,7 +18706,6 @@ private:
     self->wlClip_.setFocused(false);
     self->setFocus(nullptr);
     self->repeatKeycode_ = 0;
-    self->hideTooltip();
   }
 
   static void keyboardKey(void *data, wl_keyboard *, uint32_t serial, uint32_t,
@@ -19285,7 +19077,6 @@ private:
     relayout();
 
     pollAndRelayout();
-    hideTooltip();
     if (eglReady_)
       redraw();
   }
@@ -19392,7 +19183,7 @@ private:
     c.cachedImageMips = false;
     c.cachedImagePixels = nullptr; // the cached upload is gone
     c.canvasNeedsRedraw = true;    // contents were GPU-only: repaint them
-    c.canvasFullRepaint = true;    // ... all of them, even when retained
+    c.canvasFullRepaint = true;    // ... all of them
     c.canvasBuiltForWidth = c.canvasBuiltForHeight = -1.0f;
   }
 
@@ -19422,8 +19213,6 @@ private:
       forgetGlHandles(root_);
     rectProgram_ = flatProgram_ = texProgram_ = canvasProgram_ = 0;
     quadVbo_ = flatVbo_ = 0;
-    tooltipTextTexture_ = 0;
-    tooltipTextureBuiltFor_.clear();
     canvasGl_.abandon();
     try {
       createEglContext();
@@ -19627,99 +19416,6 @@ private:
                static_cast<float>(radius), {r, g, b}, clip);
   }
 
-  GLuint tooltipTextTexture_ = 0;
-  int tooltipTexW_ = 0, tooltipTexH_ = 0; // logical size (layout)
-  int tooltipPxW_ = 0, tooltipPxH_ = 0;   // texture size in device pixels
-  std::string tooltipTextureBuiltFor_;
-
-  void ensureTooltipTexture(const std::string &text) {
-    if (tooltipTextTexture_ && tooltipTextureBuiltFor_ == text)
-      return;
-    if (tooltipTextTexture_) {
-      glDeleteTextures(1, &tooltipTextTexture_);
-      tooltipTextTexture_ = 0;
-    }
-    TextStyle ts;
-    ts.fontSize = tooltipStyle_.fontSize;
-    ts.fontFamily = tooltipStyle_.fontFamily;
-    ts.wrap = TextWrap::NoWrap;
-    liteui_text::Measurement m = liteui_text::measure(
-        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
-        resolveStatic(ts.fontStyle), -1);
-    int w = std::max(1, (int)std::ceil(m.width)),
-        h = std::max(1, (int)std::ceil(m.height));
-    const int pw = deviceDim(w), ph = deviceDim(h);
-    cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
-    cairo_surface_set_device_scale(surf, scale_, scale_);
-    cairo_t *cr = cairo_create(surf);
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
-    cairo_paint(cr);
-    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-    cairo_set_source_rgba(cr, 1, 1, 1, 1);
-    PangoLayout *layout = liteui_text::makeLayout(
-        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
-        resolveStatic(ts.fontStyle), -1, cr);
-    pango_cairo_show_layout(cr, layout);
-    g_object_unref(layout);
-    cairo_surface_flush(surf);
-    unsigned char *data = cairo_image_surface_get_data(surf);
-    int stride = cairo_image_surface_get_stride(surf);
-    std::vector<unsigned char> alpha((size_t)pw * ph);
-    for (int row = 0; row < ph; ++row)
-      for (int col = 0; col < pw; ++col)
-        alpha[row * pw + col] = data[row * stride + col * 4 + 3];
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, pw, ph, 0, GL_ALPHA,
-                 GL_UNSIGNED_BYTE, alpha.data());
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    cairo_destroy(cr);
-    cairo_surface_destroy(surf);
-    tooltipTextTexture_ = tex;
-    tooltipTexW_ = w;
-    tooltipTexH_ = h;
-    tooltipPxW_ = pw;
-    tooltipPxH_ = ph;
-    tooltipTextureBuiltFor_ = text;
-  }
-
-  void paintTooltip() {
-    if (!tooltipVisible_ || !tooltipTarget_ || tooltipTarget_->tooltip.empty())
-      return;
-    ensureTooltipTexture(tooltipTarget_->tooltip);
-    float pad = tooltipStyle_.padding;
-    float boxW = tooltipTexW_ + pad * 2, boxH = tooltipTexH_ + pad * 2;
-    float maxX = std::max(2.0f, (float)width_ - boxW - 2.0f);
-    float maxY = std::max(2.0f, (float)height_ - boxH - 2.0f);
-    float bx = std::clamp(tooltipPointerX_ + 12.0f, 2.0f, maxX);
-    float by = std::clamp(tooltipPointerY_ + 18.0f, 2.0f, maxY);
-
-    drawRectGL(bx, by, boxW, boxH, 4.0f, tooltipStyle_.background, ClipRect{});
-
-    glUseProgram(texProgram_);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tooltipTextTexture_);
-    glUniform1i(texUTex_, 0);
-    glBindBuffer(GL_ARRAY_BUFFER, quadVbo_);
-    glEnableVertexAttribArray(texAPos_);
-    glVertexAttribPointer(texAPos_, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
-    glUniform2f(texUPos_, snapPx(bx + pad), snapPx(by + pad));
-    glUniform2f(texUSize_, tooltipPxW_ / scale_, tooltipPxH_ / scale_);
-    glUniform2f(texUScreen_, (float)width_, (float)height_);
-    Color c = tooltipStyle_.textColor;
-    glUniform4f(texUColor_, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f,
-                c.a / 255.0f);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-  }
-
   // Rasterizes v.text under v.textStyle into an alpha-only glyph-coverage
   // surface sized to v's final content box (via Pango/Cairo), uploads it
   // as a GL texture, and caches the result until v.computed.w changes —
@@ -19863,9 +19559,9 @@ private:
 
   // (Re)builds v's GPU target — an RGBA8 texture + FBO(s) sized to v's inner
   // (padding-excluded) content box — whenever that size changed, then
-  // re-invokes v.onPaint into it whenever the size changed OR the app
-  // requested a redraw via View::requestCanvasRedraw() (canvasNeedsRedraw
-  // starts true, so this always happens at least once). A plain repaint with
+  // re-invokes v.onPaint into it whenever the size changed OR damage was
+  // reported through Canvas::damage (canvasNeedsRedraw starts true, so this
+  // always happens at least once). A plain repaint with
   // neither condition true reuses the texture untouched: no CPU work, no
   // upload. Drawing happens between canvasGl_.begin()/end(), which save and
   // restore the window renderer's GL state around it.
@@ -19896,11 +19592,11 @@ private:
     if (!v.computed.canvasTexture)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      // Retained canvas with damage: repaint only that box (see
-      // liteui_canvas_damage::plan); anything else repaints everything.
+      // Repaint only the damaged box (see liteui_canvas_damage::plan); a
+      // full request (first paint, resize, device loss) repaints everything.
       const auto plan = liteui_canvas_damage::plan(
-          v.canvasRetained, v.computed.canvasFullRepaint,
-          v.computed.canvasDamageRect, scale_, pw, ph);
+          v.computed.canvasFullRepaint, v.computed.canvasDamageRect, scale_, pw,
+          ph);
       if (!plan.nothing) {
         canvasGl_.begin(v.computed, pw, ph, plan.full ? nullptr : &plan.dev);
         {
@@ -20189,7 +19885,6 @@ private:
     // Paint the titlebar and its buttons on top of that background.
     if (!hideTitlebar_)
       drawTitlebar();
-    paintTooltip();
     if (eglSwapBuffers(eglDisplay_, eglSurface_))
       contextLossStreak_ = 0;
     else if (eglGetError() == EGL_CONTEXT_LOST)
@@ -20203,7 +19898,6 @@ private:
   // (see beginPress/endPress).
   void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
     lastPressSerial_ = serial;
-    hideTooltip();
     // Resize/move grabs and the chrome buttons are a left-button-only
     // convention (matching every desktop's own titlebar) — a middle/
     // right click on the resize strip just falls through to whatever's
@@ -20501,8 +20195,6 @@ inline LiteUIImpl::~LiteUIImpl() {
       glDeleteProgram(texProgram_);
     if (canvasProgram_)
       glDeleteProgram(canvasProgram_);
-    if (tooltipTextTexture_)
-      glDeleteTextures(1, &tooltipTextTexture_);
     if (quadVbo_)
       glDeleteBuffers(1, &quadVbo_);
     if (flatVbo_)
@@ -20635,11 +20327,7 @@ View View::toView(TextInput ti) {
     return state->focused ? focusedBorderColor : borderColor;
   };
 
-  v.canvasDirtySource = [state] {
-    bool d = state->dirty;
-    state->dirty = false;
-    return d;
-  };
+  v.canvasDamage = state->damage;
 
   v.wantsFocus = [state]() -> bool {
     if (!state->requestFocus)
@@ -20708,25 +20396,25 @@ View View::toView(TextInput ti) {
         resolveStatic(ts.fontWeight), resolveStatic(ts.fontStyle),
         e.x - leftPad + state->scrollOffset);
     state->blinkOn = true;
-    state->dirty = true;
+    state->markDirty();
     e.stopPropagation(); // the field owns the press; don't also click a parent
   };
 
   v.onFocus = [state] {
     state->focused = true;
     state->blinkOn = true;
-    state->dirty = true;
+    state->markDirty();
     if (state->blinkTimerHandle < 0 && LiteUIImpl::current()) {
       state->blinkTimerHandle =
           LiteUIImpl::current()->addInterval(530, [state] {
             state->blinkOn = !state->blinkOn;
-            state->dirty = true;
+            state->markDirty();
           });
     }
   };
   v.onBlur = [state] {
     state->focused = false;
-    state->dirty = true;
+    state->markDirty();
     if (state->blinkTimerHandle >= 0 && LiteUIImpl::current()) {
       LiteUIImpl::current()->removeInterval(state->blinkTimerHandle);
       state->blinkTimerHandle = -1;
@@ -20791,7 +20479,7 @@ View View::toView(TextInput ti) {
       return;
     }
     state->blinkOn = true;
-    state->dirty = true;
+    state->markDirty();
   };
 
   v.onTextInput = [state, onChange](uint32_t cp) {
@@ -20799,7 +20487,7 @@ View View::toView(TextInput ti) {
       state->text.insert(state->cursor, 1, static_cast<char>(cp));
       state->cursor++;
       state->blinkOn = true;
-      state->dirty = true;
+      state->markDirty();
       if (onChange)
         onChange(state->text);
     }
@@ -20812,7 +20500,7 @@ View View::toView(Image img) {
   auto state = std::make_shared<ImageState>();
 
   // A dynamic source is polled every dispatch cycle (see
-  // canvasDirtySource below); a fixed value or path/memoryData is
+  // canvasPoll below); a fixed value or path/memoryData is
   // resolved exactly once, right here, matching the old one-shot-decode
   // behavior.
   std::function<std::shared_ptr<CanvasImage>()> sourceFn;
@@ -20912,8 +20600,9 @@ View View::toView(Image img) {
   // a different shared_ptr than last time, swaps it in, re-fires
   // onLoad/onError, and marks this canvas dirty. A no-op (one call, one
   // pointer compare) for a static source, since sourceFn is empty there.
-  v.canvasDirtySource = [state, sourceFn, hdrFn, hdrMode, settingsFn, onLoad,
-                         onError] {
+  v.canvasDamage = state->damage;
+  v.canvasPoll = [state, sourceFn, hdrFn, hdrMode, settingsFn, onLoad,
+                  onError] {
     if (hdrMode && (hdrFn || settingsFn)) {
       std::shared_ptr<ImageBuffer> next = hdrFn ? hdrFn() : state->hdr;
       const DisplaySettings cur = settingsFn ? settingsFn() : state->settings;
@@ -20930,7 +20619,7 @@ View View::toView(Image img) {
         if (state->pixels)
           state->retired.push_back(std::move(state->pixels));
         state->pixels = std::move(disp);
-        state->dirty = true;
+        state->markDirty();
         if (state->pixels && onLoad && bufferChanged)
           onLoad(state->pixels->width, state->pixels->height);
         else if (!state->pixels && onError)
@@ -20943,16 +20632,13 @@ View View::toView(Image img) {
       std::shared_ptr<CanvasImage> next = sourceFn();
       if (next != state->pixels) {
         state->pixels = next;
-        state->dirty = true;
+        state->markDirty();
         if (state->pixels && onLoad)
           onLoad(state->pixels->width, state->pixels->height);
         else if (!state->pixels && onError)
           onError("liteui: dynamic image source returned null");
       }
     }
-    bool d = state->dirty;
-    state->dirty = false;
-    return d;
   };
 
   v.onPaint = [state, fit, bg, sampling](CanvasContext &ctx) {
@@ -21196,12 +20882,10 @@ inline void LiteUIImpl::setRoot(View view) {
   // about to be destroyed (freeTextResources() below, then replaced) —
   // leaving any of these pointing at it would dangle the moment the old
   // tree's destructor runs, and the next dispatched event (a keypress
-  // via focusedView_, a scroll via scrollDrag_.target, a tooltip poll
-  // via tooltipTarget_, ...) would then use-after-free.
+  // via focusedView_, a scroll via scrollDrag_.target, ...) would then use-after-free.
   focusedView_ = nullptr;
   ptrRouter_.invalidate();
   scrollDrag_ = ScrollDrag{};
-  hideTooltip(); // clears tooltipTarget_ and its timer
   if (hasRoot_)
     root_.freeTextResources();
   root_ = std::move(view);
@@ -21550,9 +21234,6 @@ int LiteUI::addInterval(int ms, std::function<void()> fn) {
   return p_->addInterval(ms, std::move(fn));
 }
 void LiteUI::removeInterval(int handle) { p_->removeInterval(handle); }
-void LiteUI::setTooltipStyle(TooltipStyle s) {
-  p_->setTooltipStyle(std::move(s));
-}
 void LiteUI::setWindowBackground(Color c) { p_->setWindowBackground(c); }
 void LiteUI::setScrollbarColors(Color track, Color thumb) {
   p_->setScrollbarColors(track, thumb);

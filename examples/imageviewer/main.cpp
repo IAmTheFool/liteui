@@ -107,7 +107,9 @@ namespace
     float scrollX = 0, scrollY = 0;
     float viewW = 0, viewH = 0; // canvas size, updated from onLayout
     bool needFit = false;       // fit the new image once the view size is known
-    bool dirty = false;         // the Canvas must repaint
+    // The Canvas's damage handle: markDirty() repaints all of it.
+    std::shared_ptr<CanvasDamage> damage = std::make_shared<CanvasDamage>();
+    void markDirty() { damage->invalidate(DirtyRect::everything()); }
     bool dropHover = false;     // a file is being dragged over the canvas
     // How the Canvas filters the image when it is scaled; see ImageSampling.
     ImageSampling sampling = ImageSampling::Auto;
@@ -239,7 +241,7 @@ namespace
     s.scrollX = ix * pxScale(s) - (ax - b.offX);
     s.scrollY = iy * pxScale(s) - (ay - b.offY);
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // Zooms about the middle of the visible area (the 100% button).
@@ -275,7 +277,7 @@ namespace
     s.zoom = std::max(kMinZoom, fit);
     s.scrollX = s.scrollY = 0;
     s.needFit = false;
-    s.dirty = true;
+    s.markDirty();
   }
 
   std::string baseName(const std::string &path)
@@ -327,7 +329,7 @@ namespace
   void settingsChanged(ViewerState &s)
   {
     if (s.working && settingsAffectDisplay(s.working->format))
-      s.needRebuild = true;
+      { s.needRebuild = true; s.markDirty(); }
   }
 
   // master -> working (in the chosen format).
@@ -351,6 +353,7 @@ namespace
       s.working = std::make_shared<const ImageBuffer>(std::move(converted));
     }
     s.needRebuild = true;
+    s.markDirty();
   }
 
   // working + display settings -> the RGBA8 copy the Canvas draws.
@@ -374,7 +377,7 @@ namespace
     if (s.image)
       s.retired.push_back(std::move(s.image));
     s.image = std::make_shared<CanvasImage>(std::move(*disp));
-    s.dirty = true;
+    s.markDirty();
   }
 
   // Installs `img` as the new master and shows it, fitted to the view.
@@ -389,7 +392,7 @@ namespace
     rebuildDisplay(s); // now, so the size is known for fitting
     s.needFit = true;  // on the first layout if the view size isn't known yet
     fitToView(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // Decodes `path` into the state. On failure the previous image (if any)
@@ -425,7 +428,7 @@ namespace
     if (s.dropHover != on)
     {
       s.dropHover = on;
-      s.dirty = true;
+      s.markDirty();
     }
   }
 
@@ -616,7 +619,7 @@ namespace
       {
         s.scrollY += (y < t.pos ? -g.availH : g.availH);
         clampScroll(s);
-        s.dirty = true;
+        s.markDirty();
       }
       return;
     }
@@ -633,7 +636,7 @@ namespace
       {
         s.scrollX += (x < t.pos ? -g.availW : g.availW);
         clampScroll(s);
-        s.dirty = true;
+        s.markDirty();
       }
       return;
     }
@@ -675,7 +678,7 @@ namespace
       break;
     }
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // Drawn over everything while a file is dragged over the canvas.
@@ -698,6 +701,9 @@ namespace
 
   void paintViewer(ViewerState &s, CanvasContext &ctx)
   {
+    // Several exposure clicks within one frame cost a single display rebuild.
+    if (s.needRebuild)
+      rebuildDisplay(s);
     // Learn the display scale. It is only known here (not in onLayout), so on
     // the first paint, or after the window moves to a monitor with another
     // scale, adapt: keep the same image point scrolled into view, and redo a
@@ -937,7 +943,7 @@ int main(int argc, char **argv)
       grey, greyHover, [&state]
       {
         state.sampling = nextSampling(state.sampling);
-        state.dirty = true; })); // the pixels are unchanged: only repaint
+        state.markDirty(); })); // the pixels are unchanged: only repaint
 
   // ---- Info row: the long pipeline description gets a row of its own, so
   // it can't squeeze the controls above it. ------------------------------
@@ -956,16 +962,8 @@ int main(int argc, char **argv)
   canvas.style.flexGrow = 1;
   canvas.onPaint = [&state](CanvasContext &ctx)
   { paintViewer(state, ctx); };
-  // Polled once per frame; returning true re-runs onPaint. Several clicks on
-  // the exposure buttons within one frame cost a single display rebuild.
-  canvas.canvasDirtySource = [&state]
-  {
-    if (state.needRebuild)
-      rebuildDisplay(state);
-    bool d = state.dirty;
-    state.dirty = false;
-    return d;
-  };
+  // markDirty() reports the damage; onPaint re-runs on the next frame.
+  canvas.canvasDamage = state.damage;
   // Fires on every relayout (window resize included) with the final size.
   canvas.onLayout = [&state](float, float, float w, float h)
   {

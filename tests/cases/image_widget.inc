@@ -16,6 +16,14 @@ View &addImage(View &parent, Image img) {
   parent.addChild(std::move(img));
   return parent.children.back();
 }
+// Runs the Image's source poll and reports whether it asked for a repaint,
+// i.e. whether damage is now pending on its canvas. (The very first paint is
+// always a full one and needs no damage.)
+bool repaintRequested(View &v) {
+  if (v.canvasPoll)
+    v.canvasPoll();
+  return v.canvasDamage && v.canvasDamage->take().any;
+}
 } // namespace
 
 TEST_CASE("toCanvasImage: RGBA32F is sRGB-encoded and clamped", "[image][hdr]") {
@@ -73,9 +81,10 @@ TEST_CASE("Image: fixed hdrSource sizes the node and fires onLoad", "[image][hdr
   REQUIRE(std::get_if<Size>(&child.style.width));
   CHECK(std::get<Size>(child.style.width).value == 6);
   CHECK(std::get<Size>(child.style.height).value == 4);
-  REQUIRE(child.canvasDirtySource);
-  CHECK(child.canvasDirtySource());       // first paint is always due
-  CHECK_FALSE(child.canvasDirtySource()); // and then nothing changes
+  REQUIRE(child.canvasPoll);
+  REQUIRE(child.canvasDamage);
+  CHECK_FALSE(repaintRequested(child)); // the first paint needs no damage
+  CHECK_FALSE(repaintRequested(child)); // and nothing changes after it
 }
 
 TEST_CASE("Image: dynamic hdrSource swaps by pointer", "[image][hdr]") {
@@ -92,14 +101,13 @@ TEST_CASE("Image: dynamic hdrSource swaps by pointer", "[image][hdr]") {
   View &child = addImage(parent, std::move(im));
   CHECK(loads == 1);
   CHECK(lastW == 2);
-  CHECK(child.canvasDirtySource());       // initial paint
-  CHECK_FALSE(child.canvasDirtySource()); // same pointer: no repaint
+  CHECK_FALSE(repaintRequested(child)); // same pointer: no repaint
 
   current = b;
-  CHECK(child.canvasDirtySource());       // new pointer: repaint
+  CHECK(repaintRequested(child));       // new pointer: repaint
   CHECK(loads == 2);
   CHECK(lastW == 5);
-  CHECK_FALSE(child.canvasDirtySource());
+  CHECK_FALSE(repaintRequested(child));
 
   // Fit-sized nodes re-poll their size from the new image.
   auto *w = std::get_if<std::function<Size()>>(&child.style.width);
@@ -129,9 +137,9 @@ TEST_CASE("Image: bad hdrSource reports an error and paints nothing", "[image][h
   dyn.onError = [&](const std::string &) { ++errs2; };
   View parent2;
   View &c2 = addImage(parent2, std::move(dyn));
-  c2.canvasDirtySource();
+  repaintRequested(c2);
   current = nullptr;
-  CHECK(c2.canvasDirtySource());
+  CHECK(repaintRequested(c2));
   CHECK(errs2 == 1);
 }
 
@@ -149,17 +157,16 @@ TEST_CASE("Image: displaySettings callback rebuilds without a new buffer", "[ima
   View parent;
   View &child = addImage(parent, std::move(im));
   CHECK(loads == 1);
-  CHECK(child.canvasDirtySource());       // first paint
-  CHECK_FALSE(child.canvasDirtySource()); // settings unchanged
+  CHECK_FALSE(repaintRequested(child)); // settings unchanged
 
-  cur.exposureEv = 1.5f;                  // e.g. the exposure slider moved
-  CHECK(child.canvasDirtySource());
-  CHECK_FALSE(child.canvasDirtySource());
+  cur.exposureEv = 1.5f;                // e.g. the exposure slider moved
+  CHECK(repaintRequested(child));
+  CHECK_FALSE(repaintRequested(child));
   CHECK(loads == 1); // same image: onLoad is not repeated
   CHECK(errors == 0);
 
   cur.clamp = ClampMode::PreserveHue;
-  CHECK(child.canvasDirtySource());
+  CHECK(repaintRequested(child));
 }
 
 TEST_CASE("Image: displaySettings is ignored for non-hdr sources", "[image][hdr]") {
@@ -169,6 +176,5 @@ TEST_CASE("Image: displaySettings is ignored for non-hdr sources", "[image][hdr]
   im.displaySettings = std::function<DisplaySettings()>([] { return DisplaySettings{}; });
   View parent;
   View &child = addImage(parent, std::move(im));
-  CHECK(child.canvasDirtySource());       // first paint
-  CHECK_FALSE(child.canvasDirtySource()); // the callback must not retrigger it
+  CHECK_FALSE(repaintRequested(child)); // the callback must not retrigger it
 }

@@ -21,8 +21,8 @@
 //    cell on the grid so a fallback font's odd advance can't shift a line.
 //  * Scroll position is in LOGICAL units and rows are snapped to DEVICE pixels
 //    (CanvasContext::devicePixelRatio()), so text stays crisp at 125% / 150%.
-//  * Repaint only on change: handlers set state.dirty, and the Canvas polls it
-//    through canvasDirtySource (same pattern as imageviewer).
+//  * Repaint only on change: handlers call state.markDirty(), which reports the
+//    damage to the Canvas through Canvas::damage (same pattern as imageviewer).
 //
 // Features: Open (button, Ctrl+O, drop a file, drop text), line-number gutter,
 // wheel / trackpad scroll (Shift+wheel = sideways), draggable scrollbars,
@@ -46,6 +46,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -311,7 +312,9 @@ namespace
 
     float viewW = 0, viewH = 0; // canvas size, from onLayout
     float scrollX = 0, scrollY = 0;
-    bool dirty = true;
+    // The Canvas's damage handle: markDirty() repaints all of it.
+    std::shared_ptr<CanvasDamage> damage = std::make_shared<CanvasDamage>();
+    void markDirty() { damage->invalidate(DirtyRect::everything()); }
     bool dropHover = false;
 
     // Word wrap: rowsBefore[i] = visual rows above logical line i (n+1 entries).
@@ -365,7 +368,7 @@ namespace
   {
     s.notice = std::move(msg);
     s.noticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // Logical line shown on visual row `row`.
@@ -469,7 +472,7 @@ namespace
     s.scrollX += dx;
     s.scrollY += dy;
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // ---- Loading ---------------------------------------------------------------
@@ -484,7 +487,7 @@ namespace
     s.pendingTopLine = 0;
     s.hasCur = false;
     s.matchCount = -1;
-    s.dirty = true;
+    s.markDirty();
   }
 
   bool loadFile(Viewer &s, const std::string &path)
@@ -531,7 +534,7 @@ namespace
   void openDropped(Viewer &s, const DropEvent &e)
   {
     s.dropHover = false;
-    s.dirty = true;
+    s.markDirty();
     for (const std::string &p : e.paths)
       if (loadFile(s, p))
       {
@@ -563,7 +566,7 @@ namespace
     s.wrapValid = false; // columns per row changed
     s.pendingTopLine = -1;
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   void toggleWrap(Viewer &s)
@@ -578,7 +581,7 @@ namespace
       s.scrollY = static_cast<float>(std::max(0L, s.pendingTopLine)) * s.lineH;
     s.pendingTopLine = s.wrap ? s.pendingTopLine : -1;
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // ---- Search ------------------------------------------------------------------
@@ -616,7 +619,7 @@ namespace
         s.scrollX = x - g.availW / 3.0f;
     }
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   void findNext(Viewer &s, bool forward)
@@ -902,7 +905,7 @@ namespace
         s.scrollX = s.dragScroll + (x - s.dragPos) / range * g.maxX;
     }
     clampScroll(s);
-    s.dirty = true;
+    s.markDirty();
   }
 
   // ---- UI helpers (same shape as imageviewer's) ----------------------------------
@@ -992,7 +995,7 @@ int main(int argc, char **argv)
     state.hasCur = false;
     recount(state);
     findNext(state, true);
-    state.dirty = true;
+    state.markDirty();
   };
   search.onSubmit = [&state](const std::string &)
   { findNext(state, true); };
@@ -1049,18 +1052,13 @@ int main(int argc, char **argv)
   canvas.focusable = true; // click the text to give it keyboard focus
   canvas.onPaint = [&state](CanvasContext &ctx)
   { paintViewer(state, ctx); };
-  canvas.canvasDirtySource = [&state]
-  {
-    bool d = state.dirty;
-    state.dirty = false;
-    return d;
-  };
+  canvas.canvasDamage = state.damage;
   canvas.onLayout = [&state](float, float, float w, float h)
   {
     state.viewW = w;
     state.viewH = h;
     clampScroll(state);
-    state.dirty = true;
+    state.markDirty();
   };
   canvas.onWheel = [&state](WheelEvent &e)
   {
@@ -1100,12 +1098,12 @@ int main(int argc, char **argv)
   canvas.onDragEnter = [&state](DropEvent &e)
   {
     state.dropHover = e.hasFiles || e.hasText;
-    state.dirty = true;
+    state.markDirty();
   };
   canvas.onDragLeave = [&state](DropEvent &)
   {
     state.dropHover = false;
-    state.dirty = true;
+    state.markDirty();
   };
   canvas.onDrop = [&state](DropEvent &e)
   { openDropped(state, e); };
@@ -1138,14 +1136,14 @@ int main(int argc, char **argv)
         state.scrollY = 0;
       state.scrollX = 0;
       clampScroll(state);
-      state.dirty = true;
+      state.markDirty();
       break;
     case Key::End:
       if (e.mods.ctrl)
       {
         state.scrollY = g.maxY;
         clampScroll(state);
-        state.dirty = true;
+        state.markDirty();
       }
       break;
     default:
@@ -1176,7 +1174,7 @@ int main(int argc, char **argv)
     ui.addShortcut(ctrl, Key::F, [&state, searchState, &ui]
                    {
       searchState->requestFocus = true;
-      state.dirty = true;
+      state.markDirty();
       ui.requestRepaint(); });
     ui.addShortcut(KeyModifiers{}, Key::F3, [&state]
                    { findNext(state, true); });
