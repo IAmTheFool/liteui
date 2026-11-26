@@ -2853,8 +2853,15 @@ private:
 class LiteUIImpl;
 class LiteUI {
 public:
+  // hideTitlebar (default true): the library draws NO window chrome, so the
+  // app builds its own top bar from the Views and the request* calls below
+  // (requestMove / requestMinimize / requestMaximize / requestClose, plus
+  // setOnCloseRequest / forceClose). On Linux there is never a built-in
+  // titlebar and the flag is ignored. On Windows pass false to get the native
+  // caption and borders back instead. Frameless windows keep their edge
+  // resize handles on both platforms.
   explicit LiteUI(const std::string &title = "Window", int width = -1,
-                  int height = -1, bool hideTitlebar = false);
+                  int height = -1, bool hideTitlebar = true);
   ~LiteUI();
   LiteUI(const LiteUI &) = delete;
   LiteUI &operator=(const LiteUI &) = delete;
@@ -2870,6 +2877,9 @@ public:
   // Toggles: maximizes if the window is normal, restores it if maximized.
   void requestMaximize();
   void requestMove();
+  // Whether the window is currently maximized (for a maximize/restore icon
+  // on an app-drawn top bar). Poll it from a Text label source.
+  bool isMaximized() const;
   // Handler invoked when the user asks to close the window; it must call
   // forceClose() itself. With no handler, close requests close immediately.
   void setOnCloseRequest(std::function<void()> fn);
@@ -13651,9 +13661,9 @@ inline void placeNode(View &node, float x, float y, float w, float h) {
   }
 }
 
-// originX/originY let a caller reserve space above/left of the root — used
-// on Linux to keep content out of the custom titlebar strip; Windows (no
-// custom titlebar) always passes the defaults of (0, 0).
+// originX/originY let a caller reserve space above/left of the root. The
+// window currently always passes the defaults of (0, 0): there is no built-in
+// titlebar strip to keep content out of.
 inline void layoutRoot(View &root, float windowW, float windowH,
                        float originX = 0, float originY = 0) {
   Natural n = measureNatural(root, windowW, windowH, true, true);
@@ -14821,7 +14831,7 @@ public:
   // Constructor: explicit prevents accidental implicit conversions from a bare
 
   explicit LiteUIImpl(const std::string &title = "Window", int width = -1,
-                      int height = -1, bool hideTitlebar = false);
+                      int height = -1, bool hideTitlebar = true);
   // Destructor: tears down whatever platform resources were created.
   ~LiteUIImpl();
   // Copying is disabled — a LiteUI owns unique OS handles that can't be
@@ -14873,6 +14883,14 @@ public:
 #endif
   }
 
+  bool isMaximized() const {
+#if defined(_WIN32)
+    return hwnd_ && IsZoomed(hwnd_);
+#else
+    return maximized_;
+#endif
+  }
+
   void requestMove() {
 #if defined(_WIN32)
     // Can't start the move from here: we're still inside WM_LBUTTONDOWN,
@@ -14885,7 +14903,7 @@ public:
   }
 
   // Installs a handler invoked whenever the user asks to close the window
-  // (the system close button, the custom titlebar/menu-bar close button
+  // (the system close button, an app-drawn titlebar/menu-bar close button
   // via requestClose(), Alt+F4, or a window-manager "Close" action) —
   // instead of the window closing immediately. The handler is fully
   // responsible for deciding what happens next: call forceClose() right
@@ -14945,25 +14963,11 @@ private:
   void relayout() {
     if (!hasRoot_)
       return;
-#if defined(_WIN32)
-    // Native window decorations — the root view owns the whole client area.
+    // No built-in titlebar on Linux, and on Windows either none (frameless,
+    // the default) or the native one outside the client area — in every case
+    // the root view owns the whole client area.
     liteui_layout::layoutRoot(root_, static_cast<float>(width_),
                               static_cast<float>(height_));
-#else
-    // Custom (client-side) titlebar occupies the top kTitlebarHeight
-    // pixels, drawn as an opaque overlay after content (see redraw()).
-    // The root view must be laid out *below* that strip, not underneath
-    // it — otherwise a child near the top of root (e.g. a heading) can
-    // extend far enough to peek out past the titlebar's bottom edge,
-    // which is exactly what happened here: the heading's box reached
-    // deeper than kTitlebarHeight, so its lower slice (including the
-    // text) rendered outside the titlebar's opaque cover instead of
-    // safely underneath it.
-    float top = static_cast<float>(titlebarHeight());
-    float availH = std::max(0.0f, static_cast<float>(height_) - top);
-    liteui_layout::layoutRoot(root_, static_cast<float>(width_), availH, 0.0f,
-                              top);
-#endif
   }
 
   // Hit-testing geometry and the pointer router live in liteui_pointer (no
@@ -16129,6 +16133,8 @@ private:
   // Native window handle; null until CreateWindowExW succeeds.
   HWND hwnd_ = nullptr;
   bool moveRequested_ = false;
+  // Width in logical pixels of the resize handles on a frameless window.
+  static constexpr int kResizeBorder = 6;
   std::unordered_map<UINT_PTR, std::function<void()>> timers_;
 
   // ---- DPI scaling -----------------------------------------------------
@@ -16979,6 +16985,37 @@ private:
       }
       return 0;
 
+      // Frameless window: the whole window rectangle is client area, so the
+      // WS_THICKFRAME border contributes no visible (or non-client) pixels.
+    case WM_NCCALCSIZE:
+      if (self && self->hideTitlebar_ && wp)
+        return 0;
+      break;
+
+      // Frameless window: report the outer kResizeBorder pixels as resize
+      // handles (Windows then runs the sizing loop and shows the cursor);
+      // everything else is client, so the app's own top bar gets normal
+      // pointer events and starts moves via requestMove().
+    case WM_NCHITTEST: {
+      if (self && self->hideTitlebar_ && !IsZoomed(hwnd)) {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        RECT wr;
+        GetWindowRect(hwnd, &wr);
+        const int b = self->toPhysical(kResizeBorder);
+        const bool l = pt.x < wr.left + b, r = pt.x >= wr.right - b;
+        const bool t = pt.y < wr.top + b, bt = pt.y >= wr.bottom - b;
+        if (t && l) return HTTOPLEFT;
+        if (t && r) return HTTOPRIGHT;
+        if (bt && l) return HTBOTTOMLEFT;
+        if (bt && r) return HTBOTTOMRIGHT;
+        if (l) return HTLEFT;
+        if (r) return HTRIGHT;
+        if (t) return HTTOP;
+        if (bt) return HTBOTTOM;
+      }
+      return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
       // Keeps a frameless window from covering the taskbar when maximized.
     case WM_GETMINMAXINFO: {
       if (self && self->hideTitlebar_) {
@@ -17531,20 +17568,6 @@ private:
       nullptr; // Per-window decoration-mode object obtained from
                // decoration_manager_.
 
-  // software rendered CSD titlebar. No cairo here, so buttons are drawn with
-  // raw pixel writes straight into the shm buffer.
-
-  static constexpr int kTitlebarHeight =
-      32; // Height in pixels reserved at the top of the window for the custom
-  // titlebar.
-  int titlebarHeight() const { return hideTitlebar_ ? 0 : kTitlebarHeight; }
-
-  static constexpr int kButtonSize =
-      18; // Width/height in pixels of each titlebar button's square hitbox.
-
-  static constexpr int kButtonMargin =
-      8; // Horizontal gap in pixels between buttons and between the last button
-         // and the window edge.
   // Raw Linux input-event code for the left mouse button (from
   // linux/input-event-codes.h).
   static constexpr uint32_t BTN_LEFT_CODE = 0x110;  // linux/input-event-codes.h
@@ -18905,9 +18928,9 @@ private:
                                                             registryRemove};
 
   // How close (in pixels) the pointer must be to the window's outer edge
-  // before we treat it as a resize grab instead of ordinary titlebar
-  // content. Kept well inside the button icons (which start ~7px into a
-  // 32px titlebar) so it never steals clicks from minimize/maximize/close.
+  // before we treat it as a resize grab instead of ordinary content. There is
+  // no built-in titlebar, so an app-drawn top bar should keep its buttons
+  // inset by at least this much from the window edge.
   static constexpr int kResizeMargin = 6;
 
   // Maps a pointer position to which edge (if any) an interactive resize
@@ -19365,7 +19388,7 @@ private:
   }
 
   // Thick line as an oriented quad — needed (rather than a bbox rect) since
-  // drawTitlebar uses this for the X icon's two diagonal strokes.
+  // Used by drawLine() for diagonal strokes.
   void drawLineGL(float x0, float y0, float x1, float y1, Color c,
                   float thickness = 2.0f) {
     float dx = x1 - x0, dy = y1 - y0;
@@ -19376,7 +19399,7 @@ private:
     const float verts[8] = {x0 + nx * hw, y0 + ny * hw, x0 - nx * hw,
                             y0 - ny * hw, x1 + nx * hw, y1 + ny * hw,
                             x1 - nx * hw, y1 - ny * hw};
-    applyScissor(ClipRect{}); // titlebar icons are never clipped
+    applyScissor(ClipRect{}); // lines are never clipped
     glUseProgram(flatProgram_);
     glBindBuffer(GL_ARRAY_BUFFER, flatVbo_);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
@@ -19768,83 +19791,6 @@ private:
                static_cast<float>(x1), static_cast<float>(y1), {r, g, b});
   }
 
-  // ---- titlebar button layout ----
-  // Plain axis-aligned rectangle used for button hit-testing.
-  struct Rect {
-    int x, y, w, h;
-  };
-  // Returns whether point (px, py) falls within rectangle r (using half-open
-  // bounds).
-  static bool inside(const Rect &r, double px, double py) {
-    // Standard axis-aligned bounding box containment test.
-    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
-  }
-  // Computes the close button's rectangle: flush against the right edge of the
-  // titlebar.
-  Rect closeRect() const {
-    // x is inset from the right edge by the margin and the button's own width;
-    // y centers it vertically in the titlebar.
-    return {width_ - kButtonMargin - kButtonSize,
-            (kTitlebarHeight - kButtonSize) / 2, kButtonSize, kButtonSize};
-  }
-  // Computes the maximize button's rectangle, positioned one button-width left
-  // of the close button.
-  Rect maximizeRect() const {
-    // Start from the close button's rectangle as a reference point.
-    Rect c = closeRect();
-    // Shift left by one margin plus one button width, keeping the same y/size.
-    return {c.x - kButtonMargin - kButtonSize, c.y, kButtonSize, kButtonSize};
-  }
-  // Computes the minimize button's rectangle, positioned one button-width left
-  // of the maximize button.
-  Rect minimizeRect() const {
-    // Start from the maximize button's rectangle as a reference point.
-    Rect m = maximizeRect();
-    // Shift left by one margin plus one button width, keeping the same y/size.
-    return {m.x - kButtonMargin - kButtonSize, m.y, kButtonSize, kButtonSize};
-  }
-
-  // Paints the custom titlebar background and its three buttons/icons.
-  void drawTitlebar() {
-    // Fill the whole titlebar strip with a dark gray background.
-    fillRect(0, 0, width_, kTitlebarHeight, 0x2D, 0x2D, 0x2D);
-
-    // Compute all three button rectangles up front for reuse below.
-    Rect minr = minimizeRect(), maxr = maximizeRect(), clsr = closeRect();
-    // Draw the minimize button's background in a lighter gray.
-    fillRect(minr.x, minr.y, minr.w, minr.h, 0x50, 0x50, 0x50);
-    // Draw the maximize button's background in the same lighter gray.
-    fillRect(maxr.x, maxr.y, maxr.w, maxr.h, 0x50, 0x50, 0x50);
-    // Draw the close button's background in red to visually distinguish it.
-    fillRect(clsr.x, clsr.y, clsr.w, clsr.h, 0xC0, 0x39, 0x2B);
-
-    // minimize: underscore
-    // Draw a single horizontal line near the bottom of the minimize button to
-    // form an underscore glyph.
-    drawLine(minr.x + 4, minr.y + minr.h - 5, minr.x + minr.w - 4,
-             minr.y + minr.h - 5, 0xFF, 0xFF, 0xFF);
-    // maximize: square outline
-    // Top edge of the square icon.
-    drawLine(maxr.x + 4, maxr.y + 4, maxr.x + maxr.w - 4, maxr.y + 4, 0xFF,
-             0xFF, 0xFF);
-    // Bottom edge of the square icon.
-    drawLine(maxr.x + 4, maxr.y + maxr.h - 4, maxr.x + maxr.w - 4,
-             maxr.y + maxr.h - 4, 0xFF, 0xFF, 0xFF);
-    // Left edge of the square icon.
-    drawLine(maxr.x + 4, maxr.y + 4, maxr.x + 4, maxr.y + maxr.h - 4, 0xFF,
-             0xFF, 0xFF);
-    // Right edge of the square icon.
-    drawLine(maxr.x + maxr.w - 4, maxr.y + 4, maxr.x + maxr.w - 4,
-             maxr.y + maxr.h - 4, 0xFF, 0xFF, 0xFF);
-    // close: X
-    // First diagonal stroke of the X, from top-left to bottom-right.
-    drawLine(clsr.x + 4, clsr.y + 4, clsr.x + clsr.w - 4, clsr.y + clsr.h - 4,
-             0xFF, 0xFF, 0xFF);
-    // Second diagonal stroke of the X, from top-right to bottom-left.
-    drawLine(clsr.x + clsr.w - 4, clsr.y + 4, clsr.x + 4, clsr.y + clsr.h - 4,
-             0xFF, 0xFF, 0xFF);
-  }
-
   // Repaints the entire window content and commits it to the compositor.
   // Draws into whichever of the two buffers (drawBuf_) isn't currently
   // still owned by the compositor — see the "Double buffering" comment
@@ -19882,26 +19828,21 @@ private:
       for (const auto &e : absolutes)
         renderView(*e.view, e.clip);
     }
-    // Paint the titlebar and its buttons on top of that background.
-    if (!hideTitlebar_)
-      drawTitlebar();
     if (eglSwapBuffers(eglDisplay_, eglSurface_))
       contextLossStreak_ = 0;
     else if (eglGetError() == EGL_CONTEXT_LOST)
       recoverFromContextLoss();
   }
 
-  // Hit-tests a left-button press against the titlebar buttons, resize
-  // edges, and drag region. Resize/move grabs and the chrome buttons
-  // (close/maximize/minimize) still act immediately on press, same as
-  // before — only content-area widget clicks wait for a matching release
-  // (see beginPress/endPress).
+  // Hit-tests a press against the resize edges, then hands it to scrollbars /
+  // widgets. Resize grabs act immediately on press; widget clicks wait for a
+  // matching release (see beginPress/endPress). There is no built-in
+  // titlebar: apps move/close/minimize/maximize via requestMove() etc. from
+  // their own top bar, which is why lastPressSerial_ is recorded here.
   void handlePress(uint32_t serial, MouseButton btn = MouseButton::Left) {
     lastPressSerial_ = serial;
-    // Resize/move grabs and the chrome buttons are a left-button-only
-    // convention (matching every desktop's own titlebar) — a middle/
-    // right click on the resize strip just falls through to whatever's
-    // below it instead of starting a grab.
+    // Resize grabs are a left-button-only convention — a middle/right click
+    // on the resize strip just falls through to whatever's below it.
     if (btn == MouseButton::Left) {
       uint32_t edge = resizeEdgeAt(pointer_x_, pointer_y_);
       if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
@@ -19911,64 +19852,29 @@ private:
       }
     }
 
-    // Presses below the titlebar strip first give scrollbars/scrollable
-    // content a chance to claim the press (beginScrollPress) — a thumb
-    // grab or track click consumes it entirely; anything else falls
-    // through to the ordinary pending-click press, resolved later in
-    // handleRelease().
-    if (pointer_y_ >= titlebarHeight()) {
-      float x = static_cast<float>(pointer_x_),
-            y = static_cast<float>(pointer_y_);
-      // Only the left button interacts with scrollbars — a thumb grab
-      // or track-click jump is a left-drag convention.
-      if (btn != MouseButton::Left || !beginScrollPress(x, y))
-        beginPress(x, y, btn);
-      redraw();
-      return;
-    }
-
-    if (btn != MouseButton::Left)
-      return; // titlebar chrome (close/max/min/move) is left-button only
-
-    // If the click landed on the close button...
-    if (inside(closeRect(), pointer_x_, pointer_y_)) {
-      // ...request the event loop to stop, ending run().
-      running_ = false;
-      return;
-    }
-    if (inside(maximizeRect(), pointer_x_, pointer_y_)) {
-      requestMaximize();
-      redraw();
-      return;
-    }
-    if (inside(minimizeRect(), pointer_x_, pointer_y_)) {
-      requestMinimize();
-      return;
-    }
-
-    // Any other click in the titlebar (empty space) starts an interactive move,
-    // if we have a seat to drive it.
-    if (seat_)
-      xdg_toplevel_move(toplevel_, seat_, serial);
+    // Scrollbars/scrollable content get first chance to claim the press
+    // (beginScrollPress) — a thumb grab or track click consumes it entirely;
+    // anything else becomes the ordinary pending-click press, resolved later
+    // in handleRelease(). Only the left button interacts with scrollbars.
+    float x = static_cast<float>(pointer_x_), y = static_cast<float>(pointer_y_);
+    if (btn != MouseButton::Left || !beginScrollPress(x, y))
+      beginPress(x, y, btn);
+    redraw();
   }
 
   // Resolves a pending widget click (or in-progress scroll drag) on button
-  // release. Chrome buttons and resize/move grabs don't need this — they
-  // already acted on press — so this only matters for content-area
-  // interactions below the titlebar.
+  // release. Resize grabs don't need this — they already acted on press.
   void handleRelease(MouseButton btn = MouseButton::Left) {
-    if (pointer_y_ >= titlebarHeight()) {
-      bool changed = (btn == MouseButton::Left)
-                         ? endScrollPress(static_cast<float>(pointer_x_),
-                                          static_cast<float>(pointer_y_))
-                         : endPress(static_cast<float>(pointer_x_),
-                                    static_cast<float>(pointer_y_), btn);
-      if (changed)
-        redraw();
-    }
-    // Whatever the release didn't resolve — it landed in the titlebar, or a
-    // content pan (which never reaches endPress) swallowed it — can't
-    // complete: deliver onPointerCancel. A no-op after
+    bool changed = (btn == MouseButton::Left)
+                       ? endScrollPress(static_cast<float>(pointer_x_),
+                                        static_cast<float>(pointer_y_))
+                       : endPress(static_cast<float>(pointer_x_),
+                                  static_cast<float>(pointer_y_), btn);
+    if (changed)
+      redraw();
+    // Whatever the release didn't resolve — a content pan (which never
+    // reaches endPress) swallowed it — can't complete: deliver
+    // onPointerCancel. A no-op after
     // a normal release, which has already cleared everything.
     cancelPress(btn);
     if (btn == MouseButton::Left)
@@ -20027,7 +19933,11 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   if (hideTitlebar_) {
     // WS_POPUP = no caption, no border. SYSMENU/MINIMIZEBOX keep the
     // taskbar button's right-click menu and click-to-minimize working.
-    style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    // WS_THICKFRAME is what lets Windows size the window at all; the frame
+    // itself is removed again in WM_NCCALCSIZE and replaced by our own
+    // edge hit-testing in WM_NCHITTEST.
+    style = WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_MAXIMIZEBOX;
     // CW_USEDEFAULT only means "let Windows pick" for overlapped windows,
     // so center the window in the work area ourselves.
     RECT wa{};
@@ -20144,15 +20054,14 @@ inline LiteUIImpl::LiteUIImpl(const std::string &title, int w, int h,
   xdg_toplevel_set_title(toplevel_, title.c_str());
 
   // If no explicit size was given, ask the compositor to start us
-  // maximized (our own CSD titlebar stays intact, unlike fullscreen).
+  // maximized (unlike fullscreen, the window stays an ordinary toplevel).
   // The compositor's first configure event reports the real work-area
   // size via toplevelConfigure -> pendingWidth_/pendingHeight_, which
   // surfaceConfigure() then applies via resize().
   if (startMaximized_) {
     xdg_toplevel_set_maximized(toplevel_);
-    maximized_ = true; // keep our own tracking flag in sync, so the
-                       // titlebar's maximize button correctly offers
-                       // "unmaximize" as its next click
+    maximized_ = true; // keep our own tracking flag in sync, so
+                       // requestMaximize() correctly un-maximizes next
   }
 
   // Commit the surface state now, which triggers the compositor's first
@@ -21225,6 +21134,7 @@ void LiteUI::requestClose() { p_->requestClose(); }
 void LiteUI::requestMinimize() { p_->requestMinimize(); }
 void LiteUI::requestMaximize() { p_->requestMaximize(); }
 void LiteUI::requestMove() { p_->requestMove(); }
+bool LiteUI::isMaximized() const { return p_->isMaximized(); }
 void LiteUI::setOnCloseRequest(std::function<void()> fn) {
   p_->setOnCloseRequest(std::move(fn));
 }

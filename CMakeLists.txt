@@ -66,6 +66,12 @@ add_library(liteui::liteui ALIAS liteui)
 target_include_directories(liteui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(liteui INTERFACE cxx_std_23)
 
+# String literals such as "\u23AF" (glyph icons) must be UTF-8 on MSVC, which
+# otherwise encodes narrow literals in the system code page.
+if(MSVC)
+    target_compile_options(liteui INTERFACE /utf-8)
+endif()
+
 # Linux Canvas nodes always render with the OpenGL ES 3.0 backend (GPU;
 # needs an EGL driver with OpenGL ES 3.0 and libGLESv2/GLES3 headers).
 # There is no Cairo canvas fallback. Cairo/Pango are still linked below

@@ -817,6 +817,102 @@ namespace
     bar.style.backgroundColor = Color{45, 45, 48};
     return bar;
   }
+
+  // ---- Window top bar (the library draws no window chrome) --------------
+  // Glyph icons for now; swap for Svg/Image later.
+  constexpr const char *ICON_MINIMIZE = "\u23AF";
+  constexpr const char *ICON_MAXIMIZE = "\u25A1";
+  constexpr const char *ICON_RESTORE = "\u25A3";
+  constexpr const char *ICON_CLOSE = "\u00D7";
+
+  // One caption button: a fixed-size box with a centered glyph. The glyph is
+  // a function so the maximize button can flip to "restore" by itself.
+  View makeCaptionButton(std::function<std::string()> glyph, Color hover,
+                         std::function<void()> action)
+  {
+    Text t;
+    t.label = std::move(glyph);
+    t.fontSize = 16;
+    t.color = Color{255, 255, 255};
+
+    View b;
+    b.style.direction = FlexDirection::Row;
+    b.style.justifyContent = Justify::Center;
+    b.style.alignItems = Align::Center;
+    b.style.width = Size::pixel(46);
+    b.style.height = Size::pixel(30);
+    b.style.flexShrink = 0;
+    b.style.borderRadius = 4.0f;
+    b.style.hoverColor = hover;
+    // Handled on click; the press must not reach the drag area's move grab.
+    b.onPointerDown = [](PointerEvent &e)
+    { e.stopPropagation(); };
+    b.onClick = [action = std::move(action)]
+    { action(); };
+    b.addChild(t);
+    return b;
+  }
+
+  // [title ........ drag area ........ ][-][□][x]
+  // Dragging the empty part moves the window; a quick second press on it
+  // toggles maximize (done by hand: a native move loop would swallow the
+  // release that a double-click needs). The top and right 6px are left
+  // free because they are the window's resize handles.
+  View makeTopBar(LiteUI *&ui, const std::string &title)
+  {
+    Text titleText;
+    titleText.label = std::function<std::string()>([title]
+                                                   { return title; });
+    titleText.fontSize = 13;
+    titleText.color = Color{210, 210, 210};
+
+    View drag;
+    drag.style.direction = FlexDirection::Row;
+    drag.style.alignItems = Align::Center;
+    drag.style.flexGrow = 1;
+    drag.style.height = Size::full();
+    drag.addChild(titleText);
+    auto lastPress = std::make_shared<std::chrono::steady_clock::time_point>();
+    drag.onPointerDown = [&ui, lastPress](PointerEvent &e)
+    {
+      if (e.button != MouseButton::Left || !ui)
+        return;
+      const auto now = std::chrono::steady_clock::now();
+      const bool second = now - *lastPress < std::chrono::milliseconds(400);
+      *lastPress = second ? std::chrono::steady_clock::time_point{} : now;
+      if (second)
+        ui->requestMaximize();
+      else
+        ui->requestMove();
+    };
+
+    const Color hover{75, 75, 80}, closeHover{232, 17, 35};
+    View bar;
+    bar.style.direction = FlexDirection::Row;
+    bar.style.alignItems = Align::Center;
+    bar.style.gap = 2;
+    bar.style.width = Size::full();
+    bar.style.height = Size::pixel(36);
+    bar.style.flexShrink = 0;
+    bar.style.padding = EdgeInsets{6, 6, 0, 12}; // top, right, bottom, left
+    bar.style.backgroundColor = Color{32, 32, 35};
+    bar.addChild(std::move(drag));
+    bar.addChild(makeCaptionButton([]
+                                   { return std::string(ICON_MINIMIZE); },
+                                   hover, [&ui]
+                                   { if (ui) ui->requestMinimize(); }));
+    bar.addChild(makeCaptionButton([&ui]
+                                   { return std::string(ui && ui->isMaximized()
+                                                            ? ICON_RESTORE
+                                                            : ICON_MAXIMIZE); },
+                                   hover, [&ui]
+                                   { if (ui) ui->requestMaximize(); }));
+    bar.addChild(makeCaptionButton([]
+                                   { return std::string(ICON_CLOSE); },
+                                   closeHover, [&ui]
+                                   { if (ui) ui->requestClose(); }));
+    return bar;
+  }
 } // namespace
 
 int main(int argc, char **argv)
@@ -827,6 +923,10 @@ int main(int argc, char **argv)
 
   const Color blue{0, 110, 200}, blueHover{20, 130, 225};
   const Color grey{70, 70, 75}, greyHover{90, 90, 96};
+
+  // Set once the window exists; the top bar's callbacks only run after run().
+  LiteUI *window = nullptr;
+  View topBar = makeTopBar(window, "Image Viewer");
 
   // ---- Toolbar 1: [Open Image...] [HDR test] [100%]  status text -----------
   View toolbar = makeToolbar(48);
@@ -1022,12 +1122,14 @@ int main(int argc, char **argv)
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
   root.style.height = Size::full();
+  root.addChild(std::move(topBar));
   root.addChild(std::move(toolbar));
   root.addChild(std::move(toolbar2));
   root.addChild(std::move(infoBar));
   root.addChild(std::move(canvas));
 
-  LiteUI ui("Image Viewer", 1000, 700);
+  LiteUI ui("Image Viewer", 1000, 700); // frameless by default
+  window = &ui;
   ui.setRoot(root);
   // Anywhere else in the window (toolbars): same result, no highlight.
   ui.setFileDropHandler([&state](DropEvent &e)

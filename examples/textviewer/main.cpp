@@ -37,6 +37,7 @@
 
 #define LITEUI_IMPLEMENTATION
 #include "liteui.hpp"
+#include "topbar.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1156,6 +1157,7 @@ int main(int argc, char **argv)
   root.style.direction = FlexDirection::Column;
   root.style.width = Size::full();
   root.style.height = Size::full();
+  root.addChild(makeTopBar("Text Viewer")); // window chrome is ours to draw
   root.addChild(std::move(toolbar));
   root.addChild(std::move(infoBar));
   root.addChild(std::move(canvas));
