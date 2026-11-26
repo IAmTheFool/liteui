@@ -656,8 +656,8 @@ struct Text {
 //
 // CanvasContext's public methods are declared below. The platform backends
 // (CanvasContextImpl, in the LITEUI_IMPLEMENTATION section, one per
-// #if defined(_WIN32) branch) wrap either an ID2D1RenderTarget or a cairo_t
-// directly rather than going through a virtual interface — consistent with
+// #if defined(_WIN32) branch) wrap either an ID2D1RenderTarget or the OpenGL ES
+// renderer directly rather than going through a virtual interface — consistent with
 // this file's "no vtable" design. Both backends implement the exact same
 // public method surface, so app code that only calls CanvasContext's public
 // API compiles unchanged on either platform.
@@ -679,30 +679,27 @@ struct Text {
 //  - Linux Canvas rendering runs on the GPU: every canvas node is an
 //    OpenGL ES 3.0 texture (EGL context, MSAA when available) drawn with
 //    batched shaders, stencil-based fills/clips, and a shared glyph atlas
-//    for text. It is the default; configure with -DLITEUI_CANVAS_GL=OFF to
-//    use the previous Cairo-based backend instead. On the GL backend:
+//    for text. It is the only Linux Canvas backend. On it:
 //      * globalCompositeOperation supports all twelve operators (Multiply
 //        reads back the canvas drawn so far, so it costs one copy of the
 //        canvas per shape; the others are plain GPU blending).
-//      * strokeText strokes the true glyph outlines (the Cairo and Windows
-//        backends approximate it with offset copies).
+//      * strokeText strokes the true glyph outlines (the Windows backend
+//        approximates it with offset copies).
 //      * colour (emoji) glyphs keep their own colours in fillText when the
 //        fill is a solid colour; with a gradient fill they draw as
 //        silhouettes tinted by the gradient.
 //      * a lost GL context (EGL_CONTEXT_LOST) is recovered automatically:
 //        the context, programs and every canvas/text texture are rebuilt.
-//    With the Cairo backend, globalCompositeOperation maps onto the full
-//    range of Cairo operators.
 //  - On Windows, Direct2D's primitive blend modes only cover SourceOver,
 //    Copy and Lighter (additive), so those three work and every other
 //    globalCompositeOperation falls back to SourceOver.
-//  - Radial gradients use the full two-circle model exactly on Linux (Cairo
-//    natively, or the GL backend's shader); Direct2D only models a single circle plus a focal point, so
+//  - Radial gradients use the full two-circle model exactly on Linux (the GL
+//    shader); Direct2D only models a single circle plus a focal point, so
 //    the inner-radius stop is approximated there by rescaling stop
 //    offsets rather than drawn exactly.
 //  - Shadows are a simple flat-color, unblurred offset copy (no Gaussian
 //    blur).
-//  - On Windows and with the Cairo backend, strokeText approximates a
+//  - On Windows, strokeText approximates a
 //    stroked glyph outline by drawing the fill text in the stroke color,
 //    nudged in a ring of directions — it is not a true outline of the
 //    glyph contours. (The GL backend does trace the real outlines.)
@@ -2711,7 +2708,7 @@ public:
     // paint/render pass always invokes onPaint at least once; cleared by
     // whichever backend (re)builds the cached backing surface below, and
     // set again only by View::requestCanvasRedraw() or a resize (see
-    // ensureCanvasSurface/ensureCanvasTarget) — plain repaints (e.g. from
+    // ensureCanvasTargetGl/ensureCanvasTarget) — plain repaints (e.g. from
     // an unrelated sibling's hover change) do NOT re-invoke onPaint.
     mutable bool canvasNeedsRedraw = true;
     // Retained canvases: what the pending redraw has to repaint. `Full`
@@ -2809,42 +2806,26 @@ public:
     mutable float textTextureBuiltForFontSize = -1.0f;
     mutable FontWeight textTextureBuiltForFontWeight = FontWeight::Regular;
     mutable FontStyle textTextureBuiltForFontStyle = FontStyle::Normal;
-    // A CPU-side Cairo image surface the size of this canvas node's inner
-    // content box, drawn into by onPaint, then converted+uploaded as an
-    // RGBA GL texture for actual display (see
-    // LiteUI::ensureCanvasSurface/drawCanvasTexture). Keeping the Cairo
-    // surface around (rather than freeing it right after upload) is what
-    // makes getImageData possible on this platform: it's just a read of
-    // the very same pixels already sitting in `canvasSurface`.
-    mutable cairo_surface_t *canvasSurface = nullptr;
     mutable unsigned int canvasTexture = 0;
-    // GPU canvas backend (LITEUI_CANVAS_GL): canvasTexture above is then the
-    // node's RGBA8 target; canvasFbo wraps it. With multisampling available,
-    // drawing goes to canvasMsaaFbo (colour+depth/stencil renderbuffers) and
-    // is resolved into canvasTexture; otherwise canvasDsRb is attached to
-    // canvasFbo itself. All zero (and unused) with the Cairo backend.
+    // GPU canvas target: canvasTexture above is the node's RGBA8 target;
+    // canvasFbo wraps it. With multisampling available, drawing goes to
+    // canvasMsaaFbo (colour+depth/stencil renderbuffers) and is resolved
+    // into canvasTexture; otherwise canvasDsRb is attached to canvasFbo
+    // itself.
     mutable unsigned int canvasFbo = 0;
     mutable unsigned int canvasMsaaFbo = 0;
     mutable unsigned int canvasMsaaColorRb = 0;
     mutable unsigned int canvasDsRb = 0;
     mutable float canvasBuiltForWidth = -1.0f, canvasBuiltForHeight = -1.0f;
-    // Caches the cairo_surface_t most recently uploaded by this canvas
-    // node's own CanvasContext::drawImage() (see that method's comment),
-    // keyed on the source CanvasImage's pixel buffer identity+size+
-    // dimensions. A repeat draw of the SAME image content — e.g.
-    // re-painting at a new zoom level, or a window resize that leaves the
-    // image itself untouched — reuses this instead of reconverting+
-    // reuploading every pixel again. Unlike the Windows bitmap cache
-    // above, a standalone Cairo image surface isn't tied to any
-    // particular cairo_t, so it deliberately SURVIVES canvasSurface being
-    // rebuilt on a resize (the same image redrawn into a differently
-    // sized canvas is exactly the case this cache is for). It's only
-    // released in freeTextResources, or replaced when drawImage sees a
-    // different pixel buffer.
-    mutable cairo_surface_t *cachedImageSurface = nullptr;
-    // GPU canvas backend (LITEUI_CANVAS_GL): the same one-slot cache, holding
-    // the premultiplied RGBA8 texture of the image drawn last (the fields
-    // below key it, exactly as for the Cairo surface). Zero otherwise.
+    // Caches the premultiplied RGBA8 texture of the image most recently drawn
+    // by this canvas node's own CanvasContext::drawImage() (see that
+    // method's comment), keyed on the source CanvasImage's pixel buffer
+    // identity+size+dimensions (the fields below). A repeat draw of the
+    // SAME image content — e.g. re-painting at a new zoom level, or a
+    // window resize that leaves the image untouched — reuses it instead
+    // of re-uploading every pixel. It survives a canvas resize; released
+    // in freeTextResources, or replaced when drawImage sees a different
+    // pixel buffer.
     mutable unsigned int cachedImageTexture = 0;
     mutable bool cachedImageMips = false; // texture above has its mip chain
     mutable const void *cachedImagePixels = nullptr;
@@ -9032,7 +9013,7 @@ size_t caretIndexForX(const std::string &text, const TextStyle &style,
 #endif
 } // namespace liteui_text
 
-// ---------------- Canvas 2D context: Direct2D (Windows) / Cairo (Linux) ----
+// ---------------- Canvas 2D context: Direct2D (Windows) / OpenGL ES 3.0 (Linux) ----
 //
 // Two complete, independent definitions of CanvasContext follow (one per
 // platform), each exposing the identical public method surface described
@@ -10219,12 +10200,11 @@ private:
   std::vector<State> stack_;
 };
 
-#elif defined(LITEUI_CANVAS_GL)
+#else // Linux — OpenGL ES 3.0
 
-// ---------------- Canvas 2D context: OpenGL ES 3.0 (Linux, opt-in) ----------
+// ---------------- Canvas 2D context: OpenGL ES 3.0 (Linux) ----------------
 //
-// Compiled instead of the Cairo backend below when LITEUI_CANVAS_GL is
-// defined (CMake: -DLITEUI_CANVAS_GL=ON). Every Canvas node renders into its
+// Compiled on Linux, where it is the only Canvas backend. Every Canvas node renders into its
 // own GPU texture through an FBO; nothing is rasterized on the CPU and no
 // pixels are uploaded. Work in progress — see the status list in
 // liteui_canvas_gl::Renderer's comment. Operations that are not implemented
@@ -13081,7 +13061,7 @@ private:
         return;
     seen.emplace_back(what);
     fprintf(stderr,
-            "liteui [LITEUI_CANVAS_GL]: %s\n",
+            "liteui [canvas GL]: %s\n",
             what);
   }
 
@@ -13119,812 +13099,6 @@ private:
 };
 
 using CanvasContextImpl = GlCanvasContext<liteui_canvas_gl::Renderer>;
-
-#else // Linux — Cairo
-
-class CanvasContextImpl : public CanvasContext {
-public:
-  // `cr` is a Cairo context targeting an image surface sized exactly to
-  // the canvas node's inner (padding-excluded) content box, already
-  // cleared to transparent by the caller (see LiteUI::ensureCanvasSurface).
-  // `imageCacheOwner`, when non-null, is the canvas node's own
-  // View::Computed — drawImage() below uses its cachedImageSurface slot
-  // to skip reconverting the same CanvasImage on a repeat draw (see
-  // drawImage's own comment). Left null for any CanvasContext not backed
-  // by a persistent per-node Computed.
-  CanvasContextImpl(cairo_t *cr, float width, float height,
-                    const View::Computed *imageCacheOwner = nullptr)
-      : cr_(cr), width_(width), height_(height),
-        imageCacheOwner_(imageCacheOwner) {}
-  ~CanvasContextImpl() = default;
-  CanvasContextImpl(const CanvasContextImpl &) = delete;
-  CanvasContextImpl &operator=(const CanvasContextImpl &) = delete;
-
-  float width() const { return width_; }
-  float height() const { return height_; }
-  // The canvas surface carries a device scale (see ensureCanvasSurface):
-  // drawing is in logical units, the pixels are device pixels.
-  float devicePixelRatio() const {
-    double sx = 1.0, sy = 1.0;
-    cairo_surface_get_device_scale(cairo_get_target(cr_), &sx, &sy);
-    return static_cast<float>(sx);
-  }
-  int pixelWidth() const {
-    int w = cairo_image_surface_get_width(cairo_get_target(cr_));
-    return w > 0 ? w : static_cast<int>(std::ceil(width_));
-  }
-  int pixelHeight() const {
-    int h = cairo_image_surface_get_height(cairo_get_target(cr_));
-    return h > 0 ? h : static_cast<int>(std::ceil(height_));
-  }
-
-  // ---- state stack ----
-  // Cairo's own save/restore already covers the CTM, clip, line width/
-  // cap/join/miter/dash — only the fields HTML canvas tracks that Cairo
-  // has no native slot for (fill vs. stroke paint, globalAlpha, font,
-  // text align/baseline, shadow) need to be mirrored by hand here.
-  void save() {
-    cairo_save(cr_);
-    ExtraState s;
-    s.fill = fillPaint_;
-    s.stroke = strokePaint_;
-    s.globalAlpha = globalAlpha_;
-    s.imageSampling = imageSampling_;
-    s.font = font_;
-    s.textAlign = textAlign_;
-    s.textBaseline = textBaseline_;
-    s.shadowColor = shadowColor_;
-    s.shadowOffsetX = shadowOffsetX_;
-    s.shadowOffsetY = shadowOffsetY_;
-    extraStack_.push_back(std::move(s));
-  }
-  void restore() {
-    cairo_restore(cr_);
-    if (extraStack_.empty())
-      return;
-    ExtraState s = std::move(extraStack_.back());
-    extraStack_.pop_back();
-    fillPaint_ = s.fill;
-    strokePaint_ = s.stroke;
-    globalAlpha_ = s.globalAlpha;
-    imageSampling_ = s.imageSampling;
-    font_ = s.font;
-    textAlign_ = s.textAlign;
-    textBaseline_ = s.textBaseline;
-    shadowColor_ = s.shadowColor;
-    shadowOffsetX_ = s.shadowOffsetX;
-    shadowOffsetY_ = s.shadowOffsetY;
-  }
-
-  // ---- transform ----
-  void translate(float x, float y) { cairo_translate(cr_, x, y); }
-  void rotate(float radians) { cairo_rotate(cr_, radians); }
-  void scale(float sx, float sy) { cairo_scale(cr_, sx, sy); }
-  void transformBy(float a, float b, float c, float d, float e, float f) {
-    cairo_matrix_t m;
-    m.xx = a;
-    m.yx = b;
-    m.xy = c;
-    m.yy = d;
-    m.x0 = e;
-    m.y0 = f;
-    cairo_transform(cr_, &m);
-  }
-  void setTransform(float a, float b, float c, float d, float e, float f) {
-    cairo_matrix_t m;
-    m.xx = a;
-    m.yx = b;
-    m.xy = c;
-    m.yy = d;
-    m.x0 = e;
-    m.y0 = f;
-    cairo_set_matrix(cr_, &m);
-  }
-  void resetTransform() { cairo_identity_matrix(cr_); }
-
-  // ---- paint/style ----
-  void setFillColor(Color c) { fillPaint_ = Paint::solid(c); }
-  void setFillGradient(const CanvasGradient &g) { fillPaint_ = Paint::grad(g); }
-  void setStrokeColor(Color c) { strokePaint_ = Paint::solid(c); }
-  void setStrokeGradient(const CanvasGradient &g) {
-    strokePaint_ = Paint::grad(g);
-  }
-  void setLineWidth(float w) { cairo_set_line_width(cr_, std::max(0.0f, w)); }
-  void setLineCap(LineCap c) {
-    cairo_set_line_cap(cr_, c == LineCap::Round    ? CAIRO_LINE_CAP_ROUND
-                            : c == LineCap::Square ? CAIRO_LINE_CAP_SQUARE
-                                                   : CAIRO_LINE_CAP_BUTT);
-  }
-  void setLineJoin(LineJoin j) {
-    cairo_set_line_join(cr_, j == LineJoin::Round   ? CAIRO_LINE_JOIN_ROUND
-                             : j == LineJoin::Bevel ? CAIRO_LINE_JOIN_BEVEL
-                                                    : CAIRO_LINE_JOIN_MITER);
-  }
-  void setMiterLimit(float m) { cairo_set_miter_limit(cr_, m); }
-  void setLineDash(const std::vector<float> &dashes) {
-    std::vector<double> d(dashes.begin(), dashes.end());
-    cairo_set_dash(cr_, d.empty() ? nullptr : d.data(),
-                   static_cast<int>(d.size()), dashOffset_);
-  }
-  void setLineDashOffset(float offset) {
-    dashOffset_ = offset;
-    int n = cairo_get_dash_count(cr_);
-    std::vector<double> d(static_cast<size_t>(std::max(0, n)));
-    if (n > 0)
-      cairo_get_dash(cr_, d.data(), nullptr);
-    cairo_set_dash(cr_, n > 0 ? d.data() : nullptr, n, offset);
-  }
-  void setGlobalAlpha(float a) { globalAlpha_ = std::clamp(a, 0.0f, 1.0f); }
-  void setGlobalCompositeOperation(CompositeOp op) {
-    cairo_set_operator(cr_, toCairoOp(op));
-  }
-  void setImageSampling(ImageSampling mode) { imageSampling_ = mode; }
-  void setShadow(Color color, float /*blurPx, unsupported: unblurred*/,
-                 float offsetX, float offsetY) {
-    shadowColor_ = color;
-    shadowOffsetX_ = offsetX;
-    shadowOffsetY_ = offsetY;
-  }
-  void setFont(const std::string &family, float sizePx,
-               FontWeight weight = FontWeight::Regular,
-               FontStyle style = FontStyle::Normal) {
-    font_.fontFamily = family;
-    font_.fontSize = sizePx;
-    font_.fontWeight = weight;
-    font_.fontStyle = style;
-  }
-  void setTextAlign(TextAlign a) { textAlign_ = a; }
-  void setTextBaseline(TextBaseline b) { textBaseline_ = b; }
-
-  // ---- path building ----
-  void beginPath() { cairo_new_path(cr_); }
-  void closePath() { cairo_close_path(cr_); }
-  void moveTo(float x, float y) { cairo_move_to(cr_, x, y); }
-  void lineTo(float x, float y) { cairo_line_to(cr_, x, y); }
-  void quadraticCurveTo(float cpx, float cpy, float x, float y) {
-    double cx0 = 0, cy0 = 0;
-    if (cairo_has_current_point(cr_))
-      cairo_get_current_point(cr_, &cx0, &cy0);
-    float c1x =
-        static_cast<float>(cx0) + 2.0f / 3.0f * (cpx - static_cast<float>(cx0));
-    float c1y =
-        static_cast<float>(cy0) + 2.0f / 3.0f * (cpy - static_cast<float>(cy0));
-    float c2x = x + 2.0f / 3.0f * (cpx - x);
-    float c2y = y + 2.0f / 3.0f * (cpy - y);
-    cairo_curve_to(cr_, c1x, c1y, c2x, c2y, x, y);
-  }
-  void bezierCurveTo(float c1x, float c1y, float c2x, float c2y, float x,
-                     float y) {
-    cairo_curve_to(cr_, c1x, c1y, c2x, c2y, x, y);
-  }
-  void arc(float cx, float cy, float r, float startAngle, float endAngle,
-           bool ccw = false) {
-    if (ccw)
-      cairo_arc_negative(cr_, cx, cy, r, startAngle, endAngle);
-    else
-      cairo_arc(cr_, cx, cy, r, startAngle, endAngle);
-  }
-  void arcTo(float x1, float y1, float x2, float y2, float radius) {
-    double x0 = 0, y0 = 0;
-    if (cairo_has_current_point(cr_))
-      cairo_get_current_point(cr_, &x0, &y0);
-    float dx1 = static_cast<float>(x0) - x1, dy1 = static_cast<float>(y0) - y1;
-    float dx2 = x2 - x1, dy2 = y2 - y1;
-    float len1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
-    float len2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
-    if (len1 < 1e-6f || len2 < 1e-6f || radius <= 0) {
-      cairo_line_to(cr_, x1, y1);
-      return;
-    }
-    dx1 /= len1;
-    dy1 /= len1;
-    dx2 /= len2;
-    dy2 /= len2;
-    float cosA = std::clamp(dx1 * dx2 + dy1 * dy2, -1.0f, 1.0f);
-    float angle = std::acos(cosA);
-    if (angle < 1e-6f) {
-      cairo_line_to(cr_, x1, y1);
-      return;
-    }
-    float dist = radius / std::tan(angle / 2.0f);
-    float t1x = x1 + dx1 * dist, t1y = y1 + dy1 * dist;
-    float t2x = x1 + dx2 * dist, t2y = y1 + dy2 * dist;
-    cairo_line_to(cr_, t1x, t1y);
-    float bisx = dx1 + dx2, bisy = dy1 + dy2;
-    float bisLen = std::sqrt(bisx * bisx + bisy * bisy);
-    if (bisLen < 1e-6f) {
-      cairo_line_to(cr_, x1, y1);
-      return;
-    }
-    bisx /= bisLen;
-    bisy /= bisLen;
-    float centerDist = std::sqrt(radius * radius + dist * dist);
-    float ccx = x1 + bisx * centerDist, ccy = y1 + bisy * centerDist;
-    float a0 = std::atan2(t1y - ccy, t1x - ccx);
-    float a1 = std::atan2(t2y - ccy, t2x - ccx);
-    float cross = dx1 * dy2 - dy1 * dx2;
-    if (cross > 0)
-      cairo_arc_negative(cr_, ccx, ccy, radius, a0, a1);
-    else
-      cairo_arc(cr_, ccx, ccy, radius, a0, a1);
-  }
-  void ellipse(float cx, float cy, float rx, float ry, float rotation,
-               float startAngle, float endAngle, bool ccw = false) {
-    // Standard Cairo idiom: build the arc against a unit circle under a
-    // temporarily scaled/rotated/translated CTM, then restore — the path
-    // points get baked into the OUTER coordinate system as this shape's
-    // true (rx,ry)-scaled ellipse, and any path built before/after this
-    // call in the outer frame stays correctly connected.
-    cairo_save(cr_);
-    cairo_translate(cr_, cx, cy);
-    cairo_rotate(cr_, rotation);
-    cairo_scale(cr_, std::max(1e-6f, rx), std::max(1e-6f, ry));
-    if (ccw)
-      cairo_arc_negative(cr_, 0, 0, 1, startAngle, endAngle);
-    else
-      cairo_arc(cr_, 0, 0, 1, startAngle, endAngle);
-    cairo_restore(cr_);
-  }
-  void rect(float x, float y, float w, float h) {
-    cairo_rectangle(cr_, x, y, w, h);
-  }
-  void roundRect(float x, float y, float w, float h, float radius) {
-    constexpr float kPi = 3.14159265358979f;
-    radius = std::max(0.0f, std::min(radius, std::min(w, h) / 2.0f));
-    cairo_move_to(cr_, x + radius, y);
-    cairo_line_to(cr_, x + w - radius, y);
-    cairo_arc(cr_, x + w - radius, y + radius, radius, -kPi / 2, 0);
-    cairo_line_to(cr_, x + w, y + h - radius);
-    cairo_arc(cr_, x + w - radius, y + h - radius, radius, 0, kPi / 2);
-    cairo_line_to(cr_, x + radius, y + h);
-    cairo_arc(cr_, x + radius, y + h - radius, radius, kPi / 2, kPi);
-    cairo_line_to(cr_, x, y + radius);
-    cairo_arc(cr_, x + radius, y + radius, radius, kPi, kPi * 1.5);
-    cairo_close_path(cr_);
-  }
-
-  // ---- drawing ----
-  // fill()/stroke()/clip() preserve the current path (via the *_preserve
-  // variants), matching HTML canvas semantics where only beginPath()
-  // clears it.
-  void fill(FillRule rule = FillRule::NonZero) {
-    cairo_set_fill_rule(cr_, rule == FillRule::EvenOdd
-                                 ? CAIRO_FILL_RULE_EVEN_ODD
-                                 : CAIRO_FILL_RULE_WINDING);
-    drawShadowThenReal([&] { cairo_fill_preserve(cr_); }, fillPaint_);
-  }
-  void stroke() {
-    drawShadowThenReal([&] { cairo_stroke_preserve(cr_); }, strokePaint_);
-  }
-  void clip(FillRule rule = FillRule::NonZero) {
-    cairo_set_fill_rule(cr_, rule == FillRule::EvenOdd
-                                 ? CAIRO_FILL_RULE_EVEN_ODD
-                                 : CAIRO_FILL_RULE_WINDING);
-    cairo_clip_preserve(cr_);
-  }
-  void fillRect(float x, float y, float w, float h) {
-    cairo_path_t *orig = cairo_copy_path(cr_);
-    cairo_new_path(cr_);
-    cairo_rectangle(cr_, x, y, w, h);
-    drawShadowThenReal([&] { cairo_fill(cr_); }, fillPaint_);
-    cairo_new_path(cr_);
-    cairo_append_path(cr_, orig);
-    cairo_path_destroy(orig);
-  }
-  void strokeRect(float x, float y, float w, float h) {
-    cairo_path_t *orig = cairo_copy_path(cr_);
-    cairo_new_path(cr_);
-    cairo_rectangle(cr_, x, y, w, h);
-    drawShadowThenReal([&] { cairo_stroke(cr_); }, strokePaint_);
-    cairo_new_path(cr_);
-    cairo_append_path(cr_, orig);
-    cairo_path_destroy(orig);
-  }
-  // A true partial-area clear (unlike the Windows backend — see the
-  // Canvas limitations note), implemented via CAIRO_OPERATOR_CLEAR.
-  void clearRect(float x, float y, float w, float h) {
-    cairo_path_t *orig = cairo_copy_path(cr_);
-    cairo_new_path(cr_);
-    cairo_rectangle(cr_, x, y, w, h);
-    cairo_operator_t prevOp = cairo_get_operator(cr_);
-    cairo_set_operator(cr_, CAIRO_OPERATOR_CLEAR);
-    cairo_fill(cr_);
-    cairo_set_operator(cr_, prevOp);
-    cairo_new_path(cr_);
-    cairo_append_path(cr_, orig);
-    cairo_path_destroy(orig);
-  }
-
-  // ---- text ----
-  TextMetricsResult measureText(const std::string &text) {
-    TextStyle ts = fontToTextStyle();
-    PangoLayout *layout = liteui_text::makeLayout(
-        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
-        resolveStatic(ts.fontStyle), -1, cr_);
-    int w = 0, h = 0;
-    pango_layout_get_pixel_size(layout, &w, &h);
-    g_object_unref(layout);
-    return {static_cast<float>(w)};
-  }
-  void fillText(const std::string &text, float x, float y,
-                float maxWidth = -1) {
-    drawTextImpl(text, x, y, maxWidth, false);
-  }
-  void strokeText(const std::string &text, float x, float y,
-                  float maxWidth = -1) {
-    drawTextImpl(text, x, y, maxWidth, true);
-  }
-
-  // ---- images ----
-  void drawImage(const CanvasImage &img, float dx, float dy) {
-    drawImage(img, 0, 0, static_cast<float>(img.width),
-              static_cast<float>(img.height), dx, dy,
-              static_cast<float>(img.width), static_cast<float>(img.height));
-  }
-  void drawImage(const CanvasImage &img, float dx, float dy, float dw,
-                 float dh) {
-    drawImage(img, 0, 0, static_cast<float>(img.width),
-              static_cast<float>(img.height), dx, dy, dw, dh);
-  }
-  // Draws `img`, converting it to a fresh Cairo image surface first unless
-  // imageCacheOwner_ already has one cached for this exact pixel buffer
-  // (see the constructor's comment and the Windows drawImage's — same
-  // caching heuristic and the same caveat about in-place pixel mutation
-  // applies here).
-  void drawImage(const CanvasImage &img, float sx, float sy, float sw, float sh,
-                 float dx, float dy, float dw, float dh) {
-    if (img.width <= 0 || img.height <= 0)
-      return;
-    cairo_surface_t *surf = nullptr;
-    bool cacheHit =
-        imageCacheOwner_ && imageCacheOwner_->cachedImageSurface &&
-        imageCacheOwner_->cachedImagePixels == img.pixels.data() &&
-        imageCacheOwner_->cachedImagePixelsSize == img.pixels.size() &&
-        imageCacheOwner_->cachedImageW == img.width &&
-        imageCacheOwner_->cachedImageH == img.height;
-    if (cacheHit) {
-      surf = imageCacheOwner_->cachedImageSurface;
-    } else {
-      surf = imageToCairoSurface(img);
-      if (imageCacheOwner_) {
-        if (imageCacheOwner_->cachedImageSurface)
-          cairo_surface_destroy(imageCacheOwner_->cachedImageSurface);
-        imageCacheOwner_->cachedImageSurface = surf;
-        imageCacheOwner_->cachedImagePixels = img.pixels.data();
-        imageCacheOwner_->cachedImagePixelsSize = img.pixels.size();
-        imageCacheOwner_->cachedImageW = img.width;
-        imageCacheOwner_->cachedImageH = img.height;
-      }
-    }
-    cairo_save(cr_);
-    cairo_translate(cr_, dx, dy);
-    cairo_scale(cr_, dw / std::max(1.0f, sw), dh / std::max(1.0f, sh));
-    cairo_translate(cr_, -sx, -sy);
-    cairo_set_source_surface(cr_, surf, 0, 0);
-    // The CTM here already includes the dw/sw, dh/sh scale applied above, but
-    // not the surface's device scale, so only the latter is passed as dpr.
-    cairo_matrix_t m;
-    cairo_get_matrix(cr_, &m);
-    const auto filter = liteui_canvas_sampling::pickFilter(
-        imageSampling_, static_cast<float>(m.xx), static_cast<float>(m.yx),
-        static_cast<float>(m.xy), static_cast<float>(m.yy), 1.0f, 1.0f,
-        devicePixelRatio());
-    // BILINEAR only samples 2x2 texels; GOOD is Cairo's quality filter, which
-    // convolves over the whole footprint when the image is shrunk.
-    cairo_pattern_set_filter(
-        cairo_get_source(cr_),
-        filter == liteui_canvas_sampling::ImageFilter::Nearest
-            ? CAIRO_FILTER_NEAREST
-            : filter == liteui_canvas_sampling::ImageFilter::Mipmap
-                  ? CAIRO_FILTER_GOOD
-                  : CAIRO_FILTER_BILINEAR);
-    cairo_paint_with_alpha(cr_, globalAlpha_);
-    cairo_restore(cr_);
-    // Only destroy when NOT cache-owned — see the Windows drawImage's
-    // matching comment.
-    if (!imageCacheOwner_)
-      cairo_surface_destroy(surf);
-  }
-
-  // ---- app-owned textures ----
-  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy) {
-    if (t)
-      drawTexture(t, 0, 0, static_cast<float>(t->width()),
-                  static_cast<float>(t->height()), dx, dy,
-                  static_cast<float>(t->width()),
-                  static_cast<float>(t->height()));
-  }
-  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float dx, float dy,
-                   float dw, float dh) {
-    if (t)
-      drawTexture(t, 0, 0, static_cast<float>(t->width()),
-                  static_cast<float>(t->height()), dx, dy, dw, dh);
-  }
-  // The Cairo backend has no GPU copy to keep: each draw converts just the
-  // part of the CanvasTexture it needs (premultiplied RGBA -> Cairo's ARGB32) into
-  // a temporary surface. Simple rather than fast; this is the fallback
-  // backend (the default Linux backend is OpenGL ES). Geometry, cropping,
-  // filtering, clip, alpha and compositing match drawImage().
-  void drawTexture(const std::shared_ptr<CanvasTexture> &t, float sx, float sy,
-                   float sw, float sh, float dx, float dy, float dw, float dh) {
-    if (!t || !t->valid() || sw <= 0 || sh <= 0 || dw == 0 || dh == 0)
-      return;
-    const float tw = static_cast<float>(t->width()),
-                th = static_cast<float>(t->height());
-    const float cx0 = std::max(sx, 0.0f), cy0 = std::max(sy, 0.0f);
-    const float cx1 = std::min(sx + sw, tw), cy1 = std::min(sy + sh, th);
-    if (cx1 <= cx0 || cy1 <= cy0)
-      return;
-    const float rx = dw / sw, ry = dh / sh;
-    // Whole source pixels covering the cropped rectangle.
-    const int ix0 = static_cast<int>(std::floor(cx0));
-    const int iy0 = static_cast<int>(std::floor(cy0));
-    const int iw = static_cast<int>(std::ceil(cx1)) - ix0;
-    const int ih = static_cast<int>(std::ceil(cy1)) - iy0;
-    std::vector<uint8_t> px;
-    if (!t->readPixels(ix0, iy0, iw, ih, px))
-      return;
-    cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
-    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
-      cairo_surface_destroy(surf);
-      return;
-    }
-    cairo_surface_flush(surf);
-    unsigned char *dstPx = cairo_image_surface_get_data(surf);
-    const int stride = cairo_image_surface_get_stride(surf);
-    for (int row = 0; row < ih; ++row)
-      for (int col = 0; col < iw; ++col) {
-        const uint8_t *s = &px[(static_cast<size_t>(row) * iw + col) * 4];
-        unsigned char *d = dstPx + static_cast<size_t>(row) * stride + col * 4;
-        d[0] = s[2]; // ARGB32 is BGRA in memory, premultiplied
-        d[1] = s[1];
-        d[2] = s[0];
-        d[3] = s[3];
-      }
-    cairo_surface_mark_dirty(surf);
-    // Keep the app's current path intact, like fillRect() does.
-    cairo_path_t *orig = cairo_copy_path(cr_);
-    cairo_new_path(cr_);
-    cairo_save(cr_);
-    cairo_rectangle(cr_, dx + (cx0 - sx) * rx, dy + (cy0 - sy) * ry,
-                    (cx1 - cx0) * rx, (cy1 - cy0) * ry);
-    cairo_clip(cr_); // exact (possibly fractional) destination of the crop
-    cairo_translate(cr_, dx + (ix0 - sx) * rx, dy + (iy0 - sy) * ry);
-    cairo_scale(cr_, rx, ry);
-    cairo_set_source_surface(cr_, surf, 0, 0);
-    cairo_matrix_t m;
-    cairo_get_matrix(cr_, &m);
-    const auto filter = liteui_canvas_sampling::pickFilter(
-        imageSampling_, static_cast<float>(m.xx), static_cast<float>(m.yx),
-        static_cast<float>(m.xy), static_cast<float>(m.yy), 1.0f, 1.0f,
-        devicePixelRatio());
-    cairo_pattern_set_filter(
-        cairo_get_source(cr_),
-        filter == liteui_canvas_sampling::ImageFilter::Nearest
-            ? CAIRO_FILTER_NEAREST
-            : filter == liteui_canvas_sampling::ImageFilter::Mipmap
-                  ? CAIRO_FILTER_GOOD
-                  : CAIRO_FILTER_BILINEAR);
-    cairo_paint_with_alpha(cr_, globalAlpha_);
-    cairo_restore(cr_);
-    cairo_new_path(cr_);
-    cairo_append_path(cr_, orig);
-    cairo_path_destroy(orig);
-    cairo_surface_destroy(surf);
-  }
-
-  // ---- pixel data ----
-  // Fully supported: reads straight out of this canvas's own backing
-  // Cairo image surface (the render target `cr_` draws into).
-  std::optional<CanvasImage> getImageData(float x, float y, float w, float h) {
-    cairo_surface_t *target = cairo_get_target(cr_);
-    cairo_surface_flush(target);
-    int sw = cairo_image_surface_get_width(target);
-    int sh = cairo_image_surface_get_height(target);
-    int ix = static_cast<int>(std::floor(x)),
-        iy = static_cast<int>(std::floor(y));
-    int iw = std::max(0, static_cast<int>(std::round(w)));
-    int ih = std::max(0, static_cast<int>(std::round(h)));
-    CanvasImage out(iw, ih);
-    unsigned char *src = cairo_image_surface_get_data(target);
-    int stride = cairo_image_surface_get_stride(target);
-    for (int row = 0; row < ih; ++row) {
-      int sy = iy + row;
-      if (sy < 0 || sy >= sh)
-        continue;
-      for (int col = 0; col < iw; ++col) {
-        int sx = ix + col;
-        if (sx < 0 || sx >= sw)
-          continue;
-        unsigned char *p = src + sy * stride + sx * 4;
-        unsigned char b = p[0], g = p[1], r = p[2], a = p[3];
-        unsigned char *dst =
-            out.pixels.data() + (static_cast<size_t>(row) * iw + col) * 4;
-        dst[0] = a ? static_cast<unsigned char>(std::min(255, r * 255 / a)) : 0;
-        dst[1] = a ? static_cast<unsigned char>(std::min(255, g * 255 / a)) : 0;
-        dst[2] = a ? static_cast<unsigned char>(std::min(255, b * 255 / a)) : 0;
-        dst[3] = a;
-      }
-    }
-    return out;
-  }
-  // putImageData ignores the current transform/compositing and pokes
-  // pixels directly, matching HTML canvas semantics.
-  void putImageData(const CanvasImage &img, float dx, float dy) {
-    if (img.width <= 0 || img.height <= 0)
-      return;
-    cairo_surface_t *target = cairo_get_target(cr_);
-    cairo_surface_flush(target);
-    int sw = cairo_image_surface_get_width(target);
-    int sh = cairo_image_surface_get_height(target);
-    unsigned char *dst = cairo_image_surface_get_data(target);
-    int stride = cairo_image_surface_get_stride(target);
-    int ix = static_cast<int>(std::round(dx)),
-        iy = static_cast<int>(std::round(dy));
-    for (int row = 0; row < img.height; ++row) {
-      int ty = iy + row;
-      if (ty < 0 || ty >= sh)
-        continue;
-      for (int col = 0; col < img.width; ++col) {
-        int tx = ix + col;
-        if (tx < 0 || tx >= sw)
-          continue;
-        const unsigned char *s =
-            img.pixels.data() +
-            (static_cast<size_t>(row) * img.width + col) * 4;
-        unsigned char r = s[0], g = s[1], b = s[2], a = s[3];
-        unsigned char *p = dst + ty * stride + tx * 4;
-        p[0] = static_cast<unsigned char>(b * a / 255);
-        p[1] = static_cast<unsigned char>(g * a / 255);
-        p[2] = static_cast<unsigned char>(r * a / 255);
-        p[3] = a;
-      }
-    }
-    cairo_surface_mark_dirty(target);
-  }
-
-private:
-  struct Paint {
-    bool isGradient = false;
-    Color color{0, 0, 0, 255};
-    CanvasGradient gradient;
-    static Paint solid(Color c) {
-      Paint p;
-      p.isGradient = false;
-      p.color = c;
-      return p;
-    }
-    static Paint grad(const CanvasGradient &g) {
-      Paint p;
-      p.isGradient = true;
-      p.gradient = g;
-      return p;
-    }
-  };
-
-  struct ExtraState {
-    Paint fill, stroke;
-    float globalAlpha;
-    ImageSampling imageSampling;
-    TextStyle font;
-    TextAlign textAlign;
-    TextBaseline textBaseline;
-    Color shadowColor;
-    float shadowOffsetX, shadowOffsetY;
-  };
-
-  static Color colorOf(const Paint &p) {
-    if (!p.isGradient)
-      return p.color;
-    return p.gradient.stops.empty() ? Color{0, 0, 0, 255}
-                                    : p.gradient.stops.front().color;
-  }
-
-  static cairo_operator_t toCairoOp(CompositeOp op) {
-    switch (op) {
-    case CompositeOp::SourceOver:
-      return CAIRO_OPERATOR_OVER;
-    case CompositeOp::SourceIn:
-      return CAIRO_OPERATOR_IN;
-    case CompositeOp::SourceOut:
-      return CAIRO_OPERATOR_OUT;
-    case CompositeOp::SourceAtop:
-      return CAIRO_OPERATOR_ATOP;
-    case CompositeOp::DestinationOver:
-      return CAIRO_OPERATOR_DEST_OVER;
-    case CompositeOp::DestinationIn:
-      return CAIRO_OPERATOR_DEST_IN;
-    case CompositeOp::DestinationOut:
-      return CAIRO_OPERATOR_DEST_OUT;
-    case CompositeOp::DestinationAtop:
-      return CAIRO_OPERATOR_DEST_ATOP;
-    case CompositeOp::Lighter:
-      return CAIRO_OPERATOR_ADD;
-    case CompositeOp::Copy:
-      return CAIRO_OPERATOR_SOURCE;
-    case CompositeOp::Xor:
-      return CAIRO_OPERATOR_XOR;
-    case CompositeOp::Multiply:
-      return CAIRO_OPERATOR_MULTIPLY;
-    case CompositeOp::Screen:
-      return CAIRO_OPERATOR_SCREEN;
-    }
-    return CAIRO_OPERATOR_OVER;
-  }
-
-  void applyPaint(const Paint &p) {
-    if (!p.isGradient) {
-      Color c = p.color;
-      cairo_set_source_rgba(cr_, c.r / 255.0, c.g / 255.0, c.b / 255.0,
-                            (c.a / 255.0) * globalAlpha_);
-      return;
-    }
-    cairo_pattern_t *pat =
-        p.gradient.kind == CanvasGradient::Kind::Linear
-            ? cairo_pattern_create_linear(p.gradient.x0, p.gradient.y0,
-                                          p.gradient.x1, p.gradient.y1)
-            : cairo_pattern_create_radial(p.gradient.x0, p.gradient.y0,
-                                          p.gradient.r0, p.gradient.x1,
-                                          p.gradient.y1, p.gradient.r1);
-    for (auto &s : p.gradient.stops)
-      cairo_pattern_add_color_stop_rgba(pat, std::clamp(s.offset, 0.0f, 1.0f),
-                                        s.color.r / 255.0, s.color.g / 255.0,
-                                        s.color.b / 255.0,
-                                        (s.color.a / 255.0) * globalAlpha_);
-    cairo_set_source(cr_, pat);
-    cairo_pattern_destroy(pat);
-  }
-
-  // Cairo paths are stored as literal coordinate data, not re-evaluated
-  // against a later CTM — cairo_copy_path()/cairo_append_path() is the
-  // standard way to "replay" the current path under a temporarily
-  // different transform (used here to offset a shadow copy) and to put
-  // the app's original path back afterward, since fill()/stroke() must
-  // leave the current path exactly as HTML canvas would (untouched,
-  // aside from the intentional *_preserve semantics).
-  template <class Fn> void drawShadowThenReal(Fn drawFn, const Paint &paint) {
-    cairo_path_t *orig = cairo_copy_path(cr_);
-    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0)) {
-      cairo_save(cr_);
-      cairo_translate(cr_, shadowOffsetX_, shadowOffsetY_);
-      cairo_new_path(cr_);
-      cairo_append_path(cr_, orig);
-      applyPaint(Paint::solid(shadowColor_));
-      drawFn();
-      cairo_restore(cr_);
-    }
-    cairo_new_path(cr_);
-    cairo_append_path(cr_, orig);
-    applyPaint(paint);
-    drawFn();
-    cairo_path_destroy(orig);
-  }
-
-  static cairo_surface_t *imageToCairoSurface(const CanvasImage &img) {
-    int w = img.width, h = img.height;
-    cairo_surface_t *surf =
-        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
-    cairo_surface_flush(surf);
-    unsigned char *data = cairo_image_surface_get_data(surf);
-    int stride = cairo_image_surface_get_stride(surf);
-    for (int row = 0; row < h; ++row) {
-      unsigned char *dst = data + row * stride;
-      const unsigned char *src =
-          img.pixels.data() + static_cast<size_t>(row) * w * 4;
-      for (int col = 0; col < w; ++col) {
-        unsigned char r = src[col * 4 + 0], g = src[col * 4 + 1],
-                      b = src[col * 4 + 2], a = src[col * 4 + 3];
-        // Cairo's ARGB32 wants premultiplied, native-endian 32-bit
-        // pixels — byte order B,G,R,A on the little-endian platforms
-        // this file targets (same convention as ensureTextTexture above).
-        unsigned char *px = dst + col * 4;
-        if (a == 255) { // opaque: premultiply is a no-op (x * 255 / 255 == x)
-          px[0] = b;
-          px[1] = g;
-          px[2] = r;
-          px[3] = 255;
-        } else {
-          px[0] = static_cast<unsigned char>(b * a / 255);
-          px[1] = static_cast<unsigned char>(g * a / 255);
-          px[2] = static_cast<unsigned char>(r * a / 255);
-          px[3] = a;
-        }
-      }
-    }
-    cairo_surface_mark_dirty(surf);
-    return surf;
-  }
-
-  TextStyle fontToTextStyle() const {
-    TextStyle ts = font_;
-    ts.wrap = TextWrap::NoWrap;
-    return ts;
-  }
-
-  // maxWidth is accepted for API familiarity with HTML canvas but not
-  // currently applied (no horizontal squeeze-to-fit is performed).
-  void drawTextImpl(const std::string &text, float x, float y, float,
-                    bool stroked) {
-    TextStyle ts = fontToTextStyle();
-    PangoLayout *layout = liteui_text::makeLayout(
-        text, ts, resolveStatic(ts.fontSize), resolveStatic(ts.fontWeight),
-        resolveStatic(ts.fontStyle), -1, cr_);
-    int pw = 0, ph = 0;
-    pango_layout_get_pixel_size(layout, &pw, &ph);
-    PangoLayoutIter *iter = pango_layout_get_iter(layout);
-    int baseline = pango_layout_iter_get_baseline(iter) / PANGO_SCALE;
-    pango_layout_iter_free(iter);
-    float baseX = x, baseY = y;
-    switch (textAlign_) {
-    case TextAlign::Center:
-      baseX -= pw / 2.0f;
-      break;
-    case TextAlign::End:
-      baseX -= static_cast<float>(pw);
-      break;
-    default:
-      break;
-    }
-    switch (textBaseline_) {
-    case TextBaseline::Top:
-      break;
-    case TextBaseline::Middle:
-      baseY -= ph / 2.0f;
-      break;
-    case TextBaseline::Bottom:
-      baseY -= static_cast<float>(ph);
-      break;
-    case TextBaseline::Alphabetic:
-    default:
-      baseY -= static_cast<float>(baseline);
-      break;
-    }
-    auto paintOnce = [&](Color c, float ox, float oy) {
-      cairo_set_source_rgba(cr_, c.r / 255.0, c.g / 255.0, c.b / 255.0,
-                            (c.a / 255.0) * globalAlpha_);
-      cairo_move_to(cr_, baseX + ox, baseY + oy);
-      pango_cairo_show_layout(cr_, layout);
-    };
-    if (shadowColor_.a > 0 && (shadowOffsetX_ != 0 || shadowOffsetY_ != 0))
-      paintOnce(shadowColor_, shadowOffsetX_, shadowOffsetY_);
-    if (!stroked) {
-      paintOnce(colorOf(fillPaint_), 0, 0);
-    } else {
-      // Approximates a stroked glyph outline the same way the Windows
-      // backend does (see its drawTextImpl comment) — not a true glyph
-      // contour outline.
-      Color base = colorOf(strokePaint_);
-      double lw = cairo_get_line_width(cr_);
-      float r = static_cast<float>(std::max(1.0, lw / 2.0));
-      static const float offs[8][2] = {
-          {1, 0},       {-1, 0},       {0, 1},        {0, -1},
-          {0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f, -0.7f}, {-0.7f, -0.7f}};
-      for (auto &o : offs)
-        paintOnce(base, o[0] * r, o[1] * r);
-    }
-    g_object_unref(layout);
-  }
-
-  cairo_t *cr_;
-  float width_, height_;
-  // Not owned — lifetime is the canvas node's own Computed (see the
-  // constructor's comment). Null when there's no per-node cache to use.
-  const View::Computed *imageCacheOwner_ = nullptr;
-
-  Paint fillPaint_ = Paint::solid(Color{0, 0, 0, 255});
-  Paint strokePaint_ = Paint::solid(Color{0, 0, 0, 255});
-  float dashOffset_ = 0.0f;
-  float globalAlpha_ = 1.0f;
-  ImageSampling imageSampling_ = ImageSampling::Smooth;
-  Color shadowColor_{0, 0, 0, 0};
-  float shadowOffsetX_ = 0.0f, shadowOffsetY_ = 0.0f;
-  TextStyle font_;
-  TextAlign textAlign_ = TextAlign::Start;
-  TextBaseline textBaseline_ = TextBaseline::Alphabetic;
-
-  std::vector<ExtraState> extraStack_;
-};
 
 #endif
 
@@ -15682,14 +14856,6 @@ void View::freeTextResources() {
   if (computed.canvasTexture) {
     glDeleteTextures(1, &computed.canvasTexture);
     computed.canvasTexture = 0;
-  }
-  if (computed.canvasSurface) {
-    cairo_surface_destroy(computed.canvasSurface);
-    computed.canvasSurface = nullptr;
-  }
-  if (computed.cachedImageSurface) {
-    cairo_surface_destroy(computed.cachedImageSurface);
-    computed.cachedImageSurface = nullptr;
   }
 #endif
   for (auto &c : children)
@@ -18832,9 +17998,7 @@ private:
 
   GLuint rectProgram_ = 0, flatProgram_ = 0;
   GLuint texProgram_ = 0;
-#if defined(LITEUI_CANVAS_GL)
   liteui_canvas_gl::Renderer canvasGl_; // shared by every canvas node
-#endif
   GLuint canvasProgram_ = 0; // samples RGBA directly, no alpha-tint (unlike
                              // texProgram_'s glyph-coverage tinting)
   GLuint quadVbo_ = 0; // static unit quad, reused by every rectProgram_ draw
@@ -18936,30 +18100,16 @@ private:
     }
   )";
 
-  // Draws a Canvas node's cached backing texture (see ensureCanvasSurface).
+  // Draws a Canvas node's GPU backing texture (see ensureCanvasTargetGl).
   // Unlike kTexFS (which stores only glyph coverage in alpha and tints it
   // with a separate u_color), a canvas texture already carries real RGBA
-  // color data straight out of Cairo, so this simply samples it as-is —
-  // reuses kTexVS unchanged since the vertex stage (position a unit quad,
-  // pass through UV) is identical.
-  // The GPU canvas backend's targets hold plain RGBA (no Cairo BGRA
-  // byte order), already premultiplied: sample as-is.
+  // color data, so this simply samples it as-is — reuses kTexVS unchanged.
   static constexpr const char *kCanvasRgbaFS = R"(
     precision mediump float;
     varying vec2 v_uv;
     uniform sampler2D u_tex;
     void main() {
       gl_FragColor = texture2D(u_tex, v_uv);
-    }
-  )";
-  static constexpr const char *kCanvasFS = R"(
-    precision mediump float;
-    varying vec2 v_uv;
-    uniform sampler2D u_tex;
-    void main() {
-      // Cairo ARGB32 bytes are B,G,R,A (little-endian) and premultiplied;
-      // uploaded as GL_RGBA they arrive as (r=B, g=G, b=R, a=A), so swizzle back.
-      gl_FragColor = texture2D(u_tex, v_uv).bgra;
     }
   )";
 
@@ -20201,11 +19351,7 @@ private:
     texUTex_ = glGetUniformLocation(texProgram_, "u_tex");
     texUColor_ = glGetUniformLocation(texProgram_, "u_color");
 
-#if defined(LITEUI_CANVAS_GL)
     canvasProgram_ = linkProgram(kTexVS, kCanvasRgbaFS);
-#else
-    canvasProgram_ = linkProgram(kTexVS, kCanvasFS);
-#endif
     canvasAPos_ = glGetAttribLocation(canvasProgram_, "a_pos");
     canvasUPos_ = glGetUniformLocation(canvasProgram_, "u_pos");
     canvasUSize_ = glGetUniformLocation(canvasProgram_, "u_size");
@@ -20221,10 +19367,8 @@ private:
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_SCISSOR_TEST); // ClipRect maps straight onto glScissor
-#if defined(LITEUI_CANVAS_GL)
     if (!canvasGl_.init())
       throw std::runtime_error("liteui: GL canvas renderer failed to start");
-#endif
   }
 
   // Forgets (does NOT delete) every GL name held by the view tree. Used when
@@ -20280,9 +19424,7 @@ private:
     quadVbo_ = flatVbo_ = 0;
     tooltipTextTexture_ = 0;
     tooltipTextureBuiltFor_.clear();
-#if defined(LITEUI_CANVAS_GL)
     canvasGl_.abandon();
-#endif
     try {
       createEglContext();
       makeContextCurrent();
@@ -20719,155 +19861,6 @@ private:
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
-#if !defined(LITEUI_CANVAS_GL)
-  // (Re)builds v.computed.canvasSurface — a Cairo ARGB32 image surface
-  // sized to v's inner (padding-excluded) content box — whenever that
-  // size has changed since it was last built, then (re)invokes v.onPaint
-  // into it whenever the size changed OR the app requested a redraw via
-  // View::requestCanvasRedraw() (canvasNeedsRedraw starts true, so this
-  // always happens at least once). Finally (re)uploads the surface's
-  // pixels as a GL texture whenever either of those happened — a plain
-  // repaint with neither condition true reuses the existing texture
-  // untouched.
-  void ensureCanvasSurface(const View &v) {
-    const EdgeInsets &pad =
-        resolveDynamic(v.style.padding, v.computed.resolvedPadding);
-    float innerW = std::max(1.0f, v.computed.w - pad.left - pad.right);
-    float innerH = std::max(1.0f, v.computed.h - pad.top - pad.bottom);
-    int iw = std::max(1, static_cast<int>(innerW));
-    int ih = std::max(1, static_cast<int>(innerH));
-    const int pw = deviceDimF(innerW), ph = deviceDimF(innerH); // device px
-    bool resized = !v.computed.canvasSurface ||
-                   v.computed.canvasBuiltForWidth != innerW ||
-                   v.computed.canvasBuiltForHeight != innerH;
-    if (resized) {
-      if (v.computed.canvasSurface) {
-        cairo_surface_destroy(v.computed.canvasSurface);
-        v.computed.canvasSurface = nullptr;
-      }
-      v.computed.canvasSurface =
-          cairo_image_surface_create(CAIRO_FORMAT_ARGB32, pw, ph);
-      // Device scale: onPaint draws in logical units onto pw x ph pixels.
-      cairo_surface_set_device_scale(v.computed.canvasSurface, scale_, scale_);
-      v.computed.canvasBuiltForWidth = innerW;
-      v.computed.canvasBuiltForHeight = innerH;
-      v.computed.canvasNeedsRedraw = true;
-      v.computed.canvasFullRepaint = true; // new storage: nothing to keep
-    }
-    if (!v.computed.canvasSurface)
-      return;
-
-    bool needUpload = resized;
-    // Set when a retained canvas repainted only a box: just that box is then
-    // re-uploaded instead of the whole surface.
-    bool partialUpload = false;
-    liteui_canvas_damage::DeviceRect partialRect;
-    if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      const auto plan = liteui_canvas_damage::plan(
-          v.canvasRetained, v.computed.canvasFullRepaint,
-          v.computed.canvasDamageRect, scale_, pw, ph);
-      if (!plan.nothing) {
-        cairo_t *cr = cairo_create(v.computed.canvasSurface);
-        if (!plan.full) {
-          // Clip to the box (logical units; the surface carries the device
-          // scale). Aliased, so an edge on a whole device pixel never leaves
-          // a faint partial-coverage row behind.
-          cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
-          cairo_rectangle(cr, plan.logical.x, plan.logical.y, plan.logical.w,
-                          plan.logical.h);
-          cairo_clip(cr);
-          cairo_set_antialias(cr, CAIRO_ANTIALIAS_DEFAULT);
-        }
-        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-        cairo_set_source_rgba(cr, 0, 0, 0, 0);
-        cairo_paint(cr);
-        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-        CanvasContextImpl ctx(cr, scale_ == 1.0f ? static_cast<float>(iw) : innerW,
-                              scale_ == 1.0f ? static_cast<float>(ih) : innerH,
-                              &v.computed);
-        static_cast<CanvasContext &>(ctx).setDamageState(plan.logical,
-                                                         plan.full);
-        v.onPaint(ctx);
-        cairo_destroy(cr);
-        needUpload = true;
-        if (!plan.full && !resized && v.computed.canvasTexture) {
-          partialUpload = true;
-          partialRect = plan.dev;
-        }
-      }
-      v.computed.canvasNeedsRedraw = false;
-      v.computed.canvasFullRepaint = false;
-      v.computed.canvasDamageRect = DirtyRect{};
-    }
-    if (!needUpload && v.computed.canvasTexture)
-      return;
-
-    cairo_surface_flush(v.computed.canvasSurface);
-    unsigned char *data =
-        cairo_image_surface_get_data(v.computed.canvasSurface);
-    int stride = cairo_image_surface_get_stride(v.computed.canvasSurface);
-
-    if (partialUpload) {
-      // Repack just the repainted box into a contiguous buffer (no reliance
-      // on GL_UNPACK_ROW_LENGTH) and overwrite that region of the texture.
-      const int rw = partialRect.width(), rh = partialRect.height();
-      std::vector<unsigned char> sub(static_cast<size_t>(rw) * rh * 4);
-      for (int row = 0; row < rh; ++row)
-        std::memcpy(sub.data() + static_cast<size_t>(row) * rw * 4,
-                    data + static_cast<size_t>(partialRect.y0 + row) * stride +
-                        static_cast<size_t>(partialRect.x0) * 4,
-                    static_cast<size_t>(rw) * 4);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, v.computed.canvasTexture);
-      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-      glTexSubImage2D(GL_TEXTURE_2D, 0, partialRect.x0, partialRect.y0, rw, rh,
-                      GL_RGBA, GL_UNSIGNED_BYTE, sub.data());
-      return;
-    }
-
-    // Cairo's ARGB32 stride is always width*4, so the surface can be
-    // uploaded directly. Fall back to a repack only if that ever changes.
-    std::vector<unsigned char> repacked;
-    const unsigned char *upload = data;
-    if (stride != pw * 4) {
-      repacked.resize(static_cast<size_t>(pw) * ph * 4);
-      for (int row = 0; row < ph; ++row)
-        std::memcpy(repacked.data() + static_cast<size_t>(row) * pw * 4,
-                    data + static_cast<size_t>(row) * stride,
-                    static_cast<size_t>(pw) * 4);
-      upload = repacked.data();
-    }
-
-    glActiveTexture(GL_TEXTURE0);
-    bool created = false;
-    if (!v.computed.canvasTexture) {
-      GLuint tex = 0;
-      glGenTextures(1, &tex);
-      v.computed.canvasTexture = tex;
-      glBindTexture(GL_TEXTURE_2D, tex);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      created = true;
-    } else {
-      glBindTexture(GL_TEXTURE_2D, v.computed.canvasTexture);
-    }
-
-    glPixelStorei(GL_UNPACK_ALIGNMENT,
-                  4); // rows are pw*4 bytes, always 4-aligned
-    if (created || resized) {
-      // (Re)specify storage: new texture, or the canvas changed size.
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0, GL_RGBA,
-                   GL_UNSIGNED_BYTE, upload);
-    } else {
-      // Same size: overwrite in place, no reallocation on the driver side.
-      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE,
-                      upload);
-    }
-  }
-
-#else // LITEUI_CANVAS_GL
   // (Re)builds v's GPU target — an RGBA8 texture + FBO(s) sized to v's inner
   // (padding-excluded) content box — whenever that size changed, then
   // re-invokes v.onPaint into it whenever the size changed OR the app
@@ -20927,14 +19920,9 @@ private:
       v.computed.canvasDamageRect = DirtyRect{};
     }
   }
-#endif // LITEUI_CANVAS_GL
 
   void drawCanvasTexture(const View &v, const ClipRect &clip) {
-#if defined(LITEUI_CANVAS_GL)
     ensureCanvasTargetGl(v);
-#else
-    ensureCanvasSurface(v);
-#endif
     if (!v.computed.canvasTexture)
       return;
     applyScissor(clip);
@@ -21503,9 +20491,7 @@ inline LiteUIImpl::~LiteUIImpl() {
 // Linux/Wayland-specific teardown path.
 #else
   if (eglDisplay_ != EGL_NO_DISPLAY) {
-#if defined(LITEUI_CANVAS_GL)
     canvasGl_.destroy(); // needs the context still current
-#endif
     eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (rectProgram_)
       glDeleteProgram(rectProgram_);

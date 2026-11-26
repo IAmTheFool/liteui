@@ -6,7 +6,7 @@
 // cases in canvas_hardware.inc.
 // (Included from liteui_tests.cpp — not a standalone .cpp.)
 
-#if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)
+#if !defined(_WIN32)
 
 #include <array>
 
@@ -1634,4 +1634,4 @@ TEST_CASE("GL canvas: minified images use mipmaps, built lazily", "[canvas][gl][
   }
 }
 
-#endif // LITEUI_CANVAS_GL && !_WIN32
+#endif // !_WIN32

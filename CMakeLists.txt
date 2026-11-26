@@ -66,13 +66,10 @@ add_library(liteui::liteui ALIAS liteui)
 target_include_directories(liteui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(liteui INTERFACE cxx_std_23)
 
-# Linux only: render Canvas nodes with the OpenGL ES 3.0 backend (GPU,
+# Linux Canvas nodes always render with the OpenGL ES 3.0 backend (GPU;
 # needs an EGL driver with OpenGL ES 3.0 and libGLESv2/GLES3 headers).
-# Turn OFF to fall back to the previous Cairo-based Canvas backend.
-option(LITEUI_CANVAS_GL "Use the OpenGL ES 3.0 Canvas backend (Linux)" ON)
-if(LITEUI_CANVAS_GL AND NOT WIN32)
-    target_compile_definitions(liteui INTERFACE LITEUI_CANVAS_GL)
-endif()
+# There is no Cairo canvas fallback. Cairo/Pango are still linked below
+# because text shaping and glyph rasterisation use them.
 
 set(LITEUI_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/wayland-protocols")
 

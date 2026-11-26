@@ -43,7 +43,7 @@
 #include "cases/file_drop_wayland.inc"
 #include "cases/clipboard_windows.inc"
 
-// Canvas: the GL backend cases compile only on Linux with LITEUI_CANVAS_GL (the
+// Canvas: the GL backend cases compile only on Linux (the
 // two canvas_gl_*.inc files are empty elsewhere). canvas_hardware.inc builds on
 // every platform but is hidden unless "[hardware]" is requested explicitly.
 #include "cases/canvas_sampling.inc"

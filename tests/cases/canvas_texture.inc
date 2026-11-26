@@ -524,7 +524,7 @@ TEST_CASE("CanvasTexture: concurrent updates and collection", "[texture][threads
   CHECK(mirror == whole(*t));
 }
 
-#if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)
+#if !defined(_WIN32)
 
 TEST_CASE("GL canvas: drawTexture", "[canvas][gl][texture]") {
   using namespace canvas_gl_context_test;
@@ -723,75 +723,4 @@ TEST_CASE("GL canvas: textures use mipmaps, rebuilt only after a change",
   }
 }
 
-#endif // LITEUI_CANVAS_GL && !_WIN32
-
-#if !defined(_WIN32) && !defined(LITEUI_CANVAS_GL)
-
-TEST_CASE("Cairo canvas: drawTexture", "[canvas][cairo][texture]") {
-  struct Surf {
-    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 16, 16);
-    cairo_t *cr = cairo_create(s);
-    ~Surf() {
-      cairo_destroy(cr);
-      cairo_surface_destroy(s);
-    }
-    // BGRA bytes of one pixel.
-    const unsigned char *px(int x, int y) {
-      cairo_surface_flush(s);
-      return cairo_image_surface_get_data(s) +
-             y * cairo_image_surface_get_stride(s) + x * 4;
-    }
-  };
-  auto quad = [] {
-    auto t = std::make_shared<CanvasTexture>(2, 2);
-    CanvasImage img(2, 2);
-    const uint8_t q[16] = {255, 0, 0, 255, 0, 255, 0, 255,
-                           0,   0, 255, 255, 255, 255, 255, 255};
-    std::copy(q, q + 16, img.pixels.begin());
-    REQUIRE(t->update(0, 0, img));
-    return t;
-  };
-  Surf sf;
-  CanvasContextImpl c(sf.cr, 16.0f, 16.0f);
-  c.setImageSampling(ImageSampling::Nearest);
-
-  SECTION("scales the texture onto the destination") {
-    c.drawTexture(quad(), 0, 0, 2, 2, 4, 4, 4, 4);
-    CHECK(sf.px(4, 4)[2] == 255);                  // red
-    CHECK(sf.px(6, 4)[1] == 255);                  // green
-    CHECK(sf.px(4, 6)[0] == 255);                  // blue
-    CHECK(sf.px(7, 7)[0] == 255);                  // white
-    CHECK(sf.px(3, 3)[3] == 0);                    // outside: untouched
-    CHECK(sf.px(8, 8)[3] == 0);
-  }
-  SECTION("the source rectangle crops") {
-    c.drawTexture(quad(), 1, 0, 1, 2, 0, 0, 8, 16); // right column only
-    CHECK(sf.px(3, 3)[1] == 255);                    // green
-    CHECK(sf.px(3, 12)[0] == 255);                   // white
-    CHECK(sf.px(9, 3)[3] == 0);                      // nothing past 8 px
-  }
-  SECTION("the app's current path survives") {
-    c.beginPath();
-    c.rect(1, 1, 3, 3);
-    c.drawTexture(quad(), 8, 8);
-    c.setFillColor(Color{0, 0, 255, 255});
-    c.fill();
-    CHECK(sf.px(2, 2)[0] == 255); // the rect from before the draw was filled
-  }
-  SECTION("a wrapped texture draws the same") {
-    auto img = std::make_shared<CanvasImage>(2, 2);
-    const uint8_t q[16] = {255, 0, 0, 255, 0, 255, 0, 255,
-                           0,   0, 255, 255, 255, 255, 255, 255};
-    std::copy(q, q + 16, img->pixels.begin());
-    c.drawTexture(CanvasTexture::wrap(img), 0, 0, 2, 2, 4, 4, 4, 4);
-    CHECK(sf.px(4, 4)[2] == 255); // red
-    CHECK(sf.px(6, 4)[1] == 255); // green
-  }
-  SECTION("degenerate input draws nothing") {
-    c.drawTexture(nullptr, 0, 0);
-    c.drawTexture(std::make_shared<CanvasTexture>(0, 0), 0, 0);
-    CHECK(sf.px(0, 0)[3] == 0);
-  }
-}
-
-#endif // !_WIN32 && !LITEUI_CANVAS_GL
+#endif // !_WIN32

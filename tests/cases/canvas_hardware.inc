@@ -1,16 +1,15 @@
 // Hardware canvas checks: opens a real window, draws known patterns into a
 // Canvas, reads the actual pixels back with getImageData() and verifies them.
 // Unlike the other canvas cases this exercises the real backend and driver
-// (OpenGL ES 3.0 on Linux, Direct3D 11 on Windows, or Cairo with
-// -DLITEUI_CANVAS_GL=OFF), so it is how you find out whether a particular
-// GPU/driver does what liteui expects.
+// (OpenGL ES 3.0 on Linux, Direct3D 11 on Windows), so it is how you find
+// out whether a particular GPU/driver does what liteui expects.
 //
 // HIDDEN BY DEFAULT: it needs a display, so the "[.]" tag keeps it out of a
 // normal run (and out of CI). Run it explicitly:
 //
 //     liteui_core_test "[hardware]"        (add -s to also list passing checks)
 //
-// Run it under each backend (Linux GL / Linux Cairo / Windows) to compare them.
+// Run it on each platform (Linux GL / Windows) to compare them.
 // Backends without a feature are reported as a warning ("SKIP ...") rather
 // than a failure; the emoji line is informational.
 //
@@ -23,10 +22,8 @@ constexpr float kPi = 3.14159265358979f;
 
 #if defined(_WIN32)
 constexpr const char *kBackend = "Windows (Direct3D 11 + Direct2D)";
-#elif defined(LITEUI_CANVAS_GL)
-constexpr const char *kBackend = "Linux (OpenGL ES 3.0)";
 #else
-constexpr const char *kBackend = "Linux (Cairo)";
+constexpr const char *kBackend = "Linux (OpenGL ES 3.0)";
 #endif
 
 // Results are recorded while the window paints and reported through Catch2
@@ -667,9 +664,9 @@ inline void runAll(CanvasContext &g) {
                 "max alpha " + std::to_string(maxA));
        });
 
-#if defined(LITEUI_CANVAS_GL)
+#if !defined(_WIN32)
   {
-    // Only the GL backend strokes real glyph outlines; the others draw an
+    // Only the GL backend strokes real glyph outlines; Windows draws an
     // approximation (fill text nudged in a ring), which is much heavier.
     int fillN = 0;
     g.clearRect(0, 0, W, H);

@@ -22,7 +22,7 @@
 // Included from liteui_tests.cpp after liteui.hpp. Only meaningful when the
 // GL canvas backend is compiled in (Linux, LITEUI_CANVAS_GL).
 
-#if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)
+#if !defined(_WIN32)
 
 #include <algorithm>
 #include <array>

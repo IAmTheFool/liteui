@@ -3,7 +3,7 @@
 // premultiplication and the colour-glyph heuristic. None of these touch GL.
 // (Included from liteui_tests.cpp — not a standalone .cpp.)
 
-#if defined(LITEUI_CANVAS_GL) && !defined(_WIN32)
+#if !defined(_WIN32)
 
 namespace cgl = liteui_canvas_gl; // short alias for the cases below
 
@@ -393,4 +393,4 @@ TEST_CASE("premultiplyImage: straight RGBA to premultiplied", "[canvas][gl][imag
   CHECK(out[15] == 1);
 }
 
-#endif // LITEUI_CANVAS_GL && !_WIN32
+#endif // !_WIN32
