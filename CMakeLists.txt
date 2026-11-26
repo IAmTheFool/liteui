@@ -21,8 +21,8 @@ endif()
 #     target_link_libraries(app PRIVATE liteui::liteui)
 #
 # Because the implementation is compiled inside the consumer, the platform
-# libraries (Win32/D2D, or Wayland/Cairo/EGL/...) and the LITEUI_PROFILE
-# define are all INTERFACE: they propagate to whatever links liteui.
+# libraries (Win32/D2D, or Wayland/Cairo/EGL/...) are all INTERFACE: they
+# propagate to whatever links liteui.
 #
 # This variant VENDORS the generated xdg-shell / xdg-decoration protocol
 # bindings under platform/wayland-protocols/ (checked into git). A
@@ -65,15 +65,6 @@ add_library(liteui::liteui ALIAS liteui)
 
 target_include_directories(liteui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(liteui INTERFACE cxx_std_23)
-
-# Optional frame profiler (see LITEUI_PROFILE in liteui.hpp). When ON,
-# consumers are compiled with -DLITEUI_PROFILE and print per-second timing
-# of mouse handling / painting / etc. to stderr. OFF by default: compiles
-# to nothing.
-option(LITEUI_PROFILE "Print per-second frame timing to stderr" OFF)
-if(LITEUI_PROFILE)
-    target_compile_definitions(liteui INTERFACE LITEUI_PROFILE)
-endif()
 
 # Linux only: render Canvas nodes with the OpenGL ES 3.0 backend (GPU,
 # needs an EGL driver with OpenGL ES 3.0 and libGLESv2/GLES3 headers).

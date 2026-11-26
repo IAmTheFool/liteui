@@ -3159,73 +3159,6 @@ inline KeyModifiers currentModifiers() {
 }
 #endif
 
-// ---- optional frame profiler ------------------------------------------
-// Compile with -DLITEUI_PROFILE to print, once per second on stderr, how
-// long each stage of interaction/painting takes (avg and worst case, in
-// ms, plus how many times it ran that second). Compiled out entirely
-// otherwise — LITEUI_PROF_START/ADD expand to nothing. Stages nest: e.g.
-// `build` (all of WM_PAINT's drawing) contains `canvas` and `blit`.
-#ifdef LITEUI_PROFILE
-#include <chrono>
-namespace liteui_prof {
-struct Stat {
-  double sum = 0, worst = 0;
-  int n = 0;
-  void add(double ms) {
-    sum += ms;
-    if (ms > worst)
-      worst = ms;
-    ++n;
-  }
-  double avg() const { return n ? sum / n : 0.0; }
-};
-struct Report {
-  Stat move, build, endDraw, canvas, blit, recompute, appPaint;
-  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-  void flushIfDue() {
-    auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(1))
-      return;
-    auto line = [](const char *name, const Stat &s) {
-      if (s.n)
-        std::fprintf(stderr, "  %-9s x%-4d avg %6.2f ms  worst %6.2f ms\n",
-                     name, s.n, s.avg(), s.worst);
-    };
-    if (move.n || build.n) {
-      std::fprintf(stderr, "[liteui profile]\n");
-      line("mouse", move);
-      line("recompute", recompute);
-      line("build", build);
-      line("canvas", canvas);
-      line("appPaint", appPaint);
-      line("blit", blit);
-      line("EndDraw", endDraw);
-    }
-    move = build = endDraw = canvas = blit = recompute = appPaint = Stat{};
-    last = now;
-  }
-};
-inline Report &report() {
-  static Report r;
-  return r;
-}
-inline double msSince(std::chrono::steady_clock::time_point t) {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now() - t)
-      .count();
-}
-} // namespace liteui_prof
-#define LITEUI_PROF_START(var) auto var = std::chrono::steady_clock::now()
-#define LITEUI_PROF_ADD(stat, var)                                             \
-  do {                                                                         \
-    liteui_prof::report().stat.add(liteui_prof::msSince(var));                 \
-    liteui_prof::report().flushIfDue();                                        \
-  } while (0)
-#else
-#define LITEUI_PROF_START(var) ((void)0)
-#define LITEUI_PROF_ADD(stat, var) ((void)0)
-#endif
-
 // ======================= File / folder pickers =======================
 //
 // All five public pickers (openFilePicker, openFilesPicker, saveFilePicker,
@@ -17736,19 +17669,15 @@ private:
       bool recreate = false;
       if (self) {
         self->ensureRenderTarget();
-        LITEUI_PROF_START(profBuild);
         self->renderTarget_->BeginDraw();
         self->renderTarget_->Clear(toD2DColor(self->windowBg_));
         self->paintRoot(self->renderTarget_);
         self->paintTooltip(self->renderTarget_);
-        LITEUI_PROF_ADD(build, profBuild);
-        LITEUI_PROF_START(profEnd);
         HRESULT hr = self->renderTarget_->EndDraw();
         // Hand the finished frame to the display (vsync'd). Skipped when
         // drawing already failed or a canvas reported device loss.
         if (SUCCEEDED(hr) && !self->deviceLost_)
           hr = self->swapChain_->Present(1, 0);
-        LITEUI_PROF_ADD(endDraw, profEnd);
         // The GPU/driver went away (reset, removal, TDR): drop every device
         // object — canvas textures included — and rebuild on the next
         // paint, which we request below once EndPaint has run.
@@ -17849,7 +17778,6 @@ private:
     // this costs nothing on ordinary hover.
     case WM_MOUSEMOVE: {
       if (self) {
-        LITEUI_PROF_START(profMove);
         float x = self->mouseX(lp);
         float y = self->mouseY(lp);
         bool changed = self->updateScrollDrag(x, y);
@@ -17865,7 +17793,6 @@ private:
         }
         if (changed && self->hwnd_)
           InvalidateRect(self->hwnd_, nullptr, FALSE);
-        LITEUI_PROF_ADD(move, profMove);
       }
       return 0;
     }
@@ -18365,7 +18292,6 @@ private:
     if (!v.computed.canvasBitmap)
       return;
     if (v.computed.canvasNeedsRedraw && v.onPaint) {
-      LITEUI_PROF_START(profCanvas);
       // Retained canvas with damage: repaint only that box (see
       // liteui_canvas_damage::plan); anything else repaints everything.
       const D2D1_SIZE_U bmpPx = v.computed.canvasBitmap->GetPixelSize();
@@ -18422,7 +18348,6 @@ private:
       v.computed.canvasNeedsRedraw = false;
       v.computed.canvasFullRepaint = false;
       v.computed.canvasDamageRect = DirtyRect{};
-      LITEUI_PROF_ADD(canvas, profCanvas);
     }
   }
 
@@ -18435,7 +18360,6 @@ private:
     ID2D1Bitmap1 *bmp = v.computed.canvasBitmap;
     if (!bmp)
       return;
-    LITEUI_PROF_START(profBlit);
     const EdgeInsets &pad =
         resolveDynamic(v.style.padding, v.computed.resolvedPadding);
     float x = v.computed.x + pad.left;
@@ -18448,7 +18372,6 @@ private:
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->DrawBitmap(bmp, D2D1::RectF(l, t, l + px.width / scale_,
                                     t + px.height / scale_));
-    LITEUI_PROF_ADD(blit, profBlit);
   }
 
   // `clip` is the accumulated visible region from scrollable ancestors.
